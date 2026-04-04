@@ -775,6 +775,40 @@ int lisa_run_frame(lisa_t *lisa) {
         }
     }
 
+    /* Debug: log CPU/VIA/vector state once after significant execution */
+    static int frame_count = 0;
+    if (++frame_count == 120) {
+        fprintf(stderr, "DIAG frame %d: PC=$%06X SR=$%04X stopped=%d pending_irq=%d setup=%d\n",
+                frame_count, lisa->cpu.pc, lisa->cpu.sr, lisa->cpu.stopped,
+                lisa->cpu.pending_irq, lisa->mem.setup_mode);
+        fprintf(stderr, "  VIA1: t1_run=%d t1_cnt=%d t1_latch=%d ier=$%02X ifr=$%02X\n",
+                lisa->via1.t1_running, lisa->via1.t1_counter, lisa->via1.t1_latch,
+                lisa->via1.ier, lisa->via1.ifr);
+        fprintf(stderr, "  VIA2: t1_run=%d t1_cnt=%d t1_latch=%d ier=$%02X ifr=$%02X\n",
+                lisa->via2.t1_running, lisa->via2.t1_counter, lisa->via2.t1_latch,
+                lisa->via2.ier, lisa->via2.ifr);
+        /* Check key exception vectors in RAM */
+        uint32_t trap1_vec = ((uint32_t)lisa->mem.ram[0x84] << 24) |
+                             ((uint32_t)lisa->mem.ram[0x85] << 16) |
+                             ((uint32_t)lisa->mem.ram[0x86] << 8) |
+                             lisa->mem.ram[0x87];
+        uint32_t trap2_vec = ((uint32_t)lisa->mem.ram[0x88] << 24) |
+                             ((uint32_t)lisa->mem.ram[0x89] << 16) |
+                             ((uint32_t)lisa->mem.ram[0x8A] << 8) |
+                             lisa->mem.ram[0x8B];
+        uint32_t int1_vec = ((uint32_t)lisa->mem.ram[0x64] << 24) |
+                            ((uint32_t)lisa->mem.ram[0x65] << 16) |
+                            ((uint32_t)lisa->mem.ram[0x66] << 8) |
+                            lisa->mem.ram[0x67];
+        fprintf(stderr, "  Vectors (RAM): TRAP1=$%08X TRAP2=$%08X INT1=$%08X\n",
+                trap1_vec, trap2_vec, int1_vec);
+        /* Also read via CPU path to compare */
+        uint32_t trap1_cpu = lisa_mem_read32(&lisa->mem, 0x84);
+        fprintf(stderr, "  Vectors (CPU): TRAP1=$%08X  SGLOBAL@$2A0=$%08X\n",
+                trap1_cpu,
+                lisa_mem_read32(&lisa->mem, 0x2A0));
+    }
+
     /* Vertical retrace: pulse the IRQ for one instruction only.
      * Set it, let CPU take it, immediately clear. */
     if (lisa->mem.vretrace_enabled) {
