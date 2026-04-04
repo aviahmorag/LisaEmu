@@ -47,6 +47,7 @@ struct ContentView: View {
                     showingFilePicker = true
                 } label: {
                     Label("Build from Source", systemImage: "hammer")
+                        .labelStyle(.titleAndIcon)
                 }
                 .help("Select Lisa_Source folder to compile Lisa OS")
                 .disabled(viewModel.isBuilding)
@@ -58,6 +59,7 @@ struct ContentView: View {
                     showingFilePicker = true
                 } label: {
                     Label("Open Image", systemImage: "doc")
+                        .labelStyle(.titleAndIcon)
                 }
                 .help("Open a disk image file")
             }
@@ -74,6 +76,7 @@ struct ContentView: View {
                         viewModel.isRunning ? "Power Off" : "Power On",
                         systemImage: viewModel.isRunning ? "power.circle.fill" : "power.circle"
                     )
+                    .labelStyle(.titleAndIcon)
                 }
                 .help(viewModel.isRunning ? "Power off the Lisa" : "Power on the Lisa")
             }
@@ -83,6 +86,7 @@ struct ContentView: View {
                     viewModel.reset()
                 } label: {
                     Label("Reset", systemImage: "arrow.counterclockwise")
+                        .labelStyle(.titleAndIcon)
                 }
                 .help("Reset the Lisa")
                 .disabled(!viewModel.isRunning)
@@ -93,6 +97,7 @@ struct ContentView: View {
                     viewModel.showDebugger.toggle()
                 } label: {
                     Label("Debug", systemImage: "terminal")
+                        .labelStyle(.titleAndIcon)
                 }
                 .help("CPU debugger")
             }
