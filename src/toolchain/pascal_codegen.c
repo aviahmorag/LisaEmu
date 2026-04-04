@@ -467,8 +467,24 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                     emit16(cg, 0x8041);  /* OR.W D1,D0 */
                     break;
                 case TOK_XOR:
-                    emit16(cg, 0xB140);  /* EOR.W D0,... hmm, EOR is Dn,<ea> */
-                    /* Actually: EOR.W D1,D0 = B340 */
+                    emit16(cg, 0xB341);  /* EOR.W D1,D1... actually EOR.W D0,D1 then move */
+                    /* EOR.W D1,D0 */
+                    emit16(cg, 0xB340);
+                    break;
+                case TOK_SHL:
+                    /* ASL.W D1,D0 — shift D0 left by D1 */
+                    emit16(cg, 0xE360);
+                    break;
+                case TOK_SHR:
+                    /* LSR.W D1,D0 — shift D0 right by D1 */
+                    emit16(cg, 0xE268);
+                    break;
+                case TOK_IN:
+                    /* Set membership: D0 IN D1 (simplified — just emit BTST) */
+                    emit16(cg, 0x0100);  /* BTST D0,D1 */
+                    emit16(cg, 0x56C0);  /* SNE D0 */
+                    emit16(cg, 0x4400);  /* NEG.B D0 */
+                    emit16(cg, 0x0240); emit16(cg, 0x0001); /* ANDI.W #1,D0 */
                     break;
 
                 /* Comparisons: CMP and set condition */
@@ -936,11 +952,20 @@ static void gen_unit(codegen_t *cg, ast_node_t *unit) {
             ast_node_t *impl = unit->children[i];
             process_declarations(cg, impl, true);
 
-            /* Generate code for procedures/functions */
+            /* Generate code for procedures/functions and methods */
             for (int j = 0; j < impl->num_children; j++) {
                 if (impl->children[j]->type == AST_PROC_DECL ||
                     impl->children[j]->type == AST_FUNC_DECL) {
                     gen_proc_or_func(cg, impl->children[j]);
+                } else if (impl->children[j]->type == AST_METHODS) {
+                    /* METHODS OF section */
+                    ast_node_t *methods = impl->children[j];
+                    for (int k = 0; k < methods->num_children; k++) {
+                        if (methods->children[k]->type == AST_PROC_DECL ||
+                            methods->children[k]->type == AST_FUNC_DECL) {
+                            gen_proc_or_func(cg, methods->children[k]);
+                        }
+                    }
                 }
             }
         }
@@ -950,16 +975,28 @@ static void gen_unit(codegen_t *cg, ast_node_t *unit) {
 static void gen_program(codegen_t *cg, ast_node_t *prog) {
     process_declarations(cg, prog, true);
 
-    /* Generate main block */
+    /* Generate code for all procedures/functions and blocks */
     for (int i = 0; i < prog->num_children; i++) {
-        if (prog->children[i]->type == AST_BLOCK) {
-            gen_statement(cg, prog->children[i]);
-            break;
+        ast_node_t *child = prog->children[i];
+        if (child->type == AST_PROC_DECL || child->type == AST_FUNC_DECL) {
+            gen_proc_or_func(cg, child);
+        } else if (child->type == AST_METHODS) {
+            /* METHODS OF section — generate each method */
+            for (int j = 0; j < child->num_children; j++) {
+                if (child->children[j]->type == AST_PROC_DECL ||
+                    child->children[j]->type == AST_FUNC_DECL) {
+                    gen_proc_or_func(cg, child->children[j]);
+                }
+            }
+        } else if (child->type == AST_BLOCK) {
+            gen_statement(cg, child);
         }
     }
 
-    /* RTS at end of program */
-    emit16(cg, 0x4E75);
+    /* RTS at end of program (if there was executable code) */
+    if (cg->code_size > 0) {
+        emit16(cg, 0x4E75);
+    }
 }
 
 /* ========================================================================
@@ -985,8 +1022,15 @@ bool codegen_generate(codegen_t *cg, ast_node_t *ast) {
         case AST_PROGRAM:
             gen_program(cg, ast);
             break;
+        case AST_FRAGMENT:
+            /* Code fragment: treat like a program body */
+            gen_program(cg, ast);
+            break;
+        case AST_EMPTY:
+            /* Empty file (e.g., directive-only) */
+            break;
         default:
-            cg_error(cg, 0, "expected UNIT or PROGRAM at top level");
+            cg_error(cg, 0, "unexpected AST type at top level: %s", ast_type_name(ast->type));
             return false;
     }
 
