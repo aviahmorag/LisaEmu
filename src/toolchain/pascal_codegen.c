@@ -773,15 +773,50 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
             }
             break;
 
-        case AST_CASE:
-            /* Simplified: evaluate selector, skip to end */
+        case AST_CASE: {
+            /* Evaluate selector into D0, save in D3 */
             gen_expression(cg, node->children[0]);
-            /* Full case implementation would emit a jump table */
-            /* For now, execute first case body */
-            if (node->num_children >= 3) {
-                gen_statement(cg, node->children[2]);
+            emit16(cg, 0x3600);  /* MOVE.W D0,D3 */
+
+            uint32_t end_fixups[128];
+            int num_fixups = 0;
+
+            /* Case branches: pairs of (label, statement) starting at child[1] */
+            int ci = 1;
+            while (ci + 1 < node->num_children) {
+                /* Evaluate label into D0 */
+                gen_expression(cg, node->children[ci]);
+                emit16(cg, 0xB043);  /* CMP.W D3,D0 */
+                emit16(cg, 0x6600);  /* BNE.W next_case */
+                uint32_t next_pos = cg->code_size;
+                emit16(cg, 0);
+
+                /* Case body */
+                gen_statement(cg, node->children[ci + 1]);
+
+                /* BRA.W end_case */
+                emit16(cg, 0x6000);
+                if (num_fixups < 128) end_fixups[num_fixups++] = cg->code_size;
+                emit16(cg, 0);
+
+                /* Patch BNE to skip to here */
+                patch16(cg, next_pos, (uint16_t)(cg->code_size - next_pos));
+
+                ci += 2;
+            }
+
+            /* OTHERWISE: any remaining odd children */
+            while (ci < node->num_children) {
+                gen_statement(cg, node->children[ci]);
+                ci++;
+            }
+
+            /* Patch all end_case branches to here */
+            for (int j = 0; j < num_fixups; j++) {
+                patch16(cg, end_fixups[j], (uint16_t)(cg->code_size - end_fixups[j]));
             }
             break;
+        }
 
         case AST_DIRECTIVE:
             /* Process segment directives */
