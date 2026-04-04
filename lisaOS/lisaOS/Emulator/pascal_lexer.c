@@ -298,6 +298,7 @@ static token_t make_token(lexer_t *lex, token_type_t type) {
 
 /* Lex a single raw token (no conditional compilation processing) */
 static token_t lexer_raw_next(lexer_t *lex) {
+    while (1) {
     skip_whitespace_and_comments(lex);
 
     if (!*lex->pos) {
@@ -325,7 +326,7 @@ static token_t lexer_raw_next(lexer_t *lex) {
                 next_char(lex); /* { */
                 while (*lex->pos && *lex->pos != '}') next_char(lex);
                 if (*lex->pos == '}') next_char(lex);
-                return lexer_raw_next(lex);
+                continue; /* re-lex */
             }
         }
         tok.type = TOK_DIRECTIVE;
@@ -496,13 +497,13 @@ static token_t lexer_raw_next(lexer_t *lex) {
             break;
 
         case '#':
-            /* # character — skip and re-lex */
-            return lexer_raw_next(lex);
+            /* # character — skip and continue lexing */
+            continue;  /* top of while(1) */
 
         default:
             if ((unsigned char)c >= 128) {
-                /* Non-ASCII character (file padding) — skip and re-lex */
-                return lexer_raw_next(lex);
+                /* Non-ASCII character (file padding) — skip */
+                continue;  /* top of while(1) */
             }
             tok.type = TOK_ERROR;
             snprintf(tok.str_val, sizeof(tok.str_val), "unexpected character: '%c' (0x%02X)", c, (unsigned char)c);
@@ -510,6 +511,7 @@ static token_t lexer_raw_next(lexer_t *lex) {
     }
 
     return tok;
+    } /* end while(1) */
 }
 
 /* Public lexer_next: wraps raw lexing with conditional compilation */
