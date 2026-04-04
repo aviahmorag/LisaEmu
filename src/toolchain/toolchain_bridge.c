@@ -383,6 +383,20 @@ build_result_t toolchain_build(const char *source_dir,
     linker_t *lk = calloc(1, sizeof(linker_t));
     linker_init(lk);
 
+    /* Sort files: STARTUP program must be compiled first so it's at $400.
+     * The boot ROM jumps to $400 and STARTUP is the OS entry point. */
+    for (int i = 0; i < num_files; i++) {
+        if (strcasestr(files[i].path, "SOURCE-STARTUP.TEXT") != NULL) {
+            if (i != 0) {
+                source_file_t tmp = files[0];
+                files[0] = files[i];
+                files[i] = tmp;
+            }
+            fprintf(stderr, "Boot entry: %s (placed first at $400)\n", files[0].path);
+            break;
+        }
+    }
+
     /* Phase 1: Compile Pascal files */
     int pascal_count = 0, pascal_ok = 0, pascal_fail = 0;
     for (int i = 0; i < num_files; i++) {
