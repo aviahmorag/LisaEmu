@@ -11,6 +11,12 @@ final class EmulatorViewModel {
     var statusMessage = "No ROM loaded"
     var showDebugger = false
 
+    // Build from source
+    var isBuilding = false
+    var buildProgress = ""
+    var buildComplete = false
+    var builtImagePath: String?
+
     private var emulatorTimer: Timer?
 
     let screenWidth = Int(emu_screen_width())
@@ -145,6 +151,73 @@ final class EmulatorViewModel {
         var buffer = [CChar](repeating: 0, count: 1024)
         emu_get_cpu_state(&buffer, 1024)
         cpuState = String(cString: buffer)
+    }
+
+    // MARK: - Build from Source
+
+    /// Check if a previously built disk image exists
+    func checkForBuiltImage() {
+        let cacheDir = buildCacheDirectory()
+        let imagePath = "\(cacheDir)/lisa_profile.image"
+        if FileManager.default.fileExists(atPath: imagePath) {
+            builtImagePath = imagePath
+            buildComplete = true
+            statusMessage = "Built image available. Power On to boot."
+        }
+    }
+
+    /// Build Lisa OS from source
+    func buildFromSource(sourceURL: URL) {
+        guard !isBuilding else { return }
+        isBuilding = true
+        buildProgress = "Starting build..."
+        statusMessage = "Building..."
+
+        let sourcePath = sourceURL.path
+        let outputPath = buildCacheDirectory()
+
+        Task.detached { [weak self] in
+            let result = toolchain_build(sourcePath, outputPath, nil)
+
+            await MainActor.run {
+                guard let self else { return }
+                self.isBuilding = false
+                if result.success {
+                    var path = result.output_path
+                    self.builtImagePath = withUnsafePointer(to: &path) {
+                        $0.withMemoryRebound(to: CChar.self, capacity: 512) { String(cString: $0) }
+                    }
+                    self.buildComplete = true
+                    self.buildProgress = "Build complete: \(result.files_compiled) compiled, \(result.files_assembled) assembled"
+                    self.statusMessage = "Build complete! Power On to boot."
+
+                    // Auto-mount the built disk image
+                    if let path = self.builtImagePath {
+                        _ = emu_mount_profile(path)
+                    }
+                } else {
+                    var errBuf = result.error_message
+                    let errMsg = withUnsafePointer(to: &errBuf) {
+                        $0.withMemoryRebound(to: CChar.self, capacity: 512) { String(cString: $0) }
+                    }
+                    self.buildProgress = "Build failed: \(errMsg)"
+                    self.statusMessage = "Build failed"
+                }
+            }
+        }
+    }
+
+    /// Return the cache directory for built artifacts
+    private func buildCacheDirectory() -> String {
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let cacheDir = appSupport.appendingPathComponent("LisaEmu/build").path
+        try? FileManager.default.createDirectory(atPath: cacheDir, withIntermediateDirectories: true)
+        return cacheDir
+    }
+
+    /// Validate a source directory
+    func validateSource(url: URL) -> Bool {
+        return toolchain_validate_source(url.path)
     }
 
     // MARK: - Input

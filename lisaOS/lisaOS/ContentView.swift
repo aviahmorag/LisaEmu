@@ -6,6 +6,7 @@ struct ContentView: View {
     @State private var showingROMPicker = false
     @State private var showingProfilePicker = false
     @State private var showingFloppyPicker = false
+    @State private var showingSourcePicker = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -76,6 +77,25 @@ struct ContentView: View {
                     viewModel.showDebugger.toggle()
                 }
                 .help("Toggle CPU debugger")
+
+                Divider()
+
+                if viewModel.isBuilding {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text(viewModel.buildProgress)
+                        .font(.system(size: 10))
+                } else if viewModel.buildComplete {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                    Text("Built")
+                        .font(.system(size: 10))
+                } else {
+                    Button("Build from Source", systemImage: "hammer") {
+                        showingSourcePicker = true
+                    }
+                    .help("Build Lisa OS from Apple's source code")
+                }
             }
         }
         .fileImporter(isPresented: $showingROMPicker, allowedContentTypes: [.data]) { result in
@@ -93,8 +113,20 @@ struct ContentView: View {
                 viewModel.mountFloppy(url: url)
             }
         }
+        .fileImporter(isPresented: $showingSourcePicker, allowedContentTypes: [.folder]) { result in
+            if case .success(let url) = result {
+                if viewModel.validateSource(url: url) {
+                    viewModel.buildFromSource(sourceURL: url)
+                } else {
+                    viewModel.statusMessage = "Invalid source: expected Lisa_Source with LISA_OS subdirectory"
+                }
+            }
+        }
         .sheet(isPresented: $viewModel.showDebugger) {
             DebuggerView(viewModel: viewModel)
+        }
+        .onAppear {
+            viewModel.checkForBuiltImage()
         }
     }
 }
