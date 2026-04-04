@@ -380,10 +380,6 @@ bool linker_link(linker_t *lk) {
     int total_relocs_applied = 0;
     for (int m = 0; m < lk->num_modules; m++) {
         link_module_t *mod = lk->modules[m];
-        if (mod->num_relocs > 0 && strcasestr(mod->name, "INITRAP")) {
-            fprintf(stderr, "  INITRAP relocs: %d (module %d, base=$%X, code_size=%u)\n",
-                    mod->num_relocs, m, mod->base_addr, mod->code_size);
-        }
         for (int r = 0; r < mod->num_relocs; r++) {
             total_relocs_applied++;
             int sym_idx = find_global_symbol(lk, mod->relocs[r].symbol);
@@ -395,6 +391,10 @@ bool linker_link(linker_t *lk) {
             }
             uint32_t offset = mod->relocs[r].offset;
             int size = mod->relocs[r].size;
+            if (strcasecmp(mod->relocs[r].symbol, "TRAP1") == 0) {
+                fprintf(stderr, "  LINKER PATCH: TRAP1 target=$%08X at module offset %u (code_size=%u, base=$%X)\n",
+                        target, offset, mod->code_size, mod->base_addr);
+            }
             if (offset < mod->code_size) {
                 if (size == 4) {
                     mod->code[offset]     = (target >> 24) & 0xFF;
