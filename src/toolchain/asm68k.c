@@ -61,9 +61,12 @@ static void asm_error(asm68k_t *as, const char *fmt, ...) {
  * Symbol table
  * ======================================================================== */
 
+/* Lisa assembler truncates symbols to 8 characters */
+#define ASM_SYM_SIGCHARS 8
+
 static int find_symbol(asm68k_t *as, const char *name) {
     for (int i = 0; i < as->num_symbols; i++) {
-        if (str_eq_nocase(as->symbols[i].name, name))
+        if (strncasecmp(as->symbols[i].name, name, ASM_SYM_SIGCHARS) == 0)
             return i;
     }
     return -1;
@@ -90,6 +93,10 @@ static int add_symbol(asm68k_t *as, const char *name, sym_type_t type, int32_t v
 
     idx = as->num_symbols++;
     strncpy(as->symbols[idx].name, name, ASM_MAX_LABEL - 1);
+    /* Truncate to significant characters */
+    if (strlen(as->symbols[idx].name) > ASM_SYM_SIGCHARS && name[0] != '@') {
+        as->symbols[idx].name[ASM_SYM_SIGCHARS] = '\0';
+    }
     as->symbols[idx].type = type;
     as->symbols[idx].value = value;
     as->symbols[idx].defined = (type != SYM_REF);
@@ -228,10 +235,10 @@ static int32_t parse_number(expr_ctx_t *ctx) {
     }
 
     /* Symbol name */
-    if (isalpha((unsigned char)*p) || *p == '_' || *p == '.') {
+    if (isalpha((unsigned char)*p) || *p == '_' || *p == '.' || *p == '%' || *p == '@') {
         char name[ASM_MAX_LABEL];
         int i = 0;
-        while (isalnum((unsigned char)*p) || *p == '_' || *p == '.') {
+        while (isalnum((unsigned char)*p) || *p == '_' || *p == '.' || *p == '%' || *p == '@') {
             if (i < ASM_MAX_LABEL - 1) name[i++] = *p;
             p++;
         }
@@ -1247,6 +1254,9 @@ static bool assemble_instruction(asm68k_t *as, const char *mnemonic, const char 
  * Directive handling
  * ======================================================================== */
 
+/* Forward declaration — needed for .INCLUDE processing */
+static void assemble_line(asm68k_t *as, const char *raw_line);
+
 static bool handle_directive(asm68k_t *as, const char *directive, const char *args, const char *label) {
     char dir[64];
     strncpy(dir, directive, sizeof(dir) - 1);
@@ -1279,28 +1289,50 @@ static bool handle_directive(asm68k_t *as, const char *directive, const char *ar
         return true;
     }
 
-    /* .DEF name */
+    /* .DEF name[,name,...] */
     if (strcmp(dir, ".DEF") == 0) {
-        char name[ASM_MAX_LABEL];
-        strncpy(name, args, ASM_MAX_LABEL - 1);
-        str_trim(name);
-        int idx = find_symbol(as, name);
-        if (idx >= 0) {
-            as->symbols[idx].exported = true;
-        } else {
-            add_symbol(as, name, SYM_DEF, 0);
+        char buf[512];
+        strncpy(buf, args, sizeof(buf) - 1);
+        buf[sizeof(buf) - 1] = '\0';
+        char *tok = strtok(buf, ",");
+        while (tok) {
+            while (*tok == ' ' || *tok == '\t') tok++;
+            char name[ASM_MAX_LABEL];
+            strncpy(name, tok, ASM_MAX_LABEL - 1);
+            name[ASM_MAX_LABEL - 1] = '\0';
+            str_trim(name);
+            if (name[0]) {
+                int idx = find_symbol(as, name);
+                if (idx >= 0) {
+                    as->symbols[idx].exported = true;
+                } else {
+                    add_symbol(as, name, SYM_DEF, 0);
+                }
+            }
+            tok = strtok(NULL, ",");
         }
         return true;
     }
 
-    /* .REF name */
+    /* .REF name[,name,...] */
     if (strcmp(dir, ".REF") == 0) {
-        char name[ASM_MAX_LABEL];
-        strncpy(name, args, ASM_MAX_LABEL - 1);
-        str_trim(name);
-        int idx = find_symbol(as, name);
-        if (idx < 0) {
-            add_symbol(as, name, SYM_REF, 0);
+        char buf[512];
+        strncpy(buf, args, sizeof(buf) - 1);
+        buf[sizeof(buf) - 1] = '\0';
+        char *tok = strtok(buf, ",");
+        while (tok) {
+            while (*tok == ' ' || *tok == '\t') tok++;
+            char name[ASM_MAX_LABEL];
+            strncpy(name, tok, ASM_MAX_LABEL - 1);
+            name[ASM_MAX_LABEL - 1] = '\0';
+            str_trim(name);
+            if (name[0]) {
+                int idx = find_symbol(as, name);
+                if (idx < 0) {
+                    add_symbol(as, name, SYM_REF, 0);
+                }
+            }
+            tok = strtok(NULL, ",");
         }
         return true;
     }
@@ -1316,40 +1348,121 @@ static bool handle_directive(asm68k_t *as, const char *directive, const char *ar
 
     /* .INCLUDE filename */
     if (strcmp(dir, ".INCLUDE") == 0) {
-        /* Resolve include path */
-        char path[512];
         char inc_name[256];
         strncpy(inc_name, args, sizeof(inc_name) - 1);
+        inc_name[sizeof(inc_name) - 1] = '\0';
+        /* Strip trailing comment (everything after ;) */
+        char *semi = strchr(inc_name, ';');
+        if (semi) *semi = '\0';
         str_trim(inc_name);
 
-        /* Try base_dir/inc_name first */
-        snprintf(path, sizeof(path), "%s/%s", as->base_dir, inc_name);
+        /* Resolve Lisa-style include path to archive path.
+         * Lisa paths like "source/pascaldefs.text" map to archive names like
+         * "source-PASCALDEFS.TEXT.unix.txt" in the same directory.
+         * The convention: replace / with - and append .unix.txt */
+        char resolved[512];
+        bool found = false;
 
-        /* Lisa-style paths use / as separator, and the file might have
-           a .unix.txt suffix in the converted archive */
-        /* Try various suffixes */
-        FILE *f = fopen(path, "r");
+        /* Strategy 1: direct path under base_dir */
+        snprintf(resolved, sizeof(resolved), "%s/%s", as->base_dir, inc_name);
+        FILE *f = fopen(resolved, "r");
+        if (f) { found = true; }
+
+        /* Strategy 2: direct path + .unix.txt */
         if (!f) {
-            char path2[512];
-            snprintf(path2, sizeof(path2), "%s.unix.txt", path);
-            f = fopen(path2, "r");
-            if (f) { fclose(f); strncpy(path, path2, sizeof(path)); }
+            snprintf(resolved, sizeof(resolved), "%s/%s.unix.txt", as->base_dir, inc_name);
+            f = fopen(resolved, "r");
+            if (f) found = true;
         }
+
+        /* Strategy 3: convert Lisa path: source/file.text → source-FILE.TEXT.unix.txt */
         if (!f) {
-            /* Try uppercase */
-            char upper_name[256];
-            strncpy(upper_name, inc_name, sizeof(upper_name));
-            str_upper(upper_name);
-            snprintf(path, sizeof(path), "%s/%s.unix.txt", as->base_dir, upper_name);
-            f = fopen(path, "r");
+            char mapped[256];
+            strncpy(mapped, inc_name, sizeof(mapped) - 1);
+            mapped[sizeof(mapped) - 1] = '\0';
+            /* Replace / with - */
+            for (char *c = mapped; *c; c++) {
+                if (*c == '/') *c = '-';
+            }
+            /* Try exact case with .unix.txt */
+            snprintf(resolved, sizeof(resolved), "%s/%s.unix.txt", as->base_dir, mapped);
+            f = fopen(resolved, "r");
+            if (f) found = true;
+        }
+
+        /* Strategy 4: uppercase the mapped name */
+        if (!f) {
+            char mapped[256];
+            strncpy(mapped, inc_name, sizeof(mapped) - 1);
+            mapped[sizeof(mapped) - 1] = '\0';
+            for (char *c = mapped; *c; c++) {
+                if (*c == '/') *c = '-';
+                else *c = toupper((unsigned char)*c);
+            }
+            snprintf(resolved, sizeof(resolved), "%s/%s.unix.txt", as->base_dir, mapped);
+            f = fopen(resolved, "r");
+            if (f) found = true;
+        }
+
+        /* Strategy 5: try include paths */
+        if (!f) {
+            for (int i = 0; i < as->num_include_paths && !f; i++) {
+                snprintf(resolved, sizeof(resolved), "%s/%s", as->include_paths[i], inc_name);
+                f = fopen(resolved, "r");
+                if (!f) {
+                    snprintf(resolved, sizeof(resolved), "%s/%s.unix.txt", as->include_paths[i], inc_name);
+                    f = fopen(resolved, "r");
+                }
+                if (f) found = true;
+            }
+        }
+
+        if (found && f) {
+            /* Read and assemble the included file */
+            fseek(f, 0, SEEK_END);
+            long size = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            char *inc_source = malloc(size + 1);
+            if (inc_source) {
+                fread(inc_source, 1, size, f);
+                inc_source[size] = '\0';
+                fclose(f);
+
+                /* Save current state */
+                char saved_file[256];
+                int saved_line = as->line_num;
+                strncpy(saved_file, as->current_file, sizeof(saved_file) - 1);
+                strncpy(as->current_file, resolved, sizeof(as->current_file) - 1);
+
+                /* Assemble included content line by line */
+                const char *p = inc_source;
+                char line[ASM_MAX_LINE];
+                as->line_num = 0;
+                while (*p) {
+                    as->line_num++;
+                    int li = 0;
+                    while (*p && *p != '\n' && *p != '\r' && li < ASM_MAX_LINE - 1) {
+                        line[li++] = *p++;
+                    }
+                    line[li] = '\0';
+                    if (*p == '\r') p++;
+                    if (*p == '\n') p++;
+                    assemble_line(as, line);
+                }
+
+                /* Restore state */
+                strncpy(as->current_file, saved_file, sizeof(as->current_file) - 1);
+                as->line_num = saved_line;
+                free(inc_source);
+            } else {
+                fclose(f);
+            }
+        } else {
             if (f) fclose(f);
+            if (as->pass == 2) {
+                asm_error(as, "cannot resolve .INCLUDE '%s'", inc_name);
+            }
         }
-
-        /* For now, just note the include (full resolution needs source tree mapping) */
-        if (as->pass == 2 && !f) {
-            /* Not a fatal error - many includes can be resolved via symbol pre-population */
-        }
-        if (f) fclose(f);
         return true;
     }
 
@@ -1380,7 +1493,18 @@ static bool handle_directive(asm68k_t *as, const char *directive, const char *ar
         if (as->num_macros < ASM_MAX_MACROS) {
             as->in_macro_def = true;
             as->current_macro = as->num_macros++;
-            strncpy(as->macros[as->current_macro].name, label, ASM_MAX_LABEL - 1);
+            /* Macro name can be in label field (name .MACRO) or args field (.MACRO name) */
+            const char *mname = (label[0]) ? label : args;
+            char macro_name[ASM_MAX_LABEL];
+            strncpy(macro_name, mname, ASM_MAX_LABEL - 1);
+            macro_name[ASM_MAX_LABEL - 1] = '\0';
+            str_trim(macro_name);
+            /* Strip any parameter list after the name */
+            char *space = strchr(macro_name, ' ');
+            if (space) *space = '\0';
+            space = strchr(macro_name, '\t');
+            if (space) *space = '\0';
+            strncpy(as->macros[as->current_macro].name, macro_name, ASM_MAX_LABEL - 1);
             as->macros[as->current_macro].line_count = 0;
         }
         return true;
@@ -1608,10 +1732,48 @@ static void assemble_line(asm68k_t *as, const char *raw_line) {
     /* Check if it's a macro invocation */
     for (int i = 0; i < as->num_macros; i++) {
         if (str_eq_nocase(as->macros[i].name, mnemonic)) {
-            /* Expand macro */
-            for (int j = 0; j < as->macros[i].line_count; j++) {
-                assemble_line(as, as->macros[i].lines[j]);
+            /* Parse macro arguments (comma-separated) */
+            char *macro_args[16];
+            int nargs = 0;
+            if (operands[0]) {
+                char argbuf[512];
+                strncpy(argbuf, operands, sizeof(argbuf) - 1);
+                argbuf[sizeof(argbuf) - 1] = '\0';
+                char *tok = strtok(argbuf, ",");
+                while (tok && nargs < 16) {
+                    while (*tok == ' ' || *tok == '\t') tok++;
+                    /* Trim trailing whitespace */
+                    char *end = tok + strlen(tok) - 1;
+                    while (end > tok && (*end == ' ' || *end == '\t')) *end-- = '\0';
+                    macro_args[nargs] = strdup(tok);
+                    nargs++;
+                    tok = strtok(NULL, ",");
+                }
             }
+            /* Expand macro with parameter substitution */
+            for (int j = 0; j < as->macros[i].line_count; j++) {
+                const char *src = as->macros[i].lines[j];
+                char expanded[ASM_MAX_LINE];
+                int ei = 0;
+                while (*src && ei < ASM_MAX_LINE - 1) {
+                    if (*src == '%' && src[1] >= '1' && src[1] <= '9') {
+                        int pn = src[1] - '1'; /* %1 = arg 0 */
+                        if (pn < nargs && macro_args[pn]) {
+                            const char *arg = macro_args[pn];
+                            while (*arg && ei < ASM_MAX_LINE - 1) {
+                                expanded[ei++] = *arg++;
+                            }
+                        }
+                        src += 2;
+                    } else {
+                        expanded[ei++] = *src++;
+                    }
+                }
+                expanded[ei] = '\0';
+                assemble_line(as, expanded);
+            }
+            /* Free arg copies */
+            for (int a = 0; a < nargs; a++) free(macro_args[a]);
             return;
         }
     }
