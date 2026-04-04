@@ -46,12 +46,14 @@ static int find_global_symbol(linker_t *lk, const char *name) {
             return i;
     }
     /* 8-char prefix match — Lisa assembler truncates symbols to 8 significant
-     * characters, so .REF ENTER_SC must match .PROC ENTER_SCHEDULER.
-     * Only try this for short names (<=8 chars) to avoid false matches. */
+     * characters. Match in both directions:
+     * - Short ref (ENTER_SC) matches long def (ENTER_SCHEDULER): prefix of def
+     * - Long ref (ENTER_SCHEDULER) matches short def (ENTER_SC): truncate ref to 8 */
     size_t len = strlen(name);
-    if (len <= 8 && len >= 3) {
+    size_t match_len = (len <= 8) ? len : 8;
+    if (match_len >= 3) {
         for (int i = 0; i < lk->num_symbols; i++) {
-            if (strncasecmp(lk->symbols[i].name, name, len) == 0 &&
+            if (strncasecmp(lk->symbols[i].name, name, match_len) == 0 &&
                 lk->symbols[i].type == LSYM_ENTRY)
                 return i;
         }
