@@ -988,11 +988,12 @@ static void gen_unit(codegen_t *cg, ast_node_t *unit) {
 static void gen_program(codegen_t *cg, ast_node_t *prog) {
     process_declarations(cg, prog, true);
 
-    /* Emit a JMP forward to the main body — nested procs come first
-     * but the entry point must be at offset 0 for the boot ROM. */
-    uint32_t jmp_fixup = cg->code_size;
-    emit16(cg, 0x4EF9);  /* JMP abs.L */
-    emit32(cg, 0);        /* Placeholder — patched after nested procs */
+    /* Emit a BRA.W forward to the main body — nested procs come first
+     * but the entry point must be at offset 0 for the boot ROM.
+     * BRA.W uses PC-relative displacement, no relocation needed. */
+    uint32_t bra_fixup = cg->code_size;
+    emit16(cg, 0x6000);  /* BRA.W */
+    emit16(cg, 0x0000);  /* Placeholder displacement — patched below */
 
     /* Generate code for all procedures/functions */
     for (int i = 0; i < prog->num_children; i++) {
@@ -1009,22 +1010,13 @@ static void gen_program(codegen_t *cg, ast_node_t *prog) {
         }
     }
 
-    /* Patch the JMP to point to the main body.
-     * Register the program's entry point as a global symbol,
-     * then use a relocation to fill in the absolute address. */
-    char entry_name[64];
-    snprintf(entry_name, sizeof(entry_name), "%s__main", prog->name);
-    cg_symbol_t *main_entry = add_global_sym(cg, entry_name, NULL);
-    if (main_entry) main_entry->offset = (int)cg->code_size;
-
-    /* Add relocation for the JMP target */
-    if (cg->num_relocs < CODEGEN_MAX_RELOCS) {
-        cg_reloc_t *r = &cg->relocs[cg->num_relocs++];
-        r->offset = jmp_fixup + 2;
-        strncpy(r->symbol, entry_name, sizeof(r->symbol));
-        r->size = 4;
-        r->pc_relative = false;
-    }
+    /* Patch the BRA.W displacement to jump to the main body.
+     * BRA.W: target = PC + displacement, where PC = BRA_addr + 2.
+     * So displacement = body_offset - (bra_fixup + 2). */
+    uint32_t body_offset = cg->code_size;
+    int16_t displacement = (int16_t)(body_offset - (bra_fixup + 2));
+    cg->code[bra_fixup + 2] = (displacement >> 8) & 0xFF;
+    cg->code[bra_fixup + 3] = displacement & 0xFF;
 
     /* Generate the main body (BEGIN...END block) */
     for (int i = 0; i < prog->num_children; i++) {
@@ -1034,7 +1026,7 @@ static void gen_program(codegen_t *cg, ast_node_t *prog) {
     }
 
     /* RTS at end of program (if there was executable code) */
-    if (cg->code_size > 6) {  /* More than just the JMP */
+    if (cg->code_size > 4) {  /* More than just the BRA */
         emit16(cg, 0x4E75);
     }
 }
