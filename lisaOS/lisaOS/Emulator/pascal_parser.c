@@ -488,9 +488,13 @@ static ast_node_t *parse_statement(parser_t *p) {
     if (match(p, TOK_IF)) {
         ast_node_t *n = ast_new(AST_IF, p->lex.line);
         ast_add_child(n, parse_expression(p));
+        skip_directives(p, NULL);
         expect(p, TOK_THEN);
+        skip_directives(p, NULL);
         ast_add_child(n, parse_statement(p));
+        skip_directives(p, NULL);
         if (match(p, TOK_ELSE)) {
+            skip_directives(p, NULL);
             ast_add_child(n, parse_statement(p));
         }
         return n;

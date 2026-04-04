@@ -96,7 +96,7 @@ static void lexer_set_symbol(lexer_t *lex, const char *name, bool value) {
 /* Parse a $SETC directive: $SETC name := value */
 static void lexer_handle_setc(lexer_t *lex, const char *directive) {
     /* directive looks like: "$SETC name := value" or "$SETC name:=value" */
-    const char *p = directive + 4; /* skip $SETC */
+    const char *p = directive + 5; /* skip "$SETC" */
     while (*p == ' ') p++;
 
     char name[64];
@@ -127,7 +127,7 @@ static void lexer_handle_setc(lexer_t *lex, const char *directive) {
 
 /* Parse a $IFC directive: $IFC name [or name] [and name] */
 static bool lexer_eval_ifc(lexer_t *lex, const char *directive) {
-    const char *p = directive + 3; /* skip $IFC */
+    const char *p = directive + 4; /* skip "$IFC" */
     while (*p == ' ') p++;
 
     /* Parse first operand */
