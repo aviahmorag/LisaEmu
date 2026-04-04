@@ -382,25 +382,29 @@ bool linker_link(linker_t *lk) {
         }
     }
 
-    /* Re-apply relocations for newly resolved symbols */
+    /* Re-apply ALL relocations — resolved symbols get their address,
+     * unresolved ones get the stub address (never leave JSR $000000) */
     for (int m = 0; m < lk->num_modules; m++) {
         link_module_t *mod = lk->modules[m];
         for (int r = 0; r < mod->num_relocs; r++) {
             int sym_idx = find_global_symbol(lk, mod->relocs[r].symbol);
+            int32_t target;
             if (sym_idx >= 0 && lk->symbols[sym_idx].resolved) {
-                uint32_t offset = mod->relocs[r].offset;
-                int size = mod->relocs[r].size;
-                int32_t target = lk->symbols[sym_idx].value;
-                if (offset < mod->code_size) {
-                    if (size == 4) {
-                        mod->code[offset]     = (target >> 24) & 0xFF;
-                        mod->code[offset + 1] = (target >> 16) & 0xFF;
-                        mod->code[offset + 2] = (target >> 8)  & 0xFF;
-                        mod->code[offset + 3] = target & 0xFF;
-                    } else if (size == 2) {
-                        mod->code[offset]     = (target >> 8) & 0xFF;
-                        mod->code[offset + 1] = target & 0xFF;
-                    }
+                target = lk->symbols[sym_idx].value;
+            } else {
+                target = stub_addr;  /* Unknown symbol → stub, never 0 */
+            }
+            uint32_t offset = mod->relocs[r].offset;
+            int size = mod->relocs[r].size;
+            if (offset < mod->code_size) {
+                if (size == 4) {
+                    mod->code[offset]     = (target >> 24) & 0xFF;
+                    mod->code[offset + 1] = (target >> 16) & 0xFF;
+                    mod->code[offset + 2] = (target >> 8)  & 0xFF;
+                    mod->code[offset + 3] = target & 0xFF;
+                } else if (size == 2) {
+                    mod->code[offset]     = (target >> 8) & 0xFF;
+                    mod->code[offset + 1] = target & 0xFF;
                 }
             }
         }
