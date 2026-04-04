@@ -118,15 +118,15 @@ uint8_t *bootrom_generate(void) {
     emit16(&b, 0x0000);
     emit32(&b, 0x00FCE012);
 
-    /* 6. Check boot code at $20000 */
-    emit16(&b, 0x2039);          /* MOVE.L ($20000).L,D0 */
-    emit32(&b, 0x00020000);
+    /* 6. Check boot code at $400 (linker starts code after vector table) */
+    emit16(&b, 0x2039);          /* MOVE.L ($400).L,D0 */
+    emit32(&b, 0x00000400);
     emit16(&b, 0x4A80);          /* TST.L D0 */
     emit16(&b, 0x6706);          /* BEQ.S no_boot (+6 = skip JMP) */
 
-    /* 7. Jump to boot code */
-    emit16(&b, 0x4EF9);          /* JMP ($20000).L */
-    emit32(&b, 0x00020000);
+    /* 7. Jump to OS code at $400 */
+    emit16(&b, 0x4EF9);          /* JMP ($400).L */
+    emit32(&b, 0x00000400);
 
     /* no_boot: Draw diagonal error indicator and halt */
     emit16(&b, 0x207C);          /* MOVEA.L #$7A000,A0 */

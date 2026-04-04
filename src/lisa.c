@@ -514,6 +514,27 @@ void lisa_reset(lisa_t *lisa) {
         }
 
         printf("Pre-loaded %d boot blocks at RAM $20000\n", boot_blocks);
+
+        /* Set up exception vectors in RAM $0-$3FF.
+         * Code starts at $400, so vectors don't overlap.
+         * Point all vectors to the ROM's RTE handler at $FE0300. */
+        uint32_t rte_addr = 0x00FE0300;
+        for (int v = 0; v < 256; v++) {
+            int off = v * 4;
+            if (off + 3 < 0x400) {
+                lisa->mem.ram[off + 0] = (rte_addr >> 24) & 0xFF;
+                lisa->mem.ram[off + 1] = (rte_addr >> 16) & 0xFF;
+                lisa->mem.ram[off + 2] = (rte_addr >> 8) & 0xFF;
+                lisa->mem.ram[off + 3] = rte_addr & 0xFF;
+            }
+        }
+        /* Vector 0: Initial SSP */
+        lisa->mem.ram[0] = 0x00; lisa->mem.ram[1] = 0x07;
+        lisa->mem.ram[2] = 0x90; lisa->mem.ram[3] = 0x00;
+        /* Vector 1: Initial PC (points to first code at $400) */
+        lisa->mem.ram[4] = 0x00; lisa->mem.ram[5] = 0x00;
+        lisa->mem.ram[6] = 0x04; lisa->mem.ram[7] = 0x00;
+        printf("Set up 256 exception vectors in RAM $0-$3FF\n");
     }
 
     /* Debug: verify ROM is loaded before reset */

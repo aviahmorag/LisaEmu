@@ -259,8 +259,9 @@ bool linker_link(linker_t *lk) {
     }
 
     /* Phase 1: Layout — assign base addresses to each module.
-     * Start at 0 — the emulator handles loading at the right RAM address. */
-    uint32_t current_addr = 0;
+     * Start at $400 to leave room for the 68000 exception vector table ($0-$3FF).
+     * The emulator sets up proper vectors in the $0-$3FF area. */
+    uint32_t current_addr = 0x400;
 
     /* Create a single segment for now */
     if (lk->num_segments == 0) {
