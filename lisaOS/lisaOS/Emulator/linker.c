@@ -463,6 +463,46 @@ void linker_print_linkmap(linker_t *lk) {
 
 void linker_init(linker_t *lk) {
     memset(lk, 0, sizeof(linker_t));
+
+    /* Register Pascal builtin symbols as resolved intrinsics.
+     * These are compiled inline by the real Lisa Pascal compiler,
+     * but our codegen emits calls that need resolution.
+     * Value 0 = stub (the codegen already generated inline code). */
+    static const char *builtins[] = {
+        "ABS", "ORD", "ORD4", "CHR", "ODD", "SUCC", "PRED",
+        "SIZEOF", "POINTER", "EXIT", "HALT",
+        "LENGTH", "COPY", "CONCAT", "POS", "DELETE", "INSERT",
+        "ROUND", "TRUNC", "SQR", "SQRT",
+        "WRITE", "WRITELN", "READ", "READLN",
+        "NEW", "DISPOSE", "MARK", "RELEASE",
+        "MOVELEFT", "MOVERIGHT", "FILLCHAR", "SCANEQ", "SCANNE",
+        "BLOCKREAD", "BLOCKWRITE", "UNITREAD", "UNITWRITE",
+        "IORESULT", "UNITSTATUS", "UNITCLEAR", "UNITBUSY",
+        "TIME", "KEYPRESS",
+        "TpLONGINT", "LIntMulInt", "LIntDivLInt", "DistToLDist",
+        "LRectToRect", "LPtToPt", "LPatToPat",
+        /* QuickDraw basics */
+        "SetPt", "SetRect", "EqualRect", "EmptyRect",
+        "PenNormal", "PenMode", "PenSize", "PenPat",
+        "MoveTo", "LineTo", "Move", "Line",
+        "FrameRect", "PaintRect", "EraseRect", "InvertRect",
+        "FrameRgn", "PaintRgn", "EraseRgn", "InvertRgn",
+        "RectRgn", "DiffRgn", "SectRgn", "UnionRgn", "OffsetRgn",
+        "ClipRect", "SetClip", "GetClip",
+        "OpenPort", "ClosePort", "GetPort", "SetPort",
+        "DrawString", "StringWidth", "TextFont", "TextFace", "TextSize",
+        "GetFontInfo", "CharWidth",
+        "NewRgn", "DisposeRgn", "CopyRgn",
+        "SetPen", "GetPen",
+        /* Toolkit */
+        "InsFirst", "InsLast", "Scan", "ClipFurtherTo",
+        "NewBreakLocation", "DistinguishScreenFeedback", "DoOnAPage",
+        "StrUpperCased",
+        NULL
+    };
+    for (int i = 0; builtins[i]; i++) {
+        add_global_symbol(lk, builtins[i], LSYM_ENTRY, 0, -1);
+    }
 }
 
 void linker_free(linker_t *lk) {

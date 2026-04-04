@@ -197,11 +197,22 @@ final class EmulatorViewModel {
 
                 if result.success {
                     let imagePath = "\(outputDir)/lisa_profile.image"
+                    let romPath = "\(outputDir)/lisa_boot.rom"
                     self.builtImagePath = imagePath
                     self.buildComplete = true
                     self.buildProgress = "Built: \(result.files_compiled) compiled, \(result.files_assembled) assembled"
                     self.statusMessage = "Build complete! Choose where to save the image."
                     self.log("Build succeeded. Image at: \(imagePath)")
+
+                    // Load the generated ROM
+                    if FileManager.default.fileExists(atPath: romPath) {
+                        if emu_load_rom(romPath) {
+                            self.romLoaded = true
+                            self.log("Boot ROM loaded: \(romPath)")
+                        } else {
+                            self.log("Failed to load boot ROM")
+                        }
+                    }
 
                     _ = emu_mount_profile(imagePath)
                     onSuccess()

@@ -1425,14 +1425,48 @@ static bool handle_directive(asm68k_t *as, const char *directive, const char *ar
             if (f) found = true;
         }
 
-        /* Strategy 5: try include paths */
+        /* Strategy 5: try include paths with mapped names */
         if (!f) {
             for (int i = 0; i < as->num_include_paths && !f; i++) {
+                /* Direct */
                 snprintf(resolved, sizeof(resolved), "%s/%s", as->include_paths[i], inc_name);
                 f = fopen(resolved, "r");
                 if (!f) {
                     snprintf(resolved, sizeof(resolved), "%s/%s.unix.txt", as->include_paths[i], inc_name);
                     f = fopen(resolved, "r");
+                }
+                /* Lisa library convention: LibXX/file → LIBXX/libxx-file.unix.txt */
+                if (!f) {
+                    char *sl = strchr(inc_name, '/');
+                    if (sl) {
+                        char libdir[64], filename[128];
+                        size_t dlen = sl - inc_name;
+                        if (dlen < sizeof(libdir)) {
+                            strncpy(libdir, inc_name, dlen);
+                            libdir[dlen] = '\0';
+                            strncpy(filename, sl + 1, sizeof(filename) - 1);
+                            /* Uppercase libdir for directory name */
+                            char upper_dir[64];
+                            strncpy(upper_dir, libdir, sizeof(upper_dir));
+                            for (char *c = upper_dir; *c; c++) *c = toupper((unsigned char)*c);
+                            /* Lowercase for prefix */
+                            char lower_dir[64];
+                            strncpy(lower_dir, libdir, sizeof(lower_dir));
+                            for (char *c = lower_dir; *c; c++) *c = tolower((unsigned char)*c);
+                            snprintf(resolved, sizeof(resolved), "%s/%s/%s-%s.unix.txt",
+                                     as->include_paths[i], upper_dir, lower_dir, filename);
+                            f = fopen(resolved, "r");
+                            if (!f) {
+                                /* Try with uppercase filename */
+                                char upper_file[128];
+                                strncpy(upper_file, filename, sizeof(upper_file));
+                                for (char *c = upper_file; *c; c++) *c = toupper((unsigned char)*c);
+                                snprintf(resolved, sizeof(resolved), "%s/%s/%s-%s.unix.txt",
+                                         as->include_paths[i], upper_dir, lower_dir, upper_file);
+                                f = fopen(resolved, "r");
+                            }
+                        }
+                    }
                 }
                 if (f) found = true;
             }

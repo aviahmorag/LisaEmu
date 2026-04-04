@@ -16,6 +16,7 @@
 #include "asm68k.h"
 #include "linker.h"
 #include "diskimage.h"
+#include "bootrom.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -104,8 +105,32 @@ static int find_source_files(const char *dir, source_file_t *files, int max_file
             /* Skip non-source files */
             if (should_skip_file(entry->d_name)) continue;
 
-            /* Determine if assembly or Pascal */
+            /* Determine if assembly or Pascal by checking file content */
             bool is_asm = (strcasestr(entry->d_name, "ASM") != NULL);
+            if (!is_asm) {
+                /* Check first non-empty line: assembly starts with ; or . or tab+instruction */
+                FILE *probe = fopen(path, "r");
+                if (probe) {
+                    char line[256];
+                    while (fgets(line, sizeof(line), probe)) {
+                        /* Skip empty lines */
+                        const char *p = line;
+                        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+                        if (*p == '\0') continue;
+                        /* Assembly indicators */
+                        if (*p == ';') { is_asm = true; break; }
+                        if (*p == '.' && (p[1] == 'I' || p[1] == 'i' || p[1] == 'P' || p[1] == 'p' ||
+                                          p[1] == 'D' || p[1] == 'd' || p[1] == 'T' || p[1] == 't' ||
+                                          p[1] == 'M' || p[1] == 'm' || p[1] == 'S' || p[1] == 's' ||
+                                          p[1] == 'E' || p[1] == 'e' || p[1] == 'R' || p[1] == 'r' ||
+                                          p[1] == 'F' || p[1] == 'f' || p[1] == 'B' || p[1] == 'b')) {
+                            is_asm = true; break;
+                        }
+                        break; /* First non-empty line wasn't assembly */
+                    }
+                    fclose(probe);
+                }
+            }
 
             strncpy(files[count].path, path, sizeof(files[count].path) - 1);
             files[count].is_assembly = is_asm;
@@ -173,7 +198,7 @@ static bool compile_pascal_file(const char *path, linker_t *lk) {
     return ok;
 }
 
-static bool assemble_file(const char *path, linker_t *lk) {
+static bool assemble_file(const char *path, linker_t *lk, const char *source_root) {
     asm68k_t *as = calloc(1, sizeof(asm68k_t));
     if (!as) return false;
     asm68k_init(as);
@@ -187,6 +212,15 @@ static bool assemble_file(const char *path, linker_t *lk) {
         strncpy(dir, path, len);
         dir[len] = '\0';
         asm68k_set_base_dir(as, dir);
+    }
+
+    /* Add cross-library include paths */
+    if (source_root) {
+        char inc[512];
+        snprintf(inc, sizeof(inc), "%s/LISA_OS/LIBS", source_root);
+        asm68k_add_include_path(as, inc);
+        snprintf(inc, sizeof(inc), "%s/LISA_OS/OS", source_root);
+        asm68k_add_include_path(as, inc);
     }
 
     bool ok = asm68k_assemble_file(as, path);
@@ -271,7 +305,7 @@ build_result_t toolchain_build(const char *source_dir,
     for (int i = 0; i < num_files; i++) {
         if (!files[i].is_assembly) continue;
         asm_count++;
-        if (assemble_file(files[i].path, lk)) asm_ok++;
+        if (assemble_file(files[i].path, lk, source_dir)) asm_ok++;
     }
     result.files_assembled = asm_ok;
 
@@ -314,15 +348,29 @@ build_result_t toolchain_build(const char *source_dir,
 
     disk_finalize(db);
 
-    /* Write disk image */
-    char image_path[512];
-    snprintf(image_path, sizeof(image_path), "%s/lisa_profile.image", output_dir);
-
     /* Create output directory if needed */
     mkdir(output_dir, 0755);
 
+    /* Write disk image */
+    char image_path[512];
+    snprintf(image_path, sizeof(image_path), "%s/lisa_profile.image", output_dir);
     disk_write_image(db, image_path);
     strncpy(result.output_path, image_path, sizeof(result.output_path) - 1);
+
+    /* Phase 5: Generate boot ROM */
+    if (progress) progress("Generating boot ROM...", 90, 100);
+    uint8_t *rom = bootrom_generate();
+    if (rom) {
+        char rom_path[512];
+        snprintf(rom_path, sizeof(rom_path), "%s/lisa_boot.rom", output_dir);
+        FILE *rf = fopen(rom_path, "wb");
+        if (rf) {
+            fwrite(rom, 1, ROM_SIZE, rf);
+            fclose(rf);
+            fprintf(stderr, "Boot ROM: %s (%d bytes)\n", rom_path, ROM_SIZE);
+        }
+        free(rom);
+    }
 
     disk_free(db);
     free(db);
@@ -331,7 +379,7 @@ build_result_t toolchain_build(const char *source_dir,
     free(files);
 
     result.success = (result.files_compiled > 0);
-    result.errors = 0; /* TODO: accumulate errors */
+    result.errors = 0;
 
     if (progress) progress("Build complete!", 100, 100);
 
