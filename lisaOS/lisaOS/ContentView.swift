@@ -1,15 +1,16 @@
 import SwiftUI
-import AppKit
+import UniformTypeIdentifiers
 
 struct ContentView: View {
     @State private var viewModel = EmulatorViewModel()
+    @State private var showingSourcePicker = false
+    @State private var showingImagePicker = false
 
     var body: some View {
         VStack(spacing: 0) {
             LisaDisplayView(viewModel: viewModel)
                 .frame(minWidth: 720, minHeight: 364)
 
-            // Status bar
             HStack {
                 Circle()
                     .fill(viewModel.isRunning ? Color.green : Color.red)
@@ -37,12 +38,21 @@ struct ContentView: View {
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
                 Button {
-                    openFileOrFolder()
+                    showingSourcePicker = true
                 } label: {
-                    Label("Open", systemImage: "folder")
+                    Label("Build from Source", systemImage: "hammer")
                 }
-                .help("Open a Lisa_Source folder to build, or a disk image to boot")
+                .help("Select Lisa_Source folder to compile Lisa OS")
                 .disabled(viewModel.isBuilding)
+            }
+
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    showingImagePicker = true
+                } label: {
+                    Label("Open Image", systemImage: "doc")
+                }
+                .help("Open a disk image file")
             }
 
             ToolbarItem(placement: .primaryAction) {
@@ -80,48 +90,31 @@ struct ContentView: View {
                 .help("CPU debugger")
             }
         }
+        .fileImporter(
+            isPresented: $showingSourcePicker,
+            allowedContentTypes: [.folder]
+        ) { result in
+            if case .success(let url) = result {
+                if viewModel.validateSource(url: url) {
+                    viewModel.buildFromSource(sourceURL: url)
+                } else {
+                    viewModel.statusMessage = "Not a valid Lisa_Source folder (expected LISA_OS subdirectory)"
+                }
+            }
+        }
+        .fileImporter(
+            isPresented: $showingImagePicker,
+            allowedContentTypes: [.data]
+        ) { result in
+            if case .success(let url) = result {
+                viewModel.openDiskImage(url: url)
+            }
+        }
         .sheet(isPresented: $viewModel.showDebugger) {
             DebuggerView(viewModel: viewModel)
         }
         .onAppear {
             viewModel.checkForLastImage()
-        }
-    }
-
-    /// Open dialog that accepts both folders (source) and files (disk images)
-    private func openFileOrFolder() {
-        let panel = NSOpenPanel()
-        panel.title = "Open Lisa Source Folder or Disk Image"
-        panel.message = "Select a Lisa_Source folder to build from source, or a .image file to boot directly."
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = true
-        panel.allowsMultipleSelection = false
-
-        panel.begin { response in
-            guard response == .OK, let url = panel.url else { return }
-
-            var isDir: ObjCBool = false
-            FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir)
-
-            if isDir.boolValue {
-                if viewModel.validateSource(url: url) {
-                    // Defer the save panel to next run loop iteration
-                    DispatchQueue.main.async {
-                        let save = NSSavePanel()
-                        save.title = "Save Built Disk Image"
-                        save.nameFieldStringValue = "LisaOS.image"
-                        save.canCreateDirectories = true
-                        save.begin { saveResponse in
-                            guard saveResponse == .OK, let saveURL = save.url else { return }
-                            viewModel.buildFromSource(sourceURL: url, saveURL: saveURL)
-                        }
-                    }
-                } else {
-                    viewModel.statusMessage = "Not a valid Lisa_Source folder (expected LISA_OS subdirectory)"
-                }
-            } else {
-                viewModel.openDiskImage(url: url)
-            }
         }
     }
 }
