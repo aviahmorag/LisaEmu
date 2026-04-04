@@ -1,0 +1,27 @@
+# Build artifacts
+build/
+*.o
+*.a
+*.dylib
+
+# Xcode
+lisaOS/lisaOS.xcodeproj/xcuserdata/
+lisaOS/lisaOS.xcodeproj/project.xcworkspace/xcuserdata/
+DerivedData/
+*.xcuserstate
+*.xcscmblueprint
+
+# macOS
+.DS_Store
+*.swp
+*~
+
+# IDE
+.vscode/
+.idea/
+
+# Claude Code
+.claude/
+
+# Apple Lisa source code (not redistributable per Apple Academic License)
+Lisa_Source/
