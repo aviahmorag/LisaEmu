@@ -530,10 +530,11 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
         }
 
         case AST_FUNC_CALL: {
-            /* Push arguments right-to-left */
+            /* Push arguments right-to-left as LONGs (Lisa Pascal convention).
+             * All parameters are passed as 4 bytes on the stack. */
             for (int i = node->num_children - 1; i >= 0; i--) {
                 gen_expression(cg, node->children[i]);
-                emit16(cg, 0x3F00);  /* MOVE.W D0,-(SP) */
+                emit16(cg, 0x2F00);  /* MOVE.L D0,-(SP) */
             }
             /* JSR to function */
             emit16(cg, 0x4EB9);  /* JSR abs.L */
@@ -546,8 +547,8 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                 r->size = 4;
                 r->pc_relative = false;
             }
-            /* Clean up args */
-            int arg_bytes = node->num_children * 2;
+            /* Clean up args — 4 bytes per argument */
+            int arg_bytes = node->num_children * 4;
             if (arg_bytes > 0 && arg_bytes <= 8) {
                 emit16(cg, 0x508F | ((arg_bytes / 2) << 9));  /* ADDQ.L #n,SP */
             } else if (arg_bytes > 8) {
