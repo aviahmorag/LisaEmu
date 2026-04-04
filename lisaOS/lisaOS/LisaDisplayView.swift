@@ -66,6 +66,14 @@ final class LisaDisplayNSView: NSView {
         let keyCode = event.keyCode
         let flags = event.modifierFlags
 
+        // Ctrl+Option releases captured mouse
+        if isCapturingMouse && flags.contains(.control) && flags.contains(.option) {
+            isCapturingMouse = false
+            NSCursor.unhide()
+            CGAssociateMouseAndMouseCursorPosition(1)
+            return
+        }
+
         switch keyCode {
         case 56, 60:
             if flags.contains(.shift) { viewModel?.keyDown(keyCode) }
