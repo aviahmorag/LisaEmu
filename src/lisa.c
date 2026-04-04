@@ -698,6 +698,10 @@ int lisa_run_frame(lisa_t *lisa) {
     int cycles_this_frame = 0;
     int via_tick_accum = 0;
 
+    /* Clear any stale vretrace IRQ from previous frame BEFORE executing */
+    lisa->mem.vretrace_irq = false;
+    lisa->irq_vretrace = 0;
+
     while (cycles_this_frame < LISA_CYCLES_PER_FRAME) {
         /* Execute a batch of CPU instructions */
         int batch = 64;
@@ -713,11 +717,8 @@ int lisa_run_frame(lisa_t *lisa) {
         }
     }
 
-    /* Vertical retrace at end of frame.
-     * Set the IRQ, then immediately clear it after one CPU check.
-     * On the real Lisa, the OS reads $FCE018 to acknowledge.
-     * Since our exception handlers may not do that, we auto-clear
-     * so the interrupt doesn't fire continuously. */
+    /* Vertical retrace: pulse the IRQ for one instruction only.
+     * Set it, let CPU take it, immediately clear. */
     if (lisa->mem.vretrace_enabled) {
         lisa->mem.vretrace_irq = true;
         lisa->irq_vretrace = 1;
@@ -725,10 +726,10 @@ int lisa_run_frame(lisa_t *lisa) {
         if (lisa->irq_via2) level = 2;
         m68k_set_irq(&lisa->cpu, level);
 
-        /* Let the CPU take the interrupt (runs a few cycles) */
+        /* Execute one instruction — enough for the CPU to take the IRQ */
         m68k_execute(&lisa->cpu, 50);
 
-        /* Auto-acknowledge: clear the vretrace IRQ */
+        /* Immediately clear */
         lisa->mem.vretrace_irq = false;
         lisa->irq_vretrace = 0;
         level = 0;
