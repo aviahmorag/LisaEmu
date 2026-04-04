@@ -231,9 +231,12 @@ static bool compile_pascal_file(const char *path, linker_t *lk) {
         fprintf(stderr, "STARTUP PARSE: %d errors, lexer at line %d\n",
                 parser.num_errors, parser.lex.line);
     if (parser.num_errors > 0) {
-        parser_free(&parser);
-        free(source);
-        return false;
+        /* Log errors but continue — partial code is better than no code.
+         * Previously we discarded the entire file, losing all its symbols. */
+        const char *basename = strrchr(path, '/');
+        basename = basename ? basename + 1 : path;
+        fprintf(stderr, "  PARSE: %d errors in %s (line %d) — continuing with partial AST\n",
+                parser.num_errors, basename, parser.lex.line);
     }
 
     codegen_t *cg = calloc(1, sizeof(codegen_t));

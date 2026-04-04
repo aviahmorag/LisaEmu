@@ -18,7 +18,7 @@
 #include <stdarg.h>
 
 /* Maximum errors before bail-out to prevent infinite loops */
-#define MAX_ERRORS_BAILOUT 20
+#define MAX_ERRORS_BAILOUT 200
 
 /* ========================================================================
  * AST node management
