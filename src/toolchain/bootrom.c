@@ -73,16 +73,45 @@ uint8_t *bootrom_generate(void) {
     /* Vector 1: Initial PC — ROM code at $FE0400 */
     emit32(&b, 0x00FE0400);
 
-    /* Vectors 2-63: all → RTE handler at $FE0300 */
+    /* Vectors 2-63: default → RTE handler at $FE0300,
+     * with specific handlers for Line-A (10) and Line-F (11) */
     for (int i = 2; i < 64; i++) {
-        emit32(&b, 0x00FE0300);
+        if (i == 10) {
+            emit32(&b, 0x00FE0320);  /* Line-A → skip handler */
+        } else if (i == 11) {
+            emit32(&b, 0x00FE0310);  /* Line-F → SANE skip handler */
+        } else {
+            emit32(&b, 0x00FE0300);  /* Default RTE */
+        }
     }
 
     /* ================================================================
-     * Exception handler at $FE0300: just RTE
+     * Default exception handler at $FE0300: just RTE
      * ================================================================ */
     b.pc = 0x0300;
     emit16(&b, 0x4E73);  /* RTE */
+
+    /* ================================================================
+     * Line-F (SANE FP) handler at $FE0310:
+     * The 68000 pushes PC of the Line-F opcode on the stack.
+     * Skip past it (add 2 to stacked PC) and return.
+     * Stack frame: (SP)=SR, 2(SP)=PC.L
+     * ================================================================ */
+    b.pc = 0x0310;
+    /* ADDQ.L #2, 2(A7) — add 2 to the stacked PC
+     * ADDQ: 0101 qqq 1 ss EEEEEE, qqq=010(#2), ss=10(long), EA=101 111(d16,A7)
+     * = 0101 010 1 10 101111 = $55AF, followed by displacement word $0002 */
+    emit16(&b, 0x54AF);
+    emit16(&b, 0x0002);
+    emit16(&b, 0x4E73);          /* RTE */
+
+    /* ================================================================
+     * Line-A handler at $FE0320: same as Line-F — skip the opcode
+     * ================================================================ */
+    b.pc = 0x0320;
+    emit16(&b, 0x54AF);
+    emit16(&b, 0x0002);
+    emit16(&b, 0x4E73);          /* RTE */
 
     /* ================================================================
      * Main boot code at $FE0400

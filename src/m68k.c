@@ -2460,7 +2460,8 @@ static void execute_one(m68k_t *cpu) {
             break;
 
         case 0xA:
-            /* Line-A emulation */
+            /* Line-A emulation — 68000 pushes PC of the Line-A opcode itself */
+            cpu->pc -= 2;
             take_exception(cpu, VEC_LINE_A);
             break;
 
@@ -2499,7 +2500,10 @@ static void execute_one(m68k_t *cpu) {
             break;
 
         case 0xF:
-            /* Line-F emulation */
+            /* Line-F emulation — 68000 pushes PC of the Line-F opcode itself.
+             * The SANE handler reads the opcode word, performs the FP operation,
+             * adjusts the stacked PC past the instruction, then does RTE. */
+            cpu->pc -= 2;
             take_exception(cpu, VEC_LINE_F);
             break;
     }

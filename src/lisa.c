@@ -517,15 +517,18 @@ void lisa_reset(lisa_t *lisa) {
 
         /* Set up exception vectors in RAM $0-$3FF.
          * Code starts at $400, so vectors don't overlap.
-         * Point all vectors to the ROM's RTE handler at $FE0300. */
-        uint32_t rte_addr = 0x00FE0300;
+         * Line-A/Line-F get skip handlers; others get plain RTE. */
         for (int v = 0; v < 256; v++) {
+            uint32_t handler;
+            if (v == 10)      handler = 0x00FE0320;  /* Line-A skip handler */
+            else if (v == 11) handler = 0x00FE0310;  /* Line-F (SANE) skip handler */
+            else              handler = 0x00FE0300;  /* Default RTE */
             int off = v * 4;
             if (off + 3 < 0x400) {
-                lisa->mem.ram[off + 0] = (rte_addr >> 24) & 0xFF;
-                lisa->mem.ram[off + 1] = (rte_addr >> 16) & 0xFF;
-                lisa->mem.ram[off + 2] = (rte_addr >> 8) & 0xFF;
-                lisa->mem.ram[off + 3] = rte_addr & 0xFF;
+                lisa->mem.ram[off + 0] = (handler >> 24) & 0xFF;
+                lisa->mem.ram[off + 1] = (handler >> 16) & 0xFF;
+                lisa->mem.ram[off + 2] = (handler >> 8) & 0xFF;
+                lisa->mem.ram[off + 3] = handler & 0xFF;
             }
         }
         /* Vector 0: Initial SSP */
