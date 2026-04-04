@@ -75,8 +75,8 @@ uint8_t *bootrom_generate(void) {
      * In setup mode, ROM appears at $000000, so vectors are read from here.
      * ================================================================ */
 
-    /* Vector 0: Initial SSP — top of RAM */
-    emit32(&b, 0x00180000);     /* SSP = $180000 (1.5MB, top of 1MB + slack) */
+    /* Vector 0: Initial SSP — top of 1MB RAM */
+    emit32(&b, 0x000FFFFE);     /* SSP = $0FFFFE (just below 1MB boundary) */
 
     /* Vector 1: Initial PC — start of ROM code */
     emit32(&b, 0x00FE0400);     /* PC = $FE0400 (ROM base + $400, after vectors) */
@@ -99,102 +99,50 @@ uint8_t *bootrom_generate(void) {
      * ================================================================ */
     b.pc = 0x0400;
 
-    /* --- Disable interrupts --- */
+    /* --- Minimal ROM: just clear display and draw a rectangle --- */
+    /* No VIA init, no I/O — just RAM writes to video memory */
+
+    /* Set supervisor stack below video RAM */
+    emit16(&b, 0x2E7C);          /* MOVEA.L #$79000,SP */
+    emit32(&b, 0x00079000);
+
+    /* Disable interrupts */
     emit16(&b, 0x46FC);          /* MOVE #$2700,SR */
     emit16(&b, 0x2700);
 
-    /* --- Set up supervisor stack pointer --- */
-    emit16(&b, 0x2E7C);          /* MOVEA.L #$180000,SP */
-    emit32(&b, 0x00180000);
-
-    /* --- Initialize VIA1 ($FCD801): disable all interrupts --- */
-    /* VIA1 IER: disable all */
-    emit16(&b, 0x207C);          /* MOVEA.L #$FCD801,A0 */
-    emit32(&b, 0x00FCD801);
-    emit16(&b, 0x117C);          /* MOVE.B #$7F,$1C(A0) — IER: clear all */
-    emit16(&b, 0x007F);
-    emit16(&b, 0x001C);
-
-    /* --- Initialize VIA2 ($FCDD81): disable all interrupts --- */
-    emit16(&b, 0x207C);          /* MOVEA.L #$FCDD81,A0 */
-    emit32(&b, 0x00FCDD81);
-    emit16(&b, 0x117C);          /* MOVE.B #$7F,$1C(A0) — IER: clear all */
-    emit16(&b, 0x007F);
-    emit16(&b, 0x001C);
-
-    /* --- Set up video contrast --- */
-    emit16(&b, 0x207C);          /* MOVEA.L #$FCD01C,A0 — contrast latch */
-    emit32(&b, 0x00FCD01C);
-    emit16(&b, 0x10BC);          /* MOVE.B #$FF,(A0) — full contrast */
-    emit16(&b, 0x00FF);
-
-    /* --- Clear display memory (720x364 / 8 = 32760 bytes starting at $7A000) --- */
+    /* Clear display to white: fill $7A000-$81FF8 with $FF */
     emit16(&b, 0x207C);          /* MOVEA.L #$7A000,A0 */
     emit32(&b, 0x0007A000);
-    emit16(&b, 0x303C);          /* MOVE.W #8189,D0 — (32760/4 - 1) longwords */
+    emit16(&b, 0x303C);          /* MOVE.W #8189,D0 */
     emit16(&b, 0x1FFD);
-    /* Loop: clear_loop */
     uint32_t clear_loop = b.pc;
-    emit16(&b, 0x20FC);          /* MOVE.L #$FFFFFFFF,(A0)+ — white pixels (1=white on Lisa) */
+    emit16(&b, 0x20FC);          /* MOVE.L #$FFFFFFFF,(A0)+ */
     emit32(&b, 0xFFFFFFFF);
     emit16(&b, 0x51C8);          /* DBRA D0,clear_loop */
     emit16(&b, (uint16_t)((int16_t)(clear_loop - b.pc)));
 
-    /* --- Draw a message on screen to show ROM is alive --- */
-    /* We'll draw "LISA" in big block letters at the center of the screen.
-     * Each scanline is 90 bytes (720/8). Display starts at $7A000.
-     * Center: row 150, col 30 bytes in = offset 150*90+30 = 13530 */
-
-    /* Just draw a small filled rectangle to prove display works */
-    emit16(&b, 0x207C);          /* MOVEA.L #$7A000 + 150*90 + 35,A0 */
-    emit32(&b, 0x0007A000 + 150 * 90 + 35);
+    /* Draw black rectangle: 20 rows x 20 bytes at center of screen */
+    /* Offset = row 150 * 90 bytes/row + col 35 = 13535 */
+    emit16(&b, 0x207C);          /* MOVEA.L #$7A000+13535,A0 */
+    emit32(&b, 0x0007A000 + 13535);
     emit16(&b, 0x303C);          /* MOVE.W #19,D0 — 20 rows */
     emit16(&b, 0x0013);
-    /* Row loop */
     uint32_t row_loop = b.pc;
-    emit16(&b, 0x323C);          /* MOVE.W #19,D1 — 20 bytes = 160 pixels */
+    emit16(&b, 0x323C);          /* MOVE.W #19,D1 — 20 bytes */
     emit16(&b, 0x0013);
-    /* Col loop */
     uint32_t col_loop = b.pc;
-    emit16(&b, 0x10FC);          /* MOVE.B #$00,(A0)+ — black pixels (0=black) */
+    emit16(&b, 0x10FC);          /* MOVE.B #0,(A0)+ — black */
     emit16(&b, 0x0000);
     emit16(&b, 0x51C9);          /* DBRA D1,col_loop */
     emit16(&b, (uint16_t)((int16_t)(col_loop - b.pc)));
-    /* Advance to next row: add (90 - 20) = 70 to A0 */
-    emit16(&b, 0xD0FC);          /* ADDA.W #70,A0 */
+    emit16(&b, 0xD0FC);          /* ADDA.W #70,A0 — skip to next row */
     emit16(&b, 0x0046);
     emit16(&b, 0x51C8);          /* DBRA D0,row_loop */
     emit16(&b, (uint16_t)((int16_t)(row_loop - b.pc)));
 
-    /* --- Load boot track from ProFile --- */
-    /* For now, we'll copy the first 12KB from the ProFile image area
-     * (starting at the data portion of block 0) into RAM at $20000.
-     *
-     * In the real Lisa, the ROM would talk to the ProFile via VIA1
-     * using the parallel port protocol. In our emulator, emu_load_rom
-     * already has the ProFile image mapped, so we can just copy from
-     * the ProFile memory-mapped area.
-     *
-     * Actually, the emulator reads ProFile blocks through the VIA interface.
-     * For the synthesized ROM, we'll simply set up a minimal environment
-     * and jump to the OS entry point.
-     *
-     * Since we built the disk image ourselves, we know the OS code
-     * starts at block 26 (after boot track + MDDF + catalog).
-     * Each block has 20 bytes tag + 512 bytes data.
-     * We need to copy the code into RAM. */
-
-    /* For the initial boot, just set up the MMU and jump to a halt loop.
-     * The display rectangle proves the ROM and emulator are working. */
-
-    /* --- Switch MMU from setup mode to normal mode --- */
-    /* In setup mode, ROM is at $000000. In normal mode, RAM is at $000000.
-     * We need to be careful: after the switch, we're executing from ROM
-     * at $FE0000, which is still valid. */
-
-    /* For now: just loop forever. The display rectangle shows we booted. */
+    /* Infinite loop */
     emit16(&b, 0x4E71);          /* NOP */
-    emit16(&b, 0x60FC);          /* BRA.S -2 (self-loop) */
+    emit16(&b, 0x60FC);          /* BRA.S self */
 
     printf("Boot ROM generated: %u bytes used of %u\n", b.pc, ROM_SIZE);
     return rom;
