@@ -148,6 +148,10 @@ typedef struct {
     int num_errors;
     char errors[100][256];
     char current_file[256];
+
+    /* Imported globals from previously compiled units (set by toolchain bridge) */
+    cg_symbol_t *imported_globals;
+    int imported_globals_count;
 } codegen_t;
 
 /* Public API */

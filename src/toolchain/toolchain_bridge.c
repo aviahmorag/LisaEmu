@@ -198,6 +198,11 @@ static char *read_file(const char *path) {
     return buf;
 }
 
+/* Shared globals accumulated from all previously compiled units */
+#define MAX_SHARED_GLOBALS 16384
+static cg_symbol_t shared_globals[MAX_SHARED_GLOBALS];
+static int num_shared_globals = 0;
+
 static bool compile_pascal_file(const char *path, linker_t *lk) {
     char *source = read_file(path);
     if (!source) return false;
@@ -247,6 +252,8 @@ static bool compile_pascal_file(const char *path, linker_t *lk) {
     }
     codegen_init(cg);
     strncpy(cg->current_file, path, sizeof(cg->current_file) - 1);
+    cg->imported_globals = shared_globals;
+    cg->imported_globals_count = num_shared_globals;
 
     /* Debug: log AST type for every file to trace symbol issues */
     if (ast && (strcasestr(path, "UNITHZ") || strcasestr(path, "UNITSTD"))) {
@@ -275,6 +282,13 @@ static bool compile_pascal_file(const char *path, linker_t *lk) {
             fprintf(stderr, "  global[%d]: '%s' offset=%d ext=%d\n",
                     i, cg->globals[i].name, cg->globals[i].offset,
                     cg->globals[i].is_external);
+        }
+    }
+
+    /* Export this file's globals to the shared table for cross-unit access */
+    for (int i = 0; i < cg->num_globals && num_shared_globals < MAX_SHARED_GLOBALS; i++) {
+        if (!cg->globals[i].is_external && !cg->globals[i].is_forward) {
+            shared_globals[num_shared_globals++] = cg->globals[i];
         }
     }
 
@@ -438,24 +452,24 @@ build_result_t toolchain_build(const char *source_dir,
     linker_t *lk = calloc(1, sizeof(linker_t));
     linker_init(lk);
 
-    /* Sort files: STARTUP program must be compiled first so it's at $400.
-     * The boot ROM jumps to $400 and STARTUP is the OS entry point. */
+    /* Sort files: STARTUP must be COMPILED LAST (so it sees all other units'
+     * exported globals via the shared table) but LINKED FIRST (so the linker
+     * places it at $400 where the boot ROM jumps to). */
+    int startup_idx = -1;
     for (int i = 0; i < num_files; i++) {
         if (strcasestr(files[i].path, "SOURCE-STARTUP.TEXT") != NULL) {
-            if (i != 0) {
-                source_file_t tmp = files[0];
-                files[0] = files[i];
-                files[i] = tmp;
-            }
-            fprintf(stderr, "Boot entry: %s (placed first at $400)\n", files[0].path);
+            startup_idx = i;
+            fprintf(stderr, "Boot entry: %s (compiled last, linked first at $400)\n",
+                    files[i].path);
             break;
         }
     }
 
-    /* Phase 1: Compile Pascal files */
+    /* Phase 1: Compile Pascal files — STARTUP last */
     int pascal_count = 0, pascal_ok = 0, pascal_fail = 0;
     for (int i = 0; i < num_files; i++) {
         if (files[i].is_assembly) continue;
+        if (i == startup_idx) continue;  /* skip STARTUP for now */
         pascal_count++;
         if (compile_pascal_file(files[i].path, lk)) {
             pascal_ok++;
@@ -470,6 +484,26 @@ build_result_t toolchain_build(const char *source_dir,
             progress(msg, 10 + (pascal_count * 30 / num_files), 100);
         }
     }
+    /* Now compile STARTUP last — it needs globals from all other units */
+    if (startup_idx >= 0) {
+        pascal_count++;
+        /* Remember how many modules are loaded before STARTUP */
+        int modules_before_startup = lk->num_modules;
+        if (compile_pascal_file(files[startup_idx].path, lk)) {
+            pascal_ok++;
+            /* Move STARTUP's module to position 0 so linker places it at $400 */
+            if (lk->num_modules > modules_before_startup && modules_before_startup > 0) {
+                link_module_t *startup_mod = lk->modules[lk->num_modules - 1];
+                for (int j = lk->num_modules - 1; j > 0; j--)
+                    lk->modules[j] = lk->modules[j - 1];
+                lk->modules[0] = startup_mod;
+            }
+        } else {
+            pascal_fail++;
+            fprintf(stderr, "PASCAL FAIL: %s\n", files[startup_idx].path);
+        }
+    }
+
     fprintf(stderr, "Pascal: %d/%d succeeded, %d failed\n", pascal_ok, pascal_count, pascal_fail);
     result.files_compiled = pascal_ok;
 

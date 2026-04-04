@@ -247,10 +247,21 @@ static cg_symbol_t *find_global(codegen_t *cg, const char *name) {
     return NULL;
 }
 
+static cg_symbol_t *find_imported(codegen_t *cg, const char *name) {
+    if (!cg->imported_globals) return NULL;
+    for (int i = 0; i < cg->imported_globals_count; i++) {
+        if (str_eq_nocase(cg->imported_globals[i].name, name))
+            return &cg->imported_globals[i];
+    }
+    return NULL;
+}
+
 static cg_symbol_t *find_symbol_any(codegen_t *cg, const char *name) {
     cg_symbol_t *s = find_local(cg, name);
     if (s) return s;
-    return find_global(cg, name);
+    s = find_global(cg, name);
+    if (s) return s;
+    return find_imported(cg, name);
 }
 
 static cg_symbol_t *add_local(codegen_t *cg, const char *name, type_desc_t *type, bool is_param, bool is_var) {
