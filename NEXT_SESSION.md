@@ -1,63 +1,55 @@
 # LisaEmu — Next Session Plan
 
 ## Current State (April 4, 2026)
-- 276/276 Pascal, 96/96 assembly compile, **6,327 symbols** linked
-- Binary: 1.6MB, OS reaches TRAP #1 syscall layer
-- Exception counts: v4=241 v11=2 v33=86 (was 7.2M Line-F before this session)
-- Still 9,973 JSR $000000 patched to stub (down from original but up because more code compiled)
-- UNITHZ INTERFACE parses but IMPLEMENTATION blocked by `:=` typed-constant error at line 307
+- **OS running continuously** — scheduler loop at $09705E, 625M+ cycles
+- 276/276 Pascal, 96/96 assembly, **6,621 symbols** linked
+- Binary: 1.66MB, **HAllocate RESOLVED** at $8E9BE
+- No crashes, no Line-F loops, no stack overflow
+- Display: white (OS hasn't drawn yet — needs interrupts)
+- 10,630 JSR $000000 still patched to stub (mostly LogCall)
 
-## Session Summary (what was fixed)
-1. **ADDQ stack cleanup** — `arg_bytes/2` → `arg_bytes&7` in ADDQ encoding
-2. **Forward branch displacement** — removed erroneous `-2` from IF/WHILE/FOR patches
-3. **CASE statement** — implemented if-else chain dispatch (was stub)
-4. **INTRINSIC SHARED** — parser now handles qualifiers after INTRINSIC keyword
-5. **Linker limits** — per-module symbols/relocs raised from 4096 to 16384
-6. **Parser error handling** — continue codegen on partial ASTs instead of discarding
-7. **Parser bailout limit** — raised from 20 to 200
+## What was fixed this session
+1. ADDQ stack cleanup encoding (A7 odd → stack corruption)
+2. Forward branch displacement off-by-2 in IF/WHILE/FOR
+3. CASE statement codegen (was stub → if-else chains)
+4. INTRINSIC SHARED parsing (lost entire LIBWM, LIBFM, LIBSM units)
+5. INTERFACE functions as FORWARD (stopped body parsing cascade)
+6. Variant record depth counting (nested CASE inside variants)
+7. Linker per-module limits 4096 → 16384
+8. Parser error recovery and bailout limits
 
-## Priority 1: Fix UNITHZ IMPLEMENTATION Parsing
+## Priority 1: VIA Timer Interrupts
 
-**Problem**: Parser hits `expected =, got :=` at line 307 of UNITHZ. This is INSIDE the
-IMPLEMENTATION section's function body code, meaning `parse_declarations` on the INTERFACE
-section consumed past `IMPLEMENTATION` into actual code.
+The OS is stuck in the scheduler loop because no interrupts fire.
+The Lisa VIA1/VIA2 chips generate periodic timer interrupts that
+drive the scheduler. The emulator has VIA chip code (src/via6522.c)
+but it may not be generating interrupts or they may not be connected
+to the CPU's interrupt system.
 
-**Root cause**: Something in the INTERFACE declarations (lines 31-206) confuses the parser,
-causing it to consume tokens past the IMPLEMENTATION keyword. Most likely a FUNCTION/PROCEDURE
-declaration in the INTERFACE that gets misparsed, causing the parser to treat IMPLEMENTATION
-as part of a declaration body.
+**Check**: Does via6522_step() assert interrupt lines? Does lisa_step()
+check for pending interrupts and deliver them to the CPU?
 
-**Investigation**: Check what's around lines 140-206 in UNITHZ INTERFACE — specifically:
-- FUNCTION declarations with complex parameter lists (records, sets, function pointers)
-- `{$IFC fOS}` conditional blocks where fOS might not be defined
-- USES clause references
+## Priority 2: TRAP #1 System Call Handler
 
-**Impact**: Fixing this unlocks HAllocate, FreeH, HzInit, and 80+ other heap/memory functions.
+The OS uses TRAP #1 for all system calls. Currently they go to the
+boot ROM's RTE handler (no-op). The OS's own TRAP handler is in
+EXCEPASM (already assembled). The boot startup code should install
+these vectors via INIT_TRAPV, but if the installation itself uses
+system calls, it won't work.
 
-## Priority 2: TRAP #1 Handler (OS System Calls)
+**Check**: Does INIT_TRAPV write to the vector table directly?
+Look at SOURCE-INITRAP.TEXT for how it installs handlers.
 
-The OS now reaches TRAP #1 instructions (vector 33). These are Lisa OS system calls
-(MOVE_INFO, MAKE_PROCESS, etc.). The boot ROM handler at $FE0300 just does RTE,
-which doesn't handle syscalls. The OS startup code uses TRAP #1 to set up the initial
-exception vectors via the OS's own exception handler.
+## Priority 3: Remaining LogCall Stubs
 
-**Fix**: The EXCEPASM assembly module (already compiled) contains the real TRAP handlers.
-The OS needs to install its own exception vectors early in boot. Check if INIT_TRAPV
-(which sets up the vector table) is being called and if its code is correct.
+LogCall appears ~40+ times. It's a debug trace function never defined
+in source (called behind {$IFC fTraceSM} which evaluates to true
+because fTraceSM is undefined). Fix: either add LogCall as a built-in
+no-op symbol in the linker, or fix the conditional compilation so
+fTraceSM defaults to FALSE.
 
-## Priority 3: Remaining Unresolved Symbols
-
-Now seeing LIBSU unresolved symbols (FreeBk, AllocBk, PMapN, etc.) — these are from
-newly-compiled units that were previously empty due to INTRINSIC SHARED bug.
-
-**LogCall** — appears ~40 times across LIBDB, LIBPR, LIBSU. Never defined in source.
-Should be a no-op stub added to the linker.
-
-## Key files
-```
-src/toolchain/pascal_parser.c   — INTRINSIC SHARED fix, parse_unit()
-src/toolchain/pascal_codegen.c  — CASE, branch displacement, stack cleanup
-src/toolchain/linker.c          — limits, relocation patching
-src/toolchain/linker.h          — per-module array sizes
-src/m68k.c                      — 68000 CPU emulator
-```
+## Key metrics
+- Symbols: 5,627 → 6,621 (+994)
+- Line-F exceptions: 7,270,254 → 0 in current build
+- Binary: 1.5MB → 1.66MB
+- CPU cycles to crash: ~150M → runs indefinitely (625M+)
