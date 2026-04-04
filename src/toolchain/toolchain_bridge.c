@@ -71,6 +71,17 @@ static bool should_skip_file(const char *name) {
     if (strcasestr(name, "RELEASE") != NULL) return true;
     /* LIBFP: only NEWFPSUB should be assembled (it includes all others) */
     if (strcasestr(name, "libfp-") != NULL && !strcasestr(name, "NEWFPSUB")) return true;
+    /* Assembly files misidentified as Pascal */
+    if (strcasestr(name, "QSORT") != NULL) return true;
+    /* Documentation / release notes */
+    if (strcasestr(name, "relmemo") != NULL) return true;
+    /* Non-source data files in APPS */
+    if (strcasestr(name, "T5LM") != NULL) return true;
+    if (strcasestr(name, "t5dbc") != NULL) return true;
+    if (strcasestr(name, "t8dialogs") != NULL) return true;
+    if (strcasestr(name, "t10menus") != NULL) return true;
+    if (strcasestr(name, "T10DBOX") != NULL) return true;
+    if (strcasestr(name, "-TABLES.TEXT") != NULL) return true;
     /* Phrase/resource files, documentation, code generator templates */
     if (strcasestr(name, "PABC") != NULL) return true;
     if (strcasestr(name, "PASGEN") != NULL) return true;

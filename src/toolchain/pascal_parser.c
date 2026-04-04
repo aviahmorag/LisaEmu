@@ -545,6 +545,11 @@ static ast_node_t *parse_statement(parser_t *p) {
         while (!check(p, TOK_END) && !check(p, TOK_OTHERWISE) && !check(p, TOK_EOF) && !BAILED(p)) {
             skip_directives(p, n);
             if (check(p, TOK_END) || check(p, TOK_OTHERWISE)) break;
+            /* Handle empty case alternative (comment-only line followed by ;) */
+            if (check(p, TOK_SEMICOLON)) {
+                match(p, TOK_SEMICOLON);
+                continue;
+            }
             /* case label(s) : statement */
             ast_node_t *label_node = parse_expression(p);
             while (match(p, TOK_COMMA)) {
