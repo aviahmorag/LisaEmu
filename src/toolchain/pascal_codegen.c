@@ -389,10 +389,15 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                     emit16(cg, (uint16_t)(int16_t)sym->offset);
                     emit16(cg, 0x3010);  /* MOVE.W (A0),D0 */
                 } else if (sym->is_param || !sym->is_global) {
-                    /* Local/param: MOVE.W offset(A6),D0 */
+                    /* Local/param: size-aware load from stack frame */
                     int sz = sym->type ? sym->type->size : 2;
+                    if (strcasestr(cg->current_file, "STARTUP") && sz == 4) {
+                        fprintf(stderr, "  CODEGEN: MOVE.L %s offset=%d sz=%d type=%s\n",
+                                sym->name, sym->offset, sz,
+                                sym->type ? sym->type->name : "null");
+                    }
                     if (sz == 4) {
-                        emit16(cg, 0x302E);  /* MOVE.W offset(A6),D0 */
+                        emit16(cg, 0x202E);  /* MOVE.L offset(A6),D0 */
                     } else if (sz == 1) {
                         emit16(cg, 0x102E);  /* MOVE.B offset(A6),D0 */
                     } else {
