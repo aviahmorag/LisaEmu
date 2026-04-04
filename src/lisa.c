@@ -584,6 +584,58 @@ void lisa_reset(lisa_t *lisa) {
         lisa->mem.ram[4] = 0x00; lisa->mem.ram[5] = 0x00;
         lisa->mem.ram[6] = 0x04; lisa->mem.ram[7] = 0x00;
         printf("Set up 256 exception vectors in RAM $0-$3FF\n");
+
+        /* Set up loader parameter block in low memory.
+         * The real Lisa boot loader fills these before calling the OS.
+         * From source/ldequ.text: */
+        #define WRITE32(addr, val) do { \
+            lisa->mem.ram[(addr)]   = ((val) >> 24) & 0xFF; \
+            lisa->mem.ram[(addr)+1] = ((val) >> 16) & 0xFF; \
+            lisa->mem.ram[(addr)+2] = ((val) >> 8)  & 0xFF; \
+            lisa->mem.ram[(addr)+3] = (val) & 0xFF; \
+        } while(0)
+        #define WRITE16(addr, val) do { \
+            lisa->mem.ram[(addr)]   = ((val) >> 8) & 0xFF; \
+            lisa->mem.ram[(addr)+1] = (val) & 0xFF; \
+        } while(0)
+
+        /* Screen pointers (from LDEQU) */
+        WRITE32(0x110, 0x0007A000);   /* prom_screen: main screen base */
+        WRITE32(0x160, 0x0007A000);   /* realscreenptr: mapped screen */
+        WRITE32(0x170, 0x00078000);   /* altscreenptr: alternate screen */
+        WRITE32(0x174, 0x0007A000);   /* mainscreenptr: main screen */
+
+        /* Memory info */
+        WRITE32(0x294, LISA_RAM_SIZE); /* prom_memsize: last byte + 1 */
+        WRITE32(0x2A4, 0x00000000);   /* prom_byte0: physical byte 0 */
+        WRITE32(0x2A8, LISA_RAM_SIZE); /* prom_realsize: amount of memory */
+
+        /* Loader database — create a minimal parameter block at $800.
+         * PASCALINIT reads adrparamptr ($218) to find it. */
+        uint32_t param_block = 0x800;
+        WRITE32(0x218, param_block);  /* adrparamptr */
+        WRITE32(0x21C, 0x00020000);   /* ldbaseptr: loader base */
+        WRITE16(0x210, BOOT_TRACK_BLOCKS + 1); /* ld_fs_block0: MDDF block */
+        WRITE16(0x22E, 1);            /* dev_type: profile */
+
+        /* Parameter block at $800: loader version, global size, etc.
+         * The loader stores its memory map variables here.
+         * esysgloboff = 28 — offset to end-of-sysglobal pointer */
+        uint32_t sysglobal_base = 0x4000;  /* Place sysglobal at $4000 */
+        uint32_t sysglobal_end  = sysglobal_base + 0x10000; /* 64KB for globals */
+        WRITE32(param_block + 28, sysglobal_end); /* esysglobal */
+
+        /* Set up A5 initial value — points into sysglobal with 32 bytes of
+         * initial data below it (PASCALINIT copies these from the user stack). */
+        /* The boot ROM needs to set A5 before jumping to OS code.
+         * We'll set it in the CPU state after reset. */
+        uint32_t initial_a5 = sysglobal_end;
+
+        printf("Loader params: adrparamptr=$%X, sysglobal=$%X-$%X, A5=$%X\n",
+               param_block, sysglobal_base, sysglobal_end, initial_a5);
+
+        #undef WRITE32
+        #undef WRITE16
     }
 
     /* Debug: verify ROM is loaded before reset */
@@ -594,7 +646,13 @@ void lisa_reset(lisa_t *lisa) {
 
     m68k_reset(&lisa->cpu);
 
-    printf("After reset: PC=$%08X SSP=$%08X\n", lisa->cpu.pc, lisa->cpu.ssp);
+    /* Set A5 to initial global data pointer (loader normally does this).
+     * PASCALINIT in starasm1 expects A5 to point to the end of the
+     * user-stack global area, which it copies into sysglobal. */
+    lisa->cpu.a[5] = 0x14000;  /* Point into sysglobal area */
+
+    printf("After reset: PC=$%08X SSP=$%08X A5=$%08X\n",
+           lisa->cpu.pc, lisa->cpu.ssp, lisa->cpu.a[5]);
 
     /* Queue initial COPS data: keyboard ID so OS init can proceed */
     cops_queue_init(&lisa->cops_rx);
