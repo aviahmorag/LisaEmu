@@ -8,14 +8,13 @@ struct ContentView: View {
     @State private var showingFloppyPicker = false
     @State private var showingSourcePicker = false
     @State private var showingImagePicker = false
-    @State private var showingSavePanel = false
-    @State private var pendingSourceURL: URL?
 
     var body: some View {
         VStack(spacing: 0) {
             LisaDisplayView(viewModel: viewModel)
                 .frame(minWidth: 720, minHeight: 364)
 
+            // Status bar
             HStack {
                 Circle()
                     .fill(viewModel.isRunning ? Color.green : Color.red)
@@ -24,11 +23,18 @@ struct ContentView: View {
                 Text(viewModel.statusMessage)
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(.secondary)
+                    .lineLimit(1)
 
                 Spacer()
 
-                if viewModel.isRunning {
-                    Text("Click to capture mouse | Right-click to release")
+                if viewModel.isBuilding {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text(viewModel.buildProgress)
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                } else if viewModel.isRunning {
+                    Text("Click to capture mouse")
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
                 }
@@ -38,39 +44,20 @@ struct ContentView: View {
             .background(Color(nsColor: .controlBackgroundColor))
         }
         .toolbar {
-            ToolbarItemGroup(placement: .primaryAction) {
-                // Disk image / build options
-                Menu {
-                    Button("Build from Source...", systemImage: "hammer") {
-                        showingSourcePicker = true
-                    }
-                    .help("Compile Lisa OS from Apple's released source code")
-
-                    Button("Open Disk Image...", systemImage: "opticaldiscdrive") {
-                        showingImagePicker = true
-                    }
-                    .help("Open a previously built Lisa disk image")
-
-                    Divider()
-
-                    Button("Load ROM...", systemImage: "memorychip") {
-                        showingROMPicker = true
-                    }
-
-                    Button("Mount ProFile...", systemImage: "externaldrive") {
-                        showingProfilePicker = true
-                    }
-
-                    Button("Mount Floppy...", systemImage: "opticaldisc") {
-                        showingFloppyPicker = true
-                    }
-                } label: {
-                    Label("Disk", systemImage: "internaldrive")
+            ToolbarItem(placement: .primaryAction) {
+                Button("Build from Source", systemImage: "hammer") {
+                    showingSourcePicker = true
                 }
+                .disabled(viewModel.isBuilding)
+            }
 
-                Divider()
+            ToolbarItem(placement: .primaryAction) {
+                Button("Open Image", systemImage: "doc") {
+                    showingImagePicker = true
+                }
+            }
 
-                // Power / Reset
+            ToolbarItem(placement: .primaryAction) {
                 Button(
                     viewModel.isRunning ? "Power Off" : "Power On",
                     systemImage: viewModel.isRunning ? "power.circle.fill" : "power.circle"
@@ -81,27 +68,18 @@ struct ContentView: View {
                         viewModel.startEmulation()
                     }
                 }
-                .help(viewModel.isRunning ? "Stop emulation" : "Start emulation")
+            }
 
+            ToolbarItem(placement: .primaryAction) {
                 Button("Reset", systemImage: "arrow.counterclockwise") {
                     viewModel.reset()
                 }
-                .help("Reset Lisa")
                 .disabled(!viewModel.isRunning)
+            }
 
-                Divider()
-
+            ToolbarItem(placement: .primaryAction) {
                 Button("Debug", systemImage: "terminal") {
                     viewModel.showDebugger.toggle()
-                }
-                .help("Toggle CPU debugger")
-
-                // Build status
-                if viewModel.isBuilding {
-                    ProgressView()
-                        .controlSize(.small)
-                    Text(viewModel.buildProgress)
-                        .font(.system(size: 10))
                 }
             }
         }
@@ -123,8 +101,15 @@ struct ContentView: View {
         .fileImporter(isPresented: $showingSourcePicker, allowedContentTypes: [.folder]) { result in
             if case .success(let url) = result {
                 if viewModel.validateSource(url: url) {
-                    pendingSourceURL = url
-                    showingSavePanel = true
+                    // Use NSSavePanel to let user choose where to save the built image
+                    let panel = NSSavePanel()
+                    panel.title = "Save Built Disk Image"
+                    panel.nameFieldStringValue = "LisaOS.image"
+                    panel.allowedContentTypes = [.data]
+                    panel.canCreateDirectories = true
+                    if panel.runModal() == .OK, let saveURL = panel.url {
+                        viewModel.buildFromSource(sourceURL: url, saveURL: saveURL)
+                    }
                 } else {
                     viewModel.statusMessage = "Invalid: expected Lisa_Source folder with LISA_OS subdirectory"
                 }
@@ -135,35 +120,12 @@ struct ContentView: View {
                 viewModel.openDiskImage(url: url)
             }
         }
-        .fileExporter(
-            isPresented: $showingSavePanel,
-            document: DiskImageDocument(),
-            contentType: .data,
-            defaultFilename: "LisaOS.image"
-        ) { result in
-            if case .success(let saveURL) = result, let sourceURL = pendingSourceURL {
-                viewModel.buildFromSource(sourceURL: sourceURL, saveURL: saveURL)
-                pendingSourceURL = nil
-            }
-        }
         .sheet(isPresented: $viewModel.showDebugger) {
             DebuggerView(viewModel: viewModel)
         }
         .onAppear {
             viewModel.checkForLastImage()
         }
-    }
-}
-
-/// Empty document for the save panel
-struct DiskImageDocument: FileDocument {
-    static var readableContentTypes: [UTType] { [.data] }
-
-    init() {}
-    init(configuration: ReadConfiguration) throws {}
-
-    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
-        FileWrapper(regularFileWithContents: Data())
     }
 }
 
