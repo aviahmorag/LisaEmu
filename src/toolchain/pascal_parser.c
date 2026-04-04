@@ -1048,8 +1048,12 @@ static void parse_proc_or_func(parser_t *p, ast_node_t *parent, bool is_func) {
     expect(p, TOK_SEMICOLON);
     skip_directives(p, n);
 
+    /* In INTERFACE section, all procs/funcs are implicitly forward */
+    if (p->in_interface) {
+        strncpy(n->str_val, "FORWARD", sizeof(n->str_val));
+    }
     /* OVERRIDE (Clascal) */
-    if (match_ident(p, "OVERRIDE")) {
+    else if (match_ident(p, "OVERRIDE")) {
         strncpy(n->str_val, "OVERRIDE", sizeof(n->str_val));
         match(p, TOK_SEMICOLON);
     }
@@ -1148,12 +1152,14 @@ static ast_node_t *parse_unit(parser_t *p) {
 
     skip_directives(p, unit);
 
-    /* INTERFACE section */
+    /* INTERFACE section — all procedure/function declarations are implicitly FORWARD */
     if (match(p, TOK_INTERFACE)) {
         ast_node_t *iface = ast_new(AST_INTERFACE, p->lex.line);
+        p->in_interface = true;
         skip_directives(p, iface);
         if (match(p, TOK_USES)) parse_uses(p, iface);
         parse_declarations(p, iface);
+        p->in_interface = false;
         ast_add_child(unit, iface);
     }
 

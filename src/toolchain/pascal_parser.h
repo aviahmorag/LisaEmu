@@ -121,6 +121,7 @@ typedef struct {
     ast_node_t *root;
     int num_errors;
     char errors[100][256];
+    bool in_interface;  /* true when parsing UNIT INTERFACE section */
 } parser_t;
 
 /* Public API */
