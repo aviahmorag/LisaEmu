@@ -453,7 +453,28 @@ static uint32_t read_ea_mode(m68k_t *cpu, int mode, int reg, int size) {
 
 static int exception_count = 0;
 
+static int exception_histogram[256] = {0};
+
 static void take_exception(m68k_t *cpu, int vector) {
+    /* Count all exceptions by type */
+    if (vector < 256) exception_histogram[vector]++;
+
+    /* Detect stack overflow */
+    if (cpu->a[7] < 0x1000 || cpu->a[7] > 0x1FF000) {
+        static int overflow_reported = 0;
+        if (!overflow_reported) {
+            overflow_reported = 1;
+            fprintf(stderr, "STACK OVERFLOW: A7=$%08X at PC=$%06X, vector=%d\n",
+                    cpu->a[7], cpu->pc, vector);
+            fprintf(stderr, "Exception counts: ");
+            for (int i = 0; i < 64; i++) {
+                if (exception_histogram[i] > 0)
+                    fprintf(stderr, "v%d=%d ", i, exception_histogram[i]);
+            }
+            fprintf(stderr, "\n");
+        }
+    }
+
     /* Trace exceptions for debugging */
     if (exception_count < 50) {
         static const char *vec_names[] = {
