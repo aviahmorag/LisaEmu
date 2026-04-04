@@ -2593,6 +2593,18 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             break;
         }
 
+        /* Log highest PC reached in OS code (tracks execution progress) */
+        static uint32_t max_os_pc = 0;
+        static int pc_log_count = 0;
+        if (cpu->pc >= 0x400 && cpu->pc < 0x200000 && cpu->pc > max_os_pc) {
+            max_os_pc = cpu->pc;
+            if (pc_log_count < 20) {
+                fprintf(stderr, "PC HIGH: $%06X A5=$%08X A6=$%08X A7=$%08X\n",
+                        cpu->pc, cpu->a[5], cpu->a[6], cpu->a[7]);
+                pc_log_count++;
+            }
+        }
+
         cpu->cycles = 0;
         execute_one(cpu);
         if (cpu->cycles == 0) cpu->cycles = 4; /* minimum */
