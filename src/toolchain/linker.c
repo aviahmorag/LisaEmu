@@ -40,10 +40,15 @@ static bool str_eq_nocase(const char *a, const char *b) {
  * ======================================================================== */
 
 static int find_global_symbol(linker_t *lk, const char *name) {
-    /* Exact match (case-insensitive) */
+    /* Exact match (case-insensitive), preferring ENTRY over EXTERN */
+    int extern_match = -1;
     for (int i = 0; i < lk->num_symbols; i++) {
-        if (str_eq_nocase(lk->symbols[i].name, name))
-            return i;
+        if (str_eq_nocase(lk->symbols[i].name, name)) {
+            if (lk->symbols[i].type == LSYM_ENTRY)
+                return i;  /* ENTRY always wins */
+            if (extern_match < 0)
+                extern_match = i;  /* Remember first EXTERN match */
+        }
     }
     /* 8-char prefix match — Lisa assembler truncates symbols to 8 significant
      * characters. Match in both directions:
@@ -58,7 +63,7 @@ static int find_global_symbol(linker_t *lk, const char *name) {
                 return i;
         }
     }
-    return -1;
+    return extern_match;  /* Fall back to EXTERN if no ENTRY found */
 }
 
 static int add_global_symbol(linker_t *lk, const char *name, link_sym_type_t type,
