@@ -681,13 +681,19 @@ static void emit_ea_extension(asm68k_t *as, operand_t *op, int size) {
             break;
         case OP_ABS_LONG:
             /* Record relocation for external (.REF) symbols */
-            if (op->ref_sym_idx >= 0 && as->pass == 2 &&
-                as->num_relocs < ASM_MAX_RELOCS) {
-                asm_reloc_t *r = &as->relocs[as->num_relocs++];
-                r->offset = as->sections[as->current_section].size;
-                r->symbol_idx = op->ref_sym_idx;
-                r->size = 4;
-                r->pc_relative = false;
+            if (op->ref_sym_idx >= 0 && as->pass == 2) {
+                if (as->num_relocs < ASM_MAX_RELOCS) {
+                    asm_reloc_t *r = &as->relocs[as->num_relocs++];
+                    r->offset = as->sections[as->current_section].size;
+                    r->symbol_idx = op->ref_sym_idx;
+                    r->size = 4;
+                    r->pc_relative = false;
+                }
+                if (strcasestr(as->current_file, "INITRAP")) {
+                    fprintf(stderr, "  ASM RELOC: %s sym='%s' at offset %u\n",
+                            as->current_file, as->symbols[op->ref_sym_idx].name,
+                            as->sections[as->current_section].size);
+                }
             }
             emit32(as, (uint32_t)op->disp);
             break;

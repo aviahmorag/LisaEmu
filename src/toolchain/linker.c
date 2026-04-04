@@ -377,9 +377,15 @@ bool linker_link(linker_t *lk) {
 
     /* Re-apply ALL relocations — resolved symbols get their address,
      * unresolved ones get the stub address (never leave JSR $000000) */
+    int total_relocs_applied = 0;
     for (int m = 0; m < lk->num_modules; m++) {
         link_module_t *mod = lk->modules[m];
+        if (mod->num_relocs > 0 && strcasestr(mod->name, "INITRAP")) {
+            fprintf(stderr, "  INITRAP relocs: %d (module %d, base=$%X, code_size=%u)\n",
+                    mod->num_relocs, m, mod->base_addr, mod->code_size);
+        }
         for (int r = 0; r < mod->num_relocs; r++) {
+            total_relocs_applied++;
             int sym_idx = find_global_symbol(lk, mod->relocs[r].symbol);
             int32_t target;
             if (sym_idx >= 0 && lk->symbols[sym_idx].resolved) {
