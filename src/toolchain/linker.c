@@ -345,18 +345,11 @@ bool linker_link(linker_t *lk) {
         }
     }
 
-    /* Phase 4: Build output — concatenate all module code + stub area */
-    uint32_t total_size = 0;
-    for (int i = 0; i < lk->num_modules; i++) {
-        total_size += lk->modules[i]->code_size;
-        if (total_size & 1) total_size++; /* word-align */
-    }
-
-    /* Add a stub function at the end for unresolved symbols.
-     * The stub just does RTS (return to caller) so the OS doesn't crash. */
-    uint32_t stub_addr = total_size;
+    /* Phase 4: Build output — modules are placed starting at $400.
+     * Output buffer must be large enough for base_addr + code. */
+    uint32_t stub_addr = current_addr;  /* After all modules (includes $400 base) */
     if (stub_addr & 1) stub_addr++;
-    total_size = stub_addr + 4;  /* Room for CLR.L D0 + RTS */
+    uint32_t total_size = stub_addr + 4;  /* Room for CLR.L D0 + RTS */
 
     lk->output = malloc(total_size);
     if (!lk->output) {
