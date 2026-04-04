@@ -428,9 +428,21 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                     emit16(cg, (uint16_t)(int16_t)sym->offset);
                 }
             } else {
-                /* Unknown — might be a constant or external */
-                emit16(cg, 0x303C);  /* MOVE.W #0,D0 placeholder */
-                emit16(cg, 0);
+                /* Check for built-in constants */
+                if (str_eq_nocase(node->name, "true") || str_eq_nocase(node->name, "TRUE")) {
+                    emit16(cg, 0x7001);  /* MOVEQ #1,D0 */
+                } else if (str_eq_nocase(node->name, "false") || str_eq_nocase(node->name, "FALSE")) {
+                    emit16(cg, 0x7000);  /* MOVEQ #0,D0 */
+                } else if (str_eq_nocase(node->name, "nil") || str_eq_nocase(node->name, "NIL")) {
+                    emit16(cg, 0x7000);  /* MOVEQ #0,D0 (nil = 0) */
+                } else if (str_eq_nocase(node->name, "maxint") || str_eq_nocase(node->name, "MAXINT")) {
+                    emit16(cg, 0x303C);  /* MOVE.W #32767,D0 */
+                    emit16(cg, 0x7FFF);
+                } else {
+                    /* Unknown — treat as external, emit 0 */
+                    emit16(cg, 0x303C);  /* MOVE.W #0,D0 placeholder */
+                    emit16(cg, 0);
+                }
             }
             break;
         }
