@@ -268,6 +268,9 @@ final class EmulatorViewModel {
 
     /// Open a previously built disk image
     func openDiskImage(url: URL) {
+        let accessing = url.startAccessingSecurityScopedResource()
+        defer { if accessing { url.stopAccessingSecurityScopedResource() } }
+
         let path = url.path
         // Verify file exists and has content
         guard FileManager.default.fileExists(atPath: path),
@@ -281,6 +284,10 @@ final class EmulatorViewModel {
             buildComplete = true
             statusMessage = "Disk image loaded: \(url.lastPathComponent). Power On to boot."
             log("Disk image loaded: \(path)")
+            // Save bookmark for sandbox access on next launch
+            if let bookmark = try? url.bookmarkData(options: .withSecurityScope, includingResourceValuesForKeys: nil, relativeTo: nil) {
+                UserDefaults.standard.set(bookmark, forKey: "lastDiskImageBookmark")
+            }
             UserDefaults.standard.set(path, forKey: "lastDiskImage")
         } else {
             statusMessage = "Failed to open disk image"
@@ -290,33 +297,49 @@ final class EmulatorViewModel {
 
     /// Check if a previously used disk image exists
     func checkForLastImage() {
-        if let lastPath = UserDefaults.standard.string(forKey: "lastDiskImage") {
-            log("Found last image path: \(lastPath)")
-            if FileManager.default.fileExists(atPath: lastPath) {
-                let size = (try? FileManager.default.attributesOfItem(atPath: lastPath))?[.size] as? UInt64 ?? 0
-                log("File exists, size: \(size) bytes")
-                if size > 0 {
-                    builtImagePath = lastPath
+        // Try bookmark first (security-scoped access)
+        if let bookmarkData = UserDefaults.standard.data(forKey: "lastDiskImageBookmark") {
+            var isStale = false
+            if let url = try? URL(resolvingBookmarkData: bookmarkData, options: .withSecurityScope, relativeTo: nil, bookmarkDataIsStale: &isStale) {
+                let accessing = url.startAccessingSecurityScopedResource()
+                let path = url.path
+                log("Restoring last image from bookmark: \(path)")
+                if emu_mount_profile(path) {
+                    builtImagePath = path
                     buildComplete = true
-                    let name = URL(fileURLWithPath: lastPath).lastPathComponent
-                    statusMessage = "Last image: \(name). Power On to boot."
-                    let mounted = emu_mount_profile(lastPath)
-                    log("Mount result: \(mounted)")
+                    statusMessage = "Last image: \(url.lastPathComponent). Power On to boot."
+                    log("Mount from bookmark: success")
 
-                    // Also try to load ROM from same directory
-                    let romPath = URL(fileURLWithPath: lastPath).deletingLastPathComponent().appendingPathComponent("lisa_boot.rom").path
+                    // Try ROM from same directory
+                    let romPath = url.deletingLastPathComponent().appendingPathComponent("lisa_boot.rom").path
                     if FileManager.default.fileExists(atPath: romPath) {
-                        let romOK = emu_load_rom(romPath)
-                        romLoaded = romOK
-                        log("ROM load (\(romPath)): \(romOK)")
+                        romLoaded = emu_load_rom(romPath)
+                        log("ROM load: \(romLoaded)")
                     }
                 } else {
-                    log("File is empty, ignoring")
-                    UserDefaults.standard.removeObject(forKey: "lastDiskImage")
+                    log("Mount from bookmark: failed")
+                    if accessing { url.stopAccessingSecurityScopedResource() }
                 }
-            } else {
-                log("File doesn't exist, clearing saved path")
-                UserDefaults.standard.removeObject(forKey: "lastDiskImage")
+                return
+            }
+        }
+
+        // Fallback: try the container cache path (no bookmark needed)
+        let cacheDir = buildCacheDirectory()
+        let imagePath = "\(cacheDir)/lisa_profile.image"
+        if FileManager.default.fileExists(atPath: imagePath) {
+            log("Found cached image: \(imagePath)")
+            if emu_mount_profile(imagePath) {
+                builtImagePath = imagePath
+                buildComplete = true
+                statusMessage = "Cached image loaded. Power On to boot."
+                log("Mount cached image: success")
+
+                let romPath = "\(cacheDir)/lisa_boot.rom"
+                if FileManager.default.fileExists(atPath: romPath) {
+                    romLoaded = emu_load_rom(romPath)
+                    log("ROM load: \(romLoaded)")
+                }
             }
         }
     }
