@@ -409,6 +409,26 @@ bool linker_link(linker_t *lk) {
         }
     }
 
+    /* Final safety: scan output for JSR $000000 patterns and patch to stub.
+     * This catches any relocations that were dropped due to limits. */
+    int patched_zeros = 0;
+    for (uint32_t i = 0x400; i + 5 < lk->output_size; i += 2) {
+        if (lk->output[i] == 0x4E && lk->output[i+1] == 0xB9 &&
+            lk->output[i+2] == 0x00 && lk->output[i+3] == 0x00 &&
+            lk->output[i+4] == 0x00 && lk->output[i+5] == 0x00) {
+            /* JSR $000000 — patch to stub */
+            lk->output[i+2] = (stub_addr >> 24) & 0xFF;
+            lk->output[i+3] = (stub_addr >> 16) & 0xFF;
+            lk->output[i+4] = (stub_addr >> 8)  & 0xFF;
+            lk->output[i+5] = stub_addr & 0xFF;
+            patched_zeros++;
+        }
+    }
+    if (patched_zeros > 0) {
+        fprintf(stderr, "Linker: patched %d JSR $000000 to stub at $%X\n",
+                patched_zeros, stub_addr);
+    }
+
     /* Check for unresolved externals and dump debug info */
     int unresolved = 0;
     for (int i = 0; i < lk->num_symbols; i++) {
