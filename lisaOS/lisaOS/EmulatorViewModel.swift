@@ -73,8 +73,10 @@ final class EmulatorViewModel {
     func startEmulation() {
         guard romLoaded || buildComplete else {
             statusMessage = "Load a ROM or Build from Source first"
+            log("Power On failed: no ROM or built image loaded")
             return
         }
+        log("Power On")
 
         emu_reset()
         isRunning = true
@@ -94,6 +96,7 @@ final class EmulatorViewModel {
         isRunning = false
         emu_set_running(false)
         statusMessage = "Stopped"
+        log("Power Off")
     }
 
     func togglePause() {
@@ -167,8 +170,8 @@ final class EmulatorViewModel {
 
     // MARK: - Build from Source
 
-    /// Build Lisa OS from source, saving to app's cache directory
-    func buildFromSource(sourceURL: URL) {
+    /// Build Lisa OS from source. On success, calls onSuccess so the UI can prompt for save location.
+    func buildFromSource(sourceURL: URL, onSuccess: @escaping () -> Void = {}) {
         guard !isBuilding else { return }
         isBuilding = true
         showLogs = true
@@ -180,7 +183,6 @@ final class EmulatorViewModel {
         let outputDir = buildCacheDirectory()
         log("Output directory: \(outputDir)")
 
-        // Security-scoped access for sandboxed app
         let accessing = sourceURL.startAccessingSecurityScopedResource()
 
         Task.detached {
@@ -198,11 +200,11 @@ final class EmulatorViewModel {
                     self.builtImagePath = imagePath
                     self.buildComplete = true
                     self.buildProgress = "Built: \(result.files_compiled) compiled, \(result.files_assembled) assembled"
-                    self.statusMessage = "Build complete. Power On to boot."
-                    self.log("Disk image: \(imagePath)")
+                    self.statusMessage = "Build complete! Choose where to save the image."
+                    self.log("Build succeeded. Image at: \(imagePath)")
 
                     _ = emu_mount_profile(imagePath)
-                    UserDefaults.standard.set(imagePath, forKey: "lastDiskImage")
+                    onSuccess()
                 } else {
                     var errBuf = result.error_message
                     let errMsg = withUnsafePointer(to: &errBuf) {
@@ -217,6 +219,26 @@ final class EmulatorViewModel {
                     }
                 }
             }
+        }
+    }
+
+    /// Copy the built image to a user-chosen location
+    func saveBuiltImage(to url: URL) {
+        guard let sourcePath = builtImagePath else {
+            log("No built image to save")
+            return
+        }
+        do {
+            if FileManager.default.fileExists(atPath: url.path) {
+                try FileManager.default.removeItem(at: url)
+            }
+            try FileManager.default.copyItem(atPath: sourcePath, toPath: url.path)
+            log("Image saved to: \(url.path)")
+            statusMessage = "Image saved. Power On to boot."
+            UserDefaults.standard.set(url.path, forKey: "lastDiskImage")
+        } catch {
+            log("Failed to save image: \(error.localizedDescription)")
+            statusMessage = "Failed to save image"
         }
     }
 

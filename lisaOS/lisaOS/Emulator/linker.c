@@ -51,12 +51,10 @@ static int add_global_symbol(linker_t *lk, const char *name, link_sym_type_t typ
                               int32_t value, int module_idx) {
     int existing = find_global_symbol(lk, name);
     if (existing >= 0) {
-        /* Update existing symbol */
+        /* Update existing symbol — allow redefinition (last one wins).
+         * In Lisa OS, the same method names (CREATE, Draw, etc.) appear in
+         * different compilation units for different classes. */
         if (type == LSYM_ENTRY) {
-            if (lk->symbols[existing].resolved && lk->symbols[existing].type == LSYM_ENTRY) {
-                link_error(lk, "duplicate symbol '%s' (in module %d and %d)",
-                          name, lk->symbols[existing].module_idx, module_idx);
-            }
             lk->symbols[existing].type = LSYM_ENTRY;
             lk->symbols[existing].value = value;
             lk->symbols[existing].module_idx = module_idx;

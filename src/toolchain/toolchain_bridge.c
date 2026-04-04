@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <dirent.h>
 #include <sys/stat.h>
 
@@ -32,6 +33,45 @@ typedef struct {
     char path[512];
     bool is_assembly;  /* true = assembly, false = Pascal */
 } source_file_t;
+
+/* Check if a directory name should be skipped (non-source directories) */
+static bool should_skip_dir(const char *name) {
+    /* Skip build scripts, linkmaps, docs, exec files */
+    if (strcasecmp(name, "BUILD") == 0) return true;
+    if (strstr(name, "Linkmaps") != NULL) return true;
+    if (strstr(name, "exec") != NULL) return true;
+    if (strcasecmp(name, "DICT") == 0) return true;
+    if (strcasecmp(name, "FONTS") == 0) return true; /* binary fonts, not source */
+    return false;
+}
+
+/* Check if a file is likely a non-Pascal/non-assembly file that should be skipped */
+static bool should_skip_file(const char *name) {
+    /* Skip build scripts, link lists, alert tables, 68k assembly stubs, docs */
+    if (strncasecmp(name, "BUILD-", 6) == 0) return true;
+    if (strncasecmp(name, "build-", 6) == 0) return true;
+    if (strcasestr(name, "ALERT") != NULL) return true;  /* alert resource files */
+    if (strcasestr(name, "LINK.TEXT") != NULL) return true; /* link command files */
+    if (strcasestr(name, "linkmap") != NULL) return true;
+    if (strcasestr(name, "68K.TEXT") != NULL && !strcasestr(name, "ASM")) return true; /* 68k stubs, not asm */
+    if (strcasestr(name, "68k.text") != NULL && !strcasestr(name, "asm")) return true;
+    if (strcasestr(name, "COMP.TEXT") != NULL) return true; /* compile scripts */
+    if (strcasestr(name, "INSTALL.TEXT") != NULL) return true;
+    if (strcasestr(name, "DOC.TEXT") != NULL) return true;
+    if (strcasestr(name, "REL.TEXT") != NULL && strncasecmp(name, "libhw-REL", 9) == 0) return true;
+    if (strcasestr(name, "LEGENDS") != NULL) return true;
+    if (strcasestr(name, "APPENDIX") != NULL) return true;
+    if (strcasestr(name, "INSTRUCT") != NULL) return true;
+    if (strcasestr(name, "RELEASE") != NULL) return true;
+    /* Skip files that start with P/X and are in TK dirs (phrase/exec config files) */
+    if ((name[0] == 'P' || name[0] == 'X') && isupper(name[1]) &&
+        !strstr(name, "PROC") && !strstr(name, "proc") &&
+        strlen(name) < 20) {
+        /* Likely a TK config file like PBOXER, XBOXER, PCLOCK, etc. */
+        /* But only if it's short and all-caps before the extension */
+    }
+    return false;
+}
 
 static int find_source_files(const char *dir, source_file_t *files, int max_files) {
     int count = 0;
@@ -49,13 +89,15 @@ static int find_source_files(const char *dir, source_file_t *files, int max_file
         if (stat(path, &st) != 0) continue;
 
         if (S_ISDIR(st.st_mode)) {
-            /* Recurse into subdirectories */
+            if (should_skip_dir(entry->d_name)) continue;
             count += find_source_files(path, files + count, max_files - count);
         } else if (S_ISREG(st.st_mode)) {
-            /* Check if it's a source file */
-            const char *ext = strstr(entry->d_name, ".TEXT.unix.txt");
-            if (!ext) ext = strstr(entry->d_name, ".text.unix.txt");
+            /* Must have .TEXT.unix.txt extension */
+            const char *ext = strcasestr(entry->d_name, ".TEXT.unix.txt");
             if (!ext) continue;
+
+            /* Skip non-source files */
+            if (should_skip_file(entry->d_name)) continue;
 
             /* Determine if assembly or Pascal */
             bool is_asm = (strcasestr(entry->d_name, "ASM") != NULL);

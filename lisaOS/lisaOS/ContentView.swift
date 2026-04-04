@@ -4,7 +4,9 @@ import UniformTypeIdentifiers
 struct ContentView: View {
     @State private var viewModel = EmulatorViewModel()
     @State private var showingFilePicker = false
+    @State private var showingSavePicker = false
     @State private var pickerMode: PickerMode = .image
+    @State private var pendingSourceURL: URL?
 
     enum PickerMode {
         case source  // picking a folder
@@ -157,7 +159,10 @@ struct ContentView: View {
                 if pickerMode == .source {
                     viewModel.log("Selected source folder: \(url.path)")
                     if viewModel.validateSource(url: url) {
-                        viewModel.buildFromSource(sourceURL: url)
+                        viewModel.buildFromSource(sourceURL: url) {
+                            // On success, trigger save dialog
+                            showingSavePicker = true
+                        }
                     } else {
                         let msg = "Not a valid Lisa_Source folder (expected LISA_OS subdirectory)"
                         viewModel.statusMessage = msg
@@ -173,12 +178,32 @@ struct ContentView: View {
                 viewModel.log(msg)
             }
         }
+        .fileExporter(
+            isPresented: $showingSavePicker,
+            document: DiskImageDocument(),
+            contentType: .data,
+            defaultFilename: "LisaOS.image"
+        ) { result in
+            if case .success(let saveURL) = result {
+                viewModel.saveBuiltImage(to: saveURL)
+            }
+        }
         .sheet(isPresented: $viewModel.showDebugger) {
             DebuggerView(viewModel: viewModel)
         }
         .onAppear {
             viewModel.checkForLastImage()
         }
+    }
+}
+
+/// Placeholder document for fileExporter save panel
+struct DiskImageDocument: FileDocument {
+    static var readableContentTypes: [UTType] { [.data] }
+    init() {}
+    init(configuration: ReadConfiguration) throws {}
+    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
+        FileWrapper(regularFileWithContents: Data())
     }
 }
 
