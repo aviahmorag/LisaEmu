@@ -702,15 +702,18 @@ static ast_node_t *parse_type(parser_t *p) {
         /* Variant part (CASE tag OF ...) */
         if (match(p, TOK_CASE)) {
             /* CASE [tag :] type OF variant_list */
-            /* Skip the variant part — it's complex and we just need the END */
-            int depth = 1;
-            while (depth > 0 && !check(p, TOK_EOF) && !BAILED(p)) {
-                if (CURTYPE(p) == TOK_RECORD || CURTYPE(p) == TOK_CASE) {
+            /* Skip the variant part — track depth with RECORD/END pairs.
+             * Nested CASE inside variants does NOT add depth — only RECORD does.
+             * This handles nested variant records like TAbk in UNITHZ. */
+            int depth = 0;
+            while (!check(p, TOK_EOF) && !BAILED(p)) {
+                if (CURTYPE(p) == TOK_RECORD) {
                     depth++;
                     advance(p);
                 } else if (CURTYPE(p) == TOK_END) {
+                    if (depth <= 0) break;  /* This END closes the outer RECORD */
                     depth--;
-                    if (depth > 0) advance(p);
+                    advance(p);
                 } else {
                     advance(p);
                 }
@@ -1066,10 +1069,20 @@ static void parse_proc_or_func(parser_t *p, ast_node_t *parent, bool is_func) {
         match(p, TOK_SEMICOLON);
     } else {
         /* Full body: declarations + compound statement */
+        int errors_before = p->num_errors;
         parse_declarations(p, n);
         if (check(p, TOK_BEGIN)) {
             ast_add_child(n, parse_compound_statement(p));
             match(p, TOK_SEMICOLON);
+        }
+        /* If parsing the body caused errors, recover by scanning forward
+         * to the next FUNCTION/PROCEDURE/END at the top level. This prevents
+         * one bad function from destroying all subsequent functions. */
+        if (p->num_errors > errors_before) {
+            while (!check(p, TOK_PROCEDURE) && !check(p, TOK_FUNCTION) &&
+                   !check(p, TOK_END) && !check(p, TOK_EOF) && !BAILED(p)) {
+                advance(p);
+            }
         }
     }
 

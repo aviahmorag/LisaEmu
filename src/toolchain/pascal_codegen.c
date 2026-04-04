@@ -1003,6 +1003,20 @@ static void gen_unit(codegen_t *cg, ast_node_t *unit) {
             ast_node_t *impl = unit->children[i];
             process_declarations(cg, impl, true);
 
+            /* Count and log IMPLEMENTATION functions */
+            int impl_funcs = 0;
+            for (int j = 0; j < impl->num_children; j++) {
+                if (impl->children[j]->type == AST_PROC_DECL ||
+                    impl->children[j]->type == AST_FUNC_DECL)
+                    impl_funcs++;
+            }
+            if (impl_funcs > 0) {
+                const char *bn = strrchr(cg->current_file, '/');
+                bn = bn ? bn + 1 : cg->current_file;
+                fprintf(stderr, "  IMPL: %s — %d procs/funcs in IMPLEMENTATION\n",
+                        bn, impl_funcs);
+            }
+
             /* Generate code for procedures/functions and methods */
             for (int j = 0; j < impl->num_children; j++) {
                 if (impl->children[j]->type == AST_PROC_DECL ||
