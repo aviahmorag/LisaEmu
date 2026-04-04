@@ -451,7 +451,24 @@ static uint32_t read_ea_mode(m68k_t *cpu, int mode, int reg, int size) {
  * Exception processing
  * ======================================================================== */
 
+static int exception_count = 0;
+
 static void take_exception(m68k_t *cpu, int vector) {
+    /* Trace exceptions for debugging */
+    if (exception_count < 50) {
+        static const char *vec_names[] = {
+            [2] = "Bus Error", [3] = "Address Error", [4] = "Illegal Instruction",
+            [5] = "Zero Divide", [6] = "CHK", [7] = "TRAPV",
+            [8] = "Privilege Violation", [9] = "Trace",
+            [10] = "Line-A", [11] = "Line-F"
+        };
+        const char *name = (vector < 12 && vec_names[vector]) ? vec_names[vector] :
+                           (vector >= 32 && vector < 48) ? "TRAP" : "IRQ";
+        printf("Exception: vector %d (%s) at PC=$%06X, new PC=$%08X\n",
+               vector, name, cpu->pc, cpu_read32(cpu, vector * 4));
+        exception_count++;
+    }
+
     /* Save old SR, enter supervisor mode */
     uint16_t old_sr = cpu->sr;
     set_supervisor(cpu, true);

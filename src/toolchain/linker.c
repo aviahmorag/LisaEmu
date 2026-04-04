@@ -258,7 +258,8 @@ bool linker_link(linker_t *lk) {
         return false;
     }
 
-    /* Phase 1: Layout — assign base addresses to each module */
+    /* Phase 1: Layout — assign base addresses to each module.
+     * Start at 0 — the emulator handles loading at the right RAM address. */
     uint32_t current_addr = 0;
 
     /* Create a single segment for now */
@@ -324,12 +325,18 @@ bool linker_link(linker_t *lk) {
         }
     }
 
-    /* Phase 4: Build output — concatenate all module code */
+    /* Phase 4: Build output — concatenate all module code + stub area */
     uint32_t total_size = 0;
     for (int i = 0; i < lk->num_modules; i++) {
         total_size += lk->modules[i]->code_size;
         if (total_size & 1) total_size++; /* word-align */
     }
+
+    /* Add a stub function at the end for unresolved symbols.
+     * The stub just does RTS (return to caller) so the OS doesn't crash. */
+    uint32_t stub_addr = total_size;
+    if (stub_addr & 1) stub_addr++;
+    total_size = stub_addr + 4;  /* Room for CLR.L D0 + RTS */
 
     lk->output = malloc(total_size);
     if (!lk->output) {
@@ -340,6 +347,44 @@ bool linker_link(linker_t *lk) {
     lk->output_capacity = total_size;
 
     memset(lk->output, 0, total_size);
+
+    /* Write stub: CLR.L D0; RTS — returns 0 for any unresolved function */
+    lk->output[stub_addr]     = 0x42; /* CLR.L D0 = $4280 */
+    lk->output[stub_addr + 1] = 0x80;
+    lk->output[stub_addr + 2] = 0x4E; /* RTS = $4E75 */
+    lk->output[stub_addr + 3] = 0x75;
+
+    /* Resolve all unresolved externals to point to the stub */
+    for (int i = 0; i < lk->num_symbols; i++) {
+        if (lk->symbols[i].type == LSYM_EXTERN && !lk->symbols[i].resolved) {
+            lk->symbols[i].value = stub_addr;
+            lk->symbols[i].resolved = true;
+        }
+    }
+
+    /* Re-apply relocations for newly resolved symbols */
+    for (int m = 0; m < lk->num_modules; m++) {
+        link_module_t *mod = lk->modules[m];
+        for (int r = 0; r < mod->num_relocs; r++) {
+            int sym_idx = find_global_symbol(lk, mod->relocs[r].symbol);
+            if (sym_idx >= 0 && lk->symbols[sym_idx].resolved) {
+                uint32_t offset = mod->relocs[r].offset;
+                int size = mod->relocs[r].size;
+                int32_t target = lk->symbols[sym_idx].value;
+                if (offset < mod->code_size) {
+                    if (size == 4) {
+                        mod->code[offset]     = (target >> 24) & 0xFF;
+                        mod->code[offset + 1] = (target >> 16) & 0xFF;
+                        mod->code[offset + 2] = (target >> 8)  & 0xFF;
+                        mod->code[offset + 3] = target & 0xFF;
+                    } else if (size == 2) {
+                        mod->code[offset]     = (target >> 8) & 0xFF;
+                        mod->code[offset + 1] = target & 0xFF;
+                    }
+                }
+            }
+        }
+    }
     for (int i = 0; i < lk->num_modules; i++) {
         link_module_t *mod = lk->modules[i];
         if (mod->code && mod->code_size > 0) {

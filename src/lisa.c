@@ -497,7 +497,7 @@ void lisa_reset(lisa_t *lisa) {
             uint32_t num_blocks = ((uint32_t)catalog[40] << 8) | (uint32_t)catalog[41];
 
             if (file_size > 0 && start_block > 0) {
-                /* Load system.os at RAM address $0 (where linker expects it) */
+                /* Load system.os into RAM at $0. */
                 uint32_t ram_dest = 0;
                 uint32_t loaded = 0;
                 for (uint32_t b = 0; b < num_blocks && ram_dest + PROFILE_DATA_SIZE < LISA_RAM_SIZE; b++) {
@@ -514,6 +514,27 @@ void lisa_reset(lisa_t *lisa) {
         }
 
         printf("Pre-loaded %d boot blocks at RAM $20000\n", boot_blocks);
+
+        /* Set up exception vectors in RAM at $0.
+         * After MMU switch, CPU reads vectors from RAM.
+         * Vector 0 (SSP) and 1 (PC) aren't used after reset.
+         * All other vectors point to the ROM's RTE handler at $FE0300. */
+        uint32_t rte_handler = 0x00FE0300;
+        /* Vector 0: SSP (not used after reset, keep as-is) */
+        lisa->mem.ram[0] = 0; lisa->mem.ram[1] = 0x07;
+        lisa->mem.ram[2] = 0x90; lisa->mem.ram[3] = 0x00;  /* $79000 */
+        /* Vector 1: PC (not used after reset) */
+        lisa->mem.ram[4] = 0; lisa->mem.ram[5] = 0x02;
+        lisa->mem.ram[6] = 0x00; lisa->mem.ram[7] = 0x00;  /* $20000 */
+        /* Vectors 2-63: exception handlers → ROM RTE */
+        for (int v = 2; v < 64; v++) {
+            int off = v * 4;
+            lisa->mem.ram[off + 0] = (rte_handler >> 24) & 0xFF;
+            lisa->mem.ram[off + 1] = (rte_handler >> 16) & 0xFF;
+            lisa->mem.ram[off + 2] = (rte_handler >> 8) & 0xFF;
+            lisa->mem.ram[off + 3] = rte_handler & 0xFF;
+        }
+        printf("Set up %d exception vectors in RAM at $0\n", 64);
     }
 
     /* Debug: verify ROM is loaded before reset */
