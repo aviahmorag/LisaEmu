@@ -90,34 +90,37 @@ struct ContentView: View {
 
     /// Open dialog that accepts both folders (source) and files (disk images)
     private func openFileOrFolder() {
-        let panel = NSOpenPanel()
-        panel.title = "Open Lisa Source Folder or Disk Image"
-        panel.message = "Select a Lisa_Source folder to build from source, or a .image file to boot directly."
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = true
-        panel.allowsMultipleSelection = false
+        // Dispatch async to avoid blocking SwiftUI's layout pass
+        DispatchQueue.main.async {
+            let panel = NSOpenPanel()
+            panel.title = "Open Lisa Source Folder or Disk Image"
+            panel.message = "Select a Lisa_Source folder to build from source, or a .image file to boot directly."
+            panel.canChooseFiles = true
+            panel.canChooseDirectories = true
+            panel.allowsMultipleSelection = false
 
-        guard panel.runModal() == .OK, let url = panel.url else { return }
+            guard panel.runModal() == .OK, let url = panel.url else { return }
 
-        var isDir: ObjCBool = false
-        FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir)
+            var isDir: ObjCBool = false
+            FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir)
 
-        if isDir.boolValue {
-            // It's a folder — validate and build from source
-            if viewModel.validateSource(url: url) {
-                // Ask where to save the built image
-                let save = NSSavePanel()
-                save.title = "Save Built Disk Image"
-                save.nameFieldStringValue = "LisaOS.image"
-                save.canCreateDirectories = true
-                guard save.runModal() == .OK, let saveURL = save.url else { return }
-                viewModel.buildFromSource(sourceURL: url, saveURL: saveURL)
+            if isDir.boolValue {
+                // It's a folder — validate and build from source
+                if viewModel.validateSource(url: url) {
+                    // Ask where to save the built image
+                    let save = NSSavePanel()
+                    save.title = "Save Built Disk Image"
+                    save.nameFieldStringValue = "LisaOS.image"
+                    save.canCreateDirectories = true
+                    guard save.runModal() == .OK, let saveURL = save.url else { return }
+                    viewModel.buildFromSource(sourceURL: url, saveURL: saveURL)
+                } else {
+                    viewModel.statusMessage = "Not a valid Lisa_Source folder (expected LISA_OS subdirectory)"
+                }
             } else {
-                viewModel.statusMessage = "Not a valid Lisa_Source folder (expected LISA_OS subdirectory)"
+                // It's a file — open as disk image
+                viewModel.openDiskImage(url: url)
             }
-        } else {
-            // It's a file — open as disk image
-            viewModel.openDiskImage(url: url)
         }
     }
 }

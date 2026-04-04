@@ -127,8 +127,9 @@ static bool compile_pascal_file(const char *path, linker_t *lk) {
 }
 
 static bool assemble_file(const char *path, linker_t *lk) {
-    asm68k_t as;
-    asm68k_init(&as);
+    asm68k_t *as = calloc(1, sizeof(asm68k_t));
+    if (!as) return false;
+    asm68k_init(as);
 
     /* Set base dir for includes */
     char *slash = strrchr(path, '/');
@@ -138,20 +139,19 @@ static bool assemble_file(const char *path, linker_t *lk) {
         if (len > 255) len = 255;
         strncpy(dir, path, len);
         dir[len] = '\0';
-        asm68k_set_base_dir(&as, dir);
+        asm68k_set_base_dir(as, dir);
     }
 
-    bool ok = asm68k_assemble_file(&as, path);
+    bool ok = asm68k_assemble_file(as, path);
 
-    if (ok && as.output_size > 0) {
-        /* Load assembled output into linker */
-        /* For now, create a simple module from the raw output */
+    if (ok && as->output_size > 0) {
         linker_load_codegen(lk, path,
-                            asm68k_get_output(&as, NULL), as.output_size,
+                            asm68k_get_output(as, NULL), as->output_size,
                             NULL, 0, NULL, 0);
     }
 
-    asm68k_free(&as);
+    asm68k_free(as);
+    free(as);
     return ok;
 }
 
