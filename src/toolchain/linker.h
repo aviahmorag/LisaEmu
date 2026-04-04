@@ -17,7 +17,7 @@
 #include <stdbool.h>
 
 /* Limits */
-#define LINK_MAX_OBJECTS    256
+#define LINK_MAX_OBJECTS    2048
 #define LINK_MAX_SEGMENTS   128
 #define LINK_MAX_SYMBOLS    16384
 #define LINK_MAX_RELOCS     65536

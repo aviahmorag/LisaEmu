@@ -36,12 +36,17 @@ typedef struct {
 
 /* Check if a directory name should be skipped (non-source directories) */
 static bool should_skip_dir(const char *name) {
-    /* Skip build scripts, linkmaps, docs, exec files */
     if (strcasecmp(name, "BUILD") == 0) return true;
-    if (strstr(name, "Linkmaps") != NULL) return true;
-    if (strstr(name, "exec") != NULL) return true;
+    if (strcasestr(name, "Linkmaps") != NULL) return true;
+    if (strcasestr(name, "exec") != NULL) return true;
     if (strcasecmp(name, "DICT") == 0) return true;
-    if (strcasecmp(name, "FONTS") == 0) return true; /* binary fonts, not source */
+    if (strcasecmp(name, "FONTS") == 0) return true;
+    if (strcasecmp(name, "APIN") == 0) return true;  /* install scripts */
+    if (strcasecmp(name, "GUIDE_APIM") == 0) return true; /* guide/tutorial app */
+    if (strcasecmp(name, "TKIN") == 0) return true;  /* toolkit install */
+    if (strcasecmp(name, "LIBHW") == 0 && !strcasestr(name, "LIBS")) return true; /* duplicate LIBHW outside LIBS */
+    /* Skip TK3/TK4/TK5 sample app directories (contain build scripts, not compilable units) */
+    if (strcasecmp(name, "TK3") == 0 || strcasecmp(name, "TK4") == 0 || strcasecmp(name, "TK5") == 0) return true;
     return false;
 }
 

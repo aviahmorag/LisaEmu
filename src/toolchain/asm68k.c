@@ -1044,6 +1044,27 @@ static bool assemble_instruction(asm68k_t *as, const char *mnemonic, const char 
         return true;
     }
 
+    /* ---- CMPM ---- */
+    if (strcmp(base, "CMPM") == 0) {
+        /* CMPM (Ay)+,(Ax)+  opcode: 1011 Ax 1 ss 001 Ay */
+        int ax = op2.reg;
+        int ay = op1.reg;
+        emit16(as, 0xB108 | (ax << 9) | (size_enc(size) << 6) | ay);
+        return true;
+    }
+
+    /* ---- ADDX, SUBX ---- */
+    if (strcmp(base, "ADDX") == 0 || strcmp(base, "SUBX") == 0) {
+        int sub = (strcmp(base, "SUBX") == 0) ? 1 : 0;
+        int rm = (op1.type == OP_PRE_DEC) ? 1 : 0;
+        int rx = op2.reg;
+        int ry = op1.reg;
+        /* ADDX: 1101 Rx 1 ss 00 rm Ry  SUBX: 1001 Rx 1 ss 00 rm Ry */
+        uint16_t base_op = sub ? 0x9100 : 0xD100;
+        emit16(as, base_op | (rx << 9) | (size_enc(size) << 6) | (rm << 3) | ry);
+        return true;
+    }
+
     /* ---- MULU, MULS, DIVU, DIVS ---- */
     if (strcmp(base, "MULU") == 0 || strcmp(base, "MULS") == 0 ||
         strcmp(base, "DIVU") == 0 || strcmp(base, "DIVS") == 0) {
