@@ -644,7 +644,7 @@ static void emit_ea_extension(asm68k_t *as, operand_t *op, int size) {
 }
 
 /* Size of EA extension in bytes */
-static int ea_extension_size(operand_t *op, int size) {
+static int __attribute__((unused)) ea_extension_size(operand_t *op, int size) {
     switch (op->type) {
         case OP_DISP_AN: case OP_DISP_PC: case OP_ABS_SHORT:
         case OP_INDEX_AN: case OP_INDEX_PC:

@@ -56,9 +56,7 @@ static inline uint32_t fetch32(m68k_t *cpu) {
 }
 
 /* Sign extension */
-static inline int32_t sign_extend_8(uint8_t val) {
-    return (int32_t)(int8_t)val;
-}
+
 
 static inline int32_t sign_extend_16(uint16_t val) {
     return (int32_t)(int16_t)val;
@@ -420,7 +418,8 @@ static uint32_t read_ea(m68k_t *cpu, ea_result_t *ea, int size) {
 }
 
 /* Write value to effective address */
-static void write_ea(m68k_t *cpu, ea_result_t *ea, int size, uint32_t val) {
+static void write_ea(m68k_t *cpu, ea_result_t *ea, int size, uint64_t val64) {
+    uint32_t val = (uint32_t)val64;
     if (ea->is_register) {
         switch (size) {
             case SIZE_BYTE:
@@ -1859,8 +1858,6 @@ static void op_shift(m68k_t *cpu) {
         cpu->cycles += (size == SIZE_LONG) ? 8 : 6;
         return;
     }
-
-    int bits = (size == SIZE_BYTE) ? 8 : (size == SIZE_WORD) ? 16 : 32;
 
     switch (type) {
         case 0: /* ASd */

@@ -264,7 +264,7 @@ static void render_framebuffer(lisa_t *lisa) {
  * ProFile disk operations
  * ======================================================================== */
 
-static void profile_read_block(lisa_t *lisa, uint32_t block) {
+static void __attribute__((unused)) profile_read_block(lisa_t *lisa, uint32_t block) {
     if (!lisa->profile.mounted || !lisa->profile.data) {
         memset(lisa->profile.sector_buf, 0xFF, PROFILE_BLOCK_SIZE);
         return;
@@ -279,7 +279,7 @@ static void profile_read_block(lisa_t *lisa, uint32_t block) {
     lisa->profile.buf_index = 0;
 }
 
-static void profile_write_block(lisa_t *lisa, uint32_t block) {
+static void __attribute__((unused)) profile_write_block(lisa_t *lisa, uint32_t block) {
     if (!lisa->profile.mounted || !lisa->profile.data) return;
 
     size_t offset = (size_t)block * PROFILE_BLOCK_SIZE;

@@ -70,10 +70,7 @@ static void patch16(codegen_t *cg, uint32_t offset, uint16_t val) {
     }
 }
 
-/* Get a unique label number */
-static int new_label(codegen_t *cg) {
-    return cg->label_counter++;
-}
+
 
 /* Record current code position as a label target */
 #define HERE(cg) ((cg)->code_size)

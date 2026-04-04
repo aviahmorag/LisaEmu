@@ -8,7 +8,7 @@ final class EmulatorViewModel {
     var isRunning = false
     var cpuState = ""
     var romLoaded = false
-    var statusMessage = "No ROM loaded"
+    var statusMessage = "Click 'Build from Source' to compile Lisa OS, or load a ROM"
     var showDebugger = false
 
     // Build from source
@@ -61,8 +61,8 @@ final class EmulatorViewModel {
     }
 
     func startEmulation() {
-        guard romLoaded else {
-            statusMessage = "Load a ROM first"
+        guard romLoaded || buildComplete else {
+            statusMessage = "Load a ROM or Build from Source first"
             return
         }
 
@@ -71,8 +71,9 @@ final class EmulatorViewModel {
         statusMessage = "Running"
 
         emulatorTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+            guard let vm = self else { return }
             Task { @MainActor in
-                self?.runFrame()
+                vm.runFrame()
             }
         }
     }
@@ -93,8 +94,9 @@ final class EmulatorViewModel {
             emu_set_running(true)
             statusMessage = "Running"
             emulatorTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+                guard let vm = self else { return }
                 Task { @MainActor in
-                    self?.runFrame()
+                    vm.runFrame()
                 }
             }
         }
@@ -176,10 +178,10 @@ final class EmulatorViewModel {
         let sourcePath = sourceURL.path
         let outputPath = buildCacheDirectory()
 
-        Task.detached { [weak self] in
+        Task.detached {
             let result = toolchain_build(sourcePath, outputPath, nil)
 
-            await MainActor.run {
+            await MainActor.run { [weak self] in
                 guard let self else { return }
                 self.isBuilding = false
                 if result.success {

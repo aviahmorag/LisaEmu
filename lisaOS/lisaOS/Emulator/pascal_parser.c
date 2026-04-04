@@ -228,17 +228,6 @@ static void synchronize(parser_t *p) {
     }
 }
 
-/* Check if a token looks like a statement/keyword start (not an expression continuation) */
-static bool is_statement_start(parser_t *p) {
-    switch (CURTYPE(p)) {
-        case TOK_BEGIN: case TOK_IF: case TOK_WHILE: case TOK_FOR:
-        case TOK_REPEAT: case TOK_CASE: case TOK_WITH: case TOK_GOTO:
-        case TOK_END: case TOK_ELSE: case TOK_UNTIL:
-            return true;
-        default:
-            return false;
-    }
-}
 
 /* ========================================================================
  * Forward declarations
