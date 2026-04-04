@@ -552,7 +552,7 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
             /* Clean up args — 2 bytes per argument */
             int arg_bytes = node->num_children * 2;
             if (arg_bytes > 0 && arg_bytes <= 8) {
-                emit16(cg, 0x508F | ((arg_bytes / 2) << 9));  /* ADDQ.L #n,SP */
+                emit16(cg, 0x508F | ((arg_bytes & 7) << 9));  /* ADDQ.L #n,SP */
             } else if (arg_bytes > 8) {
                 emit16(cg, 0xDEFC);  /* ADDA.W #imm,SP */
                 emit16(cg, (uint16_t)arg_bytes);
@@ -675,11 +675,11 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                 emit16(cg, 0x6000);  /* BRA.W end_if */
                 uint32_t end_pos = cg->code_size;
                 emit16(cg, 0);
-                patch16(cg, else_pos, (uint16_t)(cg->code_size - else_pos - 2));
+                patch16(cg, else_pos, (uint16_t)(cg->code_size - else_pos));
                 gen_statement(cg, node->children[2]);
-                patch16(cg, end_pos, (uint16_t)(cg->code_size - end_pos - 2));
+                patch16(cg, end_pos, (uint16_t)(cg->code_size - end_pos));
             } else {
-                patch16(cg, else_pos, (uint16_t)(cg->code_size - else_pos - 2));
+                patch16(cg, else_pos, (uint16_t)(cg->code_size - else_pos));
             }
             break;
         }
@@ -696,7 +696,7 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
             emit16(cg, 0x6000);  /* BRA.W loop_start */
             emit16(cg, (uint16_t)((int32_t)loop_start - (int32_t)cg->code_size));
 
-            patch16(cg, end_pos, (uint16_t)(cg->code_size - end_pos - 2));
+            patch16(cg, end_pos, (uint16_t)(cg->code_size - end_pos));
             break;
         }
 
@@ -762,7 +762,7 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
             emit16(cg, 0x6000);
             emit16(cg, (uint16_t)((int32_t)loop_start - (int32_t)cg->code_size));
 
-            patch16(cg, end_pos, (uint16_t)(cg->code_size - end_pos - 2));
+            patch16(cg, end_pos, (uint16_t)(cg->code_size - end_pos));
             break;
         }
 

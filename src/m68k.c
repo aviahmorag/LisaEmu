@@ -487,6 +487,7 @@ static void take_exception(m68k_t *cpu, int vector) {
                            (vector >= 32 && vector < 48) ? "TRAP" : "IRQ";
         printf("Exception: vector %d (%s) at PC=$%06X, new PC=$%08X\n",
                vector, name, cpu->pc, cpu_read32(cpu, vector * 4));
+
         exception_count++;
     }
 
@@ -2529,9 +2530,8 @@ static void execute_one(m68k_t *cpu) {
             break;
 
         case 0xF:
-            /* Line-F emulation — 68000 pushes PC of the Line-F opcode itself.
-             * The SANE handler reads the opcode word, performs the FP operation,
-             * adjusts the stacked PC past the instruction, then does RTE. */
+            /* Line-F: 68000 pushes PC of the Line-F opcode itself.
+             * Skip past it and continue. */
             cpu->pc -= 2;
             take_exception(cpu, VEC_LINE_F);
             break;
