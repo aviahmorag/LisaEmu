@@ -218,9 +218,10 @@ static bool compile_pascal_file(const char *path, linker_t *lk) {
             /* For INITSYS, dump its nested declarations */
             if ((c->type == 11 || c->type == 12) &&
                 strcasecmp(c->name, "INITSYS") == 0) {
-                for (int j = 0; j < c->num_children && j < 20; j++) {
-                    fprintf(stderr, "    INITSYS child[%d]: type=%d name='%s'\n",
-                            j, c->children[j]->type, c->children[j]->name);
+                for (int j = 0; j < c->num_children && j < 45; j++) {
+                    ast_node_t *ic = c->children[j];
+                    fprintf(stderr, "    INITSYS child[%d]: type=%d name='%s' children=%d\n",
+                            j, ic->type, ic->name, ic->num_children);
                 }
             }
         }
