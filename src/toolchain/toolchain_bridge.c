@@ -318,7 +318,13 @@ build_result_t toolchain_build(const char *source_dir,
         return result;
     }
 
-    int num_files = find_source_files(source_dir, files, MAX_SOURCE_FILES);
+    /* Only compile OS kernel and system libraries (LISA_OS/).
+     * Apps (APPS/) and Toolkit (Lisa_Toolkit/) are loaded on demand —
+     * the kernel must fit in 1MB RAM. */
+    int num_files = 0;
+    char subdir[512];
+    snprintf(subdir, sizeof(subdir), "%s/LISA_OS", source_dir);
+    num_files += find_source_files(subdir, files + num_files, MAX_SOURCE_FILES - num_files);
     if (progress) progress("Found source files", 1, 100);
 
     /* Create linker */
