@@ -37,6 +37,7 @@ typedef enum {
     TOK_XOR, TOK_EXTERNAL, TOK_FORWARD, TOK_INLINE,
     TOK_BOOLEAN, TOK_CHAR, TOK_INTEGER_KW, TOK_LONGINT,
     TOK_REAL_KW, TOK_TEXT,
+    TOK_METHODS, TOK_SUBCLASS, TOK_OVERRIDE,
 
     /* Operators / punctuation */
     TOK_PLUS,          /* + */
@@ -79,6 +80,15 @@ typedef struct {
     };
 } token_t;
 
+/* Conditional compilation state */
+#define LEX_MAX_COND_DEPTH 32
+#define LEX_MAX_SYMBOLS    128
+
+typedef struct {
+    char name[64];
+    bool value;
+} lex_symbol_t;
+
 /* Lexer state */
 typedef struct {
     const char *source;
@@ -89,6 +99,17 @@ typedef struct {
     token_t current;
     token_t lookahead;
     bool has_lookahead;
+
+    /* Conditional compilation */
+    struct {
+        bool active;     /* Are we emitting tokens? */
+        bool had_true;   /* Has this level seen a true branch? */
+    } cond_stack[LEX_MAX_COND_DEPTH];
+    int cond_depth;
+
+    /* Compile-time symbols ({$SETC name := value}) */
+    lex_symbol_t symbols[LEX_MAX_SYMBOLS];
+    int num_symbols;
 } lexer_t;
 
 /* Public API */

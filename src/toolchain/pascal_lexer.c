@@ -28,6 +28,9 @@ static const struct { const char *word; token_type_t type; } keywords[] = {
     {"TO", TOK_TO}, {"TYPE", TOK_TYPE}, {"UNIT", TOK_UNIT},
     {"UNTIL", TOK_UNTIL}, {"USES", TOK_USES}, {"VAR", TOK_VAR},
     {"WHILE", TOK_WHILE}, {"WITH", TOK_WITH}, {"XOR", TOK_XOR},
+    {"METHODS", TOK_METHODS}, {"SUBCLASS", TOK_SUBCLASS},
+    /* Note: OVERRIDE is NOT a keyword — it's used as a variable name in some files.
+     * It's handled contextually in the parser (after method declarations in SUBCLASS). */
     {NULL, TOK_EOF}
 };
 
@@ -50,14 +53,192 @@ static token_type_t lookup_keyword(const char *ident) {
 /* ======================================================================== */
 
 void lexer_init(lexer_t *lex, const char *source, const char *filename) {
+    memset(lex, 0, sizeof(lexer_t));
     lex->source = source;
     lex->pos = source;
     lex->filename = filename;
     lex->line = 1;
     lex->col = 1;
-    lex->has_lookahead = false;
-    memset(&lex->current, 0, sizeof(token_t));
-    memset(&lex->lookahead, 0, sizeof(token_t));
+}
+
+/* Conditional compilation helpers */
+
+static bool lexer_is_active(lexer_t *lex) {
+    /* We're active if all levels of the conditional stack are active */
+    for (int i = 0; i < lex->cond_depth; i++) {
+        if (!lex->cond_stack[i].active) return false;
+    }
+    return true;
+}
+
+static bool lexer_lookup_symbol(lexer_t *lex, const char *name) {
+    for (int i = 0; i < lex->num_symbols; i++) {
+        if (str_eq_upper(lex->symbols[i].name, name))
+            return lex->symbols[i].value;
+    }
+    return false; /* Unknown symbols default to FALSE (release build) */
+}
+
+static void lexer_set_symbol(lexer_t *lex, const char *name, bool value) {
+    for (int i = 0; i < lex->num_symbols; i++) {
+        if (str_eq_upper(lex->symbols[i].name, name)) {
+            lex->symbols[i].value = value;
+            return;
+        }
+    }
+    if (lex->num_symbols < LEX_MAX_SYMBOLS) {
+        strncpy(lex->symbols[lex->num_symbols].name, name, 63);
+        lex->symbols[lex->num_symbols].value = value;
+        lex->num_symbols++;
+    }
+}
+
+/* Parse a $SETC directive: $SETC name := value */
+static void lexer_handle_setc(lexer_t *lex, const char *directive) {
+    /* directive looks like: "$SETC name := value" or "$SETC name:=value" */
+    const char *p = directive + 4; /* skip $SETC */
+    while (*p == ' ') p++;
+
+    char name[64];
+    int ni = 0;
+    while (*p && *p != ':' && *p != '=' && *p != ' ' && ni < 63) {
+        name[ni++] = *p++;
+    }
+    name[ni] = '\0';
+
+    /* Skip := */
+    while (*p == ' ' || *p == ':' || *p == '=') p++;
+
+    /* Parse value — TRUE, FALSE, or a symbol name */
+    char val_str[64];
+    int vi = 0;
+    while (*p && *p != ' ' && *p != '}' && vi < 63) {
+        val_str[vi++] = *p++;
+    }
+    val_str[vi] = '\0';
+
+    bool value;
+    if (str_eq_upper(val_str, "TRUE")) value = true;
+    else if (str_eq_upper(val_str, "FALSE")) value = false;
+    else value = lexer_lookup_symbol(lex, val_str); /* $SETC a := b */
+
+    lexer_set_symbol(lex, name, value);
+}
+
+/* Parse a $IFC directive: $IFC name [or name] [and name] */
+static bool lexer_eval_ifc(lexer_t *lex, const char *directive) {
+    const char *p = directive + 3; /* skip $IFC */
+    while (*p == ' ') p++;
+
+    /* Parse first operand */
+    char name[64];
+    int ni = 0;
+    while (*p && *p != ' ' && *p != '}' && *p != '*' && ni < 63) {
+        name[ni++] = *p++;
+    }
+    name[ni] = '\0';
+
+    bool result;
+    if (str_eq_upper(name, "TRUE")) result = true;
+    else if (str_eq_upper(name, "FALSE")) result = false;
+    else if (str_eq_upper(name, "NOT")) {
+        /* $IFC NOT name */
+        while (*p == ' ') p++;
+        ni = 0;
+        while (*p && *p != ' ' && *p != '}' && *p != '*' && ni < 63) {
+            name[ni++] = *p++;
+        }
+        name[ni] = '\0';
+        result = !lexer_lookup_symbol(lex, name);
+    } else {
+        result = lexer_lookup_symbol(lex, name);
+    }
+
+    /* Check for AND/OR operators */
+    while (*p == ' ') p++;
+    while (*p) {
+        char op[8];
+        ni = 0;
+        while (*p && *p != ' ' && ni < 7) { op[ni++] = *p++; }
+        op[ni] = '\0';
+        while (*p == ' ') p++;
+
+        char operand[64];
+        ni = 0;
+        while (*p && *p != ' ' && *p != '}' && *p != '*' && ni < 63) {
+            operand[ni++] = *p++;
+        }
+        operand[ni] = '\0';
+        if (!operand[0]) break;
+
+        bool val = lexer_lookup_symbol(lex, operand);
+        if (str_eq_upper(op, "OR")) result = result || val;
+        else if (str_eq_upper(op, "AND")) result = result && val;
+        while (*p == ' ') p++;
+    }
+
+    return result;
+}
+
+/* Process a directive — returns true if the directive was handled (conditional compilation) */
+static bool lexer_handle_directive(lexer_t *lex, const char *dir) {
+    /* dir starts with '$' */
+    if (dir[0] != '$') return false;
+
+    /* $SETC */
+    if ((dir[1] == 'S' || dir[1] == 's') &&
+        (dir[2] == 'E' || dir[2] == 'e') &&
+        (dir[3] == 'T' || dir[3] == 't') &&
+        (dir[4] == 'C' || dir[4] == 'c')) {
+        if (lexer_is_active(lex)) {
+            lexer_handle_setc(lex, dir);
+        }
+        return true;
+    }
+
+    /* $IFC */
+    if ((dir[1] == 'I' || dir[1] == 'i') &&
+        (dir[2] == 'F' || dir[2] == 'f') &&
+        (dir[3] == 'C' || dir[3] == 'c')) {
+        bool cond = lexer_is_active(lex) ? lexer_eval_ifc(lex, dir) : false;
+        if (lex->cond_depth < LEX_MAX_COND_DEPTH) {
+            lex->cond_stack[lex->cond_depth].active = cond;
+            lex->cond_stack[lex->cond_depth].had_true = cond;
+            lex->cond_depth++;
+        }
+        return true;
+    }
+
+    /* $ELSEC */
+    if ((dir[1] == 'E' || dir[1] == 'e') &&
+        (dir[2] == 'L' || dir[2] == 'l') &&
+        (dir[3] == 'S' || dir[3] == 's') &&
+        (dir[4] == 'E' || dir[4] == 'e') &&
+        (dir[5] == 'C' || dir[5] == 'c')) {
+        if (lex->cond_depth > 0) {
+            int top = lex->cond_depth - 1;
+            if (!lex->cond_stack[top].had_true) {
+                lex->cond_stack[top].active = true;
+                lex->cond_stack[top].had_true = true;
+            } else {
+                lex->cond_stack[top].active = false;
+            }
+        }
+        return true;
+    }
+
+    /* $ENDC */
+    if ((dir[1] == 'E' || dir[1] == 'e') &&
+        (dir[2] == 'N' || dir[2] == 'n') &&
+        (dir[3] == 'D' || dir[3] == 'd') &&
+        (dir[4] == 'C' || dir[4] == 'c')) {
+        if (lex->cond_depth > 0) {
+            lex->cond_depth--;
+        }
+        return true;
+    }
+
+    return false;
 }
 
 static char peek_char(lexer_t *lex) {
@@ -115,18 +296,12 @@ static token_t make_token(lexer_t *lex, token_type_t type) {
     return tok;
 }
 
-token_t lexer_next(lexer_t *lex) {
-    if (lex->has_lookahead) {
-        lex->has_lookahead = false;
-        lex->current = lex->lookahead;
-        return lex->current;
-    }
-
+/* Lex a single raw token (no conditional compilation processing) */
+static token_t lexer_raw_next(lexer_t *lex) {
     skip_whitespace_and_comments(lex);
 
     if (!*lex->pos) {
-        lex->current = make_token(lex, TOK_EOF);
-        return lex->current;
+        return make_token(lex, TOK_EOF);
     }
 
     token_t tok = make_token(lex, TOK_ERROR);
@@ -134,6 +309,25 @@ token_t lexer_next(lexer_t *lex) {
 
     /* Compiler directive: {$...} */
     if (c == '{' && lex->pos[1] == '$') {
+        /* Distinguish hex comments {$80} {$A0} from directives {$S seg} {$IFC x}.
+         * Real directives: $S, $R, $U, $I, $D, $E (SETC/ENDC/ELSEC/IFC), $L, $C, $%
+         * Hex comments: {$80}, {$A0}, {$9D in a byte}, etc.
+         * Rule: if the content after $ parses as a hex number (1-4 hex digits)
+         * optionally followed by non-alnum, it's a comment. */
+        {
+            const char *scan = lex->pos + 2; /* first char after {$ */
+            int hex_count = 0;
+            while (isxdigit((unsigned char)*scan)) { hex_count++; scan++; }
+            /* If we got 1-4 hex digits followed by non-alnum (space, }, text) → hex comment */
+            if (hex_count >= 1 && hex_count <= 4 &&
+                (*scan == '}' || *scan == ' ' || *scan == '\0' || !isalnum((unsigned char)*scan))) {
+                /* Hex comment — skip */
+                next_char(lex); /* { */
+                while (*lex->pos && *lex->pos != '}') next_char(lex);
+                if (*lex->pos == '}') next_char(lex);
+                return lexer_raw_next(lex);
+            }
+        }
         tok.type = TOK_DIRECTIVE;
         next_char(lex); /* { */
         next_char(lex); /* $ */
@@ -144,7 +338,6 @@ token_t lexer_next(lexer_t *lex) {
         }
         tok.str_val[i] = '\0';
         if (*lex->pos == '}') next_char(lex);
-        lex->current = tok;
         return tok;
     }
 
@@ -165,7 +358,6 @@ token_t lexer_next(lexer_t *lex) {
             next_char(lex);
         }
         tok.str_val[i] = '\0';
-        lex->current = tok;
         return tok;
     }
 
@@ -244,10 +436,10 @@ token_t lexer_next(lexer_t *lex) {
         return tok;
     }
 
-    /* Identifier or keyword */
-    if (isalpha((unsigned char)c) || c == '_') {
+    /* Identifier or keyword (% prefix for Lisa intrinsics) */
+    if (isalpha((unsigned char)c) || c == '_' || c == '%') {
         int i = 0;
-        while (isalnum((unsigned char)*lex->pos) || *lex->pos == '_') {
+        while (isalnum((unsigned char)*lex->pos) || *lex->pos == '_' || *lex->pos == '%') {
             if (i < 1022) tok.str_val[i++] = next_char(lex);
             else next_char(lex);
         }
@@ -303,14 +495,57 @@ token_t lexer_next(lexer_t *lex) {
             else tok.type = TOK_GT;
             break;
 
+        case '#':
+            /* # character — skip and re-lex */
+            return lexer_raw_next(lex);
+
         default:
+            if ((unsigned char)c >= 128) {
+                /* Non-ASCII character (file padding) — skip and re-lex */
+                return lexer_raw_next(lex);
+            }
             tok.type = TOK_ERROR;
-            snprintf(tok.str_val, sizeof(tok.str_val), "unexpected character: '%c'", c);
+            snprintf(tok.str_val, sizeof(tok.str_val), "unexpected character: '%c' (0x%02X)", c, (unsigned char)c);
             break;
     }
 
-    lex->current = tok;
     return tok;
+}
+
+/* Public lexer_next: wraps raw lexing with conditional compilation */
+token_t lexer_next(lexer_t *lex) {
+    if (lex->has_lookahead) {
+        lex->has_lookahead = false;
+        lex->current = lex->lookahead;
+        return lex->current;
+    }
+
+    while (1) {
+        token_t tok = lexer_raw_next(lex);
+
+        if (tok.type == TOK_EOF) {
+            lex->current = tok;
+            return tok;
+        }
+
+        /* Handle conditional compilation directives */
+        if (tok.type == TOK_DIRECTIVE) {
+            if (lexer_handle_directive(lex, tok.str_val)) {
+                /* Conditional directive consumed — continue lexing */
+                continue;
+            }
+            /* Non-conditional directive — pass through if active */
+            if (!lexer_is_active(lex)) continue;
+            lex->current = tok;
+            return tok;
+        }
+
+        /* If we're in an inactive conditional branch, skip this token */
+        if (!lexer_is_active(lex)) continue;
+
+        lex->current = tok;
+        return tok;
+    }
 }
 
 token_t lexer_peek(lexer_t *lex) {
@@ -378,6 +613,9 @@ const char *token_type_name(token_type_t type) {
         case TOK_LONGINT: return "LONGINT"; case TOK_REAL_KW: return "REAL";
         case TOK_TEXT: return "TEXT"; case TOK_SHL: return "SHL";
         case TOK_SHR: return "SHR";
+        case TOK_METHODS: return "METHODS";
+        case TOK_SUBCLASS: return "SUBCLASS";
+        case TOK_OVERRIDE: return "OVERRIDE";
         case TOK_PLUS: return "+"; case TOK_MINUS: return "-";
         case TOK_STAR: return "*"; case TOK_SLASH: return "/";
         case TOK_ASSIGN: return ":="; case TOK_EQ: return "=";

@@ -1,6 +1,13 @@
 /*
  * LisaEm Toolchain — Lisa Pascal Parser
  * Recursive descent parser producing an AST.
+ *
+ * Handles:
+ *   - Full UNIT and PROGRAM files
+ *   - Code fragments (files starting with procedures, METHODS OF, etc.)
+ *   - Lisa Pascal extensions: write format specifiers (expr:width),
+ *     comment-wrapped params, SUBCLASS OF, METHODS OF, OVERRIDE
+ *   - Conditional compilation directives ({$IFC}/{$ENDC})
  */
 
 #include "pascal_parser.h"
@@ -9,6 +16,9 @@
 #include <string.h>
 #include <ctype.h>
 #include <stdarg.h>
+
+/* Maximum errors before bail-out to prevent infinite loops */
+#define MAX_ERRORS_BAILOUT 20
 
 /* ========================================================================
  * AST node management
@@ -42,6 +52,7 @@ const char *ast_type_name(ast_type_t type) {
     switch (type) {
         case AST_PROGRAM: return "PROGRAM";
         case AST_UNIT: return "UNIT";
+        case AST_FRAGMENT: return "FRAGMENT";
         case AST_INTERFACE: return "INTERFACE";
         case AST_IMPLEMENTATION: return "IMPLEMENTATION";
         case AST_USES: return "USES";
@@ -64,8 +75,11 @@ const char *ast_type_name(ast_type_t type) {
         case AST_TYPE_STRING: return "STRING_TYPE";
         case AST_TYPE_PACKED: return "PACKED";
         case AST_TYPE_ENUM: return "ENUM";
+        case AST_TYPE_CLASS: return "CLASS";
         case AST_FIELD_LIST: return "FIELDS";
         case AST_FIELD: return "FIELD";
+        case AST_VARIANT: return "VARIANT";
+        case AST_METHODS: return "METHODS";
         case AST_BLOCK: return "BLOCK";
         case AST_ASSIGN: return "ASSIGN";
         case AST_CALL: return "CALL";
@@ -90,6 +104,7 @@ const char *ast_type_name(ast_type_t type) {
         case AST_ADDR_OF: return "ADDR";
         case AST_SET_EXPR: return "SET";
         case AST_NIL_EXPR: return "NIL";
+        case AST_TYPE_CAST: return "CAST";
         case AST_DIRECTIVE: return "DIRECTIVE";
         default: return "???";
     }
@@ -114,6 +129,7 @@ void ast_print(ast_node_t *node, int indent) {
 
 #define CUR(p)    ((p)->lex.current)
 #define CURTYPE(p) ((p)->lex.current.type)
+#define BAILED(p) ((p)->num_errors >= MAX_ERRORS_BAILOUT)
 
 static void parser_error(parser_t *p, const char *fmt, ...) {
     if (p->num_errors >= 100) return;
@@ -150,6 +166,24 @@ static bool expect(parser_t *p, token_type_t type) {
     return false;
 }
 
+/* Case-insensitive string comparison */
+static bool str_eq_upper(const char *a, const char *b) {
+    while (*a && *b) {
+        if (toupper((unsigned char)*a) != toupper((unsigned char)*b)) return false;
+        a++; b++;
+    }
+    return *a == *b;
+}
+
+/* Match a specific identifier (case-insensitive) */
+static bool match_ident(parser_t *p, const char *name) {
+    if (CURTYPE(p) == TOK_IDENT && str_eq_upper(CUR(p).str_val, name)) {
+        advance(p);
+        return true;
+    }
+    return false;
+}
+
 /* Skip compiler directives, collecting them as nodes */
 static ast_node_t *try_directive(parser_t *p) {
     if (CURTYPE(p) == TOK_DIRECTIVE) {
@@ -169,6 +203,43 @@ static void skip_directives(parser_t *p, ast_node_t *parent) {
     }
 }
 
+/* Synchronize after an error — skip tokens until a likely recovery point */
+static void synchronize(parser_t *p) {
+    while (!check(p, TOK_EOF)) {
+        /* Stop at statement/declaration boundaries */
+        if (check(p, TOK_SEMICOLON)) { advance(p); return; }
+        if (check(p, TOK_END)) return;
+        if (check(p, TOK_BEGIN)) return;
+        if (check(p, TOK_PROCEDURE)) return;
+        if (check(p, TOK_FUNCTION)) return;
+        if (check(p, TOK_CONST)) return;
+        if (check(p, TOK_TYPE)) return;
+        if (check(p, TOK_VAR)) return;
+        if (check(p, TOK_IF)) return;
+        if (check(p, TOK_WHILE)) return;
+        if (check(p, TOK_FOR)) return;
+        if (check(p, TOK_REPEAT)) return;
+        if (check(p, TOK_CASE)) return;
+        if (check(p, TOK_WITH)) return;
+        if (check(p, TOK_IMPLEMENTATION)) return;
+        if (check(p, TOK_INTERFACE)) return;
+        if (check(p, TOK_METHODS)) return;
+        advance(p);
+    }
+}
+
+/* Check if a token looks like a statement/keyword start (not an expression continuation) */
+static bool is_statement_start(parser_t *p) {
+    switch (CURTYPE(p)) {
+        case TOK_BEGIN: case TOK_IF: case TOK_WHILE: case TOK_FOR:
+        case TOK_REPEAT: case TOK_CASE: case TOK_WITH: case TOK_GOTO:
+        case TOK_END: case TOK_ELSE: case TOK_UNTIL:
+            return true;
+        default:
+            return false;
+    }
+}
+
 /* ========================================================================
  * Forward declarations
  * ======================================================================== */
@@ -177,13 +248,14 @@ static ast_node_t *parse_expression(parser_t *p);
 static ast_node_t *parse_statement(parser_t *p);
 static ast_node_t *parse_type(parser_t *p);
 static void parse_declarations(parser_t *p, ast_node_t *parent);
-static ast_node_t *parse_block(parser_t *p);
+static ast_node_t *parse_compound_statement(parser_t *p);
 
 /* ========================================================================
  * Expression parser (precedence climbing)
  * ======================================================================== */
 
 static ast_node_t *parse_factor(parser_t *p) {
+    if (BAILED(p)) return ast_new(AST_EMPTY, p->lex.line);
     skip_directives(p, NULL);
 
     /* Integer literal */
@@ -267,16 +339,17 @@ static ast_node_t *parse_factor(parser_t *p) {
         return n;
     }
 
-    /* Identifier (variable, function call, etc.) */
+    /* Identifier (variable, function call, type name used as value, etc.) */
     if (check(p, TOK_IDENT) || check(p, TOK_INTEGER_KW) || check(p, TOK_BOOLEAN) ||
         check(p, TOK_CHAR) || check(p, TOK_LONGINT) || check(p, TOK_REAL_KW) ||
-        check(p, TOK_TEXT)) {
+        check(p, TOK_TEXT) || check(p, TOK_STRING_KW)) {
         ast_node_t *n = ast_new(AST_IDENT_EXPR, p->lex.line);
         strncpy(n->name, CUR(p).str_val, sizeof(n->name) - 1);
         advance(p);
 
         /* Postfix: function call, array access, field access, dereference */
         while (1) {
+            if (BAILED(p)) break;
             if (match(p, TOK_LPAREN)) {
                 /* Function/procedure call */
                 ast_node_t *call = ast_new(AST_FUNC_CALL, n->line);
@@ -286,6 +359,10 @@ static ast_node_t *parse_factor(parser_t *p) {
                     do {
                         skip_directives(p, NULL);
                         ast_add_child(call, parse_expression(p));
+                        /* Handle write format specifiers: expr:width[:decimals] */
+                        while (match(p, TOK_COLON)) {
+                            parse_expression(p); /* discard width/decimals */
+                        }
                     } while (match(p, TOK_COMMA));
                 }
                 expect(p, TOK_RPAREN);
@@ -318,7 +395,8 @@ static ast_node_t *parse_factor(parser_t *p) {
         return n;
     }
 
-    parser_error(p, "unexpected token in expression: %s", token_type_name(CURTYPE(p)));
+    parser_error(p, "unexpected token in expression: %s '%s'",
+                 token_type_name(CURTYPE(p)), CUR(p).str_val);
     advance(p); /* skip bad token */
     return ast_new(AST_EMPTY, p->lex.line);
 }
@@ -327,6 +405,7 @@ static ast_node_t *parse_term(parser_t *p) {
     ast_node_t *left = parse_factor(p);
     while (check(p, TOK_STAR) || check(p, TOK_SLASH) || check(p, TOK_DIV) ||
            check(p, TOK_MOD) || check(p, TOK_AND) || check(p, TOK_SHL) || check(p, TOK_SHR)) {
+        if (BAILED(p)) break;
         token_type_t op = CURTYPE(p);
         advance(p);
         ast_node_t *n = ast_new(AST_BINARY_OP, p->lex.line);
@@ -341,6 +420,7 @@ static ast_node_t *parse_term(parser_t *p) {
 static ast_node_t *parse_simple_expr(parser_t *p) {
     ast_node_t *left = parse_term(p);
     while (check(p, TOK_PLUS) || check(p, TOK_MINUS) || check(p, TOK_OR) || check(p, TOK_XOR)) {
+        if (BAILED(p)) break;
         token_type_t op = CURTYPE(p);
         advance(p);
         ast_node_t *n = ast_new(AST_BINARY_OP, p->lex.line);
@@ -353,6 +433,7 @@ static ast_node_t *parse_simple_expr(parser_t *p) {
 }
 
 static ast_node_t *parse_expression(parser_t *p) {
+    if (BAILED(p)) return ast_new(AST_EMPTY, p->lex.line);
     ast_node_t *left = parse_simple_expr(p);
     if (check(p, TOK_EQ) || check(p, TOK_NE) || check(p, TOK_LT) ||
         check(p, TOK_LE) || check(p, TOK_GT) || check(p, TOK_GE) || check(p, TOK_IN)) {
@@ -374,19 +455,41 @@ static ast_node_t *parse_expression(parser_t *p) {
 static ast_node_t *parse_compound_statement(parser_t *p) {
     ast_node_t *block = ast_new(AST_BLOCK, p->lex.line);
     expect(p, TOK_BEGIN);
-    while (!check(p, TOK_END) && !check(p, TOK_EOF)) {
+    while (!check(p, TOK_END) && !check(p, TOK_EOF) && !BAILED(p)) {
+        const char *prev_pos = p->lex.pos;
         skip_directives(p, block);
         if (check(p, TOK_END)) break;
         ast_add_child(block, parse_statement(p));
-        match(p, TOK_SEMICOLON); /* optional between statements */
+        match(p, TOK_SEMICOLON);
         skip_directives(p, block);
+        if (p->lex.pos == prev_pos && !check(p, TOK_END) && !check(p, TOK_EOF)) {
+            parser_error(p, "stuck at '%s', skipping", token_type_name(CURTYPE(p)));
+            advance(p);
+        }
     }
     expect(p, TOK_END);
     return block;
 }
 
 static ast_node_t *parse_statement(parser_t *p) {
+    if (BAILED(p)) return ast_new(AST_EMPTY, p->lex.line);
     skip_directives(p, NULL);
+
+    /* Numeric label prefix: 123: statement */
+    if (check(p, TOK_INTEGER) && p->lex.pos[0] != '\0') {
+        /* Look ahead to see if this is a label */
+        token_t saved = CUR(p);
+        lexer_t saved_lex = p->lex;
+        advance(p);
+        if (check(p, TOK_COLON)) {
+            advance(p); /* consume colon */
+            /* Label prefix — now parse the actual statement */
+            return parse_statement(p);
+        }
+        /* Not a label — restore and fall through to expression parsing */
+        p->lex = saved_lex;
+        p->lex.current = saved;
+    }
 
     /* Compound statement */
     if (check(p, TOK_BEGIN))
@@ -416,7 +519,7 @@ static ast_node_t *parse_statement(parser_t *p) {
     /* REPEAT */
     if (match(p, TOK_REPEAT)) {
         ast_node_t *n = ast_new(AST_REPEAT, p->lex.line);
-        while (!check(p, TOK_UNTIL) && !check(p, TOK_EOF)) {
+        while (!check(p, TOK_UNTIL) && !check(p, TOK_EOF) && !BAILED(p)) {
             ast_add_child(n, parse_statement(p));
             match(p, TOK_SEMICOLON);
         }
@@ -446,23 +549,26 @@ static ast_node_t *parse_statement(parser_t *p) {
         ast_node_t *n = ast_new(AST_CASE, p->lex.line);
         ast_add_child(n, parse_expression(p));
         expect(p, TOK_OF);
-        while (!check(p, TOK_END) && !check(p, TOK_OTHERWISE) && !check(p, TOK_EOF)) {
+        while (!check(p, TOK_END) && !check(p, TOK_OTHERWISE) && !check(p, TOK_EOF) && !BAILED(p)) {
             skip_directives(p, n);
+            if (check(p, TOK_END) || check(p, TOK_OTHERWISE)) break;
             /* case label(s) : statement */
             ast_node_t *label_node = parse_expression(p);
             while (match(p, TOK_COMMA)) {
-                /* multiple labels - just parse and discard extras for now */
-                parse_expression(p);
+                parse_expression(p); /* additional labels */
             }
-            expect(p, TOK_COLON);
+            if (!expect(p, TOK_COLON)) { synchronize(p); continue; }
             ast_node_t *stmt = parse_statement(p);
             ast_add_child(n, label_node);
             ast_add_child(n, stmt);
             match(p, TOK_SEMICOLON);
         }
         if (match(p, TOK_OTHERWISE)) {
-            ast_add_child(n, parse_statement(p));
-            match(p, TOK_SEMICOLON);
+            /* OTHERWISE can have multiple statements */
+            while (!check(p, TOK_END) && !check(p, TOK_EOF) && !BAILED(p)) {
+                ast_add_child(n, parse_statement(p));
+                if (!match(p, TOK_SEMICOLON)) break;
+            }
         }
         expect(p, TOK_END);
         return n;
@@ -487,9 +593,31 @@ static ast_node_t *parse_statement(parser_t *p) {
         return n;
     }
 
+    /* INLINE (assembly inline) — skip the data words */
+    if (match(p, TOK_INLINE)) {
+        ast_node_t *n = ast_new(AST_EMPTY, p->lex.line);
+        /* INLINE can appear as: INLINE expr, expr, ... or INLINE(data) */
+        if (match(p, TOK_LPAREN)) {
+            while (!check(p, TOK_RPAREN) && !check(p, TOK_EOF) && !BAILED(p)) {
+                advance(p);
+            }
+            match(p, TOK_RPAREN);
+        } else {
+            /* INLINE followed by data words separated by / */
+            /* Actually Lisa Pascal INLINE is: INLINE $1234/$5678/... */
+            /* Just skip tokens until semicolon or statement boundary */
+            while (!check(p, TOK_SEMICOLON) && !check(p, TOK_END) &&
+                   !check(p, TOK_EOF) && !BAILED(p)) {
+                advance(p);
+            }
+        }
+        return n;
+    }
+
     /* Assignment or procedure call */
     if (check(p, TOK_IDENT) || check(p, TOK_INTEGER_KW) || check(p, TOK_BOOLEAN) ||
-        check(p, TOK_CHAR) || check(p, TOK_LONGINT)) {
+        check(p, TOK_CHAR) || check(p, TOK_LONGINT) || check(p, TOK_TEXT) ||
+        check(p, TOK_REAL_KW) || check(p, TOK_STRING_KW)) {
         ast_node_t *lhs = parse_factor(p);
 
         if (match(p, TOK_ASSIGN)) {
@@ -509,7 +637,15 @@ static ast_node_t *parse_statement(parser_t *p) {
         return call;
     }
 
-    /* Empty statement */
+    /* Unknown token — skip it and return empty statement */
+    if (!check(p, TOK_SEMICOLON) && !check(p, TOK_END) && !check(p, TOK_EOF) &&
+        !check(p, TOK_ELSE) && !check(p, TOK_UNTIL)) {
+        /* Don't report error for truly empty statements (just a semicolon) */
+        if (!check(p, TOK_DIRECTIVE)) {
+            parser_error(p, "unexpected token in statement: %s", token_type_name(CURTYPE(p)));
+            advance(p);
+        }
+    }
     return ast_new(AST_EMPTY, p->lex.line);
 }
 
@@ -518,6 +654,7 @@ static ast_node_t *parse_statement(parser_t *p) {
  * ======================================================================== */
 
 static ast_node_t *parse_type(parser_t *p) {
+    if (BAILED(p)) return ast_new(AST_TYPE_IDENT, p->lex.line);
     skip_directives(p, NULL);
 
     /* PACKED prefix */
@@ -533,7 +670,8 @@ static ast_node_t *parse_type(parser_t *p) {
         expect(p, TOK_LBRACKET);
         do {
             ast_add_child(n, parse_expression(p));
-            if (match(p, TOK_DOTDOT))
+            /* Accept both ".." and ":" as range separator (Lisa Pascal uses both) */
+            if (match(p, TOK_DOTDOT) || match(p, TOK_COLON))
                 ast_add_child(n, parse_expression(p));
         } while (match(p, TOK_COMMA));
         expect(p, TOK_RBRACKET);
@@ -545,7 +683,7 @@ static ast_node_t *parse_type(parser_t *p) {
     /* RECORD ... END */
     if (match(p, TOK_RECORD)) {
         ast_node_t *n = ast_new(AST_TYPE_RECORD, p->lex.line);
-        while (!check(p, TOK_END) && !check(p, TOK_CASE) && !check(p, TOK_EOF)) {
+        while (!check(p, TOK_END) && !check(p, TOK_CASE) && !check(p, TOK_EOF) && !BAILED(p)) {
             skip_directives(p, n);
             if (check(p, TOK_END) || check(p, TOK_CASE)) break;
 
@@ -554,7 +692,6 @@ static ast_node_t *parse_type(parser_t *p) {
             strncpy(field->name, CUR(p).str_val, sizeof(field->name) - 1);
             advance(p);
             while (match(p, TOK_COMMA)) {
-                /* Additional field names - append to name */
                 strncat(field->name, ",", sizeof(field->name) - strlen(field->name) - 1);
                 strncat(field->name, CUR(p).str_val, sizeof(field->name) - strlen(field->name) - 1);
                 advance(p);
@@ -564,16 +701,95 @@ static ast_node_t *parse_type(parser_t *p) {
             ast_add_child(n, field);
             match(p, TOK_SEMICOLON);
         }
-        /* Variant part (CASE) - skip for now */
+        /* Variant part (CASE tag OF ...) */
         if (match(p, TOK_CASE)) {
-            /* Skip variant part until END */
+            /* CASE [tag :] type OF variant_list */
+            /* Skip the variant part — it's complex and we just need the END */
             int depth = 1;
-            while (depth > 0 && !check(p, TOK_EOF)) {
-                if (check(p, TOK_RECORD) || check(p, TOK_CASE)) depth++;
-                if (check(p, TOK_END)) depth--;
-                if (depth > 0) advance(p);
+            while (depth > 0 && !check(p, TOK_EOF) && !BAILED(p)) {
+                if (CURTYPE(p) == TOK_RECORD || CURTYPE(p) == TOK_CASE) {
+                    depth++;
+                    advance(p);
+                } else if (CURTYPE(p) == TOK_END) {
+                    depth--;
+                    if (depth > 0) advance(p);
+                } else {
+                    advance(p);
+                }
             }
         }
+        expect(p, TOK_END);
+        return n;
+    }
+
+    /* SUBCLASS OF parentclass ... END */
+    if (match(p, TOK_SUBCLASS)) {
+        ast_node_t *n = ast_new(AST_TYPE_CLASS, p->lex.line);
+        expect(p, TOK_OF);
+        /* Parent class name (could be NIL for root) */
+        strncpy(n->name, CUR(p).str_val, sizeof(n->name) - 1);
+        advance(p);
+
+        /* Class body: fields, methods, until END */
+        while (!check(p, TOK_END) && !check(p, TOK_EOF) && !BAILED(p)) {
+            skip_directives(p, n);
+            if (check(p, TOK_END)) break;
+
+            if (check(p, TOK_PROCEDURE) || check(p, TOK_FUNCTION)) {
+                /* Method declaration in class */
+                bool is_func = check(p, TOK_FUNCTION);
+                advance(p);
+                ast_node_t *m = ast_new(is_func ? AST_FUNC_DECL : AST_PROC_DECL, p->lex.line);
+                /* Method name: ClassName.MethodName */
+                strncpy(m->name, CUR(p).str_val, sizeof(m->name) - 1);
+                advance(p);
+
+                /* Parameters */
+                if (check(p, TOK_LPAREN)) {
+                    /* Skip params for class declaration (they're just signatures) */
+                    int depth = 1;
+                    advance(p);
+                    while (depth > 0 && !check(p, TOK_EOF)) {
+                        if (check(p, TOK_LPAREN)) depth++;
+                        if (check(p, TOK_RPAREN)) depth--;
+                        if (depth > 0) advance(p);
+                    }
+                    match(p, TOK_RPAREN);
+                }
+
+                /* Return type for functions */
+                if (is_func && match(p, TOK_COLON)) {
+                    advance(p); /* skip return type name */
+                }
+
+                match(p, TOK_SEMICOLON);
+                /* OVERRIDE keyword */
+                match_ident(p, "OVERRIDE");
+                match(p, TOK_SEMICOLON);
+
+                ast_add_child(n, m);
+            } else if (check(p, TOK_IDENT)) {
+                /* Field declaration */
+                ast_node_t *field = ast_new(AST_FIELD, p->lex.line);
+                strncpy(field->name, CUR(p).str_val, sizeof(field->name) - 1);
+                advance(p);
+                while (match(p, TOK_COMMA)) {
+                    strncat(field->name, ",", sizeof(field->name) - strlen(field->name) - 1);
+                    strncat(field->name, CUR(p).str_val, sizeof(field->name) - strlen(field->name) - 1);
+                    advance(p);
+                }
+                if (match(p, TOK_COLON)) {
+                    ast_add_child(field, parse_type(p));
+                }
+                match(p, TOK_SEMICOLON);
+                ast_add_child(n, field);
+            } else {
+                /* Skip unknown tokens (comments turned into tokens, etc.) */
+                advance(p);
+            }
+        }
+        /* Note: don't consume END here — let the caller's type_decl handling get the semicolon */
+        /* Actually, we do need END since this is the type definition */
         expect(p, TOK_END);
         return n;
     }
@@ -629,17 +845,42 @@ static ast_node_t *parse_type(parser_t *p) {
         return n;
     }
 
-    /* Simple type name or subrange */
+    /* Simple type name, possibly followed by ".." for subrange */
     if (check(p, TOK_IDENT) || check(p, TOK_INTEGER_KW) || check(p, TOK_BOOLEAN) ||
         check(p, TOK_CHAR) || check(p, TOK_LONGINT) || check(p, TOK_REAL_KW) || check(p, TOK_TEXT)) {
-        ast_node_t *n = ast_new(AST_TYPE_IDENT, p->lex.line);
-        strncpy(n->name, CUR(p).str_val, sizeof(n->name) - 1);
+        char name[256];
+        strncpy(name, CUR(p).str_val, sizeof(name) - 1);
+        name[255] = '\0';
+        int line = p->lex.line;
         advance(p);
+
+        /* Check for identifier-based subrange: ident..ident */
+        if (check(p, TOK_DOTDOT)) {
+            advance(p); /* consume .. */
+            ast_node_t *n = ast_new(AST_TYPE_SUBRANGE, line);
+            ast_node_t *lo = ast_new(AST_IDENT_EXPR, line);
+            strncpy(lo->name, name, sizeof(lo->name) - 1);
+            ast_add_child(n, lo);
+            ast_add_child(n, parse_expression(p));
+            return n;
+        }
+
+        ast_node_t *n = ast_new(AST_TYPE_IDENT, line);
+        strncpy(n->name, name, sizeof(n->name) - 1);
         return n;
     }
 
-    /* Subrange starting with a constant (e.g., 0..255) */
+    /* Subrange starting with a constant (e.g., 0..255) or negative (-128..127) */
     if (check(p, TOK_INTEGER) || check(p, TOK_MINUS)) {
+        ast_node_t *n = ast_new(AST_TYPE_SUBRANGE, p->lex.line);
+        ast_add_child(n, parse_expression(p));
+        expect(p, TOK_DOTDOT);
+        ast_add_child(n, parse_expression(p));
+        return n;
+    }
+
+    /* String constant as subrange low bound (e.g., 'A'..'Z') */
+    if (check(p, TOK_STRING)) {
         ast_node_t *n = ast_new(AST_TYPE_SUBRANGE, p->lex.line);
         ast_add_child(n, parse_expression(p));
         expect(p, TOK_DOTDOT);
@@ -659,9 +900,16 @@ static void parse_uses(parser_t *p, ast_node_t *parent) {
     ast_node_t *uses = ast_new(AST_USES, p->lex.line);
     do {
         skip_directives(p, uses); /* captures {$U path} directives */
+        if (check(p, TOK_SEMICOLON) || check(p, TOK_EOF)) break;
         ast_node_t *item = ast_new(AST_USES_ITEM, p->lex.line);
         strncpy(item->name, CUR(p).str_val, sizeof(item->name) - 1);
         advance(p);
+        /* Handle path-style unit names: LibHW/hwint */
+        if (match(p, TOK_SLASH)) {
+            strncat(item->name, "/", sizeof(item->name) - strlen(item->name) - 1);
+            strncat(item->name, CUR(p).str_val, sizeof(item->name) - strlen(item->name) - 1);
+            advance(p);
+        }
         ast_add_child(uses, item);
     } while (match(p, TOK_COMMA));
     expect(p, TOK_SEMICOLON);
@@ -669,7 +917,7 @@ static void parse_uses(parser_t *p, ast_node_t *parent) {
 }
 
 static void parse_const_section(parser_t *p, ast_node_t *parent) {
-    while (check(p, TOK_IDENT) || check(p, TOK_DIRECTIVE)) {
+    while ((check(p, TOK_IDENT) || check(p, TOK_DIRECTIVE)) && !BAILED(p)) {
         skip_directives(p, parent);
         if (!check(p, TOK_IDENT)) break;
 
@@ -684,7 +932,7 @@ static void parse_const_section(parser_t *p, ast_node_t *parent) {
 }
 
 static void parse_type_section(parser_t *p, ast_node_t *parent) {
-    while (check(p, TOK_IDENT) || check(p, TOK_DIRECTIVE)) {
+    while ((check(p, TOK_IDENT) || check(p, TOK_DIRECTIVE)) && !BAILED(p)) {
         skip_directives(p, parent);
         if (!check(p, TOK_IDENT)) break;
 
@@ -699,7 +947,7 @@ static void parse_type_section(parser_t *p, ast_node_t *parent) {
 }
 
 static void parse_var_section(parser_t *p, ast_node_t *parent) {
-    while (check(p, TOK_IDENT) || check(p, TOK_DIRECTIVE)) {
+    while ((check(p, TOK_IDENT) || check(p, TOK_DIRECTIVE)) && !BAILED(p)) {
         skip_directives(p, parent);
         if (!check(p, TOK_IDENT)) break;
 
@@ -721,11 +969,37 @@ static void parse_var_section(parser_t *p, ast_node_t *parent) {
 static ast_node_t *parse_param_list(parser_t *p) {
     ast_node_t *params = ast_new(AST_PARAM_LIST, p->lex.line);
     expect(p, TOK_LPAREN);
-    while (!check(p, TOK_RPAREN) && !check(p, TOK_EOF)) {
+    while (!check(p, TOK_RPAREN) && !check(p, TOK_EOF) && !BAILED(p)) {
         skip_directives(p, NULL);
         ast_node_t *param = ast_new(AST_PARAM, p->lex.line);
 
-        /* VAR, const, or value parameter */
+        /* FUNCTION/PROCEDURE parameter (passing a routine) */
+        if (check(p, TOK_FUNCTION) || check(p, TOK_PROCEDURE)) {
+            bool is_func = check(p, TOK_FUNCTION);
+            advance(p);
+            strncpy(param->name, CUR(p).str_val, sizeof(param->name) - 1);
+            advance(p);
+            /* Skip any param list and return type */
+            if (check(p, TOK_LPAREN)) {
+                int depth = 1;
+                advance(p);
+                while (depth > 0 && !check(p, TOK_EOF)) {
+                    if (check(p, TOK_LPAREN)) depth++;
+                    if (check(p, TOK_RPAREN)) depth--;
+                    if (depth > 0) advance(p);
+                }
+                match(p, TOK_RPAREN);
+            }
+            if (is_func && match(p, TOK_COLON)) {
+                advance(p); /* return type name */
+            }
+            strncpy(param->str_val, is_func ? "FUNCPARAM" : "PROCPARAM", sizeof(param->str_val));
+            ast_add_child(params, param);
+            if (!match(p, TOK_SEMICOLON)) break;
+            continue;
+        }
+
+        /* VAR parameter */
         bool is_var = match(p, TOK_VAR);
         if (is_var) strncpy(param->str_val, "VAR", sizeof(param->str_val));
 
@@ -751,10 +1025,16 @@ static ast_node_t *parse_param_list(parser_t *p) {
 static void parse_proc_or_func(parser_t *p, ast_node_t *parent, bool is_func) {
     ast_node_t *n = ast_new(is_func ? AST_FUNC_DECL : AST_PROC_DECL, p->lex.line);
 
-    /* Name */
+    /* Name — may include class prefix: ClassName.MethodName */
     if (check(p, TOK_IDENT)) {
         strncpy(n->name, CUR(p).str_val, sizeof(n->name) - 1);
         advance(p);
+        /* Check for ClassName.MethodName */
+        if (match(p, TOK_DOT)) {
+            strncat(n->name, ".", sizeof(n->name) - strlen(n->name) - 1);
+            strncat(n->name, CUR(p).str_val, sizeof(n->name) - strlen(n->name) - 1);
+            advance(p);
+        }
     }
 
     /* Parameters */
@@ -770,8 +1050,13 @@ static void parse_proc_or_func(parser_t *p, ast_node_t *parent, bool is_func) {
     expect(p, TOK_SEMICOLON);
     skip_directives(p, n);
 
+    /* OVERRIDE (Clascal) */
+    if (match_ident(p, "OVERRIDE")) {
+        strncpy(n->str_val, "OVERRIDE", sizeof(n->str_val));
+        match(p, TOK_SEMICOLON);
+    }
     /* EXTERNAL or FORWARD */
-    if (match(p, TOK_EXTERNAL)) {
+    else if (match(p, TOK_EXTERNAL)) {
         strncpy(n->str_val, "EXTERNAL", sizeof(n->str_val));
         match(p, TOK_SEMICOLON);
     } else if (match(p, TOK_FORWARD)) {
@@ -790,11 +1075,11 @@ static void parse_proc_or_func(parser_t *p, ast_node_t *parent, bool is_func) {
 }
 
 static void parse_declarations(parser_t *p, ast_node_t *parent) {
-    while (1) {
+    while (!BAILED(p)) {
         skip_directives(p, parent);
 
         if (match(p, TOK_LABEL)) {
-            /* LABEL section */
+            /* LABEL section: label1, label2, ... ; */
             do { advance(p); } while (match(p, TOK_COMMA));
             expect(p, TOK_SEMICOLON);
         } else if (match(p, TOK_CONST)) {
@@ -811,6 +1096,34 @@ static void parse_declarations(parser_t *p, ast_node_t *parent) {
             break;
         }
     }
+}
+
+/* Parse METHODS OF ClassName; section (Clascal OOP) */
+static void parse_methods_section(parser_t *p, ast_node_t *parent) {
+    /* METHODS keyword already consumed */
+    expect(p, TOK_OF);
+    ast_node_t *methods = ast_new(AST_METHODS, p->lex.line);
+    strncpy(methods->name, CUR(p).str_val, sizeof(methods->name) - 1);
+    advance(p); /* class name */
+    match(p, TOK_SEMICOLON); /* optional — some files omit it */
+
+    /* Parse method implementations until next METHODS OF or end of file */
+    while (!check(p, TOK_EOF) && !check(p, TOK_METHODS) && !check(p, TOK_END) && !BAILED(p)) {
+        skip_directives(p, methods);
+        if (check(p, TOK_EOF) || check(p, TOK_METHODS) || check(p, TOK_END)) break;
+
+        if (check(p, TOK_PROCEDURE)) {
+            advance(p);
+            parse_proc_or_func(p, methods, false);
+        } else if (check(p, TOK_FUNCTION)) {
+            advance(p);
+            parse_proc_or_func(p, methods, true);
+        } else {
+            /* Might be stray directives or other declarations */
+            advance(p);
+        }
+    }
+    ast_add_child(parent, methods);
 }
 
 /* ========================================================================
@@ -840,6 +1153,13 @@ static ast_node_t *parse_unit(parser_t *p) {
         skip_directives(p, impl);
         if (match(p, TOK_USES)) parse_uses(p, impl);
         parse_declarations(p, impl);
+
+        /* Handle METHODS OF sections (Clascal) */
+        while (check(p, TOK_METHODS) && !BAILED(p)) {
+            advance(p); /* consume METHODS */
+            parse_methods_section(p, impl);
+        }
+
         ast_add_child(unit, impl);
     }
 
@@ -875,6 +1195,55 @@ static ast_node_t *parse_program(parser_t *p) {
     return prog;
 }
 
+/* Parse a code fragment (file that doesn't start with UNIT/PROGRAM) */
+static ast_node_t *parse_fragment(parser_t *p) {
+    ast_node_t *frag = ast_new(AST_FRAGMENT, p->lex.line);
+    strncpy(frag->name, p->lex.filename, sizeof(frag->name) - 1);
+
+    while (!check(p, TOK_EOF) && !BAILED(p)) {
+        const char *prev_pos = p->lex.pos;
+        skip_directives(p, frag);
+        if (check(p, TOK_EOF)) break;
+
+        if (check(p, TOK_PROCEDURE)) {
+            advance(p);
+            parse_proc_or_func(p, frag, false);
+        } else if (check(p, TOK_FUNCTION)) {
+            advance(p);
+            parse_proc_or_func(p, frag, true);
+        } else if (match(p, TOK_METHODS)) {
+            parse_methods_section(p, frag);
+        } else if (match(p, TOK_CONST)) {
+            parse_const_section(p, frag);
+        } else if (match(p, TOK_TYPE)) {
+            parse_type_section(p, frag);
+        } else if (match(p, TOK_VAR)) {
+            parse_var_section(p, frag);
+        } else if (match(p, TOK_LABEL)) {
+            do { advance(p); } while (match(p, TOK_COMMA));
+            expect(p, TOK_SEMICOLON);
+        } else if (check(p, TOK_BEGIN)) {
+            ast_add_child(frag, parse_compound_statement(p));
+            match(p, TOK_SEMICOLON);
+        } else if (match(p, TOK_USES)) {
+            parse_uses(p, frag);
+        } else if (check(p, TOK_END)) {
+            advance(p);
+            match(p, TOK_DOT);
+        } else {
+            /* Skip unknown token */
+            advance(p);
+        }
+
+        /* Infinite loop guard: if we haven't advanced, force skip */
+        if (p->lex.pos == prev_pos && !check(p, TOK_EOF)) {
+            advance(p);
+        }
+    }
+
+    return frag;
+}
+
 /* ========================================================================
  * Public API
  * ======================================================================== */
@@ -890,12 +1259,22 @@ ast_node_t *parser_parse(parser_t *p) {
 
     skip_directives(p, NULL);
 
-    if (match(p, TOK_UNIT)) {
+    if (check(p, TOK_EOF)) {
+        /* Empty file (e.g., only {$SETC} directives) — not an error */
+        p->root = ast_new(AST_FRAGMENT, p->lex.line);
+    } else if (match(p, TOK_UNIT)) {
         p->root = parse_unit(p);
     } else if (match(p, TOK_PROGRAM)) {
         p->root = parse_program(p);
+    } else if (check(p, TOK_PROCEDURE) || check(p, TOK_FUNCTION) ||
+               check(p, TOK_CONST) || check(p, TOK_TYPE) || check(p, TOK_VAR) ||
+               check(p, TOK_BEGIN) || check(p, TOK_LABEL) ||
+               check(p, TOK_METHODS) || check(p, TOK_USES) ||
+               check(p, TOK_IDENT)) {
+        /* Code fragment — not a full unit/program */
+        p->root = parse_fragment(p);
     } else {
-        parser_error(p, "expected UNIT or PROGRAM");
+        parser_error(p, "expected UNIT, PROGRAM, or code fragment");
         p->root = ast_new(AST_EMPTY, p->lex.line);
     }
 

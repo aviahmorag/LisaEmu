@@ -29,6 +29,7 @@ typedef enum {
     /* Top-level */
     AST_PROGRAM,
     AST_UNIT,
+    AST_FRAGMENT,      /* Code fragment (not a full unit/program) */
 
     /* Sections */
     AST_INTERFACE,
@@ -60,6 +61,8 @@ typedef enum {
     AST_FIELD_LIST,
     AST_FIELD,
     AST_VARIANT,
+    AST_TYPE_CLASS,    /* SUBCLASS OF ... END */
+    AST_METHODS,       /* METHODS OF classname */
 
     /* Statements */
     AST_BLOCK,         /* begin..end */
