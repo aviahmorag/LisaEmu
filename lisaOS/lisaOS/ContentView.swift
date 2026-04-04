@@ -221,17 +221,27 @@ struct DebuggerView: View {
                 }
             }
 
-            Text(viewModel.cpuState)
-                .font(.system(size: 12, design: .monospaced))
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(8)
-                .background(Color.black.opacity(0.8))
-                .foregroundStyle(.green)
-                .clipShape(RoundedRectangle(cornerRadius: 4))
+            ScrollView {
+                Text(viewModel.cpuState)
+                    .font(.system(size: 12, design: .monospaced))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
+            }
+            .padding(8)
+            .background(Color.black.opacity(0.8))
+            .foregroundStyle(.green)
+            .clipShape(RoundedRectangle(cornerRadius: 4))
 
             HStack {
+                Button("Copy") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(viewModel.cpuState, forType: .string)
+                }
+                .buttonStyle(.bordered)
+
                 Button("Step") {
                     _ = emu_run_frame()
+                    viewModel.updateCPUState()
                 }
                 .buttonStyle(.bordered)
 

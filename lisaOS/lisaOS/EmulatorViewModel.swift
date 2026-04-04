@@ -168,7 +168,7 @@ final class EmulatorViewModel {
         )
     }
 
-    private func updateCPUState() {
+    func updateCPUState() {
         var buffer = [CChar](repeating: 0, count: 1024)
         emu_get_cpu_state(&buffer, 1024)
         cpuState = String(cString: buffer)
