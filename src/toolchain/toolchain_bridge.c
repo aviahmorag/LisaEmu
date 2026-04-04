@@ -60,8 +60,7 @@ static bool should_skip_file(const char *name) {
     if (strcasestr(name, "ALERT") != NULL) return true;  /* alert resource files */
     if (strcasestr(name, "LINK.TEXT") != NULL) return true; /* link command files */
     if (strcasestr(name, "linkmap") != NULL) return true;
-    if (strcasestr(name, "68K.TEXT") != NULL && !strcasestr(name, "ASM")) return true; /* 68k stubs, not asm */
-    if (strcasestr(name, "68k.text") != NULL && !strcasestr(name, "asm")) return true;
+    /* 68K.TEXT files are valid assembly — no longer skipped */
     if (strcasestr(name, "COMP.TEXT") != NULL) return true; /* compile scripts */
     if (strcasestr(name, "INSTALL.TEXT") != NULL) return true;
     if (strcasestr(name, "DOC.TEXT") != NULL) return true;
@@ -72,8 +71,7 @@ static bool should_skip_file(const char *name) {
     if (strcasestr(name, "RELEASE") != NULL) return true;
     /* LIBFP: only NEWFPSUB should be assembled (it includes all others) */
     if (strcasestr(name, "libfp-") != NULL && !strcasestr(name, "NEWFPSUB")) return true;
-    /* Assembly files misidentified as Pascal */
-    if (strcasestr(name, "QSORT") != NULL) return true;
+    /* QSORT: previously skipped, but it defines qsort/moverq needed by LIBDB */
     /* Documentation / release notes */
     if (strcasestr(name, "relmemo") != NULL) return true;
     /* Non-source data files in APPS */

@@ -1508,7 +1508,8 @@ static bool handle_directive(asm68k_t *as, const char *directive, const char *ar
             }
         }
 
-        /* Strategy 5b: same-directory self-reference (e.g. libfp/sanemacs from within LIBFP dir) */
+        /* Strategy 5b: same-directory self-reference (e.g. source/pascaldefs.text
+         * from within OS dir → source-PASCALDEFS.TEXT.unix.txt) */
         if (!f) {
             char *sl = strchr(inc_name, '/');
             if (sl) {
@@ -1519,14 +1520,19 @@ static bool handle_directive(asm68k_t *as, const char *directive, const char *ar
                     prefix[dlen] = '\0';
                     strncpy(filename, sl + 1, sizeof(filename) - 1);
                     filename[sizeof(filename) - 1] = '\0';
+
+                    /* Strip .text suffix from filename if present (avoid double .text) */
+                    char *dot = strcasestr(filename, ".text");
+                    if (dot) *dot = '\0';
+
                     /* Lowercase prefix for filename convention */
                     char lower_prefix[64];
                     strncpy(lower_prefix, prefix, sizeof(lower_prefix));
                     for (char *c = lower_prefix; *c; c++) *c = tolower((unsigned char)*c);
 
-                    /* Try: base_dir/prefix-filename.text.unix.txt (various cases) */
+                    /* Try: base_dir/prefix-filename.TEXT.unix.txt (various cases) */
                     const char *suffixes[] = {
-                        ".text.unix.txt", ".TEXT.unix.txt", ".unix.txt", NULL
+                        ".TEXT.unix.txt", ".text.unix.txt", ".unix.txt", NULL
                     };
                     for (int si = 0; suffixes[si] && !f; si++) {
                         /* lowercase prefix - original case filename */
@@ -1558,7 +1564,7 @@ static bool handle_directive(asm68k_t *as, const char *directive, const char *ar
                     snprintf(resolved, sizeof(resolved), "%s/%s.unix.txt", as->include_paths[i], inc_name);
                     f = fopen(resolved, "r");
                 }
-                /* Lisa library convention: LibXX/file → LIBXX/libxx-file.text.unix.txt */
+                /* Lisa library convention: LibXX/file.text → LIBXX/libxx-FILE.TEXT.unix.txt */
                 if (!f) {
                     char *sl2 = strchr(inc_name, '/');
                     if (sl2) {
@@ -1568,6 +1574,9 @@ static bool handle_directive(asm68k_t *as, const char *directive, const char *ar
                             strncpy(libdir, inc_name, dlen2);
                             libdir[dlen2] = '\0';
                             strncpy(filename2, sl2 + 1, sizeof(filename2) - 1);
+                            /* Strip .text suffix to avoid double .text */
+                            char *dot6 = strcasestr(filename2, ".text");
+                            if (dot6) *dot6 = '\0';
                             char upper_dir[64], lower_dir[64];
                             strncpy(upper_dir, libdir, sizeof(upper_dir));
                             for (char *c = upper_dir; *c; c++) *c = toupper((unsigned char)*c);

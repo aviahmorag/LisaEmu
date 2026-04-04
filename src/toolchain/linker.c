@@ -40,9 +40,21 @@ static bool str_eq_nocase(const char *a, const char *b) {
  * ======================================================================== */
 
 static int find_global_symbol(linker_t *lk, const char *name) {
+    /* Exact match (case-insensitive) */
     for (int i = 0; i < lk->num_symbols; i++) {
         if (str_eq_nocase(lk->symbols[i].name, name))
             return i;
+    }
+    /* 8-char prefix match — Lisa assembler truncates symbols to 8 significant
+     * characters, so .REF ENTER_SC must match .PROC ENTER_SCHEDULER.
+     * Only try this for short names (<=8 chars) to avoid false matches. */
+    size_t len = strlen(name);
+    if (len <= 8 && len >= 3) {
+        for (int i = 0; i < lk->num_symbols; i++) {
+            if (strncasecmp(lk->symbols[i].name, name, len) == 0 &&
+                lk->symbols[i].type == LSYM_ENTRY)
+                return i;
+        }
     }
     return -1;
 }
