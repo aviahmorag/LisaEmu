@@ -41,7 +41,7 @@ struct ContentView: View {
             .background(Color(nsColor: .controlBackgroundColor))
         }
         .toolbar {
-            ToolbarItem(placement: .primaryAction) {
+            ToolbarItem(placement: .automatic) {
                 Button {
                     pickerMode = .source
                     showingFilePicker = true
@@ -52,7 +52,7 @@ struct ContentView: View {
                 .disabled(viewModel.isBuilding)
             }
 
-            ToolbarItem(placement: .primaryAction) {
+            ToolbarItem(placement: .automatic) {
                 Button {
                     pickerMode = .image
                     showingFilePicker = true
@@ -62,7 +62,7 @@ struct ContentView: View {
                 .help("Open a disk image file")
             }
 
-            ToolbarItem(placement: .primaryAction) {
+            ToolbarItem(placement: .automatic) {
                 Button {
                     if viewModel.isRunning {
                         viewModel.stopEmulation()
@@ -78,7 +78,7 @@ struct ContentView: View {
                 .help(viewModel.isRunning ? "Power off the Lisa" : "Power on the Lisa")
             }
 
-            ToolbarItem(placement: .primaryAction) {
+            ToolbarItem(placement: .automatic) {
                 Button {
                     viewModel.reset()
                 } label: {
@@ -88,7 +88,7 @@ struct ContentView: View {
                 .disabled(!viewModel.isRunning)
             }
 
-            ToolbarItem(placement: .primaryAction) {
+            ToolbarItem(placement: .automatic) {
                 Button {
                     viewModel.showDebugger.toggle()
                 } label: {
