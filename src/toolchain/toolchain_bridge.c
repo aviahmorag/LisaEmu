@@ -203,11 +203,33 @@ static bool compile_pascal_file(const char *path, linker_t *lk) {
     char *source = read_file(path);
     if (!source) return false;
 
+    bool is_startup = (strcasestr(path, "SOURCE-STARTUP") != NULL);
+
     parser_t parser;
     parser_init(&parser, source, path);
     ast_node_t *ast = parser_parse(&parser);
 
+    if (is_startup && ast) {
+        fprintf(stderr, "STARTUP AST: type=%d name='%s' children=%d errors=%d\n",
+                ast->type, ast->name, ast->num_children, parser.num_errors);
+        for (int i = 0; i < ast->num_children && i < 40; i++) {
+            ast_node_t *c = ast->children[i];
+            fprintf(stderr, "  child[%d]: type=%d name='%s' children=%d\n",
+                    i, c->type, c->name, c->num_children);
+            /* For INITSYS, dump its nested declarations */
+            if ((c->type == 11 || c->type == 12) &&
+                strcasecmp(c->name, "INITSYS") == 0) {
+                for (int j = 0; j < c->num_children && j < 20; j++) {
+                    fprintf(stderr, "    INITSYS child[%d]: type=%d name='%s'\n",
+                            j, c->children[j]->type, c->children[j]->name);
+                }
+            }
+        }
+    }
+
     if (parser.num_errors > 0) {
+        if (is_startup)
+            fprintf(stderr, "STARTUP PARSE FAILED: %d errors\n", parser.num_errors);
         parser_free(&parser);
         free(source);
         return false;
@@ -222,6 +244,16 @@ static bool compile_pascal_file(const char *path, linker_t *lk) {
     codegen_init(cg);
     strncpy(cg->current_file, path, sizeof(cg->current_file) - 1);
     codegen_generate(cg, ast);
+
+    if (is_startup) {
+        fprintf(stderr, "STARTUP CODEGEN: %u bytes code, %d globals, %d relocs\n",
+                cg->code_size, cg->num_globals, cg->num_relocs);
+        for (int i = 0; i < cg->num_globals && i < 30; i++) {
+            fprintf(stderr, "  global[%d]: '%s' offset=%d ext=%d\n",
+                    i, cg->globals[i].name, cg->globals[i].offset,
+                    cg->globals[i].is_external);
+        }
+    }
 
     bool ok = true;
     if (cg->code_size > 0) {

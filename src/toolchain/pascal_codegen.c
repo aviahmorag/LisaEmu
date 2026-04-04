@@ -910,8 +910,24 @@ static void gen_proc_or_func(codegen_t *cg, ast_node_t *node) {
             process_var_decl(cg, child, false);
     }
 
+    /* Generate code for nested procedures/functions FIRST.
+     * In Pascal, nested procs are callable from the parent's body.
+     * They get their own LINK/UNLK frames and are placed before
+     * the parent's code in the output. */
+    for (int i = 0; i < node->num_children; i++) {
+        ast_node_t *child = node->children[i];
+        if (child->type == AST_PROC_DECL || child->type == AST_FUNC_DECL) {
+            gen_proc_or_func(cg, child);
+        }
+    }
+
     cg_scope_t *sc = current_scope(cg);
     int frame_size = sc ? sc->frame_size : 0;
+
+    /* Record the actual entry point AFTER nested procs are emitted.
+     * Update the global symbol offset to point here, not to the
+     * first nested proc's code. */
+    if (entry) entry->offset = (int)cg->code_size;
 
     /* LINK A6,#-frame_size */
     emit16(cg, 0x4E56);
@@ -972,26 +988,53 @@ static void gen_unit(codegen_t *cg, ast_node_t *unit) {
 static void gen_program(codegen_t *cg, ast_node_t *prog) {
     process_declarations(cg, prog, true);
 
-    /* Generate code for all procedures/functions and blocks */
+    /* Emit a JMP forward to the main body — nested procs come first
+     * but the entry point must be at offset 0 for the boot ROM. */
+    uint32_t jmp_fixup = cg->code_size;
+    emit16(cg, 0x4EF9);  /* JMP abs.L */
+    emit32(cg, 0);        /* Placeholder — patched after nested procs */
+
+    /* Generate code for all procedures/functions */
     for (int i = 0; i < prog->num_children; i++) {
         ast_node_t *child = prog->children[i];
         if (child->type == AST_PROC_DECL || child->type == AST_FUNC_DECL) {
             gen_proc_or_func(cg, child);
         } else if (child->type == AST_METHODS) {
-            /* METHODS OF section — generate each method */
             for (int j = 0; j < child->num_children; j++) {
                 if (child->children[j]->type == AST_PROC_DECL ||
                     child->children[j]->type == AST_FUNC_DECL) {
                     gen_proc_or_func(cg, child->children[j]);
                 }
             }
-        } else if (child->type == AST_BLOCK) {
-            gen_statement(cg, child);
+        }
+    }
+
+    /* Patch the JMP to point to the main body.
+     * Register the program's entry point as a global symbol,
+     * then use a relocation to fill in the absolute address. */
+    char entry_name[64];
+    snprintf(entry_name, sizeof(entry_name), "%s__main", prog->name);
+    cg_symbol_t *main_entry = add_global_sym(cg, entry_name, NULL);
+    if (main_entry) main_entry->offset = (int)cg->code_size;
+
+    /* Add relocation for the JMP target */
+    if (cg->num_relocs < CODEGEN_MAX_RELOCS) {
+        cg_reloc_t *r = &cg->relocs[cg->num_relocs++];
+        r->offset = jmp_fixup + 2;
+        strncpy(r->symbol, entry_name, sizeof(r->symbol));
+        r->size = 4;
+        r->pc_relative = false;
+    }
+
+    /* Generate the main body (BEGIN...END block) */
+    for (int i = 0; i < prog->num_children; i++) {
+        if (prog->children[i]->type == AST_BLOCK) {
+            gen_statement(cg, prog->children[i]);
         }
     }
 
     /* RTS at end of program (if there was executable code) */
-    if (cg->code_size > 0) {
+    if (cg->code_size > 6) {  /* More than just the JMP */
         emit16(cg, 0x4E75);
     }
 }
