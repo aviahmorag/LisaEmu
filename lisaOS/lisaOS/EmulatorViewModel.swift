@@ -83,9 +83,10 @@ final class EmulatorViewModel {
         isRunning = true
         statusMessage = "Running"
 
-        // Run a few frames immediately to check if anything happens
+        // Run first frame and update display immediately
         let firstFrame = emu_run_frame()
         log("First frame result: \(firstFrame)")
+        updateDisplay()
 
         emulatorTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
             guard let vm = self else { return }
