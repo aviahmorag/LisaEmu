@@ -1,13 +1,8 @@
 import SwiftUI
-import UniformTypeIdentifiers
+import AppKit
 
 struct ContentView: View {
     @State private var viewModel = EmulatorViewModel()
-    @State private var showingROMPicker = false
-    @State private var showingProfilePicker = false
-    @State private var showingFloppyPicker = false
-    @State private var showingSourcePicker = false
-    @State private var showingImagePicker = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -33,10 +28,6 @@ struct ContentView: View {
                     Text(viewModel.buildProgress)
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
-                } else if viewModel.isRunning {
-                    Text("Click to capture mouse")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.secondary)
                 }
             }
             .padding(.horizontal, 12)
@@ -45,79 +36,48 @@ struct ContentView: View {
         }
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
-                Button("Build from Source", systemImage: "hammer") {
-                    showingSourcePicker = true
+                Button {
+                    openFileOrFolder()
+                } label: {
+                    Label("Open", systemImage: "folder")
                 }
+                .help("Open a Lisa_Source folder to build, or a disk image to boot")
                 .disabled(viewModel.isBuilding)
             }
 
             ToolbarItem(placement: .primaryAction) {
-                Button("Open Image", systemImage: "doc") {
-                    showingImagePicker = true
-                }
-            }
-
-            ToolbarItem(placement: .primaryAction) {
-                Button(
-                    viewModel.isRunning ? "Power Off" : "Power On",
-                    systemImage: viewModel.isRunning ? "power.circle.fill" : "power.circle"
-                ) {
+                Button {
                     if viewModel.isRunning {
                         viewModel.stopEmulation()
                     } else {
                         viewModel.startEmulation()
                     }
+                } label: {
+                    Label(
+                        viewModel.isRunning ? "Power Off" : "Power On",
+                        systemImage: viewModel.isRunning ? "power.circle.fill" : "power.circle"
+                    )
                 }
+                .help(viewModel.isRunning ? "Power off the Lisa" : "Power on the Lisa")
             }
 
             ToolbarItem(placement: .primaryAction) {
-                Button("Reset", systemImage: "arrow.counterclockwise") {
+                Button {
                     viewModel.reset()
+                } label: {
+                    Label("Reset", systemImage: "arrow.counterclockwise")
                 }
+                .help("Reset the Lisa")
                 .disabled(!viewModel.isRunning)
             }
 
             ToolbarItem(placement: .primaryAction) {
-                Button("Debug", systemImage: "terminal") {
+                Button {
                     viewModel.showDebugger.toggle()
+                } label: {
+                    Label("Debug", systemImage: "terminal")
                 }
-            }
-        }
-        .fileImporter(isPresented: $showingROMPicker, allowedContentTypes: [.data]) { result in
-            if case .success(let url) = result {
-                viewModel.loadROM(url: url)
-            }
-        }
-        .fileImporter(isPresented: $showingProfilePicker, allowedContentTypes: [.data]) { result in
-            if case .success(let url) = result {
-                viewModel.mountProfile(url: url)
-            }
-        }
-        .fileImporter(isPresented: $showingFloppyPicker, allowedContentTypes: [.data]) { result in
-            if case .success(let url) = result {
-                viewModel.mountFloppy(url: url)
-            }
-        }
-        .fileImporter(isPresented: $showingSourcePicker, allowedContentTypes: [.folder]) { result in
-            if case .success(let url) = result {
-                if viewModel.validateSource(url: url) {
-                    // Use NSSavePanel to let user choose where to save the built image
-                    let panel = NSSavePanel()
-                    panel.title = "Save Built Disk Image"
-                    panel.nameFieldStringValue = "LisaOS.image"
-                    panel.allowedContentTypes = [.data]
-                    panel.canCreateDirectories = true
-                    if panel.runModal() == .OK, let saveURL = panel.url {
-                        viewModel.buildFromSource(sourceURL: url, saveURL: saveURL)
-                    }
-                } else {
-                    viewModel.statusMessage = "Invalid: expected Lisa_Source folder with LISA_OS subdirectory"
-                }
-            }
-        }
-        .fileImporter(isPresented: $showingImagePicker, allowedContentTypes: [.data]) { result in
-            if case .success(let url) = result {
-                viewModel.openDiskImage(url: url)
+                .help("CPU debugger")
             }
         }
         .sheet(isPresented: $viewModel.showDebugger) {
@@ -125,6 +85,39 @@ struct ContentView: View {
         }
         .onAppear {
             viewModel.checkForLastImage()
+        }
+    }
+
+    /// Open dialog that accepts both folders (source) and files (disk images)
+    private func openFileOrFolder() {
+        let panel = NSOpenPanel()
+        panel.title = "Open Lisa Source Folder or Disk Image"
+        panel.message = "Select a Lisa_Source folder to build from source, or a .image file to boot directly."
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        var isDir: ObjCBool = false
+        FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir)
+
+        if isDir.boolValue {
+            // It's a folder — validate and build from source
+            if viewModel.validateSource(url: url) {
+                // Ask where to save the built image
+                let save = NSSavePanel()
+                save.title = "Save Built Disk Image"
+                save.nameFieldStringValue = "LisaOS.image"
+                save.canCreateDirectories = true
+                guard save.runModal() == .OK, let saveURL = save.url else { return }
+                viewModel.buildFromSource(sourceURL: url, saveURL: saveURL)
+            } else {
+                viewModel.statusMessage = "Not a valid Lisa_Source folder (expected LISA_OS subdirectory)"
+            }
+        } else {
+            // It's a file — open as disk image
+            viewModel.openDiskImage(url: url)
         }
     }
 }
