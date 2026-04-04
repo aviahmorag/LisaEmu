@@ -41,8 +41,10 @@ final class EmulatorViewModel {
         if emu_load_rom(path) {
             romLoaded = true
             statusMessage = "ROM loaded: \(url.lastPathComponent)"
+            log("ROM loaded: \(path)")
         } else {
             statusMessage = "Failed to load ROM"
+            log("Failed to load ROM: \(path)")
         }
     }
 
@@ -50,8 +52,10 @@ final class EmulatorViewModel {
         let path = url.path
         if emu_mount_profile(path) {
             statusMessage = "ProFile mounted: \(url.lastPathComponent)"
+            log("ProFile mounted: \(path)")
         } else {
             statusMessage = "Failed to mount ProFile image"
+            log("Failed to mount ProFile: \(path)")
         }
     }
 
@@ -59,8 +63,10 @@ final class EmulatorViewModel {
         let path = url.path
         if emu_mount_floppy(path) {
             statusMessage = "Floppy mounted: \(url.lastPathComponent)"
+            log("Floppy mounted: \(path)")
         } else {
             statusMessage = "Failed to mount floppy image"
+            log("Failed to mount floppy: \(path)")
         }
     }
 
@@ -219,9 +225,11 @@ final class EmulatorViewModel {
             builtImagePath = path
             buildComplete = true
             statusMessage = "Disk image loaded: \(url.lastPathComponent). Power On to boot."
+            log("Disk image loaded: \(path)")
             UserDefaults.standard.set(path, forKey: "lastDiskImage")
         } else {
             statusMessage = "Failed to open disk image"
+            log("Failed to open disk image: \(path)")
         }
     }
 

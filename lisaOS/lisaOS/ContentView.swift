@@ -155,16 +155,22 @@ struct ContentView: View {
             case .success(let urls):
                 guard let url = urls.first else { return }
                 if pickerMode == .source {
+                    viewModel.log("Selected source folder: \(url.path)")
                     if viewModel.validateSource(url: url) {
                         viewModel.buildFromSource(sourceURL: url)
                     } else {
-                        viewModel.statusMessage = "Not a valid Lisa_Source folder (expected LISA_OS subdirectory)"
+                        let msg = "Not a valid Lisa_Source folder (expected LISA_OS subdirectory)"
+                        viewModel.statusMessage = msg
+                        viewModel.log(msg)
                     }
                 } else {
+                    viewModel.log("Opening disk image: \(url.path)")
                     viewModel.openDiskImage(url: url)
                 }
             case .failure(let error):
-                viewModel.statusMessage = "Error: \(error.localizedDescription)"
+                let msg = "Error: \(error.localizedDescription)"
+                viewModel.statusMessage = msg
+                viewModel.log(msg)
             }
         }
         .sheet(isPresented: $viewModel.showDebugger) {
