@@ -2593,17 +2593,15 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             break;
         }
 
-        /* Log highest PC reached in OS code (tracks execution progress) */
-        static uint32_t max_os_pc = 0;
-        static int pc_log_count = 0;
-        if (cpu->pc >= 0x400 && cpu->pc < 0x200000 && cpu->pc > max_os_pc) {
-            max_os_pc = cpu->pc;
-            if (pc_log_count < 20) {
-                fprintf(stderr, "PC HIGH: $%06X A5=$%08X A6=$%08X A7=$%08X\n",
-                        cpu->pc, cpu->a[5], cpu->a[6], cpu->a[7]);
-                pc_log_count++;
-            }
+        /* Log when PC enters vector table after being in OS code */
+        static uint32_t prev_pc = 0;
+        static int crash_logged = 0;
+        if (!crash_logged && cpu->pc < 0x400 && prev_pc >= 0x400 && prev_pc < 0x200000) {
+            fprintf(stderr, "CRASH TO VECTORS: prev_pc=$%06X → pc=$%06X opcode=$%04X A7=$%08X\n",
+                    prev_pc, cpu->pc, cpu_read16(cpu, prev_pc), cpu->a[7]);
+            crash_logged = 1;
         }
+        if (cpu->pc >= 0x400) prev_pc = cpu->pc;
 
         cpu->cycles = 0;
         execute_one(cpu);
