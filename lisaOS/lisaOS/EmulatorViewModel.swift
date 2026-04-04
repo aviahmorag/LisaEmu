@@ -180,12 +180,18 @@ final class EmulatorViewModel {
         let outputDir = buildCacheDirectory()
         log("Output directory: \(outputDir)")
 
+        // Security-scoped access for sandboxed app
+        let accessing = sourceURL.startAccessingSecurityScopedResource()
+
         Task.detached {
             let result = toolchain_build(sourcePath, outputDir, nil)
+            if accessing { sourceURL.stopAccessingSecurityScopedResource() }
 
             await MainActor.run { [weak self] in
                 guard let self else { return }
                 self.isBuilding = false
+
+                self.log("Compiled: \(result.files_compiled) Pascal, \(result.files_assembled) assembly, \(result.files_linked) linked, \(result.errors) errors")
 
                 if result.success {
                     let imagePath = "\(outputDir)/lisa_profile.image"
@@ -193,7 +199,6 @@ final class EmulatorViewModel {
                     self.buildComplete = true
                     self.buildProgress = "Built: \(result.files_compiled) compiled, \(result.files_assembled) assembled"
                     self.statusMessage = "Build complete. Power On to boot."
-                    self.log("Build succeeded: \(result.files_compiled) Pascal files compiled, \(result.files_assembled) assembly files assembled, \(result.files_linked) modules linked")
                     self.log("Disk image: \(imagePath)")
 
                     _ = emu_mount_profile(imagePath)
@@ -203,9 +208,13 @@ final class EmulatorViewModel {
                     let errMsg = withUnsafePointer(to: &errBuf) {
                         $0.withMemoryRebound(to: CChar.self, capacity: 512) { String(cString: $0) }
                     }
-                    self.buildProgress = "Build failed: \(errMsg)"
+                    self.buildProgress = "Build failed"
                     self.statusMessage = "Build failed"
-                    self.log("Build FAILED: \(errMsg)")
+                    if errMsg.isEmpty {
+                        self.log("Build FAILED: no files compiled (sandbox access issue?)")
+                    } else {
+                        self.log("Build FAILED: \(errMsg)")
+                    }
                 }
             }
         }
