@@ -61,7 +61,10 @@ static void asm_error(asm68k_t *as, const char *fmt, ...) {
  * Symbol table
  * ======================================================================== */
 
-/* Lisa assembler truncates symbols to 8 characters */
+/* Lisa assembler truncates symbols to 8 significant characters for internal
+ * matching (.REF/.DEF resolution). Exported symbols keep their full names
+ * for Pascal interop — the truncation only affects the assembler's own
+ * find_symbol lookups. */
 #define ASM_SYM_SIGCHARS 8
 
 static int find_symbol(asm68k_t *as, const char *name) {
@@ -93,10 +96,8 @@ static int add_symbol(asm68k_t *as, const char *name, sym_type_t type, int32_t v
 
     idx = as->num_symbols++;
     strncpy(as->symbols[idx].name, name, ASM_MAX_LABEL - 1);
-    /* Truncate to significant characters */
-    if (strlen(as->symbols[idx].name) > ASM_SYM_SIGCHARS && name[0] != '@') {
-        as->symbols[idx].name[ASM_SYM_SIGCHARS] = '\0';
-    }
+    /* Note: symbol names are stored in full for linker export.
+     * The 8-char significant comparison happens in find_symbol(). */
     as->symbols[idx].type = type;
     as->symbols[idx].value = value;
     as->symbols[idx].defined = (type != SYM_REF);
@@ -188,15 +189,17 @@ static int32_t parse_number(expr_ctx_t *ctx) {
     }
 
     if (*p == '@') {
-        /* Octal */
-        p++;
-        int32_t val = 0;
-        while (*p >= '0' && *p <= '7') {
-            val = val * 8 + (*p - '0');
+        /* @ followed by digits = local label reference (e.g., @1, @100).
+         * Lisa assembler doesn't use @ for octal. */
+        char name[ASM_MAX_LABEL];
+        int i = 0;
+        while (isalnum((unsigned char)*p) || *p == '@') {
+            if (i < ASM_MAX_LABEL - 1) name[i++] = *p;
             p++;
         }
+        name[i] = '\0';
         ctx->p = p;
-        return val;
+        return get_symbol_value(ctx->as, name);
     }
 
     if (*p == '%') {
@@ -296,7 +299,7 @@ static int32_t parse_mul(expr_ctx_t *ctx) {
     return val;
 }
 
-static int32_t parse_expr(expr_ctx_t *ctx) {
+static int32_t parse_add(expr_ctx_t *ctx) {
     int32_t val = parse_mul(ctx);
     skip_spaces(ctx);
     while (*ctx->p == '+' || *ctx->p == '-') {
@@ -305,6 +308,43 @@ static int32_t parse_expr(expr_ctx_t *ctx) {
         if (op == '+') val += right;
         else val -= right;
         skip_spaces(ctx);
+    }
+    return val;
+}
+
+static int32_t parse_expr(expr_ctx_t *ctx) {
+    int32_t val = parse_add(ctx);
+    skip_spaces(ctx);
+    /* Comparison operators for .IF conditionals: =, <>, <, >, <=, >= */
+    if (*ctx->p == '=') {
+        ctx->p++;
+        int32_t right = parse_add(ctx);
+        return (val == right) ? 1 : 0;
+    }
+    if (*ctx->p == '<' && ctx->p[1] == '>') {
+        ctx->p += 2;
+        int32_t right = parse_add(ctx);
+        return (val != right) ? 1 : 0;
+    }
+    if (*ctx->p == '<' && ctx->p[1] == '=') {
+        ctx->p += 2;
+        int32_t right = parse_add(ctx);
+        return (val <= right) ? 1 : 0;
+    }
+    if (*ctx->p == '>' && ctx->p[1] == '=') {
+        ctx->p += 2;
+        int32_t right = parse_add(ctx);
+        return (val >= right) ? 1 : 0;
+    }
+    if (*ctx->p == '<') {
+        ctx->p++;
+        int32_t right = parse_add(ctx);
+        return (val < right) ? 1 : 0;
+    }
+    if (*ctx->p == '>') {
+        ctx->p++;
+        int32_t right = parse_add(ctx);
+        return (val > right) ? 1 : 0;
     }
     return val;
 }
@@ -1425,7 +1465,50 @@ static bool handle_directive(asm68k_t *as, const char *directive, const char *ar
             if (f) found = true;
         }
 
-        /* Strategy 5: same-directory self-reference (e.g. libfp/sanemacs from within LIBFP dir) */
+        /* Strategy 5a: infer library prefix from base_dir (e.g. in LIBPL dir, paslibequs.text → libpl-PASLIBEQUS.TEXT.unix.txt) */
+        if (!f) {
+            /* Extract last directory component to use as prefix */
+            const char *dir_end = as->base_dir + strlen(as->base_dir);
+            const char *dir_start = dir_end - 1;
+            while (dir_start > as->base_dir && *dir_start != '/') dir_start--;
+            if (*dir_start == '/') dir_start++;
+            char dir_prefix[64];
+            size_t plen = dir_end - dir_start;
+            if (plen < sizeof(dir_prefix)) {
+                strncpy(dir_prefix, dir_start, plen);
+                dir_prefix[plen] = '\0';
+                char lower_pref[64];
+                strncpy(lower_pref, dir_prefix, sizeof(lower_pref));
+                for (char *c = lower_pref; *c; c++) *c = tolower((unsigned char)*c);
+
+                /* Strip .text suffix from inc_name if present */
+                char base_name[128];
+                strncpy(base_name, inc_name, sizeof(base_name) - 1);
+                base_name[sizeof(base_name) - 1] = '\0';
+                char *dot = strcasestr(base_name, ".text");
+                if (dot) *dot = '\0';
+
+                const char *sfx5[] = { ".TEXT.unix.txt", ".text.unix.txt", NULL };
+                for (int si = 0; sfx5[si] && !f; si++) {
+                    /* Try: basedir/prefix-FILENAME.TEXT.unix.txt */
+                    char upper_name[128];
+                    strncpy(upper_name, base_name, sizeof(upper_name));
+                    for (char *c = upper_name; *c; c++) *c = toupper((unsigned char)*c);
+                    snprintf(resolved, sizeof(resolved), "%s/%s-%s%s",
+                             as->base_dir, lower_pref, upper_name, sfx5[si]);
+                    f = fopen(resolved, "r");
+                    if (!f) {
+                        /* Try original case */
+                        snprintf(resolved, sizeof(resolved), "%s/%s-%s%s",
+                                 as->base_dir, lower_pref, base_name, sfx5[si]);
+                        f = fopen(resolved, "r");
+                    }
+                }
+                if (f) found = true;
+            }
+        }
+
+        /* Strategy 5b: same-directory self-reference (e.g. libfp/sanemacs from within LIBFP dir) */
         if (!f) {
             char *sl = strchr(inc_name, '/');
             if (sl) {
@@ -1754,7 +1837,8 @@ static void assemble_line(asm68k_t *as, const char *raw_line) {
     char label[ASM_MAX_LABEL] = "";
     char *p = line;
 
-    /* Label: starts at column 0, not whitespace, not directive */
+    /* Label: starts at column 0, not whitespace, not directive.
+     * Also handle @N local labels (e.g., @1, @100) at column 0. */
     if (!isspace((unsigned char)line[0]) && line[0] != '.') {
         int i = 0;
         while (*p && !isspace((unsigned char)*p) && *p != ':' && i < ASM_MAX_LABEL - 1) {
@@ -1801,6 +1885,28 @@ static void assemble_line(asm68k_t *as, const char *raw_line) {
     while (*p == ' ' || *p == '\t') p++;
     char *operands = p;
     str_trim(operands);
+
+    /* @N local labels can appear indented (e.g., "     @1 SWAP D2").
+     * If mnemonic starts with @, treat it as a label and re-parse the rest. */
+    if (mnemonic[0] == '@') {
+        add_symbol(as, mnemonic, SYM_LABEL, as->pc);
+        /* The rest of the line (operands) is actually "INSTRUCTION OPERANDS" */
+        if (operands[0]) {
+            /* Re-parse: split operands into new mnemonic + new operands */
+            char *np = operands;
+            mi = 0;
+            while (*np && !isspace((unsigned char)*np) && mi < 63) {
+                mnemonic[mi++] = *np++;
+            }
+            mnemonic[mi] = '\0';
+            while (*np == ' ' || *np == '\t') np++;
+            operands = np;
+            str_trim(operands);
+            /* Fall through to process the actual instruction */
+        } else {
+            return; /* Label-only line */
+        }
+    }
 
     /* Is it a directive? (starts with . or is a known directive like DC.W, DS.B, EVEN) */
     if (mnemonic[0] == '.') {
@@ -1877,6 +1983,9 @@ static void assemble_line(asm68k_t *as, const char *raw_line) {
     assemble_instruction(as, mnemonic, operands);
 }
 
+/* Forward declaration for built-in macros */
+static void add_builtin_macro(asm68k_t *as, const char *name, const char *line);
+
 /* ========================================================================
  * Two-pass assembly driver
  * ======================================================================== */
@@ -1886,6 +1995,21 @@ static bool assemble_pass(asm68k_t *as, const char *source) {
     as->line_num = 0;
     as->cond_depth = 0;
     as->in_macro_def = false;
+
+    /* Free and reset macros for this pass — they'll be re-collected.
+     * This prevents the macro table from doubling on pass 2. */
+    for (int i = 0; i < as->num_macros; i++) {
+        for (int j = 0; j < as->macros[i].line_count; j++) {
+            free(as->macros[i].lines[j]);
+            as->macros[i].lines[j] = NULL;
+        }
+        as->macros[i].line_count = 0;
+    }
+    as->num_macros = 0;
+
+    /* Re-add built-in macros */
+    add_builtin_macro(as, "FCOMPOUND", "        FCOMPOUNDX");
+    add_builtin_macro(as, "FANNUITY",  "        FANNUITYX");
 
     /* Reset sections for this pass */
     for (int i = 0; i < as->num_sections; i++) {
@@ -1915,8 +2039,23 @@ static bool assemble_pass(asm68k_t *as, const char *source) {
  * Public API
  * ======================================================================== */
 
+static void add_builtin_macro(asm68k_t *as, const char *name, const char *line) {
+    if (as->num_macros >= ASM_MAX_MACROS) return;
+    int idx = as->num_macros++;
+    strncpy(as->macros[idx].name, name, ASM_MAX_LABEL - 1);
+    as->macros[idx].lines[0] = strdup(line);
+    as->macros[idx].line_count = 1;
+    as->macros[idx].param_count = 0;
+}
+
 void asm68k_init(asm68k_t *as) {
     memset(as, 0, sizeof(asm68k_t));
+
+    /* Built-in macros for SANE floating-point library.
+     * FCOMPOUND/FANNUITY are missing from sanemacs but used in elemsASM.
+     * They're equivalent to the X (extended precision) variants. */
+    add_builtin_macro(as, "FCOMPOUND", "        FCOMPOUNDX");
+    add_builtin_macro(as, "FANNUITY",  "        FANNUITYX");
 }
 
 void asm68k_free(asm68k_t *as) {

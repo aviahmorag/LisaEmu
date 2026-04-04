@@ -192,11 +192,13 @@ final class EmulatorViewModel {
 
         let accessing = sourceURL.startAccessingSecurityScopedResource()
 
-        Task.detached {
+        // Use Thread with 8MB stack — the recursive descent parser needs
+        // deep stack for INTRINSIC units with complex type declarations.
+        let thread = Thread {
             let result = toolchain_build(sourcePath, outputDir, nil)
             if accessing { sourceURL.stopAccessingSecurityScopedResource() }
 
-            await MainActor.run { [weak self] in
+            DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.isBuilding = false
 
@@ -238,6 +240,8 @@ final class EmulatorViewModel {
                 }
             }
         }
+        thread.stackSize = 8 * 1024 * 1024  // 8MB stack for parser
+        thread.start()
     }
 
     /// Copy the built image to a user-chosen location

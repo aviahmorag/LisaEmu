@@ -7,6 +7,7 @@ SDL_CFLAGS = $(shell sdl2-config --cflags)
 SDL_LIBS = $(shell sdl2-config --libs)
 
 SRCDIR = src
+TOOLDIR = src/toolchain
 BUILDDIR = build
 
 SOURCES = $(SRCDIR)/m68k.c \
@@ -16,7 +17,17 @@ SOURCES = $(SRCDIR)/m68k.c \
           $(SRCDIR)/lisa_bridge.c \
           $(SRCDIR)/main_sdl.c
 
+TOOL_SOURCES = $(TOOLDIR)/asm68k.c \
+               $(TOOLDIR)/pascal_lexer.c \
+               $(TOOLDIR)/pascal_parser.c \
+               $(TOOLDIR)/pascal_codegen.c \
+               $(TOOLDIR)/linker.c \
+               $(TOOLDIR)/diskimage.c \
+               $(TOOLDIR)/bootrom.c \
+               $(TOOLDIR)/toolchain_bridge.c
+
 OBJECTS = $(patsubst $(SRCDIR)/%.c,$(BUILDDIR)/%.o,$(SOURCES))
+TOOL_OBJECTS = $(patsubst $(TOOLDIR)/%.c,$(BUILDDIR)/%.o,$(TOOL_SOURCES))
 
 TARGET = $(BUILDDIR)/lisaemu
 
@@ -24,10 +35,13 @@ TARGET = $(BUILDDIR)/lisaemu
 
 all: $(TARGET)
 
-$(TARGET): $(OBJECTS)
+$(TARGET): $(OBJECTS) $(TOOL_OBJECTS)
 	$(CC) $(CFLAGS) -o $@ $^ $(SDL_LIBS)
 
 $(BUILDDIR)/%.o: $(SRCDIR)/%.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(SDL_CFLAGS) -c -o $@ $<
+
+$(BUILDDIR)/%.o: $(TOOLDIR)/%.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(SDL_CFLAGS) -c -o $@ $<
 
 $(BUILDDIR):
@@ -37,7 +51,7 @@ clean:
 	rm -rf $(BUILDDIR)
 
 # Build without SDL (library only, for testing compilation)
-lib: $(BUILDDIR)/m68k.o $(BUILDDIR)/lisa_mmu.o $(BUILDDIR)/via6522.o $(BUILDDIR)/lisa.o $(BUILDDIR)/lisa_bridge.o
+lib: $(OBJECTS) $(TOOL_OBJECTS)
 
 # Run
 run: $(TARGET)

@@ -1136,6 +1136,15 @@ static ast_node_t *parse_unit(parser_t *p) {
 
     skip_directives(p, unit);
 
+    /* Lisa Pascal INTRINSIC units: skip the keyword and semicolon */
+    if (CURTYPE(p) == TOK_IDENT &&
+        strncasecmp(CUR(p).str_val, "INTRINSIC", 9) == 0) {
+        advance(p);
+        match(p, TOK_SEMICOLON);
+    }
+
+    skip_directives(p, unit);
+
     /* INTERFACE section */
     if (match(p, TOK_INTERFACE)) {
         ast_node_t *iface = ast_new(AST_INTERFACE, p->lex.line);

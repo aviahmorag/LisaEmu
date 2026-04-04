@@ -48,6 +48,7 @@ static bool should_skip_dir(const char *name) {
     if (strcasecmp(name, "LIBHW") == 0 && !strcasestr(name, "LIBS")) return true; /* duplicate LIBHW outside LIBS */
     /* Skip TK3/TK4/TK5 sample app directories (contain build scripts, not compilable units) */
     if (strcasecmp(name, "TK3") == 0 || strcasecmp(name, "TK4") == 0 || strcasecmp(name, "TK5") == 0) return true;
+
     return false;
 }
 
@@ -265,9 +266,60 @@ static bool assemble_file(const char *path, linker_t *lk, const char *source_roo
     bool ok = asm68k_assemble_file(as, path);
 
     if (ok && as->output_size > 0) {
+        /* Convert assembler symbols to codegen format for the linker.
+         * Export .PROC, .FUNC, .DEF symbols and import .REF symbols. */
+        int num_exported = 0;
+        for (int i = 0; i < as->num_symbols; i++) {
+            if (as->symbols[i].exported || as->symbols[i].external)
+                num_exported++;
+        }
+
+        cg_symbol_t *syms = NULL;
+        cg_reloc_t *rels = NULL;
+        int nsyms = 0, nrels = 0;
+
+        if (num_exported > 0) {
+            syms = calloc(num_exported, sizeof(cg_symbol_t));
+            if (syms) {
+                for (int i = 0; i < as->num_symbols; i++) {
+                    asm_symbol_t *s = &as->symbols[i];
+                    if (!s->exported && !s->external) continue;
+                    strncpy(syms[nsyms].name, s->name, 63);
+                    syms[nsyms].offset = s->value;
+                    syms[nsyms].is_global = s->exported;
+                    syms[nsyms].is_external = s->external;
+                    nsyms++;
+                }
+            }
+        }
+
+        /* Convert assembler relocations */
+        if (as->num_relocs > 0) {
+            rels = calloc(as->num_relocs, sizeof(cg_reloc_t));
+            if (rels) {
+                for (int i = 0; i < as->num_relocs; i++) {
+                    rels[nrels].offset = as->relocs[i].offset;
+                    rels[nrels].size = as->relocs[i].size;
+                    rels[nrels].pc_relative = as->relocs[i].pc_relative;
+                    if (as->relocs[i].symbol_idx >= 0 &&
+                        as->relocs[i].symbol_idx < as->num_symbols) {
+                        strncpy(rels[nrels].symbol,
+                                as->symbols[as->relocs[i].symbol_idx].name, 63);
+                    }
+                    nrels++;
+                }
+            }
+        }
+
+        if (nsyms > 0 || as->output_size > 0) {
+            fprintf(stderr, "  ASM: %s — %u bytes code, %d exported symbols\n",
+                    path, as->output_size, nsyms);
+        }
         linker_load_codegen(lk, path,
                             asm68k_get_output(as, NULL), as->output_size,
-                            NULL, 0, NULL, 0);
+                            syms, nsyms, rels, nrels);
+        free(syms);
+        free(rels);
     }
 
     asm68k_free(as);
@@ -332,17 +384,24 @@ build_result_t toolchain_build(const char *source_dir,
     linker_init(lk);
 
     /* Phase 1: Compile Pascal files */
-    int pascal_count = 0, pascal_ok = 0;
+    int pascal_count = 0, pascal_ok = 0, pascal_fail = 0;
     for (int i = 0; i < num_files; i++) {
         if (files[i].is_assembly) continue;
         pascal_count++;
-        if (compile_pascal_file(files[i].path, lk)) pascal_ok++;
+        if (compile_pascal_file(files[i].path, lk)) {
+            pascal_ok++;
+        } else {
+            pascal_fail++;
+            if (pascal_fail <= 20) /* Limit output */
+                fprintf(stderr, "PASCAL FAIL: %s\n", files[i].path);
+        }
         if (progress && pascal_count % 20 == 0) {
             char msg[128];
             snprintf(msg, sizeof(msg), "Compiling Pascal: %d/%d", pascal_ok, pascal_count);
             progress(msg, 10 + (pascal_count * 30 / num_files), 100);
         }
     }
+    fprintf(stderr, "Pascal: %d/%d succeeded, %d failed\n", pascal_ok, pascal_count, pascal_fail);
     result.files_compiled = pascal_ok;
 
     /* Phase 2: Assemble assembly files */
@@ -350,8 +409,11 @@ build_result_t toolchain_build(const char *source_dir,
     for (int i = 0; i < num_files; i++) {
         if (!files[i].is_assembly) continue;
         asm_count++;
-        if (assemble_file(files[i].path, lk, source_dir)) asm_ok++;
+        bool aok = assemble_file(files[i].path, lk, source_dir);
+        if (aok) asm_ok++;
+        else fprintf(stderr, "ASM FAIL: %s\n", files[i].path);
     }
+    fprintf(stderr, "Assembly: %d/%d succeeded\n", asm_ok, asm_count);
     result.files_assembled = asm_ok;
 
     if (progress) progress("Linking...", 60, 100);

@@ -26,7 +26,7 @@
 #define ASM_MAX_LABEL       64
 #define ASM_MAX_SECTIONS    64
 #define ASM_MAX_INCLUDES    16
-#define ASM_MAX_MACROS      256
+#define ASM_MAX_MACROS      512
 #define ASM_MAX_MACRO_LINES 256
 #define ASM_MAX_OUTPUT      (512 * 1024)  /* 512KB max per file */
 #define ASM_MAX_RELOCS      4096

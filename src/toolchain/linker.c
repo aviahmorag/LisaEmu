@@ -393,12 +393,34 @@ bool linker_link(linker_t *lk) {
         }
     }
 
-    /* Check for unresolved externals */
+    /* Check for unresolved externals and dump debug info */
     int unresolved = 0;
     for (int i = 0; i < lk->num_symbols; i++) {
-        if (lk->symbols[i].type == LSYM_EXTERN && !lk->symbols[i].resolved) {
-            link_error(lk, "unresolved external: '%s'", lk->symbols[i].name);
+        if (!lk->symbols[i].resolved) {
+            link_error(lk, "unresolved external: '%s' (type=%d)",
+                      lk->symbols[i].name, lk->symbols[i].type);
             unresolved++;
+        }
+    }
+    /* Dump symbol table stats */
+    int entries = 0, externs = 0, resolved = 0;
+    for (int i = 0; i < lk->num_symbols; i++) {
+        if (lk->symbols[i].type == LSYM_ENTRY) entries++;
+        else externs++;
+        if (lk->symbols[i].resolved) resolved++;
+    }
+    fprintf(stderr, "Linker: %d symbols total (%d entries, %d externs), %d resolved, %d unresolved\n",
+            lk->num_symbols, entries, externs, resolved, unresolved);
+    /* Search for specific symbols to debug */
+    const char *debug_syms[] = {"extractkey", "EXTRACTKEY", "EXTRACTK", "retry_compact", "prefix_name", NULL};
+    for (int d = 0; debug_syms[d]; d++) {
+        int idx = find_global_symbol(lk, debug_syms[d]);
+        if (idx >= 0) {
+            fprintf(stderr, "  DEBUG: '%s' found as '%s' type=%d resolved=%d val=$%X mod=%d\n",
+                    debug_syms[d], lk->symbols[idx].name, lk->symbols[idx].type,
+                    lk->symbols[idx].resolved, lk->symbols[idx].value, lk->symbols[idx].module_idx);
+        } else {
+            fprintf(stderr, "  DEBUG: '%s' NOT FOUND in symbol table\n", debug_syms[d]);
         }
     }
 
