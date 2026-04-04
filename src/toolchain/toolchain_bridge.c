@@ -71,7 +71,7 @@ static bool should_skip_file(const char *name) {
     if (strcasestr(name, "RELEASE") != NULL) return true;
     /* LIBFP: only NEWFPSUB should be assembled (it includes all others) */
     if (strcasestr(name, "libfp-") != NULL && !strcasestr(name, "NEWFPSUB")) return true;
-    /* QSORT: previously skipped, but it defines qsort/moverq needed by LIBDB */
+    /* QSORT is assembly but starts with EQU constants — force assembly detection below */
     /* Documentation / release notes */
     if (strcasestr(name, "relmemo") != NULL) return true;
     /* Non-source data files in APPS */
@@ -144,7 +144,8 @@ static int find_source_files(const char *dir, source_file_t *files, int max_file
             if (should_skip_file(entry->d_name)) continue;
 
             /* Determine if assembly or Pascal by checking file content */
-            bool is_asm = (strcasestr(entry->d_name, "ASM") != NULL);
+            bool is_asm = (strcasestr(entry->d_name, "ASM") != NULL) ||
+                          (strcasestr(entry->d_name, "QSORT") != NULL);
             if (!is_asm) {
                 /* Check first non-empty line: assembly starts with ; or . or tab+instruction */
                 FILE *probe = fopen(path, "r");
