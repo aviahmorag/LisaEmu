@@ -150,7 +150,7 @@ bool linker_load_obj(linker_t *lk, const char *filename) {
     }
 
     /* Read symbols */
-    for (uint32_t i = 0; i < num_syms && mod->num_symbols < 4096; i++) {
+    for (uint32_t i = 0; i < num_syms && mod->num_symbols < 16384; i++) {
         uint8_t type, flags, namelen;
         int32_t value;
         fread(&type, 1, 1, f);
@@ -171,7 +171,7 @@ bool linker_load_obj(linker_t *lk, const char *filename) {
     /* Read relocations */
     uint32_t num_relocs;
     fread(&num_relocs, 4, 1, f);
-    for (uint32_t i = 0; i < num_relocs && mod->num_relocs < 4096; i++) {
+    for (uint32_t i = 0; i < num_relocs && mod->num_relocs < 16384; i++) {
         uint32_t offset;
         int32_t size;
         uint8_t namelen;
@@ -231,7 +231,7 @@ bool linker_load_codegen(linker_t *lk, const char *name,
 
     /* Copy symbols from codegen format */
     const cg_symbol_t *cg_syms = (const cg_symbol_t *)sym_data;
-    for (int i = 0; i < num_symbols && mod->num_symbols < 4096; i++) {
+    for (int i = 0; i < num_symbols && mod->num_symbols < 16384; i++) {
         if (!cg_syms[i].name[0]) continue;
         int si = mod->num_symbols++;
         strncpy(mod->symbols[si].name, cg_syms[i].name, 63);
@@ -241,7 +241,7 @@ bool linker_load_codegen(linker_t *lk, const char *name,
 
     /* Copy relocations from codegen format */
     const cg_reloc_t *cg_rels = (const cg_reloc_t *)rel_data;
-    for (int i = 0; i < num_relocs && mod->num_relocs < 4096; i++) {
+    for (int i = 0; i < num_relocs && mod->num_relocs < 16384; i++) {
         int ri = mod->num_relocs++;
         mod->relocs[ri].offset = cg_rels[i].offset;
         strncpy(mod->relocs[ri].symbol, cg_rels[i].symbol, 63);

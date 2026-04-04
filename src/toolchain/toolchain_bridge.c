@@ -247,6 +247,18 @@ static bool compile_pascal_file(const char *path, linker_t *lk) {
     }
     codegen_init(cg);
     strncpy(cg->current_file, path, sizeof(cg->current_file) - 1);
+
+    /* Debug: log AST type for every file to trace symbol issues */
+    if (ast && (strcasestr(path, "UNITHZ") || strcasestr(path, "UNITSTD"))) {
+        fprintf(stderr, "  DEBUG AST: %s → type=%d (%s) children=%d\n",
+                strrchr(path, '/') ? strrchr(path, '/') + 1 : path,
+                ast->type, ast->name, ast->num_children);
+        for (int i = 0; i < ast->num_children && i < 10; i++) {
+            fprintf(stderr, "    child[%d] type=%d name='%s'\n",
+                    i, ast->children[i]->type, ast->children[i]->name);
+        }
+    }
+
     codegen_generate(cg, ast);
 
     if (is_startup) {

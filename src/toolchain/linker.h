@@ -52,7 +52,7 @@ typedef struct {
         char name[64];
         uint8_t type;        /* 0=entry, 1=external */
         int32_t value;       /* Offset within module's code */
-    } symbols[4096];
+    } symbols[16384];
     int num_symbols;
 
     /* Relocations */
@@ -60,7 +60,7 @@ typedef struct {
         uint32_t offset;     /* Offset in code */
         char symbol[64];     /* Symbol name to resolve */
         int size;            /* 2 or 4 bytes */
-    } relocs[4096];
+    } relocs[16384];
     int num_relocs;
 
     /* Assigned base address after layout */
