@@ -550,13 +550,18 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                 r->size = 4;
                 r->pc_relative = false;
             }
-            /* Clean up args — 4 bytes per argument */
-            int arg_bytes = node->num_children * 4;
-            if (arg_bytes > 0 && arg_bytes <= 8) {
-                emit16(cg, 0x508F | ((arg_bytes & 7) << 9));  /* ADDQ.L #n,SP */
-            } else if (arg_bytes > 8) {
-                emit16(cg, 0xDEFC);  /* ADDA.W #imm,SP */
-                emit16(cg, (uint16_t)arg_bytes);
+            /* Clean up args — but NOT for EXTERNAL (assembly) routines,
+             * which are callee-clean (they pop their own parameters). */
+            cg_symbol_t *callee = find_global(cg, node->name);
+            bool callee_clean = (callee && callee->is_external);
+            if (!callee_clean) {
+                int arg_bytes = node->num_children * 4;
+                if (arg_bytes > 0 && arg_bytes <= 8) {
+                    emit16(cg, 0x508F | ((arg_bytes & 7) << 9));  /* ADDQ.L #n,SP */
+                } else if (arg_bytes > 8) {
+                    emit16(cg, 0xDEFC);  /* ADDA.W #imm,SP */
+                    emit16(cg, (uint16_t)arg_bytes);
+                }
             }
             /* Result is in D0 */
             break;

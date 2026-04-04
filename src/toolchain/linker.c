@@ -448,7 +448,7 @@ bool linker_link(linker_t *lk) {
     fprintf(stderr, "Linker: %d symbols total (%d entries, %d externs), %d resolved, %d unresolved\n",
             lk->num_symbols, entries, externs, resolved, unresolved);
     /* Search for specific symbols to debug */
-    const char *debug_syms[] = {"extractkey", "EXTRACTKEY", "EXTRACTK", "retry_compact", "prefix_name", "ENTER_SCHEDULER", "ENTER_SC", "HAllocate", "SchedEnable", "SCHEDENA", NULL};
+    const char *debug_syms[] = {"INIT_TRAPV", "INIT_TRA", "TRAP1", "SCHDTRAP", "ENTER_SC", "HAllocate", "SCHEDENA", "PASCALIN", "BUS_ERR", NULL};
     for (int d = 0; debug_syms[d]; d++) {
         int idx = find_global_symbol(lk, debug_syms[d]);
         if (idx >= 0) {
