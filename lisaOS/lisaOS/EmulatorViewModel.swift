@@ -79,6 +79,7 @@ final class EmulatorViewModel {
         log("Power On — romLoaded=\(romLoaded), buildComplete=\(buildComplete), imagePath=\(builtImagePath ?? "nil")")
 
         emu_reset()
+        romLoaded = true  // emu_reset auto-generates ROM if needed
         log("CPU reset done")
         isRunning = true
         statusMessage = "Running"

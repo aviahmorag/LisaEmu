@@ -1425,7 +1425,47 @@ static bool handle_directive(asm68k_t *as, const char *directive, const char *ar
             if (f) found = true;
         }
 
-        /* Strategy 5: try include paths with mapped names */
+        /* Strategy 5: same-directory self-reference (e.g. libfp/sanemacs from within LIBFP dir) */
+        if (!f) {
+            char *sl = strchr(inc_name, '/');
+            if (sl) {
+                char prefix[64], filename[128];
+                size_t dlen = sl - inc_name;
+                if (dlen < sizeof(prefix)) {
+                    strncpy(prefix, inc_name, dlen);
+                    prefix[dlen] = '\0';
+                    strncpy(filename, sl + 1, sizeof(filename) - 1);
+                    filename[sizeof(filename) - 1] = '\0';
+                    /* Lowercase prefix for filename convention */
+                    char lower_prefix[64];
+                    strncpy(lower_prefix, prefix, sizeof(lower_prefix));
+                    for (char *c = lower_prefix; *c; c++) *c = tolower((unsigned char)*c);
+
+                    /* Try: base_dir/prefix-filename.text.unix.txt (various cases) */
+                    const char *suffixes[] = {
+                        ".text.unix.txt", ".TEXT.unix.txt", ".unix.txt", NULL
+                    };
+                    for (int si = 0; suffixes[si] && !f; si++) {
+                        /* lowercase prefix - original case filename */
+                        snprintf(resolved, sizeof(resolved), "%s/%s-%s%s",
+                                 as->base_dir, lower_prefix, filename, suffixes[si]);
+                        f = fopen(resolved, "r");
+                        if (!f) {
+                            /* lowercase prefix - UPPERCASE filename */
+                            char upper_file[128];
+                            strncpy(upper_file, filename, sizeof(upper_file));
+                            for (char *c = upper_file; *c; c++) *c = toupper((unsigned char)*c);
+                            snprintf(resolved, sizeof(resolved), "%s/%s-%s%s",
+                                     as->base_dir, lower_prefix, upper_file, suffixes[si]);
+                            f = fopen(resolved, "r");
+                        }
+                    }
+                    if (f) found = true;
+                }
+            }
+        }
+
+        /* Strategy 6: try include paths with library convention */
         if (!f) {
             for (int i = 0; i < as->num_include_paths && !f; i++) {
                 /* Direct */
@@ -1435,35 +1475,35 @@ static bool handle_directive(asm68k_t *as, const char *directive, const char *ar
                     snprintf(resolved, sizeof(resolved), "%s/%s.unix.txt", as->include_paths[i], inc_name);
                     f = fopen(resolved, "r");
                 }
-                /* Lisa library convention: LibXX/file → LIBXX/libxx-file.unix.txt */
+                /* Lisa library convention: LibXX/file → LIBXX/libxx-file.text.unix.txt */
                 if (!f) {
-                    char *sl = strchr(inc_name, '/');
-                    if (sl) {
-                        char libdir[64], filename[128];
-                        size_t dlen = sl - inc_name;
-                        if (dlen < sizeof(libdir)) {
-                            strncpy(libdir, inc_name, dlen);
-                            libdir[dlen] = '\0';
-                            strncpy(filename, sl + 1, sizeof(filename) - 1);
-                            /* Uppercase libdir for directory name */
-                            char upper_dir[64];
+                    char *sl2 = strchr(inc_name, '/');
+                    if (sl2) {
+                        char libdir[64], filename2[128];
+                        size_t dlen2 = sl2 - inc_name;
+                        if (dlen2 < sizeof(libdir)) {
+                            strncpy(libdir, inc_name, dlen2);
+                            libdir[dlen2] = '\0';
+                            strncpy(filename2, sl2 + 1, sizeof(filename2) - 1);
+                            char upper_dir[64], lower_dir[64];
                             strncpy(upper_dir, libdir, sizeof(upper_dir));
                             for (char *c = upper_dir; *c; c++) *c = toupper((unsigned char)*c);
-                            /* Lowercase for prefix */
-                            char lower_dir[64];
                             strncpy(lower_dir, libdir, sizeof(lower_dir));
                             for (char *c = lower_dir; *c; c++) *c = tolower((unsigned char)*c);
-                            snprintf(resolved, sizeof(resolved), "%s/%s/%s-%s.unix.txt",
-                                     as->include_paths[i], upper_dir, lower_dir, filename);
-                            f = fopen(resolved, "r");
-                            if (!f) {
-                                /* Try with uppercase filename */
-                                char upper_file[128];
-                                strncpy(upper_file, filename, sizeof(upper_file));
-                                for (char *c = upper_file; *c; c++) *c = toupper((unsigned char)*c);
-                                snprintf(resolved, sizeof(resolved), "%s/%s/%s-%s.unix.txt",
-                                         as->include_paths[i], upper_dir, lower_dir, upper_file);
+
+                            const char *sfx[] = { ".text.unix.txt", ".TEXT.unix.txt", ".unix.txt", NULL };
+                            for (int si = 0; sfx[si] && !f; si++) {
+                                snprintf(resolved, sizeof(resolved), "%s/%s/%s-%s%s",
+                                         as->include_paths[i], upper_dir, lower_dir, filename2, sfx[si]);
                                 f = fopen(resolved, "r");
+                                if (!f) {
+                                    char upper_file[128];
+                                    strncpy(upper_file, filename2, sizeof(upper_file));
+                                    for (char *c = upper_file; *c; c++) *c = toupper((unsigned char)*c);
+                                    snprintf(resolved, sizeof(resolved), "%s/%s/%s-%s%s",
+                                             as->include_paths[i], upper_dir, lower_dir, upper_file, sfx[si]);
+                                    f = fopen(resolved, "r");
+                                }
                             }
                         }
                     }
@@ -1717,7 +1757,7 @@ static void assemble_line(asm68k_t *as, const char *raw_line) {
     /* Label: starts at column 0, not whitespace, not directive */
     if (!isspace((unsigned char)line[0]) && line[0] != '.') {
         int i = 0;
-        while (*p && !isspace((unsigned char)*p) && *p != ':' && *p != '.' && i < ASM_MAX_LABEL - 1) {
+        while (*p && !isspace((unsigned char)*p) && *p != ':' && i < ASM_MAX_LABEL - 1) {
             label[i++] = *p++;
         }
         label[i] = '\0';

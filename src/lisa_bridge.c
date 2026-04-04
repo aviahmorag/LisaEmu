@@ -4,8 +4,14 @@
 
 #include "lisa_bridge.h"
 #include "lisa.h"
+#if __has_include("toolchain/bootrom.h")
+#include "toolchain/bootrom.h"
+#else
+#include "bootrom.h"
+#endif
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 static lisa_t lisa;
 static bool initialized = false;
@@ -24,6 +30,17 @@ void emu_destroy(void) {
 
 void emu_reset(void) {
     if (!initialized) return;
+
+    /* Auto-generate boot ROM if none loaded */
+    if (lisa.mem.rom[0] == 0 && lisa.mem.rom[4] == 0) {
+        printf("No ROM loaded — generating boot ROM\n");
+        uint8_t *rom = bootrom_generate();
+        if (rom) {
+            lisa_mem_load_rom(&lisa.mem, rom, ROM_SIZE);
+            free(rom);
+        }
+    }
+
     lisa_reset(&lisa);
 }
 

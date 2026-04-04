@@ -69,13 +69,34 @@ static bool should_skip_file(const char *name) {
     if (strcasestr(name, "APPENDIX") != NULL) return true;
     if (strcasestr(name, "INSTRUCT") != NULL) return true;
     if (strcasestr(name, "RELEASE") != NULL) return true;
-    /* Skip files that start with P/X and are in TK dirs (phrase/exec config files) */
-    if ((name[0] == 'P' || name[0] == 'X') && isupper(name[1]) &&
-        !strstr(name, "PROC") && !strstr(name, "proc") &&
-        strlen(name) < 20) {
-        /* Likely a TK config file like PBOXER, XBOXER, PCLOCK, etc. */
-        /* But only if it's short and all-caps before the extension */
-    }
+    /* Phrase/resource files, documentation, code generator templates */
+    if (strcasestr(name, "PABC") != NULL) return true;
+    if (strcasestr(name, "PASGEN") != NULL) return true;
+    if (strcasestr(name, "phquickport") != NULL) return true;
+    if (strcasestr(name, "INITFPFILE") != NULL) return true;
+    if (strcasestr(name, "qpsample") != NULL) return true;
+    if (strcasestr(name, "qpmake") != NULL) return true;
+    if (strcasestr(name, "make_qp") != NULL) return true;
+    if (strcasestr(name, "link_qp") != NULL) return true;
+    if (strcasestr(name, "lnewFPLIB") != NULL) return true;
+    if (strcasestr(name, "buildpref") != NULL) return true;
+    if (strcasestr(name, "MAKEHEUR") != NULL) return true;
+    /* Data/list files that aren't source code */
+    if (strcasestr(name, "-LIST.TEXT") != NULL) return true;
+    if (strcasestr(name, "-SIZES.TEXT") != NULL) return true;
+    if (strcasestr(name, "-EXEC.TEXT") != NULL) return true;
+    if (strcasestr(name, "LETTERCODES") != NULL) return true;
+    if (strcasestr(name, "KEYWORDS") != NULL) return true;
+    if (strcasestr(name, "FKEYWORDS") != NULL) return true;
+    if (strcasestr(name, "MENUS.TEXT") != NULL) return true;
+    if (strcasestr(name, "DBOX.TEXT") != NULL) return true;
+    if (strcasestr(name, "CNBUILD") != NULL) return true;
+    if (strcasestr(name, "CIBUILD") != NULL) return true;
+    if (strcasestr(name, "BUILDPR") != NULL) return true;
+    if (strcasestr(name, "DWBTN") != NULL) return true;
+    if (strcasestr(name, "ciBTN") != NULL) return true;
+    if (strcasestr(name, "PARBTN") != NULL) return true;
+    if (strcasestr(name, "CNBTN") != NULL) return true;
     return false;
 }
 

@@ -29,7 +29,10 @@ typedef struct {
 
 /* ProFile hard disk */
 #define PROFILE_BLOCK_SIZE   532  /* 512 data + 20 tag bytes */
+#define PROFILE_DATA_SIZE    512
+#define PROFILE_TAG_SIZE     20
 #define PROFILE_MAX_BLOCKS   19456  /* ~10MB ProFile */
+#define BOOT_TRACK_BLOCKS    24
 
 typedef struct {
     uint8_t *data;          /* Disk image data */

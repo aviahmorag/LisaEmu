@@ -89,7 +89,7 @@ struct LisaDisplayViewRepresentable: NSViewRepresentable {
         let view = LisaDisplayNSView()
         view.viewModel = viewModel
         view.wantsLayer = true
-        view.layer?.backgroundColor = NSColor.black.cgColor
+        view.layer?.backgroundColor = NSColor.clear.cgColor
         view.layer?.magnificationFilter = .nearest
         return view
     }

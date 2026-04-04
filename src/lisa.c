@@ -133,21 +133,46 @@ static void io_write_cb(uint32_t offset, uint8_t val) {
     }
 }
 
+/* Forward declarations */
+static void profile_read_block(lisa_t *lisa, uint32_t block);
+static void profile_write_block(lisa_t *lisa, uint32_t block);
+
 /* ========================================================================
  * VIA callbacks
  * ======================================================================== */
 
-/* VIA1 port B: ProFile interface */
+/* ProFile state machine states */
+#define PROF_IDLE       0   /* Waiting for command */
+#define PROF_CMD        1   /* Receiving 6-byte command */
+#define PROF_READING    2   /* Sending data to host */
+#define PROF_WRITING    3   /* Receiving data from host */
+#define PROF_STATUS     4   /* Sending status bytes */
+
+/* VIA1 port B: ProFile interface control signals
+ *   Bit 0: OCD (device connected)
+ *   Bit 1: BSY (device not busy when high)
+ *   Bit 2: CMD strobe from host
+ *   Bit 3: host direction (0=host writing, 1=host reading)
+ */
 static void via1_portb_write(uint8_t val, uint8_t ddr, void *ctx) {
-    /* ProFile hard disk interface signals */
-    /* BSY, PARITY, CMD etc. controlled via port B */
+    lisa_t *lisa = (lisa_t *)ctx;
+    if (!lisa->profile.mounted) return;
+
+    bool cmd_strobe = (val & 0x04) != 0;
+
+    /* CMD strobe rising edge triggers command processing */
+    if (cmd_strobe && lisa->profile.state == PROF_IDLE) {
+        /* Host is starting a command — expect 6 bytes on Port A */
+        lisa->profile.state = PROF_CMD;
+        lisa->profile.cmd_index = 0;
+        lisa->profile.busy = true;
+    }
 }
 
 static uint8_t via1_portb_read(void *ctx) {
     lisa_t *lisa = (lisa_t *)ctx;
     uint8_t val = 0;
 
-    /* ProFile status bits */
     if (lisa->profile.mounted) {
         val |= 0x01; /* OCD - connected */
         if (!lisa->profile.busy)
@@ -158,15 +183,62 @@ static uint8_t via1_portb_read(void *ctx) {
 }
 
 static void via1_porta_write(uint8_t val, uint8_t ddr, void *ctx) {
-    /* ProFile data bus */
+    lisa_t *lisa = (lisa_t *)ctx;
+    if (!lisa->profile.mounted) return;
+
+    if (lisa->profile.state == PROF_CMD) {
+        /* Accumulate command bytes */
+        if (lisa->profile.cmd_index < 6) {
+            lisa->profile.command[lisa->profile.cmd_index++] = val;
+        }
+        if (lisa->profile.cmd_index >= 6) {
+            /* Command complete. Byte 0 = command, bytes 1-3 = block number */
+            uint8_t cmd = lisa->profile.command[0];
+            uint32_t block = ((uint32_t)lisa->profile.command[1] << 16) |
+                             ((uint32_t)lisa->profile.command[2] << 8) |
+                             (uint32_t)lisa->profile.command[3];
+
+            if (cmd == 0x00) {
+                /* READ command */
+                profile_read_block(lisa, block);
+                lisa->profile.state = PROF_READING;
+                lisa->profile.buf_index = 0;
+                lisa->profile.busy = false;
+            } else if (cmd == 0x01) {
+                /* WRITE command */
+                lisa->profile.block_num = block;
+                lisa->profile.state = PROF_WRITING;
+                lisa->profile.buf_index = 0;
+                lisa->profile.busy = false;
+            } else {
+                /* Unknown command — just go idle */
+                lisa->profile.state = PROF_IDLE;
+                lisa->profile.busy = false;
+            }
+        }
+    } else if (lisa->profile.state == PROF_WRITING) {
+        /* Accumulate write data */
+        if (lisa->profile.buf_index < PROFILE_BLOCK_SIZE) {
+            lisa->profile.sector_buf[lisa->profile.buf_index++] = val;
+        }
+        if (lisa->profile.buf_index >= PROFILE_BLOCK_SIZE) {
+            profile_write_block(lisa, lisa->profile.block_num);
+            lisa->profile.state = PROF_IDLE;
+        }
+    }
 }
 
 static uint8_t via1_porta_read(void *ctx) {
     lisa_t *lisa = (lisa_t *)ctx;
 
-    /* Read from ProFile data bus or sector buffer */
-    if (lisa->profile.mounted && lisa->profile.buf_index < PROFILE_BLOCK_SIZE) {
-        return lisa->profile.sector_buf[lisa->profile.buf_index++];
+    if (lisa->profile.mounted && lisa->profile.state == PROF_READING) {
+        if (lisa->profile.buf_index < PROFILE_BLOCK_SIZE) {
+            uint8_t val = lisa->profile.sector_buf[lisa->profile.buf_index++];
+            if (lisa->profile.buf_index >= PROFILE_BLOCK_SIZE) {
+                lisa->profile.state = PROF_IDLE;
+            }
+            return val;
+        }
     }
     return 0xFF;
 }
@@ -264,7 +336,7 @@ static void render_framebuffer(lisa_t *lisa) {
  * ProFile disk operations
  * ======================================================================== */
 
-static void __attribute__((unused)) profile_read_block(lisa_t *lisa, uint32_t block) {
+static void profile_read_block(lisa_t *lisa, uint32_t block) {
     if (!lisa->profile.mounted || !lisa->profile.data) {
         memset(lisa->profile.sector_buf, 0xFF, PROFILE_BLOCK_SIZE);
         return;
@@ -279,7 +351,7 @@ static void __attribute__((unused)) profile_read_block(lisa_t *lisa, uint32_t bl
     lisa->profile.buf_index = 0;
 }
 
-static void __attribute__((unused)) profile_write_block(lisa_t *lisa, uint32_t block) {
+static void profile_write_block(lisa_t *lisa, uint32_t block) {
     if (!lisa->profile.mounted || !lisa->profile.data) return;
 
     size_t offset = (size_t)block * PROFILE_BLOCK_SIZE;
@@ -353,6 +425,23 @@ void lisa_reset(lisa_t *lisa) {
     lisa->mem.setup_mode = true;  /* ROM visible at address 0 */
     via_reset(&lisa->via1);
     via_reset(&lisa->via2);
+
+    /* Pre-load boot track from ProFile into RAM at $20000 */
+    if (lisa->profile.mounted && lisa->profile.data) {
+        uint32_t dest = 0x20000;
+        int blocks_loaded = 0;
+        for (int blk = 0; blk < BOOT_TRACK_BLOCKS && dest + PROFILE_DATA_SIZE < LISA_RAM_SIZE; blk++) {
+            size_t src_offset = (size_t)blk * PROFILE_BLOCK_SIZE;
+            if (src_offset + PROFILE_BLOCK_SIZE <= lisa->profile.data_size) {
+                /* Copy only the 512 data bytes, skip 20 tag bytes */
+                memcpy(&lisa->mem.ram[dest], lisa->profile.data + src_offset + PROFILE_TAG_SIZE, PROFILE_DATA_SIZE);
+                dest += PROFILE_DATA_SIZE;
+                blocks_loaded++;
+            }
+        }
+        printf("Pre-loaded %d boot blocks (%d bytes) into RAM at $20000\n",
+               blocks_loaded, blocks_loaded * PROFILE_DATA_SIZE);
+    }
 
     /* Debug: verify ROM is loaded before reset */
     printf("Reset: setup_mode=%d, rom[0..7]=%02X %02X %02X %02X %02X %02X %02X %02X\n",
