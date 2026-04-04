@@ -76,11 +76,16 @@ final class EmulatorViewModel {
             log("Power On failed: no ROM or built image loaded")
             return
         }
-        log("Power On")
+        log("Power On — romLoaded=\(romLoaded), buildComplete=\(buildComplete), imagePath=\(builtImagePath ?? "nil")")
 
         emu_reset()
+        log("CPU reset done")
         isRunning = true
         statusMessage = "Running"
+
+        // Run a few frames immediately to check if anything happens
+        let firstFrame = emu_run_frame()
+        log("First frame result: \(firstFrame)")
 
         emulatorTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
             guard let vm = self else { return }
@@ -263,6 +268,13 @@ final class EmulatorViewModel {
     /// Open a previously built disk image
     func openDiskImage(url: URL) {
         let path = url.path
+        // Verify file exists and has content
+        guard FileManager.default.fileExists(atPath: path),
+              (try? FileManager.default.attributesOfItem(atPath: path))?[.size] as? UInt64 ?? 0 > 0 else {
+            statusMessage = "Invalid disk image (empty or missing)"
+            log("Invalid disk image (empty or missing): \(path)")
+            return
+        }
         if emu_mount_profile(path) {
             builtImagePath = path
             buildComplete = true
@@ -277,13 +289,34 @@ final class EmulatorViewModel {
 
     /// Check if a previously used disk image exists
     func checkForLastImage() {
-        if let lastPath = UserDefaults.standard.string(forKey: "lastDiskImage"),
-           FileManager.default.fileExists(atPath: lastPath) {
-            builtImagePath = lastPath
-            buildComplete = true
-            let name = URL(fileURLWithPath: lastPath).lastPathComponent
-            statusMessage = "Last image: \(name). Power On to boot."
-            _ = emu_mount_profile(lastPath)
+        if let lastPath = UserDefaults.standard.string(forKey: "lastDiskImage") {
+            log("Found last image path: \(lastPath)")
+            if FileManager.default.fileExists(atPath: lastPath) {
+                let size = (try? FileManager.default.attributesOfItem(atPath: lastPath))?[.size] as? UInt64 ?? 0
+                log("File exists, size: \(size) bytes")
+                if size > 0 {
+                    builtImagePath = lastPath
+                    buildComplete = true
+                    let name = URL(fileURLWithPath: lastPath).lastPathComponent
+                    statusMessage = "Last image: \(name). Power On to boot."
+                    let mounted = emu_mount_profile(lastPath)
+                    log("Mount result: \(mounted)")
+
+                    // Also try to load ROM from same directory
+                    let romPath = URL(fileURLWithPath: lastPath).deletingLastPathComponent().appendingPathComponent("lisa_boot.rom").path
+                    if FileManager.default.fileExists(atPath: romPath) {
+                        let romOK = emu_load_rom(romPath)
+                        romLoaded = romOK
+                        log("ROM load (\(romPath)): \(romOK)")
+                    }
+                } else {
+                    log("File is empty, ignoring")
+                    UserDefaults.standard.removeObject(forKey: "lastDiskImage")
+                }
+            } else {
+                log("File doesn't exist, clearing saved path")
+                UserDefaults.standard.removeObject(forKey: "lastDiskImage")
+            }
         }
     }
 
