@@ -353,7 +353,17 @@ void lisa_reset(lisa_t *lisa) {
     lisa->mem.setup_mode = true;  /* ROM visible at address 0 */
     via_reset(&lisa->via1);
     via_reset(&lisa->via2);
+
+    /* Debug: verify ROM is loaded before reset */
+    printf("Reset: setup_mode=%d, rom[0..7]=%02X %02X %02X %02X %02X %02X %02X %02X\n",
+           lisa->mem.setup_mode,
+           lisa->mem.rom[0], lisa->mem.rom[1], lisa->mem.rom[2], lisa->mem.rom[3],
+           lisa->mem.rom[4], lisa->mem.rom[5], lisa->mem.rom[6], lisa->mem.rom[7]);
+
     m68k_reset(&lisa->cpu);
+
+    printf("After reset: PC=$%08X SSP=$%08X\n", lisa->cpu.pc, lisa->cpu.ssp);
+
     lisa->running = true;
     lisa->power_on = true;
     lisa->frame_cycles = 0;

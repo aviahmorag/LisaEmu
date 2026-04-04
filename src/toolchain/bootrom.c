@@ -145,5 +145,11 @@ uint8_t *bootrom_generate(void) {
     emit16(&b, 0x60FC);          /* BRA.S self */
 
     printf("Boot ROM generated: %u bytes used of %u\n", b.pc, ROM_SIZE);
+    /* Verify vectors */
+    uint32_t ssp = ((uint32_t)rom[0]<<24)|((uint32_t)rom[1]<<16)|((uint32_t)rom[2]<<8)|rom[3];
+    uint32_t pc = ((uint32_t)rom[4]<<24)|((uint32_t)rom[5]<<16)|((uint32_t)rom[6]<<8)|rom[7];
+    printf("  Vector 0 (SSP): $%08X\n", ssp);
+    printf("  Vector 1 (PC):  $%08X\n", pc);
+    printf("  First code byte at $0400: $%02X\n", rom[0x400]);
     return rom;
 }
