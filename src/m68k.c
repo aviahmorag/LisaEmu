@@ -508,7 +508,15 @@ static void privilege_violation(m68k_t *cpu) {
     take_exception(cpu, VEC_PRIVILEGE);
 }
 
+static int illegal_opcode_histogram[16] = {0};
+
 static void illegal_instruction(m68k_t *cpu) {
+    /* Track which opcode groups trigger illegal instruction */
+    int group = (cpu->ir >> 12) & 0xF;
+    if (illegal_opcode_histogram[group]++ < 5) {
+        fprintf(stderr, "ILLEGAL: opcode=$%04X group=%X at PC=$%06X\n",
+                cpu->ir, group, cpu->pc - 2);
+    }
     take_exception(cpu, VEC_ILLEGAL_INST);
 }
 
