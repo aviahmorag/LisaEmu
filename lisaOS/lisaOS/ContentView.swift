@@ -3,8 +3,13 @@ import UniformTypeIdentifiers
 
 struct ContentView: View {
     @State private var viewModel = EmulatorViewModel()
-    @State private var showingSourcePicker = false
-    @State private var showingImagePicker = false
+    @State private var showingFilePicker = false
+    @State private var pickerMode: PickerMode = .image
+
+    enum PickerMode {
+        case source  // picking a folder
+        case image   // picking a file
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -38,7 +43,8 @@ struct ContentView: View {
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
                 Button {
-                    showingSourcePicker = true
+                    pickerMode = .source
+                    showingFilePicker = true
                 } label: {
                     Label("Build from Source", systemImage: "hammer")
                 }
@@ -48,7 +54,8 @@ struct ContentView: View {
 
             ToolbarItem(placement: .primaryAction) {
                 Button {
-                    showingImagePicker = true
+                    pickerMode = .image
+                    showingFilePicker = true
                 } label: {
                     Label("Open Image", systemImage: "doc")
                 }
@@ -91,23 +98,24 @@ struct ContentView: View {
             }
         }
         .fileImporter(
-            isPresented: $showingSourcePicker,
-            allowedContentTypes: [.folder]
+            isPresented: $showingFilePicker,
+            allowedContentTypes: pickerMode == .source ? [.folder] : [.data],
+            allowsMultipleSelection: false
         ) { result in
-            if case .success(let url) = result {
-                if viewModel.validateSource(url: url) {
-                    viewModel.buildFromSource(sourceURL: url)
+            switch result {
+            case .success(let urls):
+                guard let url = urls.first else { return }
+                if pickerMode == .source {
+                    if viewModel.validateSource(url: url) {
+                        viewModel.buildFromSource(sourceURL: url)
+                    } else {
+                        viewModel.statusMessage = "Not a valid Lisa_Source folder (expected LISA_OS subdirectory)"
+                    }
                 } else {
-                    viewModel.statusMessage = "Not a valid Lisa_Source folder (expected LISA_OS subdirectory)"
+                    viewModel.openDiskImage(url: url)
                 }
-            }
-        }
-        .fileImporter(
-            isPresented: $showingImagePicker,
-            allowedContentTypes: [.data]
-        ) { result in
-            if case .success(let url) = result {
-                viewModel.openDiskImage(url: url)
+            case .failure(let error):
+                viewModel.statusMessage = "Error: \(error.localizedDescription)"
             }
         }
         .sheet(isPresented: $viewModel.showDebugger) {
