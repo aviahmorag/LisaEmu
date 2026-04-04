@@ -392,7 +392,7 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                     /* Local/param: MOVE.W offset(A6),D0 */
                     int sz = sym->type ? sym->type->size : 2;
                     if (sz == 4) {
-                        emit16(cg, 0x202E);  /* MOVE.L offset(A6),D0 */
+                        emit16(cg, 0x302E);  /* MOVE.W offset(A6),D0 */
                     } else if (sz == 1) {
                         emit16(cg, 0x102E);  /* MOVE.B offset(A6),D0 */
                     } else {
@@ -407,7 +407,7 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                     } else if (sz == 1) {
                         emit16(cg, 0x102D);
                     } else {
-                        emit16(cg, 0x302D);
+                        emit16(cg, 0x302D);  /* MOVE.W offset(A5),D0 */
                     }
                     emit16(cg, (uint16_t)(int16_t)sym->offset);
                 }
@@ -630,15 +630,15 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                     emit16(cg, 0x3080);  /* MOVE.W D0,(A0) */
                 } else if (sym->is_param || !sym->is_global) {
                     int sz = sym->type ? sym->type->size : 2;
-                    if (sz == 4) emit16(cg, 0x2D40);      /* MOVE.L D0,offset(A6) */
-                    else if (sz == 1) emit16(cg, 0x1D40);  /* MOVE.B D0,offset(A6) */
-                    else emit16(cg, 0x3D40);                /* MOVE.W D0,offset(A6) */
+                    if (sz == 4) emit16(cg, 0x2D40);         /* MOVE.L D0,offset(A6) */
+                    else if (sz == 1) emit16(cg, 0x1D40);    /* MOVE.B D0,offset(A6) */
+                    else emit16(cg, 0x3D40);                  /* MOVE.W D0,offset(A6) */
                     emit16(cg, (uint16_t)(int16_t)sym->offset);
                 } else {
                     int sz = sym->type ? sym->type->size : 2;
                     if (sz == 4) emit16(cg, 0x2B40);
                     else if (sz == 1) emit16(cg, 0x1B40);
-                    else emit16(cg, 0x3B40);
+                    else emit16(cg, 0x3B40);  /* MOVE.W D0,offset(A5) */
                     emit16(cg, (uint16_t)(int16_t)sym->offset);
                 }
             } else if (lhs->type == AST_ARRAY_ACCESS || lhs->type == AST_FIELD_ACCESS || lhs->type == AST_DEREF) {
@@ -726,7 +726,7 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
             /* Initialize loop variable */
             gen_expression(cg, node->children[0]);
             if (var) {
-                emit16(cg, 0x3D40);  /* MOVE.W D0,offset(A6) */
+                emit16(cg, 0x2D40);  /* MOVE.L D0,offset(A6) */
                 emit16(cg, (uint16_t)(int16_t)(var ? var->offset : 0));
             }
 
