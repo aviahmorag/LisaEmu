@@ -39,6 +39,40 @@ struct ContentView: View {
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
             .background(Color(nsColor: .controlBackgroundColor))
+
+            // Logs panel
+            if viewModel.showLogs {
+                VStack(alignment: .leading, spacing: 0) {
+                    HStack {
+                        Text("Logs")
+                            .font(.system(size: 11, weight: .semibold))
+                        Spacer()
+                        Button("Copy") {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(viewModel.logText, forType: .string)
+                        }
+                        .controlSize(.small)
+                        Button("Clear") {
+                            viewModel.clearLogs()
+                        }
+                        .controlSize(.small)
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+
+                    ScrollView {
+                        Text(viewModel.logText.isEmpty ? "No logs yet." : viewModel.logText)
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(viewModel.logText.isEmpty ? .secondary : .primary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .textSelection(.enabled)
+                            .padding(8)
+                    }
+                    .frame(height: 150)
+                    .background(Color(nsColor: .textBackgroundColor))
+                }
+                .background(Color(nsColor: .controlBackgroundColor))
+            }
         }
         .toolbar {
             ToolbarItem(placement: .automatic) {
@@ -100,6 +134,16 @@ struct ContentView: View {
                         .labelStyle(.titleAndIcon)
                 }
                 .help("CPU debugger")
+            }
+
+            ToolbarItem(placement: .automatic) {
+                Button {
+                    viewModel.showLogs.toggle()
+                } label: {
+                    Label("Logs", systemImage: "doc.text")
+                        .labelStyle(.titleAndIcon)
+                }
+                .help("Show build and emulation logs")
             }
         }
         .fileImporter(

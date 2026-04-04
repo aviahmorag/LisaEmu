@@ -17,6 +17,10 @@ final class EmulatorViewModel {
     var buildComplete = false
     var builtImagePath: String?
 
+    // Logs
+    var showLogs = false
+    var logText = ""
+
     private var emulatorTimer: Timer?
 
     let screenWidth = Int(emu_screen_width())
@@ -161,11 +165,14 @@ final class EmulatorViewModel {
     func buildFromSource(sourceURL: URL) {
         guard !isBuilding else { return }
         isBuilding = true
+        showLogs = true
         buildProgress = "Starting build..."
         statusMessage = "Building..."
+        log("Build started from: \(sourceURL.path)")
 
         let sourcePath = sourceURL.path
         let outputDir = buildCacheDirectory()
+        log("Output directory: \(outputDir)")
 
         Task.detached {
             let result = toolchain_build(sourcePath, outputDir, nil)
@@ -180,6 +187,8 @@ final class EmulatorViewModel {
                     self.buildComplete = true
                     self.buildProgress = "Built: \(result.files_compiled) compiled, \(result.files_assembled) assembled"
                     self.statusMessage = "Build complete. Power On to boot."
+                    self.log("Build succeeded: \(result.files_compiled) Pascal files compiled, \(result.files_assembled) assembly files assembled, \(result.files_linked) modules linked")
+                    self.log("Disk image: \(imagePath)")
 
                     _ = emu_mount_profile(imagePath)
                     UserDefaults.standard.set(imagePath, forKey: "lastDiskImage")
@@ -190,6 +199,7 @@ final class EmulatorViewModel {
                     }
                     self.buildProgress = "Build failed: \(errMsg)"
                     self.statusMessage = "Build failed"
+                    self.log("Build FAILED: \(errMsg)")
                 }
             }
         }
@@ -225,6 +235,15 @@ final class EmulatorViewModel {
             statusMessage = "Last image: \(name). Power On to boot."
             _ = emu_mount_profile(lastPath)
         }
+    }
+
+    func log(_ message: String) {
+        let timestamp = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
+        logText += "[\(timestamp)] \(message)\n"
+    }
+
+    func clearLogs() {
+        logText = ""
     }
 
     /// Validate a source directory
