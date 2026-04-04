@@ -82,6 +82,11 @@ static bool should_skip_file(const char *name) {
     if (strcasestr(name, "t10menus") != NULL) return true;
     if (strcasestr(name, "T10DBOX") != NULL) return true;
     if (strcasestr(name, "-TABLES.TEXT") != NULL) return true;
+    /* LIBQD include fragments (assembled via DRAWLINE master file) */
+    if (strcasestr(name, "FASTLINE") != NULL) return true;
+    if (strcasestr(name, "LINE2") != NULL) return true;
+    if (strcasestr(name, "GRAFTYPES") != NULL) return true;
+    if (strcasestr(name, "STRETCH") != NULL && strcasestr(name, "libqd") != NULL) return true;
     /* Phrase/resource files, documentation, code generator templates */
     if (strcasestr(name, "PABC") != NULL) return true;
     if (strcasestr(name, "PASGEN") != NULL) return true;
