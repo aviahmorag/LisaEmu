@@ -388,6 +388,7 @@ typedef struct {
     int32_t imm;        /* Immediate value */
     uint16_t regmask;   /* Register mask for MOVEM */
     char expr[256];     /* Raw expression text (for pass 2 resolution) */
+    int ref_sym_idx;    /* Index of .REF symbol if operand references one, -1 otherwise */
 } operand_t;
 
 /* Parse register: Dn or An, returns reg number or -1 */
@@ -443,6 +444,7 @@ static uint16_t parse_reglist(const char *s) {
 
 static bool parse_operand(asm68k_t *as, const char *str, operand_t *op) {
     memset(op, 0, sizeof(operand_t));
+    op->ref_sym_idx = -1;
     strncpy(op->expr, str, sizeof(op->expr) - 1);
 
     char buf[256];
@@ -624,9 +626,16 @@ static bool parse_operand(asm68k_t *as, const char *str, operand_t *op) {
     op->type = OP_ABS_LONG;
     op->disp = eval_expr(as, buf);
 
-    /* Use short if value fits and we know it */
-    if (op->disp >= -32768 && op->disp <= 32767 && as->pass == 2) {
-        /* Keep as long for safety unless explicitly .W */
+    /* Check if this references a .REF (external) symbol — need relocation */
+    {
+        char sym_name[ASM_MAX_LABEL];
+        strncpy(sym_name, buf, ASM_MAX_LABEL - 1);
+        sym_name[ASM_MAX_LABEL - 1] = '\0';
+        str_trim(sym_name);
+        int si = find_symbol(as, sym_name);
+        if (si >= 0 && as->symbols[si].external) {
+            op->ref_sym_idx = si;
+        }
     }
 
     return true;
@@ -671,6 +680,15 @@ static void emit_ea_extension(asm68k_t *as, operand_t *op, int size) {
             emit16(as, (uint16_t)(int16_t)op->disp);
             break;
         case OP_ABS_LONG:
+            /* Record relocation for external (.REF) symbols */
+            if (op->ref_sym_idx >= 0 && as->pass == 2 &&
+                as->num_relocs < ASM_MAX_RELOCS) {
+                asm_reloc_t *r = &as->relocs[as->num_relocs++];
+                r->offset = as->sections[as->current_section].size;
+                r->symbol_idx = op->ref_sym_idx;
+                r->size = 4;
+                r->pc_relative = false;
+            }
             emit32(as, (uint32_t)op->disp);
             break;
         case OP_IMMEDIATE:
