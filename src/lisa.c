@@ -96,6 +96,18 @@ static uint8_t io_read_cb(uint32_t offset) {
         return via_read(&lisa->via2, reg);
     }
 
+    /* Vertical retrace acknowledge — reading clears the IRQ */
+    if (offset >= 0xE018 && offset <= 0xE019) {
+        lisa->mem.vretrace_irq = false;
+        lisa->irq_vretrace = 0;
+        /* Recalculate IRQ level */
+        int level = 0;
+        if (lisa->irq_via1) level = 1;
+        if (lisa->irq_via2) level = 2;
+        m68k_set_irq(&lisa->cpu, level);
+        return lisa->mem.vretrace_irq ? 0x80 : 0x00;
+    }
+
     /* Status register */
     if (offset == 0xF800 || (offset >= 0xF800 && offset < 0xF900)) {
         return lisa->mem.status_reg;
@@ -129,6 +141,40 @@ static void io_write_cb(uint32_t offset, uint8_t val) {
     if (offset >= 0xDD81 && offset < 0xDD9F) {
         uint8_t reg = (offset - 0xDD81) / 2;
         via_write(&lisa->via2, reg, val);
+        return;
+    }
+
+    /* Vertical retrace acknowledge — writing also clears */
+    if (offset >= 0xE018 && offset <= 0xE019) {
+        lisa->mem.vretrace_irq = false;
+        lisa->irq_vretrace = 0;
+        int level = 0;
+        if (lisa->irq_via1) level = 1;
+        if (lisa->irq_via2) level = 2;
+        m68k_set_irq(&lisa->cpu, level);
+        return;
+    }
+
+    /* Contrast latch */
+    if (offset == 0xD01C) {
+        lisa->mem.contrast = val;
+        return;
+    }
+
+    /* Video page latch */
+    if (offset >= 0xE800 && offset < 0xE900) {
+        lisa->mem.video_alt = (val & 1) != 0;
+        lisa->mem.video_addr = lisa->mem.video_alt ? 0x7A000 : 0x78000;
+        return;
+    }
+
+    /* MMU setup mode set/reset */
+    if (offset == 0xE010) {
+        lisa->mem.setup_mode = true;
+        return;
+    }
+    if (offset == 0xE012) {
+        lisa->mem.setup_mode = false;
         return;
     }
 
