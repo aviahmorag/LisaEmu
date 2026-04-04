@@ -34,6 +34,11 @@ static void cops_enqueue(cops_queue_t *q, uint8_t byte) {
     q->queue[q->tail] = byte;
     q->tail = (q->tail + 1) % COPS_QUEUE_SIZE;
     q->count++;
+
+    /* Trigger VIA2 CA1 interrupt when COPS has data */
+    if (g_lisa) {
+        via_trigger_ca1(&g_lisa->via2);
+    }
 }
 
 static uint8_t cops_dequeue(cops_queue_t *q) {
@@ -255,16 +260,32 @@ static void via1_irq(bool state, void *ctx) {
     m68k_set_irq(&lisa->cpu, level);
 }
 
-/* VIA2 port B: COPS interface */
+/* COPS command states */
+#define COPS_IDLE       0
+#define COPS_CMD_RECV   1
+
+/* VIA2 port B: COPS interface
+ *   Bit 0: COPS data available (for interrupt)
+ *   Bit 4: CRDY - COPS ready for command (1=ready, 0=busy)
+ */
 static void via2_portb_write(uint8_t val, uint8_t ddr, void *ctx) {
-    /* COPS reset and control lines */
+    /* COPS reset/control — bit 0 can be used to reset COPS */
+    lisa_t *lisa = (lisa_t *)ctx;
+    if ((ddr & 0x01) && !(val & 0x01)) {
+        /* COPS reset — queue a keyboard ID response */
+        cops_enqueue(&lisa->cops_rx, 0x80);  /* Reset indicator */
+        cops_enqueue(&lisa->cops_rx, 0x2F);  /* Keyboard ID: US layout */
+    }
 }
 
 static uint8_t via2_portb_read(void *ctx) {
     lisa_t *lisa = (lisa_t *)ctx;
     uint8_t val = 0;
 
-    /* COPS data available */
+    /* Bit 4: CRDY — COPS always ready for commands */
+    val |= 0x10;
+
+    /* Bit 0: data available from COPS */
     if (lisa->cops_rx.count > 0)
         val |= 0x01;
 
@@ -272,7 +293,28 @@ static uint8_t via2_portb_read(void *ctx) {
 }
 
 static void via2_porta_write(uint8_t val, uint8_t ddr, void *ctx) {
-    /* Send command to COPS */
+    lisa_t *lisa = (lisa_t *)ctx;
+
+    /* OS is sending a command to COPS */
+    /* Commands: $7C = enable mouse, $01 = read clock, etc. */
+    /* We just acknowledge and don't do anything special for most */
+
+    switch (val) {
+        case 0x7C: /* Enable mouse with 16ms interval */
+            /* Acknowledged — mouse will be sent via cops_rx queue when moved */
+            break;
+        case 0x01: /* Read clock */
+            /* Queue clock response: 5 bytes (year, month/day, hour, min, sec) */
+            cops_enqueue(&lisa->cops_rx, 0xE0 | 0x06);  /* Clock data, year nibble (1986) */
+            cops_enqueue(&lisa->cops_rx, 0x01);  /* Month */
+            cops_enqueue(&lisa->cops_rx, 0x01);  /* Day */
+            cops_enqueue(&lisa->cops_rx, 0x00);  /* Hour */
+            cops_enqueue(&lisa->cops_rx, 0x00);  /* Minute */
+            break;
+        default:
+            /* Unknown command — just ignore */
+            break;
+    }
 }
 
 static uint8_t via2_porta_read(void *ctx) {
@@ -282,7 +324,7 @@ static uint8_t via2_porta_read(void *ctx) {
     if (lisa->cops_rx.count > 0) {
         return cops_dequeue(&lisa->cops_rx);
     }
-    return 0xFF;
+    return 0xFF;  /* No data */
 }
 
 /* VIA2 IRQ -> CPU IRQ level 2 */
@@ -452,6 +494,11 @@ void lisa_reset(lisa_t *lisa) {
     m68k_reset(&lisa->cpu);
 
     printf("After reset: PC=$%08X SSP=$%08X\n", lisa->cpu.pc, lisa->cpu.ssp);
+
+    /* Queue initial COPS data: keyboard ID so OS init can proceed */
+    cops_queue_init(&lisa->cops_rx);
+    cops_enqueue(&lisa->cops_rx, 0x80);  /* Reset/status indicator */
+    cops_enqueue(&lisa->cops_rx, 0x2F);  /* Keyboard ID: US layout */
 
     lisa->running = true;
     lisa->power_on = true;

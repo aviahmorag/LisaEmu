@@ -69,6 +69,8 @@ static bool should_skip_file(const char *name) {
     if (strcasestr(name, "APPENDIX") != NULL) return true;
     if (strcasestr(name, "INSTRUCT") != NULL) return true;
     if (strcasestr(name, "RELEASE") != NULL) return true;
+    /* LIBFP: only NEWFPSUB should be assembled (it includes all others) */
+    if (strcasestr(name, "libfp-") != NULL && !strcasestr(name, "NEWFPSUB")) return true;
     /* Phrase/resource files, documentation, code generator templates */
     if (strcasestr(name, "PABC") != NULL) return true;
     if (strcasestr(name, "PASGEN") != NULL) return true;
