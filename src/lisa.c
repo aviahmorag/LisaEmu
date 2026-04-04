@@ -468,21 +468,52 @@ void lisa_reset(lisa_t *lisa) {
     via_reset(&lisa->via1);
     via_reset(&lisa->via2);
 
-    /* Pre-load boot track from ProFile into RAM at $20000 */
+    /* Pre-load OS from ProFile disk image into RAM.
+     * Read the disk catalog to find system.os, then load all its blocks.
+     * Boot track (blocks 0-23) → RAM at $20000
+     * system.os file data → RAM at $0 (where the linker placed it) */
     if (lisa->profile.mounted && lisa->profile.data) {
+        /* First, load boot track at $20000 */
         uint32_t dest = 0x20000;
-        int blocks_loaded = 0;
+        int boot_blocks = 0;
         for (int blk = 0; blk < BOOT_TRACK_BLOCKS && dest + PROFILE_DATA_SIZE < LISA_RAM_SIZE; blk++) {
             size_t src_offset = (size_t)blk * PROFILE_BLOCK_SIZE;
             if (src_offset + PROFILE_BLOCK_SIZE <= lisa->profile.data_size) {
-                /* Copy only the 512 data bytes, skip 20 tag bytes */
                 memcpy(&lisa->mem.ram[dest], lisa->profile.data + src_offset + PROFILE_TAG_SIZE, PROFILE_DATA_SIZE);
                 dest += PROFILE_DATA_SIZE;
-                blocks_loaded++;
+                boot_blocks++;
             }
         }
-        printf("Pre-loaded %d boot blocks (%d bytes) into RAM at $20000\n",
-               blocks_loaded, blocks_loaded * PROFILE_DATA_SIZE);
+
+        /* Read catalog to find system.os and load it at $0 */
+        uint32_t cat_block = BOOT_TRACK_BLOCKS + 1;  /* Catalog is after MDDF */
+        size_t cat_offset = (size_t)cat_block * PROFILE_BLOCK_SIZE + PROFILE_TAG_SIZE;
+        if (cat_offset + PROFILE_DATA_SIZE <= lisa->profile.data_size) {
+            uint8_t *catalog = lisa->profile.data + cat_offset;
+            /* First entry (offset 0) should be system.os */
+            uint32_t file_size = ((uint32_t)catalog[34] << 24) | ((uint32_t)catalog[35] << 16) |
+                                 ((uint32_t)catalog[36] << 8)  | (uint32_t)catalog[37];
+            uint32_t start_block = ((uint32_t)catalog[38] << 8) | (uint32_t)catalog[39];
+            uint32_t num_blocks = ((uint32_t)catalog[40] << 8) | (uint32_t)catalog[41];
+
+            if (file_size > 0 && start_block > 0) {
+                /* Load system.os at RAM address $0 (where linker expects it) */
+                uint32_t ram_dest = 0;
+                uint32_t loaded = 0;
+                for (uint32_t b = 0; b < num_blocks && ram_dest + PROFILE_DATA_SIZE < LISA_RAM_SIZE; b++) {
+                    size_t blk_offset = (size_t)(start_block + b) * PROFILE_BLOCK_SIZE + PROFILE_TAG_SIZE;
+                    if (blk_offset + PROFILE_DATA_SIZE <= lisa->profile.data_size) {
+                        memcpy(&lisa->mem.ram[ram_dest], lisa->profile.data + blk_offset, PROFILE_DATA_SIZE);
+                        ram_dest += PROFILE_DATA_SIZE;
+                        loaded++;
+                    }
+                }
+                printf("Pre-loaded system.os: %u blocks (%u bytes) at RAM $0, start_block=%u\n",
+                       loaded, loaded * PROFILE_DATA_SIZE, start_block);
+            }
+        }
+
+        printf("Pre-loaded %d boot blocks at RAM $20000\n", boot_blocks);
     }
 
     /* Debug: verify ROM is loaded before reset */
