@@ -226,9 +226,10 @@ static bool compile_pascal_file(const char *path, linker_t *lk) {
         }
     }
 
+    if (is_startup)
+        fprintf(stderr, "STARTUP PARSE: %d errors, lexer at line %d\n",
+                parser.num_errors, parser.lex.line);
     if (parser.num_errors > 0) {
-        if (is_startup)
-            fprintf(stderr, "STARTUP PARSE FAILED: %d errors\n", parser.num_errors);
         parser_free(&parser);
         free(source);
         return false;
@@ -245,6 +246,13 @@ static bool compile_pascal_file(const char *path, linker_t *lk) {
     codegen_generate(cg, ast);
 
     if (is_startup) {
+        /* Count statements in main body */
+        for (int i = 0; i < ast->num_children; i++) {
+            if (ast->children[i]->type == 30) { /* AST_BLOCK */
+                fprintf(stderr, "STARTUP MAIN BODY: %d statements\n",
+                        ast->children[i]->num_children);
+            }
+        }
         fprintf(stderr, "STARTUP CODEGEN: %u bytes code, %d globals, %d relocs\n",
                 cg->code_size, cg->num_globals, cg->num_relocs);
         for (int i = 0; i < cg->num_globals && i < 30; i++) {
