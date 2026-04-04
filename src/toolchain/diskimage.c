@@ -106,12 +106,14 @@ void disk_set_volume_name(disk_builder_t *db, const char *name) {
 bool disk_write_boot_track(disk_builder_t *db, const uint8_t *boot_code, uint32_t size) {
     if (!boot_code || size == 0) return true;
 
-    uint32_t blocks = blocks_needed(size);
-    if (blocks > BOOT_TRACK_BLOCKS) {
-        disk_error(db, "boot code too large (%u bytes, max %u)",
-                  size, BOOT_TRACK_BLOCKS * PROFILE_DATA_SIZE);
-        return false;
+    /* Truncate to boot track capacity if needed */
+    uint32_t max_boot = BOOT_TRACK_BLOCKS * PROFILE_DATA_SIZE;
+    if (size > max_boot) {
+        printf("diskimage: boot code truncated from %u to %u bytes (boot track limit)\n",
+               size, max_boot);
+        size = max_boot;
     }
+    uint32_t blocks = blocks_needed(size);
 
     for (uint32_t b = 0; b < blocks; b++) {
         uint32_t offset = b * PROFILE_DATA_SIZE;

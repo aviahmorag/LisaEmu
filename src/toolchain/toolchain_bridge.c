@@ -345,10 +345,11 @@ build_result_t toolchain_build(const char *source_dir,
     disk_init(db, PROFILE_5MB_BLOCKS);
     disk_set_volume_name(db, "LisaOS");
 
-    /* Add linked output as system.os */
+    /* Add linked output as system.os and write to boot track */
     uint32_t link_size;
     const uint8_t *link_data = linker_get_output(lk, &link_size);
     if (link_data && link_size > 0) {
+        disk_write_boot_track(db, link_data, link_size);
         disk_add_file(db, "system.os", FTYPE_CODE, link_data, link_size);
     }
 
