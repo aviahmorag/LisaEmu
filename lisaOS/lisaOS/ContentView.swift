@@ -7,6 +7,9 @@ struct ContentView: View {
     @State private var showingProfilePicker = false
     @State private var showingFloppyPicker = false
     @State private var showingSourcePicker = false
+    @State private var showingImagePicker = false
+    @State private var showingSavePanel = false
+    @State private var pendingSourceURL: URL?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -36,23 +39,38 @@ struct ContentView: View {
         }
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
-                Button("Load ROM", systemImage: "memorychip") {
-                    showingROMPicker = true
-                }
-                .help("Load Lisa Boot ROM")
+                // Disk image / build options
+                Menu {
+                    Button("Build from Source...", systemImage: "hammer") {
+                        showingSourcePicker = true
+                    }
+                    .help("Compile Lisa OS from Apple's released source code")
 
-                Button("ProFile", systemImage: "externaldrive") {
-                    showingProfilePicker = true
-                }
-                .help("Mount ProFile Hard Disk Image")
+                    Button("Open Disk Image...", systemImage: "opticaldiscdrive") {
+                        showingImagePicker = true
+                    }
+                    .help("Open a previously built Lisa disk image")
 
-                Button("Floppy", systemImage: "opticaldiscdrive") {
-                    showingFloppyPicker = true
+                    Divider()
+
+                    Button("Load ROM...", systemImage: "memorychip") {
+                        showingROMPicker = true
+                    }
+
+                    Button("Mount ProFile...", systemImage: "externaldrive") {
+                        showingProfilePicker = true
+                    }
+
+                    Button("Mount Floppy...", systemImage: "opticaldisc") {
+                        showingFloppyPicker = true
+                    }
+                } label: {
+                    Label("Disk", systemImage: "internaldrive")
                 }
-                .help("Mount Floppy Disk Image")
 
                 Divider()
 
+                // Power / Reset
                 Button(
                     viewModel.isRunning ? "Power Off" : "Power On",
                     systemImage: viewModel.isRunning ? "power.circle.fill" : "power.circle"
@@ -78,23 +96,12 @@ struct ContentView: View {
                 }
                 .help("Toggle CPU debugger")
 
-                Divider()
-
+                // Build status
                 if viewModel.isBuilding {
                     ProgressView()
                         .controlSize(.small)
                     Text(viewModel.buildProgress)
                         .font(.system(size: 10))
-                } else if viewModel.buildComplete {
-                    Image(systemName: "checkmark.circle.fill")
-                        .foregroundStyle(.green)
-                    Text("Built")
-                        .font(.system(size: 10))
-                } else {
-                    Button("Build from Source", systemImage: "hammer") {
-                        showingSourcePicker = true
-                    }
-                    .help("Build Lisa OS from Apple's source code")
                 }
             }
         }
@@ -116,18 +123,47 @@ struct ContentView: View {
         .fileImporter(isPresented: $showingSourcePicker, allowedContentTypes: [.folder]) { result in
             if case .success(let url) = result {
                 if viewModel.validateSource(url: url) {
-                    viewModel.buildFromSource(sourceURL: url)
+                    pendingSourceURL = url
+                    showingSavePanel = true
                 } else {
-                    viewModel.statusMessage = "Invalid source: expected Lisa_Source with LISA_OS subdirectory"
+                    viewModel.statusMessage = "Invalid: expected Lisa_Source folder with LISA_OS subdirectory"
                 }
+            }
+        }
+        .fileImporter(isPresented: $showingImagePicker, allowedContentTypes: [.data]) { result in
+            if case .success(let url) = result {
+                viewModel.openDiskImage(url: url)
+            }
+        }
+        .fileExporter(
+            isPresented: $showingSavePanel,
+            document: DiskImageDocument(),
+            contentType: .data,
+            defaultFilename: "LisaOS.image"
+        ) { result in
+            if case .success(let saveURL) = result, let sourceURL = pendingSourceURL {
+                viewModel.buildFromSource(sourceURL: sourceURL, saveURL: saveURL)
+                pendingSourceURL = nil
             }
         }
         .sheet(isPresented: $viewModel.showDebugger) {
             DebuggerView(viewModel: viewModel)
         }
         .onAppear {
-            viewModel.checkForBuiltImage()
+            viewModel.checkForLastImage()
         }
+    }
+}
+
+/// Empty document for the save panel
+struct DiskImageDocument: FileDocument {
+    static var readableContentTypes: [UTType] { [.data] }
+
+    init() {}
+    init(configuration: ReadConfiguration) throws {}
+
+    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
+        FileWrapper(regularFileWithContents: Data())
     }
 }
 

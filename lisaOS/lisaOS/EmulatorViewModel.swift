@@ -157,46 +157,52 @@ final class EmulatorViewModel {
 
     // MARK: - Build from Source
 
-    /// Check if a previously built disk image exists
-    func checkForBuiltImage() {
-        let cacheDir = buildCacheDirectory()
-        let imagePath = "\(cacheDir)/lisa_profile.image"
-        if FileManager.default.fileExists(atPath: imagePath) {
-            builtImagePath = imagePath
-            buildComplete = true
-            statusMessage = "Built image available. Power On to boot."
-        }
-    }
-
-    /// Build Lisa OS from source
-    func buildFromSource(sourceURL: URL) {
+    /// Build Lisa OS from source and save to user-chosen location
+    func buildFromSource(sourceURL: URL, saveURL: URL) {
         guard !isBuilding else { return }
         isBuilding = true
         buildProgress = "Starting build..."
         statusMessage = "Building..."
 
         let sourcePath = sourceURL.path
-        let outputPath = buildCacheDirectory()
+        let imageName = saveURL.lastPathComponent
 
         Task.detached {
-            let result = toolchain_build(sourcePath, outputPath, nil)
+            // Build to a temp directory, then move to final location
+            let tempDir = NSTemporaryDirectory() + "LisaEmu_build_\(ProcessInfo.processInfo.globallyUniqueString)"
+            try? FileManager.default.createDirectory(atPath: tempDir, withIntermediateDirectories: true)
+
+            let result = toolchain_build(sourcePath, tempDir, nil)
 
             await MainActor.run { [weak self] in
                 guard let self else { return }
                 self.isBuilding = false
-                if result.success {
-                    var path = result.output_path
-                    self.builtImagePath = withUnsafePointer(to: &path) {
-                        $0.withMemoryRebound(to: CChar.self, capacity: 512) { String(cString: $0) }
-                    }
-                    self.buildComplete = true
-                    self.buildProgress = "Build complete: \(result.files_compiled) compiled, \(result.files_assembled) assembled"
-                    self.statusMessage = "Build complete! Power On to boot."
 
-                    // Auto-mount the built disk image
-                    if let path = self.builtImagePath {
-                        _ = emu_mount_profile(path)
+                if result.success {
+                    // Move built image to user's chosen location
+                    let builtPath = "\(tempDir)/lisa_profile.image"
+                    let finalPath = saveURL.path
+                    do {
+                        if FileManager.default.fileExists(atPath: finalPath) {
+                            try FileManager.default.removeItem(atPath: finalPath)
+                        }
+                        try FileManager.default.moveItem(atPath: builtPath, toPath: finalPath)
+                        self.builtImagePath = finalPath
+                        self.buildComplete = true
+                        self.buildProgress = "Built: \(result.files_compiled) compiled, \(result.files_assembled) assembled"
+                        self.statusMessage = "Build saved to \(imageName). Power On to boot."
+
+                        // Auto-mount
+                        _ = emu_mount_profile(finalPath)
+
+                        // Remember last image path
+                        UserDefaults.standard.set(finalPath, forKey: "lastDiskImage")
+                    } catch {
+                        self.buildProgress = "Build succeeded but failed to save: \(error.localizedDescription)"
+                        self.statusMessage = "Save failed"
                     }
+                    // Clean up temp
+                    try? FileManager.default.removeItem(atPath: tempDir)
                 } else {
                     var errBuf = result.error_message
                     let errMsg = withUnsafePointer(to: &errBuf) {
@@ -204,17 +210,35 @@ final class EmulatorViewModel {
                     }
                     self.buildProgress = "Build failed: \(errMsg)"
                     self.statusMessage = "Build failed"
+                    try? FileManager.default.removeItem(atPath: tempDir)
                 }
             }
         }
     }
 
-    /// Return the cache directory for built artifacts
-    private func buildCacheDirectory() -> String {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let cacheDir = appSupport.appendingPathComponent("LisaEmu/build").path
-        try? FileManager.default.createDirectory(atPath: cacheDir, withIntermediateDirectories: true)
-        return cacheDir
+    /// Open a previously built disk image
+    func openDiskImage(url: URL) {
+        let path = url.path
+        if emu_mount_profile(path) {
+            builtImagePath = path
+            buildComplete = true
+            statusMessage = "Disk image loaded: \(url.lastPathComponent). Power On to boot."
+            UserDefaults.standard.set(path, forKey: "lastDiskImage")
+        } else {
+            statusMessage = "Failed to open disk image"
+        }
+    }
+
+    /// Check if a previously used disk image exists
+    func checkForLastImage() {
+        if let lastPath = UserDefaults.standard.string(forKey: "lastDiskImage"),
+           FileManager.default.fileExists(atPath: lastPath) {
+            builtImagePath = lastPath
+            buildComplete = true
+            let name = URL(fileURLWithPath: lastPath).lastPathComponent
+            statusMessage = "Last image: \(name). Power On to boot."
+            _ = emu_mount_profile(lastPath)
+        }
     }
 
     /// Validate a source directory
