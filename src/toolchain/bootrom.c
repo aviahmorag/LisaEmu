@@ -147,11 +147,12 @@ uint8_t *bootrom_generate(void) {
     emit16(&b, 0x0000);
     emit32(&b, 0x00FCE012);
 
-    /* 6. Set A5 — PASCALINIT expects A5 to point into user stack area.
-     * The boot loader sets up 32 bytes of Pascal runtime data below A5.
-     * We point A5 at $14000 (the same area used by the OS). */
+    /* 6. Set A5 and A6 — PASCALINIT expects A5 in user stack area.
+     * A6 must be valid (frame pointer) before STARTUP's LINK A6. */
     emit16(&b, 0x2A7C);          /* MOVEA.L #imm,A5 */
     emit32(&b, 0x00014000);
+    emit16(&b, 0x2C7C);          /* MOVEA.L #imm,A6 */
+    emit32(&b, 0x00079000);      /* A6 = top of stack (valid frame ptr sentinel) */
 
     /* 7. Check boot code at $400 (linker starts code after vector table) */
     emit16(&b, 0x2039);          /* MOVE.L ($400).L,D0 */

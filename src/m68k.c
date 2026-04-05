@@ -2613,30 +2613,44 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             }
         }
 
-        /* Log first few TRAP exceptions with vector table state */
+        /* Log TRAP exceptions with call context */
         static int trap_detail_count = 0;
-        if (trap_detail_count < 5) {
+        if (trap_detail_count < 10) {
             uint16_t opword2 = cpu_read16(cpu, cpu->pc);
             if ((opword2 & 0xFFF0) == 0x4E40) {
                 int vec = opword2 & 0xF;
                 uint32_t vec_addr = (VEC_TRAP_BASE + vec) * 4;
                 uint32_t handler = cpu_read32(cpu, vec_addr);
-                fprintf(stderr, "TRAP #%d at PC=$%06X: vector[$%X]=$%08X  D0=$%08X A0=$%08X A6=$%08X SP=$%08X\n",
-                        vec, cpu->pc, vec_addr, handler, cpu->d[0], cpu->a[0], cpu->a[6], cpu->a[7]);
-                (void)handler; /* suppress unused warning */
-                /* Dump first few TRAP vectors */
-                if (trap_detail_count == 0) {
-                    fprintf(stderr, "  TRAP vector table ($80-$BC):\n");
-                    for (int tv = 0; tv < 16; tv++) {
-                        fprintf(stderr, "    TRAP#%d [$%02X] = $%08X\n",
-                                tv, 0x80 + tv*4, cpu_read32(cpu, 0x80 + tv*4));
+                fprintf(stderr, "TRAP #%d at PC=$%06X: handler=$%08X D0=$%08X A0=$%08X A6=$%08X SP=$%08X\n",
+                        vec, cpu->pc, handler, cpu->d[0], cpu->a[0], cpu->a[6], cpu->a[7]);
+                /* Show last 10 PCs before TRAP */
+                if (trap_detail_count < 3) {
+                    fprintf(stderr, "  Call context (last 10 PCs):\n");
+                    for (int ri = 10; ri > 0; ri--) {
+                        uint32_t rpc = pc_ring[(pc_ring_idx - ri) & 255];
+                        fprintf(stderr, "    PC=$%06X op=$%04X\n", rpc, cpu_read16(cpu, rpc));
                     }
                 }
+                (void)handler;
                 trap_detail_count++;
             }
         }
 
-        /* (TRAP7 tracing removed — handler is working) */
+        /* Trace when A7 goes to 0 or near 0 */
+        static int a7_zero_logged = 0;
+        if (!a7_zero_logged && cpu->a[7] < 0x100 && cpu->pc >= 0x400) {
+            fprintf(stderr, ">>> A7 ZEROED: PC=$%06X A7=$%08X\n", cpu->pc, cpu->a[7]);
+            fprintf(stderr, "  Last 30 PCs:\n");
+            for (int ri = 30; ri > 0; ri--) {
+                uint32_t rpc = pc_ring[(pc_ring_idx - ri) & 255];
+                fprintf(stderr, "    PC=$%06X op=$%04X\n", rpc, cpu_read16(cpu, rpc));
+            }
+            fprintf(stderr, "  D0=$%08X D1=$%08X D2=$%08X D3=$%08X\n",
+                    cpu->d[0], cpu->d[1], cpu->d[2], cpu->d[3]);
+            fprintf(stderr, "  A0=$%08X A1=$%08X A2=$%08X A3=$%08X A4=$%08X A5=$%08X A6=$%08X\n",
+                    cpu->a[0], cpu->a[1], cpu->a[2], cpu->a[3], cpu->a[4], cpu->a[5], cpu->a[6]);
+            a7_zero_logged = 1;
+        }
 
         /* Track highest PC reached in OS code and detect escape from kernel */
         static uint32_t max_os_pc = 0;
