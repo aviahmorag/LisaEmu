@@ -2649,8 +2649,23 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         static bool line_f_logged = false;
         pc_ring[pc_ring_idx++ & 255] = cpu->pc;
 
-        /* Trace POOL_INIT entry */
-        if (cpu->pc == 0xCB178) {
+        /* Trace INITSYS call sequence */
+        {
+            static const struct { uint32_t addr; const char *name; } trace_funcs[] = {
+                {0x4BFE, "INITSYS"}, {0xDB580, "INTSOFF"}, {0x456, "GETLDMAP"},
+                {0xE010A, "REG_TO_MAPPED"}, {0xCB478, "POOL_INIT"},
+                {0xD981C, "INIT_TRAPV"}, {0, NULL}
+            };
+            for (int ti = 0; trace_funcs[ti].name; ti++) {
+                if (cpu->pc == trace_funcs[ti].addr) {
+                    static int init_trace_count = 0;
+                    if (init_trace_count++ < 20)
+                        fprintf(stderr, ">>> INIT: %s at PC=$%06X A5=$%08X SP=$%08X\n",
+                                trace_funcs[ti].name, cpu->pc, cpu->a[5], cpu->a[7]);
+                }
+            }
+        }
+        if (cpu->pc == 0xCB478) {
             static int pool_logged = 0;
             if (pool_logged++ < 2) {
                 fprintf(stderr, "=== POOL_INIT at PC=$%06X A5=$%08X A6=$%08X SP=$%08X\n",
