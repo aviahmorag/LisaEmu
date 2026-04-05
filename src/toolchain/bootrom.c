@@ -126,9 +126,9 @@ uint8_t *bootrom_generate(void) {
     emit16(&b, 0x46FC);          /* MOVE #$2700,SR */
     emit16(&b, 0x2700);
 
-    /* 3. Clear display to white (bit 0 = white on Lisa) */
-    emit16(&b, 0x207C);          /* MOVEA.L #$7A000,A0 */
-    emit32(&b, 0x0007A000);
+    /* 3. Clear display to white — screen at top of 2MB RAM ($1F8000) */
+    emit16(&b, 0x207C);          /* MOVEA.L #$1F8000,A0 */
+    emit32(&b, 0x001F8000);
     emit16(&b, 0x303C);          /* MOVE.W #8189,D0 */
     emit16(&b, 0x1FFD);
     uint32_t clear_loop = b.pc;

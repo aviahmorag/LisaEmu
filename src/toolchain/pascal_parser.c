@@ -1002,7 +1002,7 @@ static ast_node_t *parse_param_list(parser_t *p) {
             }
             strncpy(param->str_val, is_func ? "FUNCPARAM" : "PROCPARAM", sizeof(param->str_val));
             ast_add_child(params, param);
-            if (!match(p, TOK_SEMICOLON)) break;
+            match(p, TOK_SEMICOLON); /* optional after proc/func params */
             continue;
         }
 

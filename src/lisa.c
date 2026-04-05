@@ -174,7 +174,9 @@ static void io_write_cb(uint32_t offset, uint8_t val) {
     /* Video page latch */
     if (offset >= 0xE800 && offset < 0xE900) {
         lisa->mem.video_alt = (val & 1) != 0;
-        lisa->mem.video_addr = lisa->mem.video_alt ? 0x7A000 : 0x78000;
+        lisa->mem.video_addr = lisa->mem.video_alt
+            ? (LISA_RAM_SIZE - 0x8000 + LISA_SCREEN_BYTES)
+            : (LISA_RAM_SIZE - 0x8000);
         return;
     }
 
@@ -602,10 +604,14 @@ void lisa_reset(lisa_t *lisa) {
         } while(0)
 
         /* Screen pointers (from LDEQU) */
-        WRITE32(0x110, 0x0007A000);   /* prom_screen: main screen base */
-        WRITE32(0x160, 0x0007A000);   /* realscreenptr: mapped screen */
-        WRITE32(0x170, 0x00078000);   /* altscreenptr: alternate screen */
-        WRITE32(0x174, 0x0007A000);   /* mainscreenptr: main screen */
+        {
+            uint32_t scr = LISA_RAM_SIZE - 0x8000;  /* $1F8000 */
+            uint32_t alt = scr - 0x8000;            /* $1F0000 */
+            WRITE32(0x110, scr);    /* prom_screen: main screen base */
+            WRITE32(0x160, scr);    /* realscreenptr: mapped screen */
+            WRITE32(0x170, alt);    /* altscreenptr: alternate screen */
+            WRITE32(0x174, scr);    /* mainscreenptr: main screen */
+        }
 
         /* Memory info */
         WRITE32(0x294, LISA_RAM_SIZE); /* prom_memsize: last byte + 1 */
@@ -638,10 +644,11 @@ void lisa_reset(lisa_t *lisa) {
         uint32_t l_superstack = 0x4000;   /* 16KB supervisor stack */
         uint32_t b_sgheap    = b_superstack + l_superstack;
         uint32_t l_sgheap    = 0x8000;    /* 32KB sysglobal heap */
-        uint32_t b_screen    = 0x7A000;   /* Main screen */
+        /* Screen at top of 2MB RAM, like real Lisa */
         uint32_t l_screen    = 0x8000;    /* 32KB screen buffer */
-        uint32_t b_dbscreen  = 0x72000;   /* Debugger screen */
         uint32_t l_dbscreen  = 0x8000;
+        uint32_t b_screen    = LISA_RAM_SIZE - l_screen;  /* $1F8000 */
+        uint32_t b_dbscreen  = b_screen - l_dbscreen;     /* $1F0000 */
         uint32_t b_syslocal  = b_sgheap + l_sgheap;
         uint32_t l_syslocal  = 0x4000;    /* 16KB syslocal */
         uint32_t b_opustack  = b_syslocal + l_syslocal;
@@ -974,6 +981,14 @@ int lisa_run_frame(lisa_t *lisa) {
         fprintf(stderr, "  VIA2: t1_run=%d t1_cnt=%d t1_latch=%d ier=$%02X ifr=$%02X\n",
                 lisa->via2.t1_running, lisa->via2.t1_counter, lisa->via2.t1_latch,
                 lisa->via2.ier, lisa->via2.ifr);
+        /* Check screen content */
+        {
+            uint32_t saddr = lisa->mem.video_addr;
+            int nz = 0;
+            for (int i = 0; i < LISA_SCREEN_BYTES && saddr + i < LISA_RAM_SIZE; i++)
+                if (lisa->mem.ram[saddr + i] != 0x00) nz++;
+            fprintf(stderr, "  Screen @$%06X: %d/%d non-zero\n", saddr, nz, LISA_SCREEN_BYTES);
+        }
         /* Check key exception vectors in RAM */
         uint32_t trap1_vec = ((uint32_t)lisa->mem.ram[0x84] << 24) |
                              ((uint32_t)lisa->mem.ram[0x85] << 16) |
