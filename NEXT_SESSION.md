@@ -3,77 +3,42 @@
 ## Quick Commands
 
 ```bash
-make audit              # Full toolchain report (all 4 stages)
-make audit-linker       # Just linker stage (fastest)
-make                    # Build SDL2 standalone emulator
+make audit              # Full toolchain report
+make audit-linker       # Just linker (fastest)
 ```
 
-## Toolchain Status: 96.9% JSR Resolution
+## MAJOR MILESTONE: OS kernel boots and executes real code!
 
-```
-Modules:     436 (338 Pascal + 98 Assembly)
-Symbols:     10,823
-JSR analysis:
-  Total:     33,602
-  Real code: 32,575 (96.9%)
-  Stub:         837 (2.5%)
-  Other:        190
+The CPU now:
+1. ROM → $400 (STARTUP) ✅
+2. STARTUP → INITSYS ✅  
+3. INITSYS runs, calls INTSOFF, processes data ✅
+4. Hits TRAP #1 at $04DCB4 — first OS system call! ✅
+5. Crashes because TRAP vectors not installed yet ❌
 
-Stub detail: 108 relocations, 39 unique symbols — all truly missing or intractable
-```
+system.os is 331KB (was 2.8MB), fits in 1MB RAM.
 
-## Phase 2: Runtime Correctness (NEXT)
+## Next: Fix TRAP vector installation
 
-The toolchain produces a ~2.7 MB linked binary. The emulator needs to:
+INITSYS calls INIT_TRAPV to install proper exception vectors. Either:
+- INIT_TRAPV isn't being called before the first TRAP
+- INIT_TRAPV runs but writes wrong values
+- The codegen for INIT_TRAPV call is wrong
 
-### Boot sequence to verify
-1. **ROM** → jumps to $400 (STARTUP entry)
-2. **STARTUP** → calls PASCALINIT (runtime init)
-3. **PASCALINIT** → sets up A5 (globals), A6 (frame), stack
-4. **INITSYS** → OS initialization, memory setup
-5. **INIT_TRAPV** → installs TRAP exception vectors
-6. **ENTER_SCHEDULER** → starts the process scheduler
-7. **Desktop** → eventually renders display at $7A000
+Check: does INITSYS call INIT_TRAPV before calling INTSOFF?
+The STARTUP source calls INIT_TRAPV(b_sysglobal_ptr) early in INITSYS.
+b_sysglobal_ptr is a SYSGLOBAL variable — needs correct A5-relative offset.
 
-### Known runtime issues from previous sessions
-- TRAP vectors write wrong values ($08000000 instead of handler addresses)
-  - Root cause: b_sysglobal_ptr is a cross-unit variable resolved to 0
-  - The shared globals mechanism should now provide it (needs verification)
-- VIA timers tick but are never loaded by OS code
-- Display shows artifacts but nothing recognizable
-- STOP instruction halts CPU waiting for interrupts that never arrive
+## Session Summary
 
-### What to do
-1. Rebuild the emulator with current toolchain (`make` or Xcode)
-2. Run and capture boot log (first 1M cycles)
-3. Check if TRAP vectors are now correct
-4. Trace execution path: does it reach INITSYS? ENTER_SCHEDULER?
-5. If stuck, identify the exact instruction/address where it fails
+### Critical fixes this session:
+1. **CONST resolution in STRING[n]** — e_name was 1.6GB instead of 33 bytes
+2. **Module index fix after STARTUP swap** — ALL cross-module calls had wrong addresses
+3. **Kernel separation** — only 46 kernel modules linked into system.os (was ALL 428)
+4. **PC ring buffer trace** — catches any Line-F crash with last 20 PCs
 
-## Toolchain Fixes Applied (this session, 20+ commits)
-
-Key infrastructure:
-- `make audit` — unified diagnostic tool for all 4 stages
-- `{$I filename}` include directive in lexer
-- `{$SETC}` AND/OR/NOT boolean expressions
-- Shared types + shared globals across compilation units
-- File sorting: units before fragments
-
-Key linker fixes:
-- .PROC/.FUNC exported without .DEF
-- .REF→.PROC/.DEF flag upgrade (cleared external flag)
-- Strict exact-match for symbol add (8-char prefix was destroying 915 symbols)
-- Clascal method suffix matching
-- Name mapping table: InClass→%_InObCN, HALT→%_HALT, FP→%f_*, math→%_SIN etc.
-
-Key codegen fixes:
-- Type casts as inline (not JSR) + shared type table
-- LogCall/LogSeg as no-op
-- SUBCLASS types registered
-- Procedure parameter indirect calls via JSR (A0)
-- EOF/EOLN as intrinsics
-
-Key skip list fixes:
-- MENUS.TEXT/DBOX.TEXT removed (caught real source)
-- LIBFP content-based asm/Pascal split
-- libqd-STRETCH.TEXT restored (standalone, not include fragment)
+### Toolchain metrics:
+- Parser: 99.5% real code
+- Assembler: 100%
+- Linker: 97.2% JSR resolution
+- system.os: 331KB (fits in 1MB RAM)
