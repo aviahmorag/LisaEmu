@@ -725,8 +725,13 @@ void lisa_reset(lisa_t *lisa) {
         /* esysgloboff (offset 28 from param_block) points to end of sysglobal.
          * PASCALINIT uses this to set up A5 relocation. */
 
-        printf("Loader params: param_block=$800-%X, os_end=$%X, sysglobal=$%X-%X\n",
-               p, os_end, b_sysglobal, b_sysglobal + l_sysglobal);
+        printf("Loader params: param_block=$%X-%X, os_end=$%X, sysglobal=$%X-%X\n",
+               p, version_addr, os_end, b_sysglobal, b_sysglobal + l_sysglobal);
+        /* Verify RAM at $4EC matches linker output */
+        printf("RAM at $4E8-$4FF: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X\n",
+               lisa->mem.ram[0x4E8], lisa->mem.ram[0x4E9], lisa->mem.ram[0x4EA], lisa->mem.ram[0x4EB],
+               lisa->mem.ram[0x4EC], lisa->mem.ram[0x4ED], lisa->mem.ram[0x4EE], lisa->mem.ram[0x4EF],
+               lisa->mem.ram[0x4F0], lisa->mem.ram[0x4F1], lisa->mem.ram[0x4F2], lisa->mem.ram[0x4F3]);
 
         #undef WRITE32
         #undef WRITE16

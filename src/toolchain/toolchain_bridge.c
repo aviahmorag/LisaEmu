@@ -379,6 +379,17 @@ static bool compile_pascal_file(const char *path, linker_t *lk) {
     codegen_generate(cg, ast);
 
     if (is_startup) {
+        /* Dump bytes around offset $EC to debug odd BRA target */
+        fprintf(stderr, "STARTUP bytes at $E8-$FF: ");
+        for (uint32_t i = 0xE8; i < 0x100 && i < cg->code_size; i++)
+            fprintf(stderr, "%02X ", cg->code[i]);
+        fprintf(stderr, "\n");
+        /* Check for relocations near offset $EC */
+        for (int ri = 0; ri < cg->num_relocs; ri++) {
+            if (cg->relocs[ri].offset >= 0xE8 && cg->relocs[ri].offset <= 0xF4)
+                fprintf(stderr, "  RELOC at $%X: sym='%s' size=%d\n",
+                        cg->relocs[ri].offset, cg->relocs[ri].symbol, cg->relocs[ri].size);
+        }
         /* Count statements in main body */
         for (int i = 0; i < ast->num_children; i++) {
             if (ast->children[i]->type == 30) { /* AST_BLOCK */

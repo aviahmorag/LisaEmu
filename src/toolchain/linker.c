@@ -703,6 +703,13 @@ bool linker_link(linker_t *lk) {
     }
     fprintf(stderr, "Linker: %d symbols total (%d entries, %d externs), %d resolved, %d unresolved\n",
             lk->num_symbols, entries, externs, resolved, unresolved);
+    /* Dump output bytes at $4EC to verify BRA displacement */
+    if (lk->output_size > 0x500) {
+        fprintf(stderr, "Linker output at $4E8-$4FF: ");
+        for (uint32_t i = 0x4E8; i < 0x500; i++)
+            fprintf(stderr, "%02X ", lk->output[i]);
+        fprintf(stderr, "\n");
+    }
     /* Find nearest symbol to the escape address $4AF14 */
     {
         uint32_t target = 0x4AF14;

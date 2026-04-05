@@ -64,7 +64,9 @@ static void emit32(codegen_t *cg, uint32_t val) {
 
 /* Ensure code is word-aligned (68000 requires even PC for instructions) */
 static void align_code(codegen_t *cg) {
-    if (cg->code_size & 1) emit16(cg, 0x4E71);  /* NOP */
+    if (cg->code_size & 1) {
+        emit8(cg, 0);  /* Single pad byte to make even */
+    }
 }
 
 /* Patch a 16-bit value at a given offset */
@@ -1517,6 +1519,8 @@ static void gen_proc_or_func(codegen_t *cg, ast_node_t *node) {
     if (entry) entry->offset = (int)cg->code_size;
 
     /* LINK A6,#-frame_size */
+    if (strcasestr(cg->current_file, "STARTUP") && strcasestr(node->name, "INITSYS"))
+        fprintf(stderr, "  INITSYS LINK: frame_size=%d at offset %u\n", frame_size, cg->code_size);
     emit16(cg, 0x4E56);
     emit16(cg, (uint16_t)(int16_t)(-frame_size));
 

@@ -2660,6 +2660,19 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             }
         }
 
+        /* Detect odd PC — should never happen on 68000 */
+        static int odd_pc_logged = 0;
+        if (!odd_pc_logged && (cpu->pc & 1) && cpu->pc >= 0x400 && cpu->pc < 0x100000) {
+            fprintf(stderr, ">>> ODD PC: $%06X! Last 30 PCs:\n", cpu->pc);
+            for (int ri = 30; ri > 0; ri--) {
+                uint32_t rpc = pc_ring[(pc_ring_idx - ri) & 255];
+                fprintf(stderr, "    PC=$%06X op=$%04X\n", rpc, cpu_read16(cpu, rpc));
+            }
+            fprintf(stderr, "  D0=$%08X A0=$%08X A5=$%08X A6=$%08X SP=$%08X SR=$%04X\n",
+                    cpu->d[0], cpu->a[0], cpu->a[5], cpu->a[6], cpu->a[7], cpu->sr);
+            odd_pc_logged = 1;
+        }
+
         /* Trace GETLDMAP — check case selector value */
         static int getldmap_logged = 0;
         if (!getldmap_logged && cpu->pc == 0x45A) {
