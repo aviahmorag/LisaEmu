@@ -141,6 +141,9 @@ typedef struct {
     /* Current segment name */
     char segment[64];
 
+    /* Global data area size (A5-relative offsets for this module) */
+    uint32_t global_data_size;
+
     /* Label counter for internal labels */
     int label_counter;
 

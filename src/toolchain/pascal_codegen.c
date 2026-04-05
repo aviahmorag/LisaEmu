@@ -240,6 +240,8 @@ static void push_scope(codegen_t *cg) {
         cg->scopes[cg->scope_depth].num_locals = 0;
         cg->scopes[cg->scope_depth].frame_size = 0;
         cg->scope_depth++;
+    } else {
+                cg->scope_depth, cg->current_file);
     }
 }
 
@@ -422,9 +424,10 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                     /* Local/param: size-aware load from stack frame */
                     int sz = sym->type ? sym->type->size : 2;
                     if (strcasestr(cg->current_file, "STARTUP") && sz == 4) {
-                        fprintf(stderr, "  CODEGEN: MOVE.L %s offset=%d sz=%d type=%s\n",
+                        fprintf(stderr, "  CODEGEN: MOVE.L %s offset=%d sz=%d type=%s global=%d param=%d\n",
                                 sym->name, sym->offset, sz,
-                                sym->type ? sym->type->name : "null");
+                                sym->type ? sym->type->name : "null",
+                                sym->is_global, sym->is_param);
                     }
                     if (sz == 4) {
                         emit16(cg, 0x202E);  /* MOVE.L offset(A6),D0 */
@@ -1238,7 +1241,9 @@ static void process_var_decl(codegen_t *cg, ast_node_t *node, bool is_global) {
         if (is_global) {
             cg_symbol_t *s = add_global_sym(cg, tok, type);
             if (s) {
-                /* Assign global offset (grow from A5) */
+                /* Assign global offset (grow from A5).
+                 * Uses a process-wide counter because all Lisa Pascal units
+                 * share the same A5-relative global data area. */
                 static int global_offset = 0;
                 if (sz >= 2 && (global_offset % 2)) global_offset++;
                 s->offset = global_offset;
@@ -1250,7 +1255,11 @@ static void process_var_decl(codegen_t *cg, ast_node_t *node, bool is_global) {
                 if (sz >= 2 && (sc->frame_size % 2)) sc->frame_size++;
                 sc->frame_size += sz;
                 cg_symbol_t *s = add_local(cg, tok, type, false, false);
-                if (s) s->offset = -(int)sc->frame_size;
+                if (s) {
+                    s->offset = -(int)sc->frame_size;
+                    if (strcasestr(cg->current_file, "STARTUP") && sc->frame_size > 10000)
+                                tok, s->offset, sc->frame_size, sz, cg->scope_depth);
+                }
             }
         }
         tok = strtok(NULL, ",");
@@ -1309,6 +1318,10 @@ static void gen_proc_or_func(codegen_t *cg, ast_node_t *node) {
     if (entry) entry->offset = (int)cg->code_size;
 
     push_scope(cg);
+    if (strcasestr(cg->current_file, "STARTUP"))
+        fprintf(stderr, "  SCOPE PUSH: %s depth=%d frame_size=%d\n",
+                node->name, cg->scope_depth,
+                cg->scope_depth > 0 ? cg->scopes[cg->scope_depth-1].frame_size : -1);
 
     /* Process parameters */
     int param_offset = 8; /* After saved A6 and return address */
@@ -1332,8 +1345,12 @@ static void gen_proc_or_func(codegen_t *cg, ast_node_t *node) {
     /* Process local declarations */
     for (int i = 0; i < node->num_children; i++) {
         ast_node_t *child = node->children[i];
-        if (child->type == AST_VAR_DECL)
+        if (child->type == AST_VAR_DECL) {
+            if (strcasestr(cg->current_file, "STARTUP") &&
+                strcasestr(node->name, "INITSYS"))
+                fprintf(stderr, "  LOCAL VAR: %s in %s\n", child->name, node->name);
             process_var_decl(cg, child, false);
+        }
     }
 
     /* Generate code for nested procedures/functions FIRST.
