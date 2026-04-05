@@ -2649,6 +2649,22 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         static bool line_f_logged = false;
         pc_ring[pc_ring_idx++ & 255] = cpu->pc;
 
+        /* Trace POOL_INIT entry */
+        if (cpu->pc == 0xCB178) {
+            static int pool_logged = 0;
+            if (pool_logged++ < 2) {
+                fprintf(stderr, "=== POOL_INIT at PC=$%06X A5=$%08X A6=$%08X SP=$%08X\n",
+                        cpu->pc, cpu->a[5], cpu->a[6], cpu->a[7]);
+                /* Parameters are on stack (after return address) */
+                fprintf(stderr, "  params: mb_sysglob=$%08X l_sysglob=$%08X mb_sgheap=$%08X l_sgheap=$%08X mb_sysloc=$%08X l_sysloc=$%08X\n",
+                        cpu_read32(cpu, cpu->a[7]+4),
+                        cpu_read32(cpu, cpu->a[7]+8),
+                        cpu_read32(cpu, cpu->a[7]+12),
+                        cpu_read32(cpu, cpu->a[7]+16),
+                        cpu_read32(cpu, cpu->a[7]+20),
+                        cpu_read32(cpu, cpu->a[7]+24));
+            }
+        }
         /* Monitor A5 for corruption */
         {
             static uint32_t last_a5 = 0;

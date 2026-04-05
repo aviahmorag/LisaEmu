@@ -1017,18 +1017,42 @@ static ast_node_t *parse_param_list(parser_t *p) {
         bool is_var = match(p, TOK_VAR);
         if (is_var) strncpy(param->str_val, "VAR", sizeof(param->str_val));
 
-        /* Parameter name(s) */
-        strncpy(param->name, CUR(p).str_val, sizeof(param->name) - 1);
-        advance(p);
-        while (match(p, TOK_COMMA)) {
-            strncat(param->name, ",", sizeof(param->name) - strlen(param->name) - 1);
-            strncat(param->name, CUR(p).str_val, sizeof(param->name) - strlen(param->name) - 1);
+        /* Parameter name(s) — "a, b, c: type" creates separate params.
+         * Collect names, parse type, then expand into individual params. */
+        {
+            char all_names[64][64];
+            int name_count = 0;
+            strncpy(all_names[name_count++], CUR(p).str_val, 63);
             advance(p);
-        }
+            while (match(p, TOK_COMMA) && name_count < 64) {
+                strncpy(all_names[name_count++], CUR(p).str_val, 63);
+                advance(p);
+            }
 
-        expect(p, TOK_COLON);
-        ast_add_child(param, parse_type(p));
-        ast_add_child(params, param);
+            expect(p, TOK_COLON);
+            ast_node_t *type_node = parse_type(p);
+
+            /* First param reuses the already-allocated 'param' node */
+            strncpy(param->name, all_names[0], sizeof(param->name) - 1);
+            ast_add_child(param, type_node);
+            ast_add_child(params, param);
+
+            /* Additional params get new nodes with a TYPE_IDENT referencing
+             * the same type by name. Can't share the type_node (double-free). */
+            for (int ni = 1; ni < name_count; ni++) {
+                ast_node_t *extra = ast_new(AST_PARAM, p->lex.line);
+                strncpy(extra->name, all_names[ni], sizeof(extra->name) - 1);
+                if (is_var) strncpy(extra->str_val, "VAR", sizeof(extra->str_val));
+                /* Create a reference to the same type */
+                ast_node_t *tref = ast_new(type_node->type, p->lex.line);
+                *tref = *type_node;  /* shallow copy */
+                tref->children = NULL;  /* don't share children */
+                tref->num_children = 0;
+                tref->children_capacity = 0;
+                ast_add_child(extra, tref);
+                ast_add_child(params, extra);
+            }
+        }
 
         if (!match(p, TOK_SEMICOLON)) break;
     }
