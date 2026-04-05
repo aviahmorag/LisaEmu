@@ -282,6 +282,18 @@ static bool is_kernel_module(const char *path) {
         /* OS library files needed for boot */
         "source-PASCALDEFS.", "source-POSLIB.", "source-oslib.",
         "source-parms.",
+        /* LIBPL — Pascal runtime (needed by ALL Pascal code) */
+        "libpl-", "LIBPL-",
+        /* LIBFP — Floating point (SANE) */
+        "libfp-", "LIBFP-",
+        /* LIBOS — OS interface (syscalls) */
+        "libos-", "LIBOS-",
+        /* LIBHW — Hardware interface */
+        "libhw-", "LIBHW-", "LibHW-",
+        /* LIBSM — Storage manager (heap zones) */
+        "LIBSM-", "libsm-",
+        /* LIBPM — Parameter RAM */
+        "LibPM-", "libpm-",
         NULL
     };
     for (int i = 0; kernel_names[i]; i++) {

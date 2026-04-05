@@ -960,22 +960,10 @@ int lisa_run_frame(lisa_t *lisa) {
     /* Debug: log CPU/VIA/vector state once after significant execution */
     static int frame_count = 0;
     frame_count++;
-    /* Force-unmask interrupts after OS reaches scheduler. */
-    if (frame_count == 30 && (lisa->cpu.sr & 0x0700) == 0x0700 &&
-        lisa->cpu.pc >= 0x400 && lisa->cpu.pc < 0x6B000) {
-        lisa->cpu.sr = (lisa->cpu.sr & ~0x0700);
-    }
-    /* Override Line-F vector to ROM skip handler instead of SYSTEM_ERROR.
-     * The OS installs LINE1111_TRAP which calls system_error for any
-     * Line-F in system code. Since we can't load the SANE FP library,
-     * redirect to the ROM handler that skips the instruction. */
-    if (frame_count == 31) {
-        uint32_t rom_linef = 0x00FE0310;  /* ROM skip handler */
-        lisa->mem.ram[0x2C] = (rom_linef >> 24) & 0xFF;
-        lisa->mem.ram[0x2D] = (rom_linef >> 16) & 0xFF;
-        lisa->mem.ram[0x2E] = (rom_linef >> 8) & 0xFF;
-        lisa->mem.ram[0x2F] = rom_linef & 0xFF;
-    }
+    /* The OS reaches its scheduler loop with interrupts masked ($2700).
+     * INTSON(0) should fire during BOOT_IO_INIT case 4 (ProFile), but
+     * the init chain may not complete fully. For now, leave interrupts
+     * as-is — the OS runs its init loop without interrupts. */
     if ((frame_count >= 120 && frame_count <= 900 && (frame_count % 120) == 0) || frame_count == 60) {
         fprintf(stderr, "DIAG frame %d: PC=$%06X SR=$%04X stopped=%d pending_irq=%d setup=%d\n",
                 frame_count, lisa->cpu.pc, lisa->cpu.sr, lisa->cpu.stopped,
