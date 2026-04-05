@@ -435,6 +435,31 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
             break;
 
         case AST_IDENT_EXPR: {
+            /* Check if this identifier is a zero-argument function call.
+             * In Pascal, `PASCALINIT` without parens calls the function. */
+            cg_proc_sig_t *ident_sig = find_proc_sig(cg, node->name);
+            if (ident_sig && ident_sig->num_params == 0) {
+                /* Zero-arg function call.
+                 * For external (assembly) functions: push space for return value
+                 * on stack before JSR. Assembly function puts result there.
+                 * For Pascal functions: result comes back in D0. */
+                if (ident_sig->is_external) {
+                    emit16(cg, 0x2F00);  /* MOVE.L D0,-(SP) — reserve space for result */
+                }
+                emit16(cg, 0x4EB9);  /* JSR abs.L */
+                emit32(cg, 0);       /* Placeholder — will be relocated */
+                if (cg->num_relocs < CODEGEN_MAX_RELOCS) {
+                    cg_reloc_t *r = &cg->relocs[cg->num_relocs++];
+                    r->offset = cg->code_size - 4;
+                    strncpy(r->symbol, node->name, sizeof(r->symbol) - 1);
+                    r->size = 4;
+                    r->pc_relative = false;
+                }
+                if (ident_sig->is_external) {
+                    emit16(cg, 0x201F);  /* MOVE.L (SP)+,D0 — pop result */
+                }
+                break;
+            }
             cg_symbol_t *sym = find_symbol_any(cg, node->name);
             if (sym) {
                 if (sym->is_const) {

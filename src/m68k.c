@@ -2593,17 +2593,17 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             break;
         }
 
-        /* PC ring buffer — trace any Line-F crash */
-        static uint32_t pc_ring[32];
+        /* PC ring buffer — trace crashes and escapes */
+        static uint32_t pc_ring[256];
         static int pc_ring_idx = 0;
         static bool line_f_logged = false;
-        pc_ring[pc_ring_idx++ & 31] = cpu->pc;
+        pc_ring[pc_ring_idx++ & 255] = cpu->pc;
         {
             uint16_t opword = cpu_read16(cpu, cpu->pc);
             if (!line_f_logged && (opword & 0xF000) == 0xF000 && cpu->pc >= 0x400 && cpu->pc < 0x300000) {
                 fprintf(stderr, "=== LINE-F TRACE: PC=$%06X opcode=$%04X. Last 20 PCs:\n", cpu->pc, opword);
                 for (int ri = 20; ri > 0; ri--) {
-                    uint32_t rpc = pc_ring[(pc_ring_idx - ri) & 31];
+                    uint32_t rpc = pc_ring[(pc_ring_idx - ri) & 255];
                     uint16_t rop = cpu_read16(cpu, rpc);
                     fprintf(stderr, "  PC=$%06X opcode=$%04X\n", rpc, rop);
                 }
@@ -2638,10 +2638,37 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
 
         /* (TRAP7 tracing removed — handler is working) */
 
-        /* Track highest PC reached in OS code */
+        /* Track highest PC reached in OS code and detect escape from kernel */
         static uint32_t max_os_pc = 0;
+        static int escape_logged = 0;
         if (cpu->pc >= 0x400 && cpu->pc < 0x100000 && cpu->pc > max_os_pc)
             max_os_pc = cpu->pc;
+        /* Track transition: last PC in valid kernel code, first PC past it */
+        static uint32_t last_valid_pc = 0;
+        static uint16_t last_valid_op = 0;
+        if (cpu->pc >= 0x400 && cpu->pc < 0x53000) {
+            last_valid_pc = cpu->pc;
+            last_valid_op = cpu_read16(cpu, cpu->pc);
+        }
+        /* Detect when PC leaves kernel binary (end ~$53000, includes PASCALINIT etc.) */
+        if (!escape_logged && cpu->pc >= 0x53000 && cpu->pc < 0x200000) {
+            fprintf(stderr, ">>> KERNEL ESCAPE: PC=$%06X (past kernel end ~$52000)\n", cpu->pc);
+            fprintf(stderr, "  Last valid PC: $%06X opcode=$%04X\n", last_valid_pc, last_valid_op);
+            fprintf(stderr, "  Last 100 PCs:\n");
+            for (int ri = 100; ri > 0; ri--) {
+                uint32_t rpc = pc_ring[(pc_ring_idx - ri) & 255];
+                uint16_t rop = cpu_read16(cpu, rpc);
+                fprintf(stderr, "  PC=$%06X opcode=$%04X%s\n", rpc, rop,
+                        (rpc >= 0x52000) ? " <<<" : "");
+            }
+            fprintf(stderr, "  D0=$%08X D1=$%08X D2=$%08X D3=$%08X\n",
+                    cpu->d[0], cpu->d[1], cpu->d[2], cpu->d[3]);
+            fprintf(stderr, "  A0=$%08X A1=$%08X A2=$%08X A3=$%08X\n",
+                    cpu->a[0], cpu->a[1], cpu->a[2], cpu->a[3]);
+            fprintf(stderr, "  A4=$%08X A5=$%08X A6=$%08X SP=$%08X SR=$%04X\n",
+                    cpu->a[4], cpu->a[5], cpu->a[6], cpu->a[7], cpu->sr);
+            escape_logged = 1;
+        }
 
         /* Log when PC enters vector table after being in OS code */
         static uint32_t prev_pc = 0;

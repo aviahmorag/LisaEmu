@@ -518,6 +518,7 @@ void lisa_reset(lisa_t *lisa) {
      * Read the disk catalog to find system.os, then load all its blocks.
      * Boot track (blocks 0-23) → RAM at $20000
      * system.os file data → RAM at $0 (where the linker placed it) */
+    uint32_t os_loaded_bytes = 0;
     if (lisa->profile.mounted && lisa->profile.data) {
         /* First, load boot track at $20000 */
         uint32_t dest = 0x20000;
@@ -554,8 +555,9 @@ void lisa_reset(lisa_t *lisa) {
                         loaded++;
                     }
                 }
+                os_loaded_bytes = loaded * PROFILE_DATA_SIZE;
                 printf("Pre-loaded system.os: %u blocks (%u bytes) at RAM $0, start_block=%u\n",
-                       loaded, loaded * PROFILE_DATA_SIZE, start_block);
+                       loaded, os_loaded_bytes, start_block);
             }
         }
 
@@ -600,29 +602,128 @@ void lisa_reset(lisa_t *lisa) {
         WRITE32(0x2A4, 0x00000000);   /* prom_byte0: physical byte 0 */
         WRITE32(0x2A8, LISA_RAM_SIZE); /* prom_realsize: amount of memory */
 
-        /* Loader database — create a minimal parameter block at $800.
-         * PASCALINIT reads adrparamptr ($218) to find it. */
-        uint32_t param_block = 0x800;
-        WRITE32(0x218, param_block);  /* adrparamptr */
-        WRITE32(0x21C, 0x00020000);   /* ldbaseptr: loader base */
-        WRITE16(0x210, BOOT_TRACK_BLOCKS + 1); /* ld_fs_block0: MDDF block */
-        WRITE16(0x22E, 1);            /* dev_type: profile */
+        /* Loader parameter block — OS reads this via PASCALINIT/GETLDMAP.
+         * Layout from source-parms.text: version, then base/length pairs
+         * for each memory region, then miscellaneous loader state.
+         * GETLDMAP copies these into INITSYS local variables. */
+        uint32_t os_end = os_loaded_bytes + 0x400; /* End of OS code */
+        if (os_end & 0xFFF) os_end = (os_end + 0xFFF) & ~0xFFF; /* Page-align */
 
-        /* Parameter block at $800: loader version, global size, etc.
-         * The loader stores its memory map variables here.
-         * esysgloboff = 28 — offset to end-of-sysglobal pointer */
-        uint32_t sysglobal_base = 0x4000;  /* Place sysglobal at $4000 */
-        uint32_t sysglobal_end  = sysglobal_base + 0x10000; /* 64KB for globals */
-        WRITE32(param_block + 28, sysglobal_end); /* esysglobal */
+        /* Memory layout for 1MB Lisa:
+         * $000000-$0003FF: Vector table
+         * $000400-os_end:  OS code (system.os)
+         * os_end-$054000:  System jump table + sysglobal
+         * $054000-$064000: Sysglobal heap (64KB)
+         * $064000-$068000: Supervisor stack (16KB)
+         * $068000-$070000: Syslocal (32KB)
+         * $070000-$078000: User stack for outer process
+         * $078000-$07A000: Screen data area
+         * $07A000-$0FF800: Screen buffer + free memory
+         * $0FF800-$100000: Top of RAM */
+        uint32_t b_sysjt     = os_end;
+        uint32_t l_sysjt     = 0x1000;    /* 4KB jump table */
+        uint32_t b_sysglobal = b_sysjt + l_sysjt;
+        uint32_t l_sysglobal = 0x6000;    /* 24KB sysglobal */
+        uint32_t b_superstack = b_sysglobal + l_sysglobal;
+        uint32_t l_superstack = 0x4000;   /* 16KB supervisor stack */
+        uint32_t b_sgheap    = b_superstack + l_superstack;
+        uint32_t l_sgheap    = 0x8000;    /* 32KB sysglobal heap */
+        uint32_t b_screen    = 0x7A000;   /* Main screen */
+        uint32_t l_screen    = 0x8000;    /* 32KB screen buffer */
+        uint32_t b_dbscreen  = 0x72000;   /* Debugger screen */
+        uint32_t l_dbscreen  = 0x8000;
+        uint32_t b_syslocal  = b_sgheap + l_sgheap;
+        uint32_t l_syslocal  = 0x4000;    /* 16KB syslocal */
+        uint32_t b_opustack  = b_syslocal + l_syslocal;
+        uint32_t l_opustack  = 0x4000;    /* 16KB user stack */
+        uint32_t b_scrdata   = b_opustack + l_opustack;
+        uint32_t l_scrdata   = 0x2000;    /* 8KB screen data */
+        uint32_t b_vmbuffer  = b_scrdata + l_scrdata;
+        uint32_t l_vmbuffer  = 0x4000;    /* 16KB VM buffer */
+        uint32_t b_drivers   = b_vmbuffer + l_vmbuffer;
+        uint32_t l_drivers   = 0x2000;    /* 8KB driver data */
+        uint32_t lomem       = b_drivers + l_drivers;
+        uint32_t himem       = 0x0FF800;
 
-        /* Set up A5 initial value — points into sysglobal with 32 bytes of
-         * initial data below it (PASCALINIT copies these from the user stack). */
-        /* The boot ROM needs to set A5 before jumping to OS code.
-         * We'll set it in the CPU state after reset. */
-        uint32_t initial_a5 = sysglobal_end;
+        /* Build parameter block — Lisa Pascal lays out variables DOWNWARD.
+         * GETLDMAP copies word-by-word, decrementing both pointers.
+         * adrparamptr points to `version` (highest address in block).
+         * Subsequent fields are at DECREASING addresses below version.
+         *
+         * We place version at $A00 and write fields downward from there. */
+        uint32_t version_addr = 0xA00;
+        WRITE16(version_addr, 22);  /* version = 22 */
 
-        printf("Loader params: adrparamptr=$%X, sysglobal=$%X-$%X, A5=$%X\n",
-               param_block, sysglobal_base, sysglobal_end, initial_a5);
+        /* Write fields downward: p starts just below version, decreases */
+        uint32_t p = version_addr;
+        #define W32D(val) do { p -= 4; WRITE32(p, (val)); } while(0)
+        #define W16D(val) do { p -= 2; WRITE16(p, (val)); } while(0)
+
+        W32D(b_sysjt);       /* b_sysjt */
+        W32D(l_sysjt);       /* l_sysjt */
+        W32D(b_sysglobal);   /* b_sys_global */
+        W32D(l_sysglobal);   /* l_sys_global */
+        W32D(b_superstack);  /* b_superstack */
+        W32D(l_superstack);  /* l_superstack */
+        W32D(b_sysglobal + l_sysglobal); /* b_intrin_ptrs */
+        W32D(0x1000);        /* l_intrin_ptrs */
+        W32D(b_sgheap);      /* b_sgheap */
+        W32D(l_sgheap);      /* l_sgheap */
+        W32D(b_screen);      /* b_screen */
+        W32D(l_screen);      /* l_screen */
+        W32D(b_dbscreen);    /* b_db_screen */
+        W32D(l_dbscreen);    /* l_db_screen */
+        W32D(b_syslocal);    /* b_opsyslocal */
+        W32D(l_syslocal);    /* l_opsyslocal */
+        W32D(b_opustack);    /* b_opustack */
+        W32D(l_opustack);    /* l_opustack */
+        W32D(b_scrdata);     /* b_scrdata */
+        W32D(l_scrdata);     /* l_scrdata */
+        W32D(b_vmbuffer);    /* b_vmbuffer */
+        W32D(l_vmbuffer);    /* l_vmbuffer */
+        W32D(b_drivers);     /* b_drivers */
+        W32D(l_drivers);     /* l_drivers */
+        W32D(himem);         /* himem */
+        W32D(lomem);         /* lomem */
+        W32D(LISA_RAM_SIZE); /* l_physicalmem */
+        W16D(24);            /* fs_block0 */
+        W16D(0);             /* debugmode = false */
+        W32D(0x280);         /* smt_base */
+        W16D(1);             /* os_segs = 1 */
+        W32D(0);             /* ld_sernum */
+        /* b_oscode[1..32] */
+        for (int seg = 1; seg <= 32; seg++)
+            W32D((seg == 1) ? 0x400 : 0);
+        /* l_oscode[1..32] */
+        for (int seg = 1; seg <= 32; seg++)
+            W32D((seg == 1) ? (os_end - 0x400) : 0);
+        /* swappedin[1..32] */
+        for (int seg = 1; seg <= 32; seg++)
+            W16D((seg == 1) ? 1 : 0);
+        W32D(0);             /* b_debugseg */
+        W32D(0);             /* l_debugseg */
+        W32D(0);             /* unpktaddr */
+        W16D(0);             /* have_lisabug = false */
+        W16D(0);             /* two_screens = false */
+        W32D(b_sysglobal + 32); /* ldr_A5 */
+        W32D(lomem);         /* toplomem */
+        W32D(himem);         /* bothimem */
+        W16D(0xFFFF);        /* parmend sentinel */
+
+        #undef W32D
+        #undef W16D
+
+        /* Low-memory pointers for PASCALINIT */
+        WRITE32(0x218, version_addr);  /* adrparamptr → version */
+        WRITE32(0x21C, 0x00020000); /* ldbaseptr: loader base */
+        WRITE16(0x210, 24);        /* ld_fs_block0 */
+        WRITE16(0x22E, 1);         /* dev_type: profile */
+
+        /* esysgloboff (offset 28 from param_block) points to end of sysglobal.
+         * PASCALINIT uses this to set up A5 relocation. */
+
+        printf("Loader params: param_block=$800-%X, os_end=$%X, sysglobal=$%X-%X\n",
+               p, os_end, b_sysglobal, b_sysglobal + l_sysglobal);
 
         #undef WRITE32
         #undef WRITE16
