@@ -118,9 +118,19 @@ static uint8_t io_read_cb(uint32_t offset) {
         return lisa->mem.contrast;
     }
 
+    /* I/O board type register ($FCC031) — determines Lisa model.
+     * For Lisa 2/10 (Pepsi with ProFile): return < -96 (signed) */
+    if (offset == 0xC031) {
+        return 0x80;  /* -128 signed → enters Pepsi branch */
+    }
+
+    /* Internal disk type register ($FCC015) — 0=twiggy, nonzero=Sony/ProFile */
+    if (offset == 0xC015) {
+        return 0x01;  /* Non-zero → iob_pepsi (not iob_twiggy) */
+    }
+
     /* Disk controller shared memory */
     if (offset < 0x2000) {
-        /* Disk shared memory area - return data from floppy controller */
         return 0;
     }
 
@@ -950,13 +960,13 @@ int lisa_run_frame(lisa_t *lisa) {
     /* Debug: log CPU/VIA/vector state once after significant execution */
     static int frame_count = 0;
     frame_count++;
-    /* If CPU has interrupts fully masked and is in OS code,
-     * lower the mask to allow vretrace and VIA interrupts through.
-     * The OS should have called INTSON but may not have reached it. */
+    /* Force-unmask interrupts after OS reaches scheduler.
+     * The OS should call INTSON during BOOT_IO_INIT but doesn't
+     * reach it yet due to incomplete init chain. This lets the
+     * scheduler drive the OS forward. */
     if (frame_count == 30 && (lisa->cpu.sr & 0x0700) == 0x0700 &&
         lisa->cpu.pc >= 0x400 && lisa->cpu.pc < 0x6B000) {
-        lisa->cpu.sr = (lisa->cpu.sr & ~0x0700);  /* Lower to level 0 — allow all */
-        fprintf(stderr, "MMU: Force-lowered interrupt mask to level 2 at frame %d\n", frame_count);
+        lisa->cpu.sr = (lisa->cpu.sr & ~0x0700);
     }
     if (frame_count == 120) {
         /* Dump code around the stuck PC */
