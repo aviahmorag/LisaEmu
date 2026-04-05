@@ -933,7 +933,14 @@ static void parse_const_section(parser_t *p, ast_node_t *parent) {
         advance(p);
         expect(p, TOK_EQ);
         ast_add_child(n, parse_expression(p));
-        expect(p, TOK_SEMICOLON);
+        /* Semicolon optional before section keywords (Lisa Pascal quirk) */
+        if (!match(p, TOK_SEMICOLON)) {
+            if (!(check(p, TOK_PROCEDURE) || check(p, TOK_FUNCTION) ||
+                  check(p, TOK_VAR) || check(p, TOK_TYPE) || check(p, TOK_CONST) ||
+                  check(p, TOK_BEGIN) || check(p, TOK_IMPLEMENTATION))) {
+                expect(p, TOK_SEMICOLON);
+            }
+        }
         ast_add_child(parent, n);
     }
 }
