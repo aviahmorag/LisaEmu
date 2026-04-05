@@ -487,9 +487,12 @@ bool linker_link(linker_t *lk) {
 
     /* Phase 4: Build output — modules are placed starting at $400.
      * Output buffer must be large enough for base_addr + code. */
-    uint32_t stub_addr = current_addr;  /* After all modules (includes $400 base) */
-    if (stub_addr & 1) stub_addr++;
-    uint32_t total_size = stub_addr + 4;  /* Room for CLR.L D0 + RTS */
+    /* Place stub at $3F0 (unused vector table area) instead of after code.
+     * The end-of-code area gets overwritten by OS init (sysglobal, etc.),
+     * but the vector table area at $0-$3FF is preserved. */
+    uint32_t stub_addr = 0x3F0;
+    uint32_t total_size = current_addr;
+    if (total_size & 1) total_size++;
 
     lk->output = malloc(total_size);
     if (!lk->output) {
@@ -501,7 +504,8 @@ bool linker_link(linker_t *lk) {
 
     memset(lk->output, 0, total_size);
 
-    /* Write stub: CLR.L D0; RTS — returns 0 for any unresolved function */
+    /* Write stub at $3F0: CLR.L D0; RTS — returns 0 for any unresolved function.
+     * This is in the vector table area (vectors 252-253, unused by Lisa). */
     lk->output[stub_addr]     = 0x42; /* CLR.L D0 = $4280 */
     lk->output[stub_addr + 1] = 0x80;
     lk->output[stub_addr + 2] = 0x4E; /* RTS = $4E75 */
