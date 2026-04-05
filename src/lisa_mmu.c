@@ -83,7 +83,7 @@ static void mmu_reg_write(lisa_mem_t *mem, uint32_t addr, uint16_t data) {
     }
 
     static int mmu_write_count = 0;
-    if (mmu_write_count < 50) {
+    if (mmu_write_count < 30) {
         fprintf(stderr, "MMU REG: ctx=%d seg=%d %s=$%03X (addr=$%06X)\n",
                 context, seg, (addr & 8) ? "SOR" : "SLR", data, addr);
         mmu_write_count++;
@@ -102,9 +102,9 @@ static uint32_t mmu_translate(lisa_mem_t *mem, uint32_t addr) {
 
     mmu_segment_t *s = &mem->segments[ctx][seg];
 
-    /* Check if segment has been configured (SOR or SLR written) */
-    if (s->sor == 0 && s->slr == 0) {
-        /* Unconfigured segment — pass through for now */
+    /* Check if segment has been configured (written via MMU registers) */
+    if (s->changed == 0) {
+        /* Unconfigured segment — pass through */
         return addr;
     }
 

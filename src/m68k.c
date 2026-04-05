@@ -2648,6 +2648,16 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         static int pc_ring_idx = 0;
         static bool line_f_logged = false;
         pc_ring[pc_ring_idx++ & 255] = cpu->pc;
+
+        /* Log calls to stub ($3F0) — shows which functions are missing */
+        if (cpu->pc == 0x3F0) {
+            static int stub_call_count = 0;
+            if (stub_call_count < 20) {
+                uint32_t caller = cpu_read32(cpu, cpu->a[7]); /* return addr on stack */
+                fprintf(stderr, "STUB CALL from $%06X (call #%d)\n", caller - 6, ++stub_call_count);
+            }
+        }
+
         {
             uint16_t opword = cpu_read16(cpu, cpu->pc);
             if (!line_f_logged && (opword & 0xF000) == 0xF000 && cpu->pc >= 0x400 && cpu->pc < 0x300000) {
