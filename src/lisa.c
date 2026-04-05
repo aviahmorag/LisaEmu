@@ -719,7 +719,21 @@ void lisa_reset(lisa_t *lisa) {
         /* Low-memory pointers for PASCALINIT */
         WRITE32(0x218, version_addr);  /* adrparamptr → version */
         WRITE32(0x21C, 0x00020000); /* ldbaseptr: loader base */
-        WRITE16(0x210, 24);        /* ld_fs_block0 */
+        /* DRIVRJT ($210) — Driver Jump Table pointer.
+         * The OS reads this 32-bit pointer and calls through it.
+         * Point to a block of RTS instructions in unused vector table area.
+         * Each entry is 4 bytes (just RTS, returns cleanly). */
+        {
+            uint32_t djt_base = 0x300;  /* Put driver JT at $300 in vector table */
+            for (int j = 0; j < 32; j++) {
+                /* Each entry: RTS ($4E75) padded to 4 bytes */
+                lisa->mem.ram[djt_base + j * 4]     = 0x4E;
+                lisa->mem.ram[djt_base + j * 4 + 1] = 0x75;
+                lisa->mem.ram[djt_base + j * 4 + 2] = 0x4E;
+                lisa->mem.ram[djt_base + j * 4 + 3] = 0x71; /* NOP */
+            }
+            WRITE32(0x210, djt_base);
+        }
         WRITE16(0x22E, 1);         /* dev_type: profile */
 
         /* esysgloboff (offset 28 from param_block) points to end of sysglobal.

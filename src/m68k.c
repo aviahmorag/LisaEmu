@@ -2657,15 +2657,38 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 fprintf(stderr, "STUB CALL from $%06X (call #%d)\n", caller - 6, ++stub_call_count);
             }
         }
-        /* Trace first escape past loaded OS code ($6A000) */
+        /* Trace first escape past loaded OS code ($6B000) */
         {
             static bool code_escape_logged = false;
-            if (!code_escape_logged && cpu->pc >= 0x6A000 && cpu->pc < 0xFC0000) {
-                fprintf(stderr, "=== CODE ESCAPE: PC=$%06X SP=$%08X A6=$%08X. Last 30 PCs:\n",
+            if (!code_escape_logged && cpu->pc >= 0x6B000 && cpu->pc < 0xFC0000) {
+                fprintf(stderr, "=== CODE ESCAPE: PC=$%06X SP=$%08X A6=$%08X\n",
                         cpu->pc, cpu->a[7], cpu->a[6]);
-                for (int ri = 30; ri > 0; ri--) {
+                fprintf(stderr, "  A0=$%08X A1=$%08X D0=$%08X D1=$%08X\n",
+                        cpu->a[0], cpu->a[1], cpu->d[0], cpu->d[1]);
+                fprintf(stderr, "  Last 10 PCs:\n");
+                for (int ri = 10; ri > 0; ri--) {
                     uint32_t rpc = pc_ring[(pc_ring_idx - ri) & 255];
-                    fprintf(stderr, "    PC=$%06X op=$%04X\n", rpc, cpu_read16(cpu, rpc));
+                    uint16_t rop = cpu_read16(cpu, rpc);
+                    fprintf(stderr, "    PC=$%06X op=$%04X", rpc, rop);
+                    /* Decode JSR/JMP targets */
+                    if (rop == 0x4EB9 || rop == 0x4EF9) {
+                        uint32_t tgt = cpu_read32(cpu, rpc + 2);
+                        fprintf(stderr, " → $%06X", tgt);
+                    }
+                    /* Decode MOVEA.L (abs),An */
+                    if ((rop & 0xF1FF) == 0x2079) {
+                        uint32_t addr = cpu_read32(cpu, rpc + 2);
+                        uint32_t val = cpu_read32(cpu, addr);
+                        fprintf(stderr, " MOVEA.L ($%06X),A%d [=$%08X]", addr, (rop >> 9) & 7, val);
+                    }
+                    /* Decode JMP d16(A0) */
+                    if ((rop & 0xFFF8) == 0x4EE8) {
+                        int16_t disp = (int16_t)cpu_read16(cpu, rpc + 2);
+                        fprintf(stderr, " JMP %d(A%d) [A%d=$%08X → $%06X]",
+                                disp, rop & 7, rop & 7, cpu->a[rop & 7],
+                                cpu->a[rop & 7] + disp);
+                    }
+                    fprintf(stderr, "\n");
                 }
                 code_escape_logged = true;
             }
