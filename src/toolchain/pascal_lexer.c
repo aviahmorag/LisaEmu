@@ -416,8 +416,10 @@ static bool lexer_handle_directive(lexer_t *lex, const char *dir) {
             }
             inc_path[pi] = '\0';
             if (inc_path[0]) {
-                lexer_push_include(lex, inc_path);
-                /* Silently skip if file not found — some includes are optional */
+                if (!lexer_push_include(lex, inc_path)) {
+                    fprintf(stderr, "  {$I} FAIL: '%s' from %s:%d\n",
+                            inc_path, lex->filename, lex->line);
+                }
             }
         }
         return true;

@@ -63,6 +63,26 @@ static int find_global_symbol(linker_t *lk, const char *name) {
                 return i;
         }
     }
+    /* Lisa Pascal compiler intrinsic name mappings.
+     * The compiler emits human-readable names but the runtime uses
+     * mangled %_ prefixed names. */
+    static const struct { const char *from; const char *to; } name_map[] = {
+        {"InClass",   "%_InObCN"},
+        {"HALT",      "%_HALT"},
+        {"WRITELN",   "%_WriteLn"},
+        {"READLN",    "%_ReadLn"},
+        {"NEW",       "%_New"},
+        {"DISPOSE",   "%_Dispose"},
+        {NULL, NULL}
+    };
+    for (int m = 0; name_map[m].from; m++) {
+        if (strcasecmp(name, name_map[m].from) == 0) {
+            int mapped = find_global_symbol(lk, name_map[m].to);
+            if (mapped >= 0 && lk->symbols[mapped].type == LSYM_ENTRY)
+                return mapped;
+        }
+    }
+
     /* Clascal method match: "AddImage" → "TDialogImage.AddImage"
      * When a method call uses just the method name, try to find an ENTRY
      * whose name ends with ".MethodName" */
