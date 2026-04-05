@@ -213,17 +213,9 @@ final class EmulatorViewModel {
                     self.statusMessage = "Build complete! Choose where to save the image."
                     self.log("Build succeeded. Image at: \(imagePath)")
 
-                    // Load the generated ROM
-                    if FileManager.default.fileExists(atPath: romPath) {
-                        if emu_load_rom(romPath) {
-                            self.romLoaded = true
-                            self.log("Boot ROM loaded: \(romPath)")
-                        } else {
-                            self.log("Failed to load boot ROM")
-                        }
-                    }
-
-                    _ = emu_mount_profile(imagePath)
+                    // Store ROM path for later loading when image is opened
+                    self.builtRomPath = romPath
+                    self.log("Build complete. Save the image and open it to boot.")
                     onSuccess()
                 } else {
                     var errBuf = result.error_message
