@@ -307,6 +307,21 @@ static void audit_codegen(source_file_t *files, int num_files) {
             if (cg->types[t2].name[0]) \
                 shared_types[num_shared_types++] = cg->types[t2]; \
         } \
+        /* Log files with unresolved relocations to stderr */ \
+        if (cg->num_relocs > 0) { \
+            int unres = 0; \
+            for (int r2 = 0; r2 < cg->num_relocs; r2++) { \
+                bool found2 = false; \
+                for (int g2 = 0; g2 < cg->num_globals; g2++) { \
+                    if (strcasecmp(cg->globals[g2].name, cg->relocs[r2].symbol) == 0) \
+                        { found2 = true; break; } \
+                } \
+                if (!found2) unres++; \
+            } \
+            if (unres > 5) \
+                fprintf(stderr, "  CODEGEN: %s — %u bytes, %d globals, %d relocs (%d unresolved)\n", \
+                        basename_of(files[idx].path), cg->code_size, cg->num_globals, cg->num_relocs, unres); \
+        } \
         codegen_free(cg); free(cg); parser_free(&p); free(src); \
     } while(0)
 

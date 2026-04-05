@@ -819,16 +819,23 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
 
             /* Type cast: TYPE_NAME(expr) — identity operation in Lisa Pascal.
              * Also handle common built-in type names that may not be in our type table. */
+            /* Type cast: TYPE_NAME(expr) — identity operation in Lisa Pascal.
+             * Check type table first, then explicit built-in names. */
             if (find_type(cg, fn) != NULL ||
                 str_eq_nocase(fn, "LONGINT") || str_eq_nocase(fn, "INTEGER") ||
                 str_eq_nocase(fn, "BOOLEAN") || str_eq_nocase(fn, "CHAR") ||
-                str_eq_nocase(fn, "BYTE") ||
-                /* Common pointer/handle type aliases used as casts */
+                str_eq_nocase(fn, "BYTE") || str_eq_nocase(fn, "REAL") ||
                 str_eq_nocase(fn, "Ptr") || str_eq_nocase(fn, "Handle") ||
                 str_eq_nocase(fn, "WordPtr") || str_eq_nocase(fn, "WindowPtr") ||
                 str_eq_nocase(fn, "PicHandle") || str_eq_nocase(fn, "FuncHandle") ||
                 str_eq_nocase(fn, "TpInteger") || str_eq_nocase(fn, "TpLONGINT") ||
-                str_eq_nocase(fn, "QDPtr") || str_eq_nocase(fn, "GrafPtr")) {
+                str_eq_nocase(fn, "QDPtr") || str_eq_nocase(fn, "GrafPtr") ||
+                str_eq_nocase(fn, "ThByte") || str_eq_nocase(fn, "TXLRect") ||
+                str_eq_nocase(fn, "TOffsets") || str_eq_nocase(fn, "TPMouseEvent") ||
+                str_eq_nocase(fn, "TGraphView") ||
+                str_eq_nocase(fn, "TUTCollection") || str_eq_nocase(fn, "TUTArray") ||
+                str_eq_nocase(fn, "TUTString") || str_eq_nocase(fn, "TUnivText") ||
+                str_eq_nocase(fn, "TReadUnivText") || str_eq_nocase(fn, "TWriteUnivText")) {
                 /* Type cast = evaluate the argument, result stays in D0 */
                 if (node->num_children > 0)
                     gen_expression(cg, node->children[0]);
