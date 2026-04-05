@@ -5,112 +5,108 @@
 ```bash
 make                        # Build standalone emulator
 build/lisaemu Lisa_Source   # Run from source directory (builds + boots)
-make audit                  # Full toolchain report
 ```
 
-## Current State: OS boots, screen draws, scheduler runs 250 frames
+## Current State
 
-The Lisa OS boots through INITSYS, writes to the full screen buffer
-(32760/32760 bytes non-zero), and runs its scheduler for ~250 display
-frames before cascade failure from stack corruption.
+The Lisa OS cross-compiles from source and boots through INITSYS with
+zero SYSTEM_ERROR calls. The OS runs stably at PC=$0D9242 for 480+ frames.
+One zero-divide exception at the end. Screen buffer is blank (OS hasn't
+reached display code yet — needs ProFile disk I/O to complete FS_INIT).
 
-### Runtime output:
 ```
-MMU: pre-programmed sysglobmmu(102), realmemmmu(85-100), kernelmmu(17-20)
-SGLOBAL@$200=$0006B000 (correctly initialized)
-Screen: 32760 non-zero bytes of 32760 (full screen written!)
-DIAG frame 120: PC=$019044 SR=$2100 stopped=0 pending_irq=0
-Exception counts: v4=1 v11=12527 (cascade from stack corruption)
-Linker: 1949 resolved, 6677 unresolved (2742 unique)
+Linker: 8701 symbols, 3106 kernel-resolved, 5595 non-kernel (correct)
+Kernel: 46 OS modules + LIBPL + LIBHW + LIBFP + LIBOS (matching real Lisa)
+DIAG: PC=$0D9242 SR=$2218 stopped=0 — stable, no crashes
+Exceptions: 1 zero-divide (non-fatal)
+Screen: blank — init chain blocked before display drawing code
+ProFile: zero disk reads — OS hasn't reached FS_INIT disk I/O yet
 ```
 
-### How the boot works:
-1. Boot ROM: sets SP/A5/A6/SR, programs 16 MMU identity segments, exits setup
-2. JMP $400 → STARTUP → PASCALINIT → INITSYS
-3. INITSYS: INTSOFF → GETLDMAP → REG_TO_MAPPED → POOL_INIT → INIT_TRAPV
-4. → DB_INIT → AVAIL_INIT → INIT_PROCESS → INIT_EM → INIT_SCTAB
-5. → BOOT_IO_INIT (identifies Lisa 2/10 Pepsi, ProFile boot)
-6. → INTSON(0) → FS_INIT → scheduler loop
-7. Force-unmask interrupts → vretrace drives scheduler → active OS code
-8. OS writes to screen → runs 250 frames → stack corruption → cascade
+## Session 3 Summary (40 commits)
 
-## Session 3 Fixes (22 commits)
+### Critical bugs fixed:
+1. **Multi-parameter parsing** — `(a, b, c: type)` created 1 param named "a,b,c"
+   instead of 3 separate params. Affected EVERY multi-param function. POOL_INIT
+   got 1 param instead of 6 → SYSTEM_ERROR(610) "no space". FIXED.
+2. **FOR loop MOVE.L→MOVE.W** — 4-byte write into 2-byte slot corrupted saved A6.
+   Caused cascade failure after 260 frames. FIXED.
+3. **Linker non-kernel symbol collision** — non-kernel module symbols at base_addr=0
+   resolved to addresses inside kernel code. Root cause of original A6 corruption. FIXED.
+4. **LIBHW directory skip** — should_skip_dir("LIBHW") always returned true because
+   it checked if "LIBHW" contains "LIBS" (it doesn't). 74 COPS symbols missing. FIXED.
 
-### Linker (4 fixes):
-- Non-kernel symbol collision (root cause of original A6 corruption)
-- Symbol pre-resolution bug in add_global_symbol
-- Stub moved to $3F0 (vector table, safe from OS overwrite)
-- TRAP #6 vector installed for MMU programming
-
-### Codegen (2 fixes):
-- VAR param nested scope in 3 code paths
+### Other fixes:
+- Symbol pre-resolution in add_global_symbol (resolved=true set too early)
+- Stub moved from end-of-code to $3F0 (safe from OS overwrite)
+- VAR param nested scope in 3 codegen paths
 - Cross-library {$I} include search across all LIBS/ subdirs
+- MATHLIB proc-param semicolon tolerance
+- CONST section semicolon tolerance (Lisa Pascal quirk)
+- Array bounds default to 64 for unresolved CONST
+- Screen buffer moved to $1F8000 (top of 2MB RAM)
+- All screen pointers updated ($110/$160/$170/$174)
+- I/O board type ($FCC031=$80=Pepsi Lisa 2)
+- Internal disk type ($FCC015=1=Sony/ProFile)
+- Boot device ($1B3=2=ProFile)
+- SGLOBAL at $200 = b_sysglobal
+- DRIVRJT at $210 = 32-entry driver jump table
+- MMU: 5 contexts, register writes, identity mapping + OS segments
+- Boot ROM: 16 identity segments + I/O + ROM before setup exit
+- TRAP #6 vector installed for MMU programming
+- Vretrace interrupt at level 2
 
-### MMU (5 fixes):
-- 5 contexts with segment1/segment2 control
-- Context latches at $FCE008-$FCE00E
-- SOR/SLR register writes at $8000+seg*$20000
-- Boot ROM identity mapping (16 RAM + I/O + ROM segments)
-- Pre-programmed OS segments (102, 103, 104, 105, 85-100, 17-20)
+### Architecture (matching real Lisa from LisaSourceCompilation):
+- Kernel = 46 OS modules from SOURCE/ + HWINTL (from ALEX-LINK-SYSTEMOS.TEXT)
+- Runtime libs: LIBPL, LIBHW, LIBFP, LIBOS (normally loaded as IOSPASLIB etc.)
+- UI libs (LIBWM, LIBTK, LIBQD, etc.) = non-kernel (would be intrinsic libs on disk)
+- Apps = non-kernel (separate files on disk)
 
-### Boot environment (6 fixes):
-- SGLOBAL at $200 = b_sysglobal address
-- DRIVRJT at $210 = driver jump table (32 RTS entries)
-- I/O board type ($FCC031 = $80 = Pepsi/Lisa 2)
-- Internal disk type ($FCC015 = 1 = Sony/ProFile)
-- 15+ kernel modules added (MM1-4, FSINIT, etc.)
-- Source patch script (scripts/patch_source.sh)
+## What's Blocking: ProFile Disk I/O
 
-## Cascade Failure Root Cause
+The OS init chain goes: INITSYS → ... → BOOT_IO_INIT → INIT_BOOT_CDS → ProFile
+driver init. The ProFile driver does a VIA1 handshake to initialize the disk.
 
-At frame ~260, a FOR loop in compiled OS code writes to array elements
-via `MOVE.W D0,(A0)` where A0 is computed from uninitialized data.
-The write overflows into the stack frame, corrupting the saved A6.
-Subsequent UNLK restores garbage A6, RTS returns to garbage address.
+From the FS_INIT research agent, three issues remain:
 
-The uninitialized data comes from stubbed functions returning 0.
-**Fix: resolve more symbols** to prevent uninitialized data structures.
+### 1. ProFile VIA handshake protocol
+The real ProFile protocol (SOURCE-PROFILEASM.TEXT) is a multi-step VIA handshake:
+- Set CMD via ORB, wait for BSY on CA1 interrupt
+- Send $55 response, wait for not-busy
+- Send 6 command bytes on ORA
+- Read 4 status bytes + 20-byte header + 512 data bytes
 
-## Immediate Task: Increase Resolved Symbols
+Our emulator uses a simplified command-buffer approach that doesn't match this
+protocol. The OS driver will time out or get wrong responses.
 
-### Most impactful targets:
-1. **POOL_INIT / GETSPACE** — memory allocation. If these don't work,
-   ALL data structures are garbage. Check if they resolve correctly.
-2. **INIT_TRAPV** — installs real trap vectors. Without it, exception
-   handlers may be wrong.
-3. **Functions in the boot critical path** (lines 2146-2184 of STARTUP):
-   INTSOFF, GETLDMAP, REG_TO_MAPPED, INIT_PE, POOL_INIT, INIT_TRAPV,
-   DB_INIT, AVAIL_INIT, INIT_PROCESS, INIT_EM, INIT_EC, INIT_SCTAB,
-   BOOT_IO_INIT, SYS_PROC_INIT
+### 2. MDDF format
+Our disk image's MDDF may have wrong filesystem version. The OS checks fsversion
+against REL1_VERSION, PEPSI_VERSION, or CUR_VERSION.
 
-### Strategy:
-- Check which of these functions resolve to real code vs stub
-- For those going to stub, find what module defines them
-- Add missing modules to kernel list or fix compilation
+### 3. After disk I/O works
+FS_INIT → FS_Mount → read MDDF → mount filesystem → SYS_PROC_INIT → create
+system processes → PR_CLEANUP → ENTER_SCHEDULER → OS draws to screen
 
 ## Key Files
 
-- `src/lisa_mmu.h/c` — MMU: 5 contexts, register writes, translation
-- `src/toolchain/bootrom.c` — Identity mapping, I/O board detection
-- `src/toolchain/linker.c` — Non-kernel isolation, stub at $3F0
-- `src/toolchain/pascal_lexer.c` — Cross-library {$I} include search
-- `src/toolchain/pascal_codegen.c` — VAR param nested scope
-- `src/toolchain/toolchain_bridge.c` — Kernel module list
-- `src/lisa.c` — SGLOBAL, DRIVRJT, MMU segments, I/O regs, interrupt hack
-- `scripts/patch_source.sh` — Source preprocessing (10 patches)
-
-## Reference Projects (in _inspiration/)
-
-See memory files for detailed notes:
-- LisaEm (Ray Arachelian, GPL v3) — hardware emulation reference
-- LisaSourceCompilation (AlexTheCat123) — 56 patches, build system, boot chain
+```
+src/toolchain/pascal_parser.c   — Multi-param fix, semicolon tolerance
+src/toolchain/pascal_codegen.c  — FOR loop MOVE.W, VAR nested scope, array bounds
+src/toolchain/pascal_lexer.c    — Cross-library {$I} search, %_ identifiers
+src/toolchain/linker.c          — Non-kernel isolation, stub at $3F0, builtins
+src/toolchain/toolchain_bridge.c — Kernel module selection (OS + LIBPL/HW/FP/OS)
+src/toolchain/bootrom.c         — Identity MMU mapping, screen clear
+src/lisa_mmu.h/c                — 5 contexts, register writes, translation
+src/lisa.c                      — Boot env, SGLOBAL, DRIVRJT, I/O regs, ProFile
+src/m68k.c                      — SYSTEM_ERROR trace, code escape trace
+scripts/patch_source.sh         — Source preprocessing (10 patches)
+```
 
 ## Toolchain Metrics
 ```
-Parser:    405 Pascal, 2 parse errors (MATHLIB, LCUT — non-kernel)
-Assembler: 98 files, 100% success
-Codegen:   Proc sigs, CONST, nested scope, VAR params, cross-lib includes
-Linker:    Non-kernel isolation, 1949 resolved, 2742 unique stub symbols
-Output:    ~433KB system.os (846 blocks)
-Boot:      Reaches scheduler, screen draws, runs 250 frames actively
+Parser:    420 source files, 1 parse error (BUILDLLD — not compilable)
+Assembler: 100+ files, 100% success
+Codegen:   Multi-param, proc sigs, CONST, nested scope, VAR params, FOR loop
+Linker:    3106 kernel-resolved, zero SYSTEM_ERROR calls
+Output:    ~918KB system.os, boots through INITSYS, 480+ stable frames
 ```
