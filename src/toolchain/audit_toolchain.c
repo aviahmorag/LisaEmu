@@ -514,10 +514,18 @@ static void audit_linker(source_file_t *files, int num_files, const char *root) 
                                     cg->globals, cg->num_globals, cg->relocs, cg->num_relocs);
                 pascal_ok++;
                 if (lk->num_modules > mb && mb > 0) {
-                    link_module_t *sm = lk->modules[lk->num_modules - 1];
+                    int old_idx = lk->num_modules - 1;
+                    link_module_t *sm = lk->modules[old_idx];
                     for (int j = lk->num_modules - 1; j > 0; j--)
                         lk->modules[j] = lk->modules[j - 1];
                     lk->modules[0] = sm;
+                    /* Fix symbol table module_idx after swap */
+                    for (int s = 0; s < lk->num_symbols; s++) {
+                        if (lk->symbols[s].module_idx == old_idx)
+                            lk->symbols[s].module_idx = 0;
+                        else if (lk->symbols[s].module_idx >= 0 && lk->symbols[s].module_idx < old_idx)
+                            lk->symbols[s].module_idx++;
+                    }
                 }
             }
             codegen_free(cg); free(cg); parser_free(&p); free(src);

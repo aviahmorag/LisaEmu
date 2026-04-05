@@ -550,10 +550,22 @@ build_result_t toolchain_build(const char *source_dir,
             pascal_ok++;
             /* Move STARTUP's module to position 0 so linker places it at $400 */
             if (lk->num_modules > modules_before_startup && modules_before_startup > 0) {
-                link_module_t *startup_mod = lk->modules[lk->num_modules - 1];
+                int startup_old_idx = lk->num_modules - 1;
+                link_module_t *startup_mod = lk->modules[startup_old_idx];
                 for (int j = lk->num_modules - 1; j > 0; j--)
                     lk->modules[j] = lk->modules[j - 1];
                 lk->modules[0] = startup_mod;
+
+                /* Fix symbol table module_idx references after swap.
+                 * STARTUP moved from last → 0; all others shifted +1. */
+                for (int s = 0; s < lk->num_symbols; s++) {
+                    if (lk->symbols[s].module_idx == startup_old_idx) {
+                        lk->symbols[s].module_idx = 0;
+                    } else if (lk->symbols[s].module_idx >= 0 &&
+                               lk->symbols[s].module_idx < startup_old_idx) {
+                        lk->symbols[s].module_idx++;
+                    }
+                }
             }
         } else {
             pascal_fail++;

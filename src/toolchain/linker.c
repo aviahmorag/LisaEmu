@@ -454,6 +454,8 @@ bool linker_link(linker_t *lk) {
 
             int32_t target = lk->symbols[sym_idx].value;
 
+            /* Debug traces removed — use targeted tracing when needed */
+
             /* Patch the code */
             uint32_t abs_offset = mod->base_addr + offset;
             if (offset < mod->code_size) {
