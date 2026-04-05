@@ -697,7 +697,7 @@ static void emit_ea_extension(asm68k_t *as, operand_t *op, int size) {
                     r->size = 4;
                     r->pc_relative = false;
                 }
-                if (strcasestr(as->current_file, "INITRAP")) {
+                if (strcasestr(as->current_file, "INITRAP") || strcasestr(as->current_file, "starasm1")) {
                     fprintf(stderr, "  ASM RELOC: %s sym='%s' at offset %u\n",
                             as->current_file, as->symbols[op->ref_sym_idx].name,
                             as->sections[as->current_section].size);

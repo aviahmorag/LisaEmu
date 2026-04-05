@@ -947,7 +947,16 @@ int lisa_run_frame(lisa_t *lisa) {
         fprintf(stderr, "  VIA2: t1_run=%d t1_cnt=%d t1_latch=%d ier=$%02X ifr=$%02X\n",
                 lisa->via2.t1_running, lisa->via2.t1_counter, lisa->via2.t1_latch,
                 lisa->via2.ier, lisa->via2.ifr);
-        /* Verify A5 and sysglobal at runtime */
+        if (frame_count == 60) {
+            /* Main body is at $400 + body_offset. BRA.W at $400 jumps there. */
+            uint16_t bra_disp = (lisa->mem.ram[0x402] << 8) | lisa->mem.ram[0x403];
+            uint32_t body = 0x402 + (int16_t)bra_disp;
+            fprintf(stderr, "Main body at $%06X:\n", body);
+            for (uint32_t a = body; a < body + 30; a += 2) {
+                uint16_t w = (lisa->mem.ram[a] << 8) | lisa->mem.ram[a+1];
+                fprintf(stderr, "  $%06X: $%04X\n", a, w);
+            }
+        }
         if (frame_count == 120) {
             fprintf(stderr, "  A5=$%08X A6=$%08X SP=$%08X\n",
                     lisa->cpu.a[5], lisa->cpu.a[6], lisa->cpu.a[7]);
