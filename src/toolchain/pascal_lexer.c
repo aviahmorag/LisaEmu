@@ -171,7 +171,43 @@ static char *lexer_resolve_include(lexer_t *lex, const char *inc_path) {
         }
     }
 
-    /* Try 4: no prefix — base_dir/name.text.unix.txt */
+    /* Try 4: Cross-library search — file might be in a different LIBS/ subdir.
+     * E.g., {$I libfp/initfp.text} might actually be in LIBPL/libpl-INITFP.TEXT */
+    if (lex->source_root[0]) {
+        /* Search all LIBS/ subdirectories for prefix-name or name */
+        static const char *lib_dirs[] = {
+            "LIBPL", "LIBFP", "LIBOS", "LIBHW", "LIBSM", "LIBQD",
+            "LIBWM", "LIBFM", "LIBTK", "LIBPR", "LIBFE", "LIBDB",
+            "LIBIN", "LIBSU", "LIBSB", "LIBQP", "LIBUT", "LIBFC",
+            "LIBPM", "LIBTE", NULL
+        };
+        for (int li = 0; lib_dirs[li]; li++) {
+            char lp[16];
+            strncpy(lp, lib_dirs[li], sizeof(lp) - 1);
+            for (char *c = lp; *c; c++) *c = tolower((unsigned char)*c);
+
+            /* Try LIBS/LIBXX/libxx-name.TEXT.unix.txt */
+            snprintf(path, sizeof(path), "%s/LISA_OS/LIBS/%s/%s-%s.TEXT.unix.txt",
+                     lex->source_root, lib_dirs[li], lp, name);
+            content = lexer_read_file(path);
+            if (content) return content;
+            snprintf(path, sizeof(path), "%s/LISA_OS/LIBS/%s/%s-%s.text.unix.txt",
+                     lex->source_root, lib_dirs[li], lp, name);
+            content = lexer_read_file(path);
+            if (content) return content;
+        }
+        /* Also try in OS/ source directory */
+        snprintf(path, sizeof(path), "%s/LISA_OS/OS/source-%s.TEXT.unix.txt",
+                 lex->source_root, name);
+        content = lexer_read_file(path);
+        if (content) return content;
+        snprintf(path, sizeof(path), "%s/LISA_OS/OS/SOURCE-%s.TEXT.unix.txt",
+                 lex->source_root, name);
+        content = lexer_read_file(path);
+        if (content) return content;
+    }
+
+    /* Try 5: no prefix — base_dir/name.text.unix.txt */
     if (lex->base_dir[0]) {
         snprintf(path, sizeof(path), "%s/%s.text.unix.txt", lex->base_dir, name);
         content = lexer_read_file(path);
