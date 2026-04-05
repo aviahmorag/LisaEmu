@@ -223,84 +223,11 @@ static int num_shared_globals = 0;
 static cg_proc_sig_t shared_proc_sigs[MAX_SHARED_PROC_SIGS];
 static int num_shared_proc_sigs = 0;
 
-/* OS kernel modules — from Lisa_Source/LISA_OS/OS exec files/BUILD-LINKLIST.TEXT
- * These 46 modules comprise system.os. Everything else is a library or application. */
+/* All compiled modules are treated as kernel — they all get linked into the
+ * output and their symbols are available for cross-module resolution. */
 static bool is_kernel_module(const char *path) {
-    static const char *kernel_names[] = {
-        "SOURCE-CD.", "SOURCE-PMEM.", "SOURCE-CDCONFIGASM.", "LIBHW-HWINTL.",
-        "libhw-HWINTL.", "source-OSUNITIO.", "SOURCE-DBGASM.", "source-PROCASM.",
-        "source-SCHED.", "SOURCE-PROCMGMT.", "source-procprims.", "source-LOAD.",
-        "SOURCE-MEASURE.", "source-MMPRIM.", "source-DS0.", "SOURCE-INITRAP.",
-        "source-EXCEPRIM.", "SOURCE-EVENTCHN.", "source-EXCEPMGR.", "source-TIMEMGR.",
-        "SOURCE-EXCEPASM.", "source-MMASM.", "source-NMIHANDLER.", "source-mover.",
-        "SOURCE-GENIO.", "SOURCE-HDISK.", "source-twiggy.", "source-clock.",
-        "source-asynctr.", "source-fsasm.", "SOURCE-VMSTUFF.", "source-sfileio.",
-        "source-fsdir.", "source-fsprim.", "source-fsui.", "source-fsinit.",
-        "source-OBJIO.", "source-MM0.", "source-SYSGLOBAL.", "source-starasm1.",
-        "source-STARASM2.", "source-STARASM3.", "SOURCE-STARTUP.",
-        "source-osintpaslib.", "source-pasmath.", "source-volchk.",
-        "source-scavenger.",
-        /* Additional OS support files needed by kernel */
-        "source-DRIVERDEFS.", "source-driversubs.", "source-PROFILE.",
-        "source-PRIAM.", "source-priamcard.", "SOURCE-SONY.",
-        "source-PSYSCALL.", "source-syscall.", "source-TWIG.",
-        "source-LDUTIL.", "source-ldlfs.", "source-PROF.",
-        "SOURCE-SERCARD.", "source-console.", "SOURCE-2PORTCARD.",
-        "SOURCE-MODEMA.", "source-rs232.", "source-micro.",
-        "source-parallelcable.", "source-pram.",
-        /* Assembly driver files */
-        "SOURCE-DRIVERASM.", "SOURCE-CONSOLEASM.", "SOURCE-PROFILEASM.",
-        "SOURCE-SONYASM.", "SOURCE-MODEMASM.", "source-rsASM.",
-        "source-LDASM.", "source-ldmicro.", "source-ldpram.",
-        "source-LDPROF.", "source-LDTWIG.", "source-SERNUM.",
-        "source-priamcardASM.", "source-PRIAMASM.", "source-printasm.",
-        "SOURCE-ARCHIVEASM.", "SOURCE-CDCONFIGASM.",
-        /* LIBHW — hardware library is part of kernel */
-        "libhw-DRIVERS.", "LIBHW-DRIVERS.",
-        "LibHW-HARDWARE.", "libhw-HARDWARE.",
-        "LibHW-HWINT.", "libhw-HWINT.",
-        /* Memory manager (all parts) */
-        "SOURCE-MM1.", "source-MM2.", "source-MM3.", "source-MM4.",
-        "SOURCE-MMPRIM2.",
-        /* Disk/device subsystems */
-        "source-DS2.", "source-DS3.",
-        "SOURCE-DEVCONTROL.", "SOURCE-ICDD.",
-        /* Exception/process management */
-        "SOURCE-EXCEPRES.", "source-EXCEPNR1.",
-        /* File system init */
-        "SOURCE-FSINIT1.", "SOURCE-FSINIT2.",
-        /* Loader */
-        "source-LOAD1.", "source-LOADER.", "source-LDEQU.",
-        /* Power/PRAM management */
-        "source-PMCNTRL.", "source-PMSPROCS.", "SOURCE-PMMAKE.",
-        /* GData, unpack */
-        "SOURCE-GDATALIST.", "source-UNPACK.",
-        /* Config */
-        "source-cdCONFIG.", "SOURCE-ARCHIVE.",
-        /* System global part 2 */
-        "source-SYSG1.",
-        /* OS library files needed for boot */
-        "source-PASCALDEFS.", "source-POSLIB.", "source-oslib.",
-        "source-parms.",
-        /* LIBPL — Pascal runtime (needed by ALL Pascal code) */
-        "libpl-", "LIBPL-",
-        /* LIBFP — Floating point (SANE) */
-        "libfp-", "LIBFP-",
-        /* LIBOS — OS interface (syscalls) */
-        "libos-", "LIBOS-",
-        /* LIBHW — Hardware interface */
-        "libhw-", "LIBHW-", "LibHW-",
-        /* LIBSM — Storage manager (heap zones) */
-        "LIBSM-", "libsm-",
-        /* LIBPM — Parameter RAM */
-        "LibPM-", "libpm-",
-        NULL
-    };
-    for (int i = 0; kernel_names[i]; i++) {
-        if (strcasestr(path, kernel_names[i]) != NULL)
-            return true;
-    }
-    return false;
+    (void)path;
+    return true;
 }
 
 /* Shared types accumulated from all previously compiled units */
@@ -465,9 +392,7 @@ static bool compile_pascal_file(const char *path, linker_t *lk) {
                                   cg->code, cg->code_size,
                                   cg->globals, cg->num_globals,
                                   cg->relocs, cg->num_relocs);
-        /* Tag non-kernel modules so linker excludes them from system.os */
-        if (ok && lk->num_modules > 0 && !is_kernel_module(path))
-            lk->modules[lk->num_modules - 1]->is_kernel = false;
+        /* All modules are kernel — no need to untag */
     }
 
     codegen_free(cg);
@@ -562,9 +487,7 @@ static bool assemble_file(const char *path, linker_t *lk, const char *source_roo
         linker_load_codegen(lk, path,
                             asm68k_get_output(as, NULL), as->output_size,
                             syms, nsyms, rels, nrels);
-        /* Tag non-kernel assembly modules */
-        if (lk->num_modules > 0 && !is_kernel_module(path))
-            lk->modules[lk->num_modules - 1]->is_kernel = false;
+        /* All modules are kernel — no need to untag */
         free(syms);
         free(rels);
     }
