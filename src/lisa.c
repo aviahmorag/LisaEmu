@@ -217,29 +217,28 @@ static void profile_write_block(lisa_t *lisa, uint32_t block);
  *   Bit 2: CMD strobe from host
  *   Bit 3: host direction (0=host writing, 1=host reading)
  */
+static uint8_t last_via1_orb = 0;
 static void via1_portb_write(uint8_t val, uint8_t ddr, void *ctx) {
     lisa_t *lisa = (lisa_t *)ctx;
-    if (!lisa->profile.mounted) return;
-
-    bool cmd_strobe = (val & 0x04) != 0;
-
-    /* CMD strobe rising edge triggers command processing */
-    if (cmd_strobe && lisa->profile.state == PROF_IDLE) {
-        /* Host is starting a command — expect 6 bytes on Port A */
-        lisa->profile.state = PROF_CMD;
-        lisa->profile.cmd_index = 0;
-        lisa->profile.busy = true;
+    (void)ddr;
+    profile_orb_write(&lisa->prof, val, last_via1_orb);
+    /* Update CA1 (BSY line) based on profile state */
+    bool bsy = profile_bsy(&lisa->prof);
+    if (bsy) {
+        /* BSY asserted → CA1 transition → set IFR bit 1 */
+        lisa->via1.ifr |= 0x02;
     }
+    last_via1_orb = val;
 }
 
 static uint8_t via1_portb_read(void *ctx) {
     lisa_t *lisa = (lisa_t *)ctx;
     uint8_t val = 0;
 
-    if (lisa->profile.mounted) {
+    if (lisa->prof.mounted) {
         val |= 0x01; /* OCD - connected */
-        if (!lisa->profile.busy)
-            val |= 0x02; /* BSY - not busy */
+        if (!profile_bsy(&lisa->prof))
+            val |= 0x02; /* BSY - not busy (active low) */
     }
 
     return val;
@@ -247,67 +246,16 @@ static uint8_t via1_portb_read(void *ctx) {
 
 static void via1_porta_write(uint8_t val, uint8_t ddr, void *ctx) {
     lisa_t *lisa = (lisa_t *)ctx;
-    if (!lisa->profile.mounted) return;
-
-    if (lisa->profile.state == PROF_CMD) {
-        /* Accumulate command bytes */
-        if (lisa->profile.cmd_index < 6) {
-            lisa->profile.command[lisa->profile.cmd_index++] = val;
-        }
-        if (lisa->profile.cmd_index >= 6) {
-            /* Command complete. Byte 0 = command, bytes 1-3 = block number */
-            uint8_t cmd = lisa->profile.command[0];
-            uint32_t block = ((uint32_t)lisa->profile.command[1] << 16) |
-                             ((uint32_t)lisa->profile.command[2] << 8) |
-                             (uint32_t)lisa->profile.command[3];
-
-            if (cmd == 0x00) {
-                /* READ command */
-                { static int read_count = 0;
-                  if (read_count++ < 10)
-                    fprintf(stderr, "ProFile READ block %u (read #%d)\n", block, read_count);
-                }
-                profile_read_block(lisa, block);
-                lisa->profile.state = PROF_READING;
-                lisa->profile.buf_index = 0;
-                lisa->profile.busy = false;
-            } else if (cmd == 0x01) {
-                /* WRITE command */
-                lisa->profile.block_num = block;
-                lisa->profile.state = PROF_WRITING;
-                lisa->profile.buf_index = 0;
-                lisa->profile.busy = false;
-            } else {
-                /* Unknown command — just go idle */
-                lisa->profile.state = PROF_IDLE;
-                lisa->profile.busy = false;
-            }
-        }
-    } else if (lisa->profile.state == PROF_WRITING) {
-        /* Accumulate write data */
-        if (lisa->profile.buf_index < PROFILE_BLOCK_SIZE) {
-            lisa->profile.sector_buf[lisa->profile.buf_index++] = val;
-        }
-        if (lisa->profile.buf_index >= PROFILE_BLOCK_SIZE) {
-            profile_write_block(lisa, lisa->profile.block_num);
-            lisa->profile.state = PROF_IDLE;
-        }
-    }
+    (void)ddr;
+    profile_porta_write(&lisa->prof, val);
+    /* Check if BSY changed */
+    if (profile_bsy(&lisa->prof))
+        lisa->via1.ifr |= 0x02;  /* CA1 flag */
 }
 
 static uint8_t via1_porta_read(void *ctx) {
     lisa_t *lisa = (lisa_t *)ctx;
-
-    if (lisa->profile.mounted && lisa->profile.state == PROF_READING) {
-        if (lisa->profile.buf_index < PROFILE_BLOCK_SIZE) {
-            uint8_t val = lisa->profile.sector_buf[lisa->profile.buf_index++];
-            if (lisa->profile.buf_index >= PROFILE_BLOCK_SIZE) {
-                lisa->profile.state = PROF_IDLE;
-            }
-            return val;
-        }
-    }
-    return 0xFF;
+    return profile_porta_read(&lisa->prof);
 }
 
 /* VIA1 IRQ -> CPU IRQ level 1 */
@@ -917,6 +865,10 @@ bool lisa_mount_profile(lisa_t *lisa, const char *path) {
     lisa->profile.state = 0;
     lisa->profile.buf_index = 0;
     lisa->profile.busy = false;
+
+    /* Also mount on the new protocol-accurate ProFile */
+    profile_init(&lisa->prof);
+    profile_mount(&lisa->prof, lisa->profile.data, size);
 
     printf("Mounted ProFile: %s (%ld bytes, %ld blocks)\n",
            path, size, size / PROFILE_BLOCK_SIZE);

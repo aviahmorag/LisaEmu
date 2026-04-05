@@ -9,6 +9,7 @@
 #include "m68k.h"
 #include "lisa_mmu.h"
 #include "via6522.h"
+#include "profile.h"
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -77,7 +78,8 @@ typedef struct {
     bool         keys_down[128];
 
     /* Storage */
-    profile_disk_t profile;
+    profile_disk_t profile;     /* Old simplified ProFile (TODO: remove) */
+    profile_t      prof;        /* New protocol-accurate ProFile */
     floppy_disk_t  floppy;
 
     /* IRQ management */

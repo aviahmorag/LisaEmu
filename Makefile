@@ -13,6 +13,7 @@ BUILDDIR = build
 SOURCES = $(SRCDIR)/m68k.c \
           $(SRCDIR)/lisa_mmu.c \
           $(SRCDIR)/via6522.c \
+          $(SRCDIR)/profile.c \
           $(SRCDIR)/lisa.c \
           $(SRCDIR)/lisa_bridge.c \
           $(SRCDIR)/main_sdl.c
