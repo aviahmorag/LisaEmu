@@ -2120,13 +2120,10 @@ static void hle_trap6_mmu(m68k_t *cpu) {
 static void op_trap(m68k_t *cpu) {
     int vector = cpu->ir & 0xF;
 
-
-    /* HLE: Intercept TRAP #6 for MMU programming */
-    if (vector == 6) {
-        hle_trap6_mmu(cpu);
-        return;
-    }
-
+    /* TRAP #6 is the MMU programming handler (DO_AN_MMU).
+     * Let it execute normally via the vector table.
+     * The handler accesses MMU registers at $8000+seg*$20000
+     * which our lisa_mem_write16 intercepts. */
     take_exception(cpu, VEC_TRAP_BASE + vector);
     cpu->cycles += 34;
 }
