@@ -123,9 +123,24 @@ static int find_global_symbol(linker_t *lk, const char *name) {
     return extern_match;  /* Fall back to EXTERN if no ENTRY found */
 }
 
+/* Strict lookup: exact case-insensitive match only. Used for add_global_symbol
+ * to avoid the 8-char prefix / method suffix heuristics destroying symbols. */
+static int find_global_symbol_exact(linker_t *lk, const char *name) {
+    int extern_match = -1;
+    for (int i = 0; i < lk->num_symbols; i++) {
+        if (str_eq_nocase(lk->symbols[i].name, name)) {
+            if (lk->symbols[i].type == LSYM_ENTRY)
+                return i;
+            if (extern_match < 0)
+                extern_match = i;
+        }
+    }
+    return extern_match;
+}
+
 static int add_global_symbol(linker_t *lk, const char *name, link_sym_type_t type,
                               int32_t value, int module_idx) {
-    int existing = find_global_symbol(lk, name);
+    int existing = find_global_symbol_exact(lk, name);
     if (existing >= 0) {
         /* Update existing symbol — allow redefinition (last one wins).
          * In Lisa OS, the same method names (CREATE, Draw, etc.) appear in
