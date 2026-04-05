@@ -142,7 +142,75 @@ uint8_t *bootrom_generate(void) {
     emit16(&b, 0x00FF);
     emit32(&b, 0x00FCD01C);
 
-    /* 5. Switch MMU to normal mode: MOVE.B #0,$FCE012 */
+    /* 5. Program MMU for identity mapping before exiting setup mode.
+     * The real Lisa boot loader does this; since we skip the loader,
+     * we program a basic identity map here.
+     *
+     * MMU registers accessed during setup mode:
+     *   SLIM (Segment Limit) at physical addr = $8000 + seg * $20000
+     *   SORG (Segment Origin) at physical addr = $8008 + seg * $20000
+     *
+     * SLR value $0700 = RW memory, length covers full segment
+     * SOR value = physical page origin (seg * 256 pages, each 512 bytes)
+     *
+     * We map segments 0-7 for the first 1MB of physical RAM. */
+
+    /* Turn setup ON explicitly (should already be on, but be safe) */
+    emit16(&b, 0x13FC);          /* MOVE.B #0,$FCE010 (setup on) */
+    emit16(&b, 0x0000);
+    emit32(&b, 0x00FCE010);
+
+    /* Set context bits to context 1 (segment1=0, segment2=0 → ctx=1) */
+    emit16(&b, 0x13FC);          /* MOVE.B #0,$FCE008 (seg1=0) */
+    emit16(&b, 0x0000);
+    emit32(&b, 0x00FCE008);
+    emit16(&b, 0x13FC);          /* MOVE.B #0,$FCE00C (seg2=0) */
+    emit16(&b, 0x0000);
+    emit32(&b, 0x00FCE00C);
+
+    /* Program 8 segments for identity mapping (1MB) */
+    /* Segment 0: SLIM=$0700 at $008000, SORG=$0000 at $008008 */
+    for (int seg = 0; seg < 8; seg++) {
+        uint32_t slim_addr = 0x008000 + (uint32_t)seg * 0x20000;
+        uint32_t sorg_addr = 0x008008 + (uint32_t)seg * 0x20000;
+        uint16_t sor_val = (uint16_t)(seg * 256);  /* seg * 128KB / 512 = seg * 256 pages */
+
+        /* MOVE.W #$0700, (slim_addr).L — SLR = RW mem, full segment */
+        emit16(&b, 0x33FC);      /* MOVE.W #imm,abs.L */
+        emit16(&b, 0x0700);      /* SLR value: RW memory */
+        emit32(&b, slim_addr);
+
+        /* MOVE.W #sor_val, (sorg_addr).L — SOR = identity page origin */
+        emit16(&b, 0x33FC);      /* MOVE.W #imm,abs.L */
+        emit16(&b, sor_val);
+        emit32(&b, sorg_addr);
+    }
+
+    /* Also map I/O segment: segment 126 ($FC0000 >> 17 = 126) */
+    {
+        uint32_t slim_addr = 0x008000 + 126U * 0x20000;
+        uint32_t sorg_addr = 0x008008 + 126U * 0x20000;
+        emit16(&b, 0x33FC);
+        emit16(&b, 0x0900);      /* SLR = I/O space */
+        emit32(&b, slim_addr);
+        emit16(&b, 0x33FC);
+        emit16(&b, (uint16_t)(126 * 256));  /* SOR for $FC0000 */
+        emit32(&b, sorg_addr);
+    }
+
+    /* Map ROM segment: segment 127 ($FE0000 >> 17 = 127) */
+    {
+        uint32_t slim_addr = 0x008000 + 127U * 0x20000;
+        uint32_t sorg_addr = 0x008008 + 127U * 0x20000;
+        emit16(&b, 0x33FC);
+        emit16(&b, 0x0F00);      /* SLR = SIO space (ROM) */
+        emit32(&b, slim_addr);
+        emit16(&b, 0x33FC);
+        emit16(&b, (uint16_t)(127 * 256));  /* SOR for $FE0000 */
+        emit32(&b, sorg_addr);
+    }
+
+    /* Now exit setup mode: MOVE.B #0,$FCE012 */
     emit16(&b, 0x13FC);
     emit16(&b, 0x0000);
     emit32(&b, 0x00FCE012);

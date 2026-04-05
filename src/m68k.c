@@ -2120,6 +2120,7 @@ static void hle_trap6_mmu(m68k_t *cpu) {
 static void op_trap(m68k_t *cpu) {
     int vector = cpu->ir & 0xF;
 
+
     /* HLE: Intercept TRAP #6 for MMU programming */
     if (vector == 6) {
         hle_trap6_mmu(cpu);
