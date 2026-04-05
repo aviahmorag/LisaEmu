@@ -175,8 +175,14 @@ static void update_mmu_context(lisa_mem_t *mem) {
     int new_ctx = compute_context(mem);
     mem->current_context = new_ctx;
 
-    /* Enable MMU translation when in normal mode (not start mode) */
-    mem->mmu_enabled = !mem->setup_mode;
+    /* Enable MMU translation only when segments have been properly
+     * configured by the OS (via TRAP #6 / PROG_MMU).
+     * Our identity boot mapping covers segments 0-7 only, but the OS
+     * expects code at segment 17+ ($220000+). Until the OS programs
+     * the full segment table, keep MMU in passthrough mode. */
+    /* mem->mmu_enabled = !mem->setup_mode; */
+    /* For now: never enable — OS code runs at physical addresses */
+    mem->mmu_enabled = false;
 }
 
 void lisa_mem_write8(lisa_mem_t *mem, uint32_t addr, uint8_t val) {
