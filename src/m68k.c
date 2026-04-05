@@ -2593,6 +2593,23 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             break;
         }
 
+        /* PC ring buffer for crash tracing */
+        static uint32_t pc_ring[32];
+        static int pc_ring_idx = 0;
+        static bool line_f_logged = false;
+        pc_ring[pc_ring_idx++ & 31] = cpu->pc;
+        if (!line_f_logged && cpu->pc == 0x20DB1E) {
+            fprintf(stderr, "=== LINE-F TRACE: PC=$%06X reached. Last 20 PCs:\n", cpu->pc);
+            for (int ri = 20; ri > 0; ri--) {
+                uint32_t rpc = pc_ring[(pc_ring_idx - ri) & 31];
+                uint16_t rop = cpu_read16(cpu, rpc);
+                fprintf(stderr, "  PC=$%06X opcode=$%04X\n", rpc, rop);
+            }
+            fprintf(stderr, "  D0=$%08X A0=$%08X A5=$%08X A6=$%08X A7=$%08X\n",
+                    cpu->d[0], cpu->a[0], cpu->a[5], cpu->a[6], cpu->a[7]);
+            line_f_logged = true;
+        }
+
         /* Breakpoint: log when PC enters INIT_TRAPV */
         static int initrap_logged = 0;
         if (!initrap_logged && cpu->pc >= 0x178000 && cpu->pc <= 0x179000) {
