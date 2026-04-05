@@ -1019,7 +1019,7 @@ int lisa_run_frame(lisa_t *lisa) {
     if (lisa->mem.vretrace_enabled) {
         lisa->mem.vretrace_irq = true;
         lisa->irq_vretrace = 1;
-        int level = 1;
+        int level = 2;  /* vretrace at level 2 to break through mask level 1 */
         if (lisa->irq_via2) level = 2;
         m68k_set_irq(&lisa->cpu, level);
 
