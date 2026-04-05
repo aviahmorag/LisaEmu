@@ -968,15 +968,7 @@ int lisa_run_frame(lisa_t *lisa) {
         lisa->cpu.pc >= 0x400 && lisa->cpu.pc < 0x6B000) {
         lisa->cpu.sr = (lisa->cpu.sr & ~0x0700);
     }
-    if (frame_count == 120 || frame_count == 250) {
-        /* Check screen content */
-        int nonwhite = 0;
-        for (int i = 0; i < LISA_SCREEN_BYTES; i++) {
-            if (lisa->mem.ram[0x7A000 + i] != 0x00) nonwhite++;
-        }
-        fprintf(stderr, "  Screen: %d non-zero bytes of %d\n", nonwhite, LISA_SCREEN_BYTES);
-    }
-    if (frame_count == 120) {
+    if (frame_count == 120 || frame_count == 300 || frame_count == 600) {
         fprintf(stderr, "DIAG frame %d: PC=$%06X SR=$%04X stopped=%d pending_irq=%d setup=%d\n",
                 frame_count, lisa->cpu.pc, lisa->cpu.sr, lisa->cpu.stopped,
                 lisa->cpu.pending_irq, lisa->mem.setup_mode);

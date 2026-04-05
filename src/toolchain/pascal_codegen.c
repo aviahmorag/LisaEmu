@@ -209,7 +209,15 @@ static type_desc_t *resolve_type(codegen_t *cg, ast_node_t *node) {
                 t->array_high = hi;
                 t->element_type = resolve_type(cg, node->children[node->num_children - 1]);
                 int count = t->array_high - t->array_low + 1;
-                t->size = count * (t->element_type ? t->element_type->size : 2);
+                if (count <= 0) {
+                    count = 64;  /* Default for unresolved CONST bounds */
+                    static int unresolved_warn = 0;
+                    if (unresolved_warn++ < 5)
+                        fprintf(stderr, "  WARN: array bounds unresolved (lo=%d hi=%d), defaulting to %d elements\n", lo, hi, count);
+                }
+                int elem_sz = t->element_type ? t->element_type->size : 2;
+                t->size = count * elem_sz;
+                if (t->size < 2) t->size = 2;  /* Minimum 2 bytes */
             }
             return t;
         }
