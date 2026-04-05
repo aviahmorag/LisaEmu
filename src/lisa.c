@@ -695,13 +695,13 @@ void lisa_reset(lisa_t *lisa) {
         W16D(1);             /* os_segs = 1 */
         W32D(0);             /* ld_sernum */
         /* b_oscode[1..32] */
-        for (int seg = 1; seg <= 32; seg++)
+        for (int seg = 1; seg <= 48; seg++)
             W32D((seg == 1) ? 0x400 : 0);
         /* l_oscode[1..32] */
-        for (int seg = 1; seg <= 32; seg++)
+        for (int seg = 1; seg <= 48; seg++)
             W32D((seg == 1) ? (os_end - 0x400) : 0);
         /* swappedin[1..32] */
-        for (int seg = 1; seg <= 32; seg++)
+        for (int seg = 1; seg <= 48; seg++)
             W16D((seg == 1) ? 1 : 0);
         W32D(0);             /* b_debugseg */
         W32D(0);             /* l_debugseg */

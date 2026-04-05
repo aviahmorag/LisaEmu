@@ -94,6 +94,15 @@ void lisa_mem_write8(lisa_mem_t *mem, uint32_t addr, uint8_t val) {
     switch (addr_region(addr)) {
         case 0: { /* RAM */
             uint32_t phys = mmu_translate(mem, addr);
+            /* Watchpoint: detect writes to code at $4EE (BRA displacement) */
+            if (phys == 0x4EE || phys == 0x4EF) {
+                static int wp_count = 0;
+                if (wp_count < 3) {
+                    fprintf(stderr, ">>> WATCHPOINT: write $%02X to phys $%X (addr=$%X)\n",
+                            val, phys, addr);
+                    wp_count++;
+                }
+            }
             if (phys < LISA_RAM_SIZE)
                 mem->ram[phys] = val;
             break;

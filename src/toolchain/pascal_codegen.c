@@ -192,8 +192,21 @@ static type_desc_t *resolve_type(codegen_t *cg, ast_node_t *node) {
             type_desc_t *t = add_type(cg, "", TK_ARRAY, 0);
             /* children: low, high, ..., element_type */
             if (node->num_children >= 3) {
-                t->array_low = (int)node->children[0]->int_val;
-                t->array_high = (int)node->children[1]->int_val;
+                /* Resolve array bounds — may be CONST identifiers */
+                int lo = (int)node->children[0]->int_val;
+                int hi = (int)node->children[1]->int_val;
+                if (lo == 0 && node->children[0]->name[0]) {
+                    cg_symbol_t *cs = find_global(cg, node->children[0]->name);
+                    if (!cs) cs = find_imported(cg, node->children[0]->name);
+                    if (cs && cs->is_const) lo = cs->offset;
+                }
+                if (hi == 0 && node->children[1]->name[0]) {
+                    cg_symbol_t *cs = find_global(cg, node->children[1]->name);
+                    if (!cs) cs = find_imported(cg, node->children[1]->name);
+                    if (cs && cs->is_const) hi = cs->offset;
+                }
+                t->array_low = lo;
+                t->array_high = hi;
                 t->element_type = resolve_type(cg, node->children[node->num_children - 1]);
                 int count = t->array_high - t->array_low + 1;
                 t->size = count * (t->element_type ? t->element_type->size : 2);
