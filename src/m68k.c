@@ -2593,6 +2593,20 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             break;
         }
 
+        /* Breakpoint: log when PC enters INIT_TRAPV */
+        static int initrap_logged = 0;
+        if (!initrap_logged && cpu->pc >= 0x178000 && cpu->pc <= 0x179000) {
+            /* Check if this is near INIT_TRAPV ($17850C) */
+            if (cpu->pc >= 0x178500 && cpu->pc <= 0x178510) {
+                fprintf(stderr, "INIT_TRAPV HIT: PC=$%06X A0=$%08X A1=$%08X A2=$%08X A5=$%08X SP=$%08X\n",
+                        cpu->pc, cpu->a[0], cpu->a[1], cpu->a[2], cpu->a[5], cpu->a[7]);
+                fprintf(stderr, "  RAM[$84]=$%02X%02X%02X%02X before INIT_TRAPV\n",
+                        cpu_read8(cpu, 0x84), cpu_read8(cpu, 0x85),
+                        cpu_read8(cpu, 0x86), cpu_read8(cpu, 0x87));
+                initrap_logged = 1;
+            }
+        }
+
         /* Log when PC enters vector table after being in OS code */
         static uint32_t prev_pc = 0;
         static int crash_logged = 0;
