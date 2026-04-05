@@ -800,6 +800,13 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                 break;
             }
 
+            /* EOF/EOLN: standard Pascal file functions — return FALSE */
+            if (str_eq_nocase(fn, "EOF") || str_eq_nocase(fn, "EOLN")) {
+                if (node->num_children > 0) gen_expression(cg, node->children[0]);
+                emit16(cg, 0x7000);  /* MOVEQ #0,D0 (FALSE) */
+                break;
+            }
+
             /* BLOCKREAD/BLOCKWRITE/UNITREAD/UNITWRITE: I/O — no-op, return 0 */
             if (str_eq_nocase(fn, "BLOCKREAD") || str_eq_nocase(fn, "BLOCKWRITE") ||
                 str_eq_nocase(fn, "UNITREAD") || str_eq_nocase(fn, "UNITWRITE") ||
@@ -840,6 +847,27 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                 if (node->num_children > 0)
                     gen_expression(cg, node->children[0]);
                 break;
+            }
+
+            /* Check if calling a procedure/function parameter (indirect call) */
+            {
+                cg_symbol_t *psym = find_local(cg, fn);
+                if (psym && psym->is_param) {
+                    /* Push arguments */
+                    for (int i = node->num_children - 1; i >= 0; i--) {
+                        gen_expression(cg, node->children[i]);
+                        emit16(cg, 0x2F00);  /* MOVE.L D0,-(SP) */
+                    }
+                    /* Load address from stack frame, call indirect */
+                    emit16(cg, 0x206E);  /* MOVEA.L offset(A6),A0 */
+                    emit16(cg, (uint16_t)(int16_t)psym->offset);
+                    emit16(cg, 0x4E90);  /* JSR (A0) */
+                    /* Caller cleans up */
+                    int ab = node->num_children * 4;
+                    if (ab > 0 && ab <= 8) emit16(cg, 0x508F | ((ab & 7) << 9));
+                    else if (ab > 8) { emit16(cg, 0xDEFC); emit16(cg, (uint16_t)ab); }
+                    break;
+                }
             }
 
             /* Generic function call — not an intrinsic */
@@ -963,11 +991,40 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
             /* No-op procedure calls (debug/trace stubs) */
             if (str_eq_nocase(node->name, "LogCall") ||
                 str_eq_nocase(node->name, "LogSeg")) {
-                /* Debug tracing — guarded by {$IFC fTraceSM} in source.
-                 * We don't evaluate conditionals, so emit NOP. */
                 break;
             }
-            /* Procedure call with no args */
+            /* Check if calling a procedure parameter (indirect call).
+             * A procedure parameter is a local with is_param=true and
+             * no type child in the AST (type defaults to "integer"). */
+            {
+                cg_symbol_t *sym = find_local(cg, node->name);
+                if (sym && sym->is_param) {
+                    /* Push any arguments */
+                    for (int a = node->num_children - 1; a >= 0; a--) {
+                        gen_expression(cg, node->children[a]);
+                        emit16(cg, 0x2F00);  /* MOVE.L D0,-(SP) */
+                    }
+                    /* Load procedure address from stack frame and call indirect */
+                    emit16(cg, 0x206E);  /* MOVEA.L offset(A6),A0 */
+                    emit16(cg, (uint16_t)(int16_t)sym->offset);
+                    emit16(cg, 0x4E90);  /* JSR (A0) */
+                    /* Caller cleans up args */
+                    int arg_bytes = node->num_children * 4;
+                    if (arg_bytes > 0 && arg_bytes <= 8)
+                        emit16(cg, 0x508F | ((arg_bytes & 7) << 9));
+                    else if (arg_bytes > 8) {
+                        emit16(cg, 0xDEFC);
+                        emit16(cg, (uint16_t)arg_bytes);
+                    }
+                    break;
+                }
+            }
+            /* Direct procedure call (no args) */
+            /* Push any arguments (some AST_CALL nodes have children) */
+            for (int a = node->num_children - 1; a >= 0; a--) {
+                gen_expression(cg, node->children[a]);
+                emit16(cg, 0x2F00);  /* MOVE.L D0,-(SP) */
+            }
             emit16(cg, 0x4EB9);
             emit32(cg, 0);
             if (cg->num_relocs < CODEGEN_MAX_RELOCS) {
@@ -975,6 +1032,16 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                 r->offset = cg->code_size - 4;
                 strncpy(r->symbol, node->name, sizeof(r->symbol) - 1);
                 r->size = 4;
+            }
+            /* Clean up args */
+            {
+                int arg_bytes = node->num_children * 4;
+                if (arg_bytes > 0 && arg_bytes <= 8)
+                    emit16(cg, 0x508F | ((arg_bytes & 7) << 9));
+                else if (arg_bytes > 8) {
+                    emit16(cg, 0xDEFC);
+                    emit16(cg, (uint16_t)arg_bytes);
+                }
             }
             break;
         }
