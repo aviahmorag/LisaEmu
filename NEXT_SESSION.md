@@ -3,94 +3,74 @@
 ## Quick Start
 
 ```bash
-make                    # Build standalone emulator
+make                        # Build standalone emulator
 build/lisaemu Lisa_Source   # Run from source directory
-make audit              # Full toolchain report (all 4 stages)
+make audit                  # Full toolchain report
 ```
 
-## Current State: OS boots past INTSOFF, executes deeper into INITSYS
+## Current State: OS executes INITSYS, makes TRAP #1 syscalls
 
-The CPU executes this path successfully:
+The CPU boot path:
 ```
-ROM ($FE0400) → JMP $400 → STARTUP → BRA $4CE0 → INITSYS ($4C00)
-→ LINK A6 → load globals → call INTSOFF ($4D7A4) → TRAP #7 → TRAP7 handler
-→ returns to INITSYS → continues execution...
-→ eventually hits illegal instruction in vector table area ($6D)
+ROM ($FE0400) → set SP/A5/SR → JMP $400 → STARTUP → PASCALINIT
+→ copy runtime data to sysglobal → set A5 → return param ptr
+→ INITSYS(ldmapbase) → INTSOFF (TRAP #7 works) → GETLDMAP
+→ ... deeper init → TRAP #1 syscalls → recursive error loop
 ```
 
-### Fixes applied this session:
-1. **Vector table installed by linker** — 17 exception vectors pre-installed in output binary $0-$FF
-2. **VAR parameter passing** — procedure signatures track VAR params, push address (not value)
-3. **Callee-clean push order** — external/assembly routines get left-to-right parameter push
-4. **Parameter size tracking** — value params use MOVE.W (2 bytes), pointers use MOVE.L (4 bytes)
-5. **SDL frontend runs toolchain** — `build/lisaemu Lisa_Source` now builds from source and boots
+### Key progress this session:
+1. **TRAP vectors work** — 17 exception vectors installed by linker
+2. **VAR parameter passing** — procedure signatures track VAR/size/external
+3. **Callee-clean push order** — external assembly routines get correct convention
+4. **CONST resolution** — emit immediate values, not memory loads
+5. **Zero-arg function calls** — PASCALINIT correctly called as function-as-value
+6. **Stack return convention** — external functions return results on stack
+7. **Loader parameter block** — memory map at $A00, downward Pascal layout
+8. **Boot ROM sets A5** — required by PASCALINIT
+9. **SDL frontend** — `build/lisaemu Lisa_Source` builds from source and boots
 
 ### Runtime logs from last run:
 ```
-Exception counts: v4=1 v11=1
-Vectors (RAM): TRAP1=$000507E6 TRAP2=$00050546 INT1=$00052724
-DIAG frame 120: PC=$04B2E0 SR=$2140 stopped=0 pending_irq=0 setup=0
-SGLOBAL@$2A0=$00000000
+TRAP #1 at PC=$04F2D0: vector[$84]=$0005064E (syscall happening!)
+Exception counts: v11=1 (single Line-F)
+DIAG frame 120: PC=$005A88 SR=$2118
+SP=$FFFFFFF6 (stack overflow — recursive TRAP #1 error loop)
 ```
 
-## Immediate Tasks
+## Immediate Task: Fix TRAP #1 Error Loop
 
-### 1. Fix constant resolution for procedure parameters
-INTSOFF(allints, dummy) — the `allints` constant ($700) is not resolving correctly.
-The codegen evaluates it to $005A instead of $0700. This means:
-- Interrupt mask not set to level 7 (all off)
-- SR ends up as $205A instead of $2700
-- `gen_expression` for constant identifiers needs to look up shared globals correctly
+The OS reaches TRAP #1 (system calls) but enters an infinite recursive loop:
+- TRAP #1 handler at $5064E is called
+- Handler itself triggers TRAP #1 again (likely SYSTEM_ERROR)
+- SP wraps around: $FFFFFFF6 → $FFFFFFE0 → ...
 
-### 2. Investigate Illegal Instruction at $6D
-After INTSOFF returns, execution eventually jumps to $6D (inside vector table).
-Something in the INITSYS flow makes a bad jump. Need to trace where the jump originates.
+This is likely a legitimate OS error:
+- A loader parameter may be wrong (memory regions, sizes)
+- GETLDMAP may copy incorrect values → bad pointer dereference
+- The OS may try to call an unimplemented function
 
-### 3. b_sysglobal_ptr still zero
-SGLOBAL@$2A0=$00000000 — either INIT_TRAPV hasn't run yet, or the value isn't set.
-Need to verify if INIT_TRAPV is reached after INTSOFF.
+### What to investigate:
+1. What code triggers the first TRAP #1? Add breakpoint at $4F2D0.
+2. What's the TRAP #1 handler doing? Why does it recurse?
+3. Are the loader params at $A00 correct? Check GETLDMAP's copies.
+4. Is the supervisor stack (b_superstack) set up correctly?
+5. What's at PC=$5A88 where the DIAG frame shows?
 
 ## Key Files
 
-- `src/toolchain/pascal_codegen.c` — Procedure signatures, VAR params, push order
-- `src/toolchain/pascal_codegen.h` — `cg_proc_sig_t` struct with is_external, param_size
-- `src/toolchain/linker.c` — Vector table installation in output binary (Phase 5)
-- `src/toolchain/toolchain_bridge.c` — Shared proc_sigs accumulation across units
-- `src/m68k.c` — Exception tracing, TRAP handler diagnostics
-- `src/lisa.c` — System.os loader (no longer overwrites vector table)
-- `src/main_sdl.c` — Now supports `build/lisaemu Lisa_Source` (toolchain + boot)
+- `src/toolchain/pascal_codegen.c` — CONST resolution, proc sigs, function-as-value
+- `src/toolchain/pascal_codegen.h` — `cg_proc_sig_t` with is_const, is_external
+- `src/toolchain/linker.c` — Vector table installation, debug symbols
+- `src/toolchain/bootrom.c` — Boot ROM with A5 init
+- `src/lisa.c` — Loader parameter block, system.os loader
+- `src/m68k.c` — TRAP tracing, kernel escape detection, PC ring buffer
+- `src/main_sdl.c` — Toolchain-aware SDL frontend
 
 ## Toolchain Metrics
 
 ```
-Parser:    405 Pascal files, 360 OK (99.5% real code, 2 edge cases)
-Assembler: 105 files, 100% success, 0 errors
-Codegen:   93.2% symbol resolution (rest resolve at link time)
-Linker:    97.2% JSR to real code, ~108 stub relocations (~39 truly missing symbols)
-Output:    ~331KB system.os (kernel only, fits in 1MB RAM)
-Vectors:   17 exception vectors pre-installed in output binary
+Parser:    405 Pascal, 360 OK (99.5%)
+Assembler: 105 files, 100% success
+Linker:    97.2% JSR to real code, ~83 stub symbols
+Output:    ~331KB system.os, 17 exception vectors
 ```
-
-## Architecture
-
-### Calling Convention Fix (this session)
-- **Callee-clean (assembly)**: Parameters pushed left-to-right, callee pops
-  - VAR params: push address via gen_lvalue_addr + MOVE.L A0,-(SP)
-  - Value params: push value via gen_expression + MOVE.W/MOVE.L D0,-(SP)
-- **Caller-clean (Pascal)**: Parameters pushed right-to-left, caller adjusts SP
-- Procedure signatures (`cg_proc_sig_t`) track: VAR flags, param sizes, is_external
-- Signatures propagated across compilation units via shared_proc_sigs table
-
-### Key fixes history
-- **Vector table**: Linker installs 17 vectors in $0-$FF of output binary
-- **TRAP #7 works**: INTSOFF → TRAP #7 → TRAP7 handler → returns correctly
-- **VAR parameters**: Signature-based VAR detection, correct address passing
-- **Parameter push order**: Left-to-right for external, right-to-left for Pascal
-- All previous session fixes (CONST resolution, module_idx, kernel separation, etc.)
-
-### Remaining toolchain issues (not blocking boot)
-- 39 truly missing symbols (print system, SU runtime, etc.)
-- Clascal vtable dispatch not implemented
-- {$I} 3 files not found (Apple didn't release them)
-- 2 parser edge cases (MATHLIB param syntax, LCUT conditional)
-- Constant identifiers in procedure call arguments may not resolve correctly
