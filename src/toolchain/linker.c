@@ -556,6 +556,11 @@ bool linker_link(linker_t *lk) {
                 fprintf(stderr, "  LINKER PATCH: TRAP1 target=$%08X at module offset %u (code_size=%u, base=$%X)\n",
                         target, offset, mod->code_size, mod->base_addr);
             }
+            if (strcasecmp(mod->relocs[r].symbol, "INIT_TRAPV") == 0 ||
+                strcasecmp(mod->relocs[r].symbol, "INIT_NMI_TRAPV") == 0) {
+                fprintf(stderr, "  LINKER PATCH: %s target=$%08X in module '%s' at offset %u\n",
+                        mod->relocs[r].symbol, target, mod->name, offset);
+            }
             if (offset < mod->code_size) {
                 if (size == 4) {
                     mod->code[offset]     = (target >> 24) & 0xFF;
@@ -574,6 +579,72 @@ bool linker_link(linker_t *lk) {
         if (mod->is_kernel && mod->code && mod->code_size > 0) {
             memcpy(lk->output + mod->base_addr, mod->code, mod->code_size);
         }
+    }
+
+    /* Phase 5: Install exception vector table in $0-$3FF.
+     * INIT_TRAPV normally does this at runtime, but INTSOFF uses TRAP #7
+     * before INIT_TRAPV runs. Pre-install vectors so early boot code works.
+     * Vector addresses match SOURCE-INITRAP.TEXT EQU definitions. */
+    {
+        /* Helper to write a vector from a symbol name */
+        #define INSTALL_VEC(vec_offset, sym_name) do { \
+            int _idx = find_global_symbol(lk, sym_name); \
+            if (_idx >= 0 && lk->symbols[_idx].resolved && \
+                lk->symbols[_idx].value != (int32_t)stub_addr) { \
+                uint32_t _addr = lk->symbols[_idx].value; \
+                lk->output[vec_offset]     = (_addr >> 24) & 0xFF; \
+                lk->output[vec_offset + 1] = (_addr >> 16) & 0xFF; \
+                lk->output[vec_offset + 2] = (_addr >> 8)  & 0xFF; \
+                lk->output[vec_offset + 3] = _addr & 0xFF; \
+                vec_installed++; \
+            } \
+        } while(0)
+
+        int vec_installed = 0;
+
+        /* Vector 0: SSP, Vector 1: PC — set by loader, not here */
+
+        /* Exception vectors (matching INITRAP EQUs) */
+        INSTALL_VEC(0x08, "BUS_ERR");            /* Bus error */
+        INSTALL_VEC(0x0C, "ADDRERROR_TRAP");     /* Address error */
+        INSTALL_VEC(0x10, "ILLGINST_TRAP");      /* Illegal instruction */
+        INSTALL_VEC(0x14, "DIVZERO_TRAP");       /* Zero divide */
+        INSTALL_VEC(0x18, "VALUEOOB_TRAP");      /* CHK instruction */
+        INSTALL_VEC(0x1C, "OVERFLOW_TRAP");      /* TRAPV instruction */
+        INSTALL_VEC(0x20, "PRIVIOLATION_TRAP");  /* Privilege violation */
+        INSTALL_VEC(0x2C, "LINE1111_TRAP");      /* Line-F emulator */
+
+        /* Spurious + autovector interrupts */
+        INSTALL_VEC(0x60, "SPURINTR_TRAP");      /* Spurious interrupt */
+        INSTALL_VEC(0x6C, "LVL3INT");            /* Level 3 interrupt */
+        INSTALL_VEC(0x70, "LVL4INT");            /* Level 4 interrupt */
+        INSTALL_VEC(0x74, "LVL5INT");            /* Level 5 interrupt */
+        INSTALL_VEC(0x78, "RSINT");              /* Level 6 interrupt */
+
+        /* TRAP vectors */
+        INSTALL_VEC(0x84, "TRAP1");              /* TRAP #1 (OS syscall) */
+        INSTALL_VEC(0x88, "SCHDTRAP");           /* TRAP #2 (scheduler) */
+        INSTALL_VEC(0x9C, "TRAP7");              /* TRAP #7 (SR change) */
+        INSTALL_VEC(0xB8, "trapEhandler");       /* TRAP #14 */
+
+        /* Fill unset vectors ($0-$FC) with stub to prevent crashes */
+        for (int v = 2; v < 64; v++) {
+            int off = v * 4;
+            uint32_t cur = ((uint32_t)lk->output[off] << 24) |
+                           ((uint32_t)lk->output[off+1] << 16) |
+                           ((uint32_t)lk->output[off+2] << 8) |
+                           (uint32_t)lk->output[off+3];
+            if (cur == 0) {
+                /* Point to stub (RTE-like behavior) */
+                lk->output[off]     = (stub_addr >> 24) & 0xFF;
+                lk->output[off + 1] = (stub_addr >> 16) & 0xFF;
+                lk->output[off + 2] = (stub_addr >> 8)  & 0xFF;
+                lk->output[off + 3] = stub_addr & 0xFF;
+            }
+        }
+
+        fprintf(stderr, "Linker: installed %d exception vectors in $0-$FF\n", vec_installed);
+        #undef INSTALL_VEC
     }
 
     /* Dump stub symbol report */
@@ -633,7 +704,7 @@ bool linker_link(linker_t *lk) {
     fprintf(stderr, "Linker: %d symbols total (%d entries, %d externs), %d resolved, %d unresolved\n",
             lk->num_symbols, entries, externs, resolved, unresolved);
     /* Search for specific symbols to debug */
-    const char *debug_syms[] = {NULL};
+    const char *debug_syms[] = {"INIT_TRAPV", "INTSOFF", "INITSYS", "TRAP1", "TRAP7", "BUS_ERR", "SCHDTRAP", "INIT_NMI_TRAPV", "INTSON", NULL};
     for (int d = 0; debug_syms[d]; d++) {
         int idx = find_global_symbol(lk, debug_syms[d]);
         if (idx >= 0) {

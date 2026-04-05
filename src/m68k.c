@@ -2613,19 +2613,35 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             }
         }
 
-        /* Breakpoint: log when PC enters INIT_TRAPV */
-        static int initrap_logged = 0;
-        if (!initrap_logged && cpu->pc >= 0x178000 && cpu->pc <= 0x179000) {
-            /* Check if this is near INIT_TRAPV ($17850C) */
-            if (cpu->pc >= 0x178500 && cpu->pc <= 0x178510) {
-                fprintf(stderr, "INIT_TRAPV HIT: PC=$%06X A0=$%08X A1=$%08X A2=$%08X A5=$%08X SP=$%08X\n",
-                        cpu->pc, cpu->a[0], cpu->a[1], cpu->a[2], cpu->a[5], cpu->a[7]);
-                fprintf(stderr, "  RAM[$84]=$%02X%02X%02X%02X before INIT_TRAPV\n",
-                        cpu_read8(cpu, 0x84), cpu_read8(cpu, 0x85),
-                        cpu_read8(cpu, 0x86), cpu_read8(cpu, 0x87));
-                initrap_logged = 1;
+        /* Log first few TRAP exceptions with vector table state */
+        static int trap_detail_count = 0;
+        if (trap_detail_count < 5) {
+            uint16_t opword2 = cpu_read16(cpu, cpu->pc);
+            if ((opword2 & 0xFFF0) == 0x4E40) {
+                int vec = opword2 & 0xF;
+                uint32_t vec_addr = (VEC_TRAP_BASE + vec) * 4;
+                uint32_t handler = cpu_read32(cpu, vec_addr);
+                fprintf(stderr, "TRAP #%d at PC=$%06X: vector[$%X]=$%08X  D0=$%08X A0=$%08X A6=$%08X SP=$%08X\n",
+                        vec, cpu->pc, vec_addr, handler, cpu->d[0], cpu->a[0], cpu->a[6], cpu->a[7]);
+                (void)handler; /* suppress unused warning */
+                /* Dump first few TRAP vectors */
+                if (trap_detail_count == 0) {
+                    fprintf(stderr, "  TRAP vector table ($80-$BC):\n");
+                    for (int tv = 0; tv < 16; tv++) {
+                        fprintf(stderr, "    TRAP#%d [$%02X] = $%08X\n",
+                                tv, 0x80 + tv*4, cpu_read32(cpu, 0x80 + tv*4));
+                    }
+                }
+                trap_detail_count++;
             }
         }
+
+        /* (TRAP7 tracing removed — handler is working) */
+
+        /* Track highest PC reached in OS code */
+        static uint32_t max_os_pc = 0;
+        if (cpu->pc >= 0x400 && cpu->pc < 0x100000 && cpu->pc > max_os_pc)
+            max_os_pc = cpu->pc;
 
         /* Log when PC enters vector table after being in OS code */
         static uint32_t prev_pc = 0;

@@ -561,29 +561,19 @@ void lisa_reset(lisa_t *lisa) {
 
         printf("Pre-loaded %d boot blocks at RAM $20000\n", boot_blocks);
 
-        /* Set up exception vectors in RAM $0-$3FF.
-         * Code starts at $400, so vectors don't overlap.
-         * Line-A/Line-F get skip handlers; others get plain RTE. */
-        for (int v = 0; v < 256; v++) {
-            uint32_t handler;
-            if (v == 10)      handler = 0x00FE0320;  /* Line-A skip handler */
-            else if (v == 11) handler = 0x00FE0310;  /* Line-F (SANE) skip handler */
-            else              handler = 0x00FE0300;  /* Default RTE */
-            int off = v * 4;
-            if (off + 3 < 0x400) {
-                lisa->mem.ram[off + 0] = (handler >> 24) & 0xFF;
-                lisa->mem.ram[off + 1] = (handler >> 16) & 0xFF;
-                lisa->mem.ram[off + 2] = (handler >> 8) & 0xFF;
-                lisa->mem.ram[off + 3] = handler & 0xFF;
-            }
-        }
+        /* Vector table ($0-$3FF) is pre-installed by the linker in system.os.
+         * Only set Vector 0 (SSP) and Vector 1 (PC) for boot. */
         /* Vector 0: Initial SSP */
         lisa->mem.ram[0] = 0x00; lisa->mem.ram[1] = 0x07;
         lisa->mem.ram[2] = 0x90; lisa->mem.ram[3] = 0x00;
         /* Vector 1: Initial PC (points to first code at $400) */
         lisa->mem.ram[4] = 0x00; lisa->mem.ram[5] = 0x00;
         lisa->mem.ram[6] = 0x04; lisa->mem.ram[7] = 0x00;
-        printf("Set up 256 exception vectors in RAM $0-$3FF\n");
+
+        /* Log vector table state */
+        printf("Vector table from linker: TRAP1[$84]=$%02X%02X%02X%02X TRAP7[$9C]=$%02X%02X%02X%02X\n",
+               lisa->mem.ram[0x84], lisa->mem.ram[0x85], lisa->mem.ram[0x86], lisa->mem.ram[0x87],
+               lisa->mem.ram[0x9C], lisa->mem.ram[0x9D], lisa->mem.ram[0x9E], lisa->mem.ram[0x9F]);
 
         /* Set up loader parameter block in low memory.
          * The real Lisa boot loader fills these before calling the OS.

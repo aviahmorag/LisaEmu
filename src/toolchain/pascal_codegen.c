@@ -127,6 +127,8 @@ static int type_size(type_desc_t *t) {
 /* Forward declarations for symbol lookup (used in resolve_type for CONST) */
 static cg_symbol_t *find_global(codegen_t *cg, const char *name);
 static cg_symbol_t *find_imported(codegen_t *cg, const char *name);
+static void register_proc_sig(codegen_t *cg, const char *name, ast_node_t *params[], int num_params);
+static cg_proc_sig_t *find_proc_sig(codegen_t *cg, const char *name);
 
 /* Resolve a type from an AST type node */
 static type_desc_t *resolve_type(codegen_t *cg, ast_node_t *node) {
@@ -887,10 +889,48 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                 }
             }
 
-            /* Generic function call — not an intrinsic */
-            for (int i = node->num_children - 1; i >= 0; i--) {
-                gen_expression(cg, node->children[i]);
-                emit16(cg, 0x2F00);  /* MOVE.L D0,-(SP) */
+            /* Generic function call — not an intrinsic.
+             * Pascal calling convention: parameters pushed left-to-right
+             * (first param pushed first = deepest on stack).
+             * Callee-clean (external/assembly) routines pop params themselves.
+             * Caller-clean (Pascal) routines need caller to adjust SP after. */
+            cg_proc_sig_t *sig = find_proc_sig(cg, fn);
+            cg_symbol_t *callee_sym = find_global(cg, fn);
+            if (!callee_sym) callee_sym = find_imported(cg, fn);
+            bool is_callee_clean = (callee_sym && callee_sym->is_external) ||
+                                   (sig && sig->is_external);
+            {
+
+            /* Push order: left-to-right for callee-clean (assembly),
+             * right-to-left for caller-clean (Pascal codegen).
+             * Use correct push size (MOVE.W vs MOVE.L) based on param type. */
+            if (is_callee_clean) {
+                for (int i = 0; i < node->num_children; i++) {
+                    bool is_var_arg = (sig && i < sig->num_params && sig->param_is_var[i]);
+                    int psize = (sig && i < sig->num_params) ? sig->param_size[i] : 4;
+                    if (is_var_arg) {
+                        gen_lvalue_addr(cg, node->children[i]);
+                        emit16(cg, 0x2F08);  /* MOVE.L A0,-(SP) */
+                    } else if (psize <= 2) {
+                        gen_expression(cg, node->children[i]);
+                        emit16(cg, 0x3F00);  /* MOVE.W D0,-(SP) */
+                    } else {
+                        gen_expression(cg, node->children[i]);
+                        emit16(cg, 0x2F00);  /* MOVE.L D0,-(SP) */
+                    }
+                }
+            } else {
+                for (int i = node->num_children - 1; i >= 0; i--) {
+                    bool is_var_arg = (sig && i < sig->num_params && sig->param_is_var[i]);
+                    if (is_var_arg) {
+                        gen_lvalue_addr(cg, node->children[i]);
+                        emit16(cg, 0x2F08);  /* MOVE.L A0,-(SP) */
+                    } else {
+                        gen_expression(cg, node->children[i]);
+                        emit16(cg, 0x2F00);  /* MOVE.L D0,-(SP) */
+                    }
+                }
+            }
             }
             /* JSR to function */
             emit16(cg, 0x4EB9);  /* JSR abs.L */
@@ -905,9 +945,7 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
             }
             /* Clean up args — but NOT for EXTERNAL (assembly) routines,
              * which are callee-clean (they pop their own parameters). */
-            cg_symbol_t *callee = find_global(cg, node->name);
-            bool callee_clean = (callee && callee->is_external);
-            if (!callee_clean) {
+            if (!is_callee_clean) {
                 int arg_bytes = node->num_children * 4;
                 if (arg_bytes > 0 && arg_bytes <= 8) {
                     emit16(cg, 0x508F | ((arg_bytes & 7) << 9));  /* ADDQ.L #n,SP */
@@ -1304,6 +1342,38 @@ static void process_declarations(codegen_t *cg, ast_node_t *node, bool is_global
             case AST_DIRECTIVE:
                 gen_statement(cg, child);
                 break;
+            case AST_PROC_DECL:
+            case AST_FUNC_DECL: {
+                bool is_ext = str_eq_nocase(child->str_val, "EXTERNAL");
+                /* Register signature for VAR parameter tracking */
+                bool has_params = false;
+                for (int j = 0; j < child->num_children; j++) {
+                    if (child->children[j]->type == AST_PARAM_LIST) {
+                        register_proc_sig(cg, child->name,
+                                          child->children[j]->children,
+                                          child->children[j]->num_children);
+                        has_params = true;
+                        break;
+                    }
+                }
+                /* If external declaration without params, mark existing signature */
+                if (is_ext) {
+                    cg_proc_sig_t *existing = find_proc_sig(cg, child->name);
+                    if (existing) existing->is_external = true;
+                    /* Also register empty sig if no params and no existing sig */
+                    if (!has_params && !existing && cg->proc_sigs &&
+                        cg->num_proc_sigs < CODEGEN_MAX_PROC_SIGS) {
+                        cg_proc_sig_t *sig = &cg->proc_sigs[cg->num_proc_sigs++];
+                        memset(sig, 0, sizeof(*sig));
+                        strncpy(sig->name, child->name, 63);
+                        sig->is_external = true;
+                    }
+                }
+                /* Register as external symbol */
+                cg_symbol_t *psym = add_global_sym(cg, child->name, NULL);
+                if (psym && is_ext) psym->is_external = true;
+                break;
+            }
             default:
                 break;
         }
@@ -1349,6 +1419,15 @@ static void gen_proc_or_func(codegen_t *cg, ast_node_t *node) {
                     if (param_offset % 2) param_offset++;
                 }
             }
+        }
+    }
+
+    /* Register procedure signature for VAR parameter tracking at call sites */
+    for (int i = 0; i < node->num_children; i++) {
+        if (node->children[i]->type == AST_PARAM_LIST) {
+            ast_node_t *params = node->children[i];
+            register_proc_sig(cg, node->name, params->children, params->num_children);
+            break;
         }
     }
 
@@ -1504,11 +1583,61 @@ static void gen_program(codegen_t *cg, ast_node_t *prog) {
 
 void codegen_init(codegen_t *cg) {
     memset(cg, 0, sizeof(codegen_t));
+    cg->proc_sigs = calloc(CODEGEN_MAX_PROC_SIGS, sizeof(cg_proc_sig_t));
     init_builtin_types(cg);
 }
 
 void codegen_free(codegen_t *cg) {
+    if (cg->proc_sigs) free(cg->proc_sigs);
     memset(cg, 0, sizeof(codegen_t));
+}
+
+/* Register a procedure signature for VAR parameter tracking */
+static void register_proc_sig(codegen_t *cg, const char *name, ast_node_t *params[], int num_params) {
+    if (!cg->proc_sigs || cg->num_proc_sigs >= CODEGEN_MAX_PROC_SIGS) return;
+    /* Log signature registrations for key boot procedures */
+    if (strcasecmp(name, "INTSOFF") == 0 || strcasecmp(name, "INTSON") == 0 ||
+        strcasecmp(name, "POOL_INIT") == 0 || strcasecmp(name, "INIT_TRAPV") == 0) {
+        fprintf(stderr, "  REGISTER SIG: %s (%d params) in %s\n", name, num_params, cg->current_file);
+    }
+    cg_proc_sig_t *sig = &cg->proc_sigs[cg->num_proc_sigs++];
+    strncpy(sig->name, name, 63);
+    sig->num_params = num_params < CODEGEN_MAX_PARAMS ? num_params : CODEGEN_MAX_PARAMS;
+    for (int i = 0; i < sig->num_params; i++) {
+        /* str_val[0] != '\0' means VAR parameter (set by parser) */
+        sig->param_is_var[i] = (params[i]->str_val[0] != '\0');
+        if (sig->param_is_var[i]) {
+            sig->param_size[i] = 4;  /* VAR params are always pointers */
+        } else {
+            /* Determine size from type */
+            type_desc_t *ptype = NULL;
+            if (params[i]->num_children > 0)
+                ptype = resolve_type(cg, params[i]->children[0]);
+            if (ptype && ptype->size == 4)
+                sig->param_size[i] = 4;  /* longint, pointer, etc. */
+            else
+                sig->param_size[i] = 2;  /* integer, enum, boolean, etc. */
+        }
+    }
+}
+
+/* Look up a procedure signature by name */
+static cg_proc_sig_t *find_proc_sig(codegen_t *cg, const char *name) {
+    /* Search local signatures */
+    if (cg->proc_sigs) {
+        for (int i = 0; i < cg->num_proc_sigs; i++) {
+            if (strcasecmp(cg->proc_sigs[i].name, name) == 0)
+                return &cg->proc_sigs[i];
+        }
+    }
+    /* Search imported signatures */
+    if (cg->imported_proc_sigs) {
+        for (int i = 0; i < cg->imported_proc_sigs_count; i++) {
+            if (strcasecmp(cg->imported_proc_sigs[i].name, name) == 0)
+                return &cg->imported_proc_sigs[i];
+        }
+    }
+    return NULL;
 }
 
 bool codegen_generate(codegen_t *cg, ast_node_t *ast) {

@@ -101,6 +101,17 @@ typedef struct {
     int frame_size;         /* Total size of local variables */
 } cg_scope_t;
 
+/* Procedure signature — tracks VAR params, sizes, and calling convention */
+#define CODEGEN_MAX_PROC_SIGS 4096
+#define CODEGEN_MAX_PARAMS 16
+typedef struct {
+    char name[64];
+    int num_params;
+    bool param_is_var[CODEGEN_MAX_PARAMS];  /* true = VAR parameter */
+    int param_size[CODEGEN_MAX_PARAMS];     /* Parameter size in bytes (2 or 4) */
+    bool is_external;                       /* true = assembly/external (callee-clean) */
+} cg_proc_sig_t;
+
 /* Relocation */
 typedef struct {
     uint32_t offset;        /* Offset in code where relocation needed */
@@ -159,6 +170,14 @@ typedef struct {
     /* Imported types from previously compiled units (set by toolchain bridge) */
     type_desc_t *imported_types;
     int imported_types_count;
+
+    /* Procedure signatures — shared across units for VAR parameter handling */
+    cg_proc_sig_t *proc_sigs;
+    int num_proc_sigs;
+
+    /* Imported procedure signatures from previously compiled units */
+    cg_proc_sig_t *imported_proc_sigs;
+    int imported_proc_sigs_count;
 } codegen_t;
 
 /* Public API */

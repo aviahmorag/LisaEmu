@@ -218,6 +218,11 @@ static char *read_file(const char *path) {
 static cg_symbol_t shared_globals[MAX_SHARED_GLOBALS];
 static int num_shared_globals = 0;
 
+/* Shared procedure signatures accumulated from all previously compiled units */
+#define MAX_SHARED_PROC_SIGS 8192
+static cg_proc_sig_t shared_proc_sigs[MAX_SHARED_PROC_SIGS];
+static int num_shared_proc_sigs = 0;
+
 /* OS kernel modules — from Lisa_Source/LISA_OS/OS exec files/BUILD-LINKLIST.TEXT
  * These 46 modules comprise system.os. Everything else is a library or application. */
 static bool is_kernel_module(const char *path) {
@@ -338,6 +343,27 @@ static bool compile_pascal_file(const char *path, linker_t *lk) {
     cg->imported_globals_count = num_shared_globals;
     cg->imported_types = shared_types;
     cg->imported_types_count = num_shared_types;
+    cg->imported_proc_sigs = shared_proc_sigs;
+    cg->imported_proc_sigs_count = num_shared_proc_sigs;
+    if (is_startup) {
+        fprintf(stderr, "STARTUP: imported %d proc sigs, %d globals, %d types\n",
+                num_shared_proc_sigs, num_shared_globals, num_shared_types);
+        /* Check for key signatures */
+        int found_intsoff = 0;
+        for (int i = 0; i < num_shared_proc_sigs; i++) {
+            if (strcasecmp(shared_proc_sigs[i].name, "INTSOFF") == 0) {
+                fprintf(stderr, "  IMPORTED SIG[%d]: %s (%d params) ext=%d\n",
+                        i, shared_proc_sigs[i].name, shared_proc_sigs[i].num_params,
+                        shared_proc_sigs[i].is_external);
+                found_intsoff++;
+            }
+        }
+        if (!found_intsoff) {
+            fprintf(stderr, "  WARNING: INTSOFF not in shared_proc_sigs! First 5 sigs:\n");
+            for (int i = 0; i < 5 && i < num_shared_proc_sigs; i++)
+                fprintf(stderr, "    [%d] %s (%d params)\n", i, shared_proc_sigs[i].name, shared_proc_sigs[i].num_params);
+        }
+    }
 
     /* Debug: log AST type for every file to trace symbol issues */
     if (ast && (strcasestr(path, "UNITHZ") || strcasestr(path, "UNITSTD"))) {
@@ -380,6 +406,13 @@ static bool compile_pascal_file(const char *path, linker_t *lk) {
     for (int i = 0; i < cg->num_types && num_shared_types < MAX_SHARED_TYPES; i++) {
         if (cg->types[i].name[0]) {
             shared_types[num_shared_types++] = cg->types[i];
+        }
+    }
+
+    /* Export this file's procedure signatures to the shared table */
+    if (cg->proc_sigs) {
+        for (int i = 0; i < cg->num_proc_sigs && num_shared_proc_sigs < MAX_SHARED_PROC_SIGS; i++) {
+            shared_proc_sigs[num_shared_proc_sigs++] = cg->proc_sigs[i];
         }
     }
 

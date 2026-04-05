@@ -6,9 +6,12 @@
  */
 
 #include "lisa.h"
+#include "toolchain/toolchain_bridge.h"
+#include "toolchain/bootrom.h"
 #include <SDL.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/stat.h>
 
 #define WINDOW_SCALE 2
 
@@ -81,20 +84,40 @@ int main(int argc, char *argv[]) {
 
     lisa_init(&lisa);
 
-    /* Load ROM */
-    if (argc > 1) {
+    if (argc < 2) {
+        printf("Usage: %s <Lisa_Source_dir>    (build from source)\n", argv[0]);
+        printf("       %s <rom_file> [profile_image] [floppy_image]\n", argv[0]);
+        return 1;
+    }
+
+    /* Detect: is argv[1] a source directory or a ROM file? */
+    if (toolchain_validate_source(argv[1])) {
+        /* Build from source */
+        printf("Building from source: %s\n", argv[1]);
+        build_result_t br = toolchain_build(argv[1], "build", NULL);
+        if (!br.success || br.files_compiled == 0) {
+            fprintf(stderr, "Toolchain build failed: %s\n", br.error_message);
+            return 1;
+        }
+        printf("Build OK: %d compiled, %d assembled, %d linked\n",
+               br.files_compiled, br.files_assembled, br.files_linked);
+
+        /* Load generated ROM */
+        if (!lisa_load_rom(&lisa, "build/lisa_boot.rom")) {
+            fprintf(stderr, "Failed to load generated ROM\n");
+            return 1;
+        }
+        /* Mount generated disk image */
+        lisa_mount_profile(&lisa, "build/lisa_profile.image");
+    } else {
+        /* Legacy: treat as ROM file */
         if (!lisa_load_rom(&lisa, argv[1])) {
             fprintf(stderr, "Failed to load ROM: %s\n", argv[1]);
             return 1;
         }
-    } else {
-        printf("Usage: %s <rom_file> [profile_image] [floppy_image]\n", argv[0]);
-        printf("No ROM specified. Running with empty ROM (will likely crash).\n\n");
+        if (argc > 2) lisa_mount_profile(&lisa, argv[2]);
+        if (argc > 3) lisa_mount_floppy(&lisa, argv[3]);
     }
-
-    /* Mount disks */
-    if (argc > 2) lisa_mount_profile(&lisa, argv[2]);
-    if (argc > 3) lisa_mount_floppy(&lisa, argv[3]);
 
     /* Initialize SDL */
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER) < 0) {
