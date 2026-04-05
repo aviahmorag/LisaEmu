@@ -16,6 +16,7 @@ final class EmulatorViewModel {
     var buildProgress = ""
     var buildComplete = false
     var builtImagePath: String?
+    var builtRomPath: String?
 
     // Logs
     var showLogs = false
@@ -76,6 +77,21 @@ final class EmulatorViewModel {
             log("Power On failed: no ROM or built image loaded")
             return
         }
+
+        // Load ROM if we have a path but haven't loaded yet
+        if !romLoaded, let romPath = builtRomPath {
+            if emu_load_rom(romPath) {
+                romLoaded = true
+                log("Boot ROM loaded: \(romPath)")
+            }
+        }
+
+        // Mount image if we have a path
+        if let imagePath = builtImagePath {
+            _ = emu_mount_profile(imagePath)
+            log("Mounted image: \(imagePath)")
+        }
+
         log("Power On — romLoaded=\(romLoaded), buildComplete=\(buildComplete), imagePath=\(builtImagePath ?? "nil")")
 
         emu_reset()
