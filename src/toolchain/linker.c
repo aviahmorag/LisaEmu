@@ -67,12 +67,30 @@ static int find_global_symbol(linker_t *lk, const char *name) {
      * The compiler emits human-readable names but the runtime uses
      * mangled %_ prefixed names. */
     static const struct { const char *from; const char *to; } name_map[] = {
+        /* Compiler intrinsics → runtime */
         {"InClass",   "%_InObCN"},
         {"HALT",      "%_HALT"},
         {"WRITELN",   "%_WriteLn"},
         {"READLN",    "%_ReadLn"},
         {"NEW",       "%_New"},
         {"DISPOSE",   "%_Dispose"},
+        /* FPLIB wrappers → NEWFPSUB assembly (2-operand form) */
+        {"fpaddx",    "%f_ADD"},
+        {"fpsubx",    "%f_SUB"},
+        {"fpmulx",    "%f_MUL"},
+        {"fpdivx",    "%f_DIV"},
+        {"fpcomx",    "%f_EQ"},     /* compare → equality test (close enough) */
+        {"fpmovex",   "%f_ADD"},    /* move via add-zero approximation */
+        {"fpnegx",    "%f_neg"},
+        {"fpabsx",    "%f_abs"},
+        {"fpadd",     "%f_ADD"},
+        {"fpmul",     "%f_MUL"},
+        /* Math functions */
+        {"SINx",      "%_SIN"},
+        {"COSx",      "%_COS"},
+        {"EXPx",      "%_EXP"},
+        {"LNx",       "%_LN"},
+        {"ATANx",     "%_ATAN"},
         {NULL, NULL}
     };
     for (int m = 0; name_map[m].from; m++) {
