@@ -168,9 +168,9 @@ uint8_t *bootrom_generate(void) {
     emit16(&b, 0x0000);
     emit32(&b, 0x00FCE00C);
 
-    /* Program 8 segments for identity mapping (1MB) */
+    /* Program 16 segments for identity mapping (2MB — full RAM) */
     /* Segment 0: SLIM=$0700 at $008000, SORG=$0000 at $008008 */
-    for (int seg = 0; seg < 8; seg++) {
+    for (int seg = 0; seg < 16; seg++) {
         uint32_t slim_addr = 0x008000 + (uint32_t)seg * 0x20000;
         uint32_t sorg_addr = 0x008008 + (uint32_t)seg * 0x20000;
         uint16_t sor_val = (uint16_t)(seg * 256);  /* seg * 128KB / 512 = seg * 256 pages */

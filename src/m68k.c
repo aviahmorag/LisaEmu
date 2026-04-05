@@ -2653,8 +2653,21 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         if (cpu->pc == 0x3F0) {
             static int stub_call_count = 0;
             if (stub_call_count < 20) {
-                uint32_t caller = cpu_read32(cpu, cpu->a[7]); /* return addr on stack */
+                uint32_t caller = cpu_read32(cpu, cpu->a[7]);
                 fprintf(stderr, "STUB CALL from $%06X (call #%d)\n", caller - 6, ++stub_call_count);
+            }
+        }
+        /* Trace first escape past loaded OS code ($6A000) */
+        {
+            static bool code_escape_logged = false;
+            if (!code_escape_logged && cpu->pc >= 0x6A000 && cpu->pc < 0xFC0000) {
+                fprintf(stderr, "=== CODE ESCAPE: PC=$%06X SP=$%08X A6=$%08X. Last 30 PCs:\n",
+                        cpu->pc, cpu->a[7], cpu->a[6]);
+                for (int ri = 30; ri > 0; ri--) {
+                    uint32_t rpc = pc_ring[(pc_ring_idx - ri) & 255];
+                    fprintf(stderr, "    PC=$%06X op=$%04X\n", rpc, cpu_read16(cpu, rpc));
+                }
+                code_escape_logged = true;
             }
         }
 
