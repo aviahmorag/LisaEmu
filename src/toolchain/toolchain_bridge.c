@@ -45,7 +45,8 @@ static bool should_skip_dir(const char *name) {
     if (strcasecmp(name, "APIN") == 0) return true;  /* install scripts */
     if (strcasecmp(name, "GUIDE_APIM") == 0) return true; /* guide/tutorial app */
     if (strcasecmp(name, "TKIN") == 0) return true;  /* toolkit install */
-    if (strcasecmp(name, "LIBHW") == 0 && !strcasestr(name, "LIBS")) return true; /* duplicate LIBHW outside LIBS */
+    /* LIBHW directory is in LIBS/ — don't skip it. Only skip if it's a duplicate at the top level. */
+    /* (Previously this was broken: name is just "LIBHW" which never contains "LIBS") */
     /* Skip TK3/TK4/TK5 sample app directories (contain build scripts, not compilable units) */
     if (strcasecmp(name, "TK3") == 0 || strcasecmp(name, "TK4") == 0 || strcasecmp(name, "TK5") == 0) return true;
 
