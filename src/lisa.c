@@ -890,7 +890,18 @@ int lisa_run_frame(lisa_t *lisa) {
 
     /* Debug: log CPU/VIA/vector state once after significant execution */
     static int frame_count = 0;
-    if (++frame_count == 120) {
+    frame_count++;
+    if (frame_count == 120) {
+        /* Dump code around the stuck PC */
+        fprintf(stderr, "Code at DIAG PC:\n");
+        for (int off = -16; off <= 16; off += 2) {
+            uint32_t addr = lisa->cpu.pc + off;
+            fprintf(stderr, "  %s$%06X: $%04X\n",
+                    off == 0 ? ">>>" : "   ", addr,
+                    (uint16_t)(lisa->mem.ram[addr] << 8 | lisa->mem.ram[addr+1]));
+        }
+    }
+    if (frame_count == 60 || frame_count == 120 || frame_count == 240 || frame_count == 480) {
         fprintf(stderr, "DIAG frame %d: PC=$%06X SR=$%04X stopped=%d pending_irq=%d setup=%d\n",
                 frame_count, lisa->cpu.pc, lisa->cpu.sr, lisa->cpu.stopped,
                 lisa->cpu.pending_irq, lisa->mem.setup_mode);
