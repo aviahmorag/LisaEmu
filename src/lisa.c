@@ -263,6 +263,10 @@ static void via1_porta_write(uint8_t val, uint8_t ddr, void *ctx) {
 
             if (cmd == 0x00) {
                 /* READ command */
+                { static int read_count = 0;
+                  if (read_count++ < 10)
+                    fprintf(stderr, "ProFile READ block %u (read #%d)\n", block, read_count);
+                }
                 profile_read_block(lisa, block);
                 lisa->profile.state = PROF_READING;
                 lisa->profile.buf_index = 0;
