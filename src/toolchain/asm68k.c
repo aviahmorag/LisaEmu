@@ -634,7 +634,7 @@ static bool parse_operand(asm68k_t *as, const char *str, operand_t *op) {
     op->type = OP_ABS_LONG;
     op->disp = eval_expr(as, buf);
 
-    /* Check if this references a .REF (external) symbol — need relocation */
+    /* Check if this references a symbol */
     {
         char sym_name[ASM_MAX_LABEL];
         strncpy(sym_name, buf, ASM_MAX_LABEL - 1);
@@ -642,6 +642,12 @@ static bool parse_operand(asm68k_t *as, const char *str, operand_t *op) {
         str_trim(sym_name);
         int si = find_symbol(as, sym_name);
         if (si >= 0 && as->symbols[si].external) {
+            /* External (.REF) symbol — need linker relocation */
+            op->ref_sym_idx = si;
+        } else if (si >= 0 && as->symbols[si].defined && !as->symbols[si].external) {
+            /* Local defined label — generate relocation just like external.
+             * The symbol will be added to the linker's table by the bridge code,
+             * and the linker will resolve it to base_addr + label_offset. */
             op->ref_sym_idx = si;
         }
     }
@@ -688,19 +694,15 @@ static void emit_ea_extension(asm68k_t *as, operand_t *op, int size) {
             emit16(as, (uint16_t)(int16_t)op->disp);
             break;
         case OP_ABS_LONG:
-            /* Record relocation for external (.REF) symbols */
             if (op->ref_sym_idx >= 0 && as->pass == 2) {
+                /* Generate relocation — linker adds module base offset.
+                 * Works for both external (.REF) and local symbols. */
                 if (as->num_relocs < ASM_MAX_RELOCS) {
                     asm_reloc_t *r = &as->relocs[as->num_relocs++];
                     r->offset = as->sections[as->current_section].size;
                     r->symbol_idx = op->ref_sym_idx;
                     r->size = 4;
                     r->pc_relative = false;
-                }
-                if (strcasestr(as->current_file, "INITRAP") || strcasestr(as->current_file, "starasm1")) {
-                    fprintf(stderr, "  ASM RELOC: %s sym='%s' at offset %u\n",
-                            as->current_file, as->symbols[op->ref_sym_idx].name,
-                            as->sections[as->current_section].size);
                 }
             }
             emit32(as, (uint32_t)op->disp);
