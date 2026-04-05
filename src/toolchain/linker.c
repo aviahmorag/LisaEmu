@@ -345,6 +345,7 @@ bool linker_load_codegen(linker_t *lk, const char *name,
     link_module_t *mod = calloc(1, sizeof(link_module_t));
     if (!mod) return false;
 
+    mod->is_kernel = true;  /* Default: include in output. Caller can override. */
     strncpy(mod->name, name, sizeof(mod->name) - 1);
     strncpy(mod->filename, name, sizeof(mod->filename) - 1);
 
@@ -419,6 +420,10 @@ bool linker_link(linker_t *lk) {
 
     for (int i = 0; i < lk->num_modules; i++) {
         link_module_t *mod = lk->modules[i];
+        if (!mod->is_kernel) {
+            mod->base_addr = 0;  /* Non-kernel modules don't get addresses */
+            continue;
+        }
         /* Word-align */
         if (current_addr & 1) current_addr++;
         mod->base_addr = current_addr;
@@ -566,7 +571,7 @@ bool linker_link(linker_t *lk) {
     }
     for (int i = 0; i < lk->num_modules; i++) {
         link_module_t *mod = lk->modules[i];
-        if (mod->code && mod->code_size > 0) {
+        if (mod->is_kernel && mod->code && mod->code_size > 0) {
             memcpy(lk->output + mod->base_addr, mod->code, mod->code_size);
         }
     }

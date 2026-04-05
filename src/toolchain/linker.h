@@ -46,6 +46,7 @@ typedef struct {
     char name[64];           /* Module name (from .PROC/.FUNC or unit name) */
     uint8_t *code;
     uint32_t code_size;
+    bool is_kernel;          /* True = include in system.os output */
 
     /* Symbols from this module */
     struct {

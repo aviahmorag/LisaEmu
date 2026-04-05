@@ -218,6 +218,54 @@ static char *read_file(const char *path) {
 static cg_symbol_t shared_globals[MAX_SHARED_GLOBALS];
 static int num_shared_globals = 0;
 
+/* OS kernel modules — from Lisa_Source/LISA_OS/OS exec files/BUILD-LINKLIST.TEXT
+ * These 46 modules comprise system.os. Everything else is a library or application. */
+static bool is_kernel_module(const char *path) {
+    static const char *kernel_names[] = {
+        "SOURCE-CD.", "SOURCE-PMEM.", "SOURCE-CDCONFIGASM.", "LIBHW-HWINTL.",
+        "libhw-HWINTL.", "source-OSUNITIO.", "SOURCE-DBGASM.", "source-PROCASM.",
+        "source-SCHED.", "SOURCE-PROCMGMT.", "source-procprims.", "source-LOAD.",
+        "SOURCE-MEASURE.", "source-MMPRIM.", "source-DS0.", "SOURCE-INITRAP.",
+        "source-EXCEPRIM.", "SOURCE-EVENTCHN.", "source-EXCEPMGR.", "source-TIMEMGR.",
+        "SOURCE-EXCEPASM.", "source-MMASM.", "source-NMIHANDLER.", "source-mover.",
+        "SOURCE-GENIO.", "SOURCE-HDISK.", "source-twiggy.", "source-clock.",
+        "source-asynctr.", "source-fsasm.", "SOURCE-VMSTUFF.", "source-sfileio.",
+        "source-fsdir.", "source-fsprim.", "source-fsui.", "source-fsinit.",
+        "source-OBJIO.", "source-MM0.", "source-SYSGLOBAL.", "source-starasm1.",
+        "source-STARASM2.", "source-STARASM3.", "SOURCE-STARTUP.",
+        "source-osintpaslib.", "source-pasmath.", "source-volchk.",
+        "source-scavenger.",
+        /* Additional OS support files needed by kernel */
+        "source-DRIVERDEFS.", "source-driversubs.", "source-PROFILE.",
+        "source-PRIAM.", "source-priamcard.", "SOURCE-SONY.",
+        "source-PSYSCALL.", "source-syscall.", "source-TWIG.",
+        "source-LDUTIL.", "source-ldlfs.", "source-PROF.",
+        "SOURCE-SERCARD.", "source-console.", "SOURCE-2PORTCARD.",
+        "SOURCE-MODEMA.", "source-rs232.", "source-micro.",
+        "source-parallelcable.", "source-pram.",
+        /* Assembly driver files */
+        "SOURCE-DRIVERASM.", "SOURCE-CONSOLEASM.", "SOURCE-PROFILEASM.",
+        "SOURCE-SONYASM.", "SOURCE-MODEMASM.", "source-rsASM.",
+        "source-LDASM.", "source-ldmicro.", "source-ldpram.",
+        "source-LDPROF.", "source-LDTWIG.", "source-SERNUM.",
+        "source-priamcardASM.", "source-PRIAMASM.", "source-printasm.",
+        "SOURCE-ARCHIVEASM.", "SOURCE-CDCONFIGASM.",
+        /* LIBHW — hardware library is part of kernel */
+        "libhw-DRIVERS.", "LIBHW-DRIVERS.",
+        "LibHW-HARDWARE.", "libhw-HARDWARE.",
+        "LibHW-HWINT.", "libhw-HWINT.",
+        /* OS library files needed for boot */
+        "source-PASCALDEFS.", "source-POSLIB.", "source-oslib.",
+        "source-parms.",
+        NULL
+    };
+    for (int i = 0; kernel_names[i]; i++) {
+        if (strcasestr(path, kernel_names[i]) != NULL)
+            return true;
+    }
+    return false;
+}
+
 /* Shared types accumulated from all previously compiled units */
 #define MAX_SHARED_TYPES 8192
 static type_desc_t shared_types[MAX_SHARED_TYPES];
@@ -341,6 +389,9 @@ static bool compile_pascal_file(const char *path, linker_t *lk) {
                                   cg->code, cg->code_size,
                                   cg->globals, cg->num_globals,
                                   cg->relocs, cg->num_relocs);
+        /* Tag non-kernel modules so linker excludes them from system.os */
+        if (ok && lk->num_modules > 0 && !is_kernel_module(path))
+            lk->modules[lk->num_modules - 1]->is_kernel = false;
     }
 
     codegen_free(cg);
@@ -435,6 +486,9 @@ static bool assemble_file(const char *path, linker_t *lk, const char *source_roo
         linker_load_codegen(lk, path,
                             asm68k_get_output(as, NULL), as->output_size,
                             syms, nsyms, rels, nrels);
+        /* Tag non-kernel assembly modules */
+        if (lk->num_modules > 0 && !is_kernel_module(path))
+            lk->modules[lk->num_modules - 1]->is_kernel = false;
         free(syms);
         free(rels);
     }
