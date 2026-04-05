@@ -62,6 +62,11 @@ static void emit32(codegen_t *cg, uint32_t val) {
     emit16(cg, val & 0xFFFF);
 }
 
+/* Ensure code is word-aligned (68000 requires even PC for instructions) */
+static void align_code(codegen_t *cg) {
+    if (cg->code_size & 1) emit16(cg, 0x4E71);  /* NOP */
+}
+
 /* Patch a 16-bit value at a given offset */
 static void patch16(codegen_t *cg, uint32_t offset, uint16_t val) {
     if (offset + 1 < CODEGEN_MAX_OUTPUT) {
@@ -1152,10 +1157,13 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                 emit16(cg, 0x6000);  /* BRA.W end_if */
                 uint32_t end_pos = cg->code_size;
                 emit16(cg, 0);
+                align_code(cg);
                 patch16(cg, else_pos, (uint16_t)(cg->code_size - else_pos));
                 gen_statement(cg, node->children[2]);
+                align_code(cg);
                 patch16(cg, end_pos, (uint16_t)(cg->code_size - end_pos));
             } else {
+                align_code(cg);
                 patch16(cg, else_pos, (uint16_t)(cg->code_size - else_pos));
             }
             break;
@@ -1170,9 +1178,11 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
             emit16(cg, 0);
 
             gen_statement(cg, node->children[1]);
+            align_code(cg);
             emit16(cg, 0x6000);  /* BRA.W loop_start */
             emit16(cg, (uint16_t)((int32_t)loop_start - (int32_t)cg->code_size));
 
+            align_code(cg);
             patch16(cg, end_pos, (uint16_t)(cg->code_size - end_pos));
             break;
         }
@@ -1236,9 +1246,11 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
             }
 
             /* Branch back */
+            align_code(cg);
             emit16(cg, 0x6000);
             emit16(cg, (uint16_t)((int32_t)loop_start - (int32_t)cg->code_size));
 
+            align_code(cg);
             patch16(cg, end_pos, (uint16_t)(cg->code_size - end_pos));
             break;
         }
@@ -1272,11 +1284,13 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                 gen_statement(cg, node->children[ci + 1]);
 
                 /* BRA.W end_case */
+                align_code(cg);
                 emit16(cg, 0x6000);
                 if (num_fixups < 128) end_fixups[num_fixups++] = cg->code_size;
                 emit16(cg, 0);
 
                 /* Patch BNE to skip to here */
+                align_code(cg);
                 patch16(cg, next_pos, (uint16_t)(cg->code_size - next_pos));
 
                 ci += 2;
@@ -1289,6 +1303,7 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
             }
 
             /* Patch all end_case branches to here */
+            align_code(cg);
             for (int j = 0; j < num_fixups; j++) {
                 patch16(cg, end_fixups[j], (uint16_t)(cg->code_size - end_fixups[j]));
             }
@@ -1428,6 +1443,9 @@ static void gen_proc_or_func(codegen_t *cg, ast_node_t *node) {
         return;
     }
 
+    /* Ensure word alignment before entry point */
+    align_code(cg);
+
     /* Record entry point */
     cg_symbol_t *entry = add_global_sym(cg, node->name, NULL);
     if (entry) entry->offset = (int)cg->code_size;
@@ -1494,6 +1512,7 @@ static void gen_proc_or_func(codegen_t *cg, ast_node_t *node) {
     /* Record the actual entry point AFTER nested procs are emitted.
      * Update the global symbol offset to point here, not to the
      * first nested proc's code. */
+    align_code(cg);
     if (entry) entry->offset = (int)cg->code_size;
 
     /* LINK A6,#-frame_size */
@@ -1591,11 +1610,17 @@ static void gen_program(codegen_t *cg, ast_node_t *prog) {
         }
     }
 
+    /* Ensure word alignment before main body — 68000 requires even PC */
+    align_code(cg);
     /* Patch the BRA.W displacement to jump to the main body.
      * BRA.W: target = PC + displacement, where PC = BRA_addr + 2.
      * So displacement = body_offset - (bra_fixup + 2). */
     uint32_t body_offset = cg->code_size;
     int16_t displacement = (int16_t)(body_offset - (bra_fixup + 2));
+    if (strcasestr(cg->current_file, "STARTUP")) {
+        fprintf(stderr, "STARTUP BRA.W: bra_fixup=%u body_offset=%u displacement=%d (0x%04X) target_odd=%d\n",
+                bra_fixup, body_offset, displacement, (uint16_t)displacement, body_offset & 1);
+    }
     cg->code[bra_fixup + 2] = (displacement >> 8) & 0xFF;
     cg->code[bra_fixup + 3] = displacement & 0xFF;
 
