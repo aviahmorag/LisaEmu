@@ -527,6 +527,15 @@ void lisa_reset(lisa_t *lisa) {
 
         printf("Pre-loaded %d boot blocks at RAM $20000\n", boot_blocks);
 
+        /* Dump PASCALINIT code (first 60 bytes) */
+        fprintf(stderr, "PASCALINIT @$DFD38:\n");
+        for (int di = 0; di < 60; di += 2) {
+            uint32_t a = 0xDFD38 + di;
+            fprintf(stderr, " $%04X", (lisa->mem.ram[a]<<8)|lisa->mem.ram[a+1]);
+            if ((di % 20) == 18) fprintf(stderr, "\n");
+        }
+        fprintf(stderr, "\n");
+
         /* Vector table ($0-$3FF) is pre-installed by the linker in system.os.
          * Only set Vector 0 (SSP) and Vector 1 (PC) for boot. */
         /* Vector 0: Initial SSP */

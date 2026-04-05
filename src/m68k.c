@@ -2120,10 +2120,17 @@ static void hle_trap6_mmu(m68k_t *cpu) {
 static void op_trap(m68k_t *cpu) {
     int vector = cpu->ir & 0xF;
 
-    /* TRAP #6 is the MMU programming handler (DO_AN_MMU).
-     * Let it execute normally via the vector table.
-     * The handler accesses MMU registers at $8000+seg*$20000
-     * which our lisa_mem_write16 intercepts. */
+    /* Log TRAP calls during early boot */
+    {
+        static int trap_log = 0;
+        if (trap_log < 10) {
+            fprintf(stderr, "TRAP #%d at PC=$%06X handler=$%08X SR=$%04X A0=$%08X D0=$%08X\n",
+                    vector, cpu->pc - 2,
+                    cpu_read32(cpu, (VEC_TRAP_BASE + vector) * 4),
+                    cpu->sr, cpu->a[0], cpu->d[0]);
+            trap_log++;
+        }
+    }
     take_exception(cpu, VEC_TRAP_BASE + vector);
     cpu->cycles += 34;
 }
@@ -2652,7 +2659,8 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         /* Trace INITSYS call sequence */
         {
             static const struct { uint32_t addr; const char *name; } trace_funcs[] = {
-                {0x4D88, "AFTER_PASCALINIT"}, {0x4BFE, "INITSYS"}, {0xDB580, "INTSOFF"}, {0x456, "GETLDMAP"},
+                {0x4D88, "AFTER_PASCALINIT"}, {0x4D8C, "JSR_INITSYS"},
+                {0x4BFE, "INITSYS"}, {0xDB580, "INTSOFF"},
                 {0xE010A, "REG_TO_MAPPED"}, {0xCB478, "POOL_INIT"},
                 {0xD981C, "INIT_TRAPV"}, {0, NULL}
             };
