@@ -8,142 +8,109 @@ build/lisaemu Lisa_Source   # Run from source directory (builds + boots)
 make audit                  # Full toolchain report
 ```
 
-## Current State: MMU framework working, blocked on unresolved symbols
+## Current State: OS boots, screen draws, scheduler runs 250 frames
 
-Boot path works through ROM → STARTUP → PASCALINIT → deep into INITSYS.
-A6 frame pointer stays intact. MMU identity mapping confirmed via register
-writes. OS execution eventually follows an uninitialized pointer to empty RAM.
+The Lisa OS boots through INITSYS, writes to the full screen buffer
+(32760/32760 bytes non-zero), and runs its scheduler for ~250 display
+frames before cascade failure from stack corruption.
 
 ### Runtime output:
 ```
-MMU REG: ctx=1 seg=0..15 identity mapped (boot ROM)
-CODE ESCAPE: PC=$180018 from $0627CC (MOVEA.L abs,A0; JMP d16(A0))
-  → pointer was never initialized (function that sets it up was stubbed)
-Exception: Line-F at $200000 (past 2MB RAM boundary → $FFFF = Line-F opcode)
-Linker: 1956 resolved, 6678 unresolved (2746 unique stub symbols)
+MMU: pre-programmed sysglobmmu(102), realmemmmu(85-100), kernelmmu(17-20)
+SGLOBAL@$200=$0006B000 (correctly initialized)
+Screen: 32760 non-zero bytes of 32760 (full screen written!)
+DIAG frame 120: PC=$019044 SR=$2100 stopped=0 pending_irq=0
+Exception counts: v4=1 v11=12527 (cascade from stack corruption)
+Linker: 1949 resolved, 6677 unresolved (2742 unique)
 ```
 
-## Session 3 Fixes (11 commits)
+### How the boot works:
+1. Boot ROM: sets SP/A5/A6/SR, programs 16 MMU identity segments, exits setup
+2. JMP $400 → STARTUP → PASCALINIT → INITSYS
+3. INITSYS: INTSOFF → GETLDMAP → REG_TO_MAPPED → POOL_INIT → INIT_TRAPV
+4. → DB_INIT → AVAIL_INIT → INIT_PROCESS → INIT_EM → INIT_SCTAB
+5. → BOOT_IO_INIT (identifies Lisa 2/10 Pepsi, ProFile boot)
+6. → INTSON(0) → FS_INIT → scheduler loop
+7. Force-unmask interrupts → vretrace drives scheduler → active OS code
+8. OS writes to screen → runs 250 frames → stack corruption → cascade
 
-### Linker fixes:
-1. **Non-kernel symbol collision** — Non-kernel module symbols with base_addr=0
-   resolved to addresses inside kernel code. JSR to MM_INIT landed inside
-   GETLDMAP's body, past its LINK A6 → corrupt frame pointer.
-   FIX: Only resolve symbols from is_kernel modules in Phase 2.
-2. **Symbol pre-resolution** — add_global_symbol() marked LSYM_ENTRY as resolved
-   immediately. Last-one-wins for duplicate symbols (non-kernel) kept resolved=true.
-   FIX: Never pre-resolve; Phase 2 handles resolution.
-3. **Stub location** — Stub at end of code got overwritten by OS init.
-   FIX: Moved to $3F0 (unused vector table area).
-4. **TRAP #6 vector** — Added do_an_mmu to vector table at $98.
+## Session 3 Fixes (22 commits)
 
-### Codegen fixes:
-5. **VAR param nested scope** — Three paths accessed outer-scope VAR params via
-   A6 without walking the frame chain. Fixed gen_lvalue_addr, gen_expression,
-   gen_statement(AST_ASSIGN).
+### Linker (4 fixes):
+- Non-kernel symbol collision (root cause of original A6 corruption)
+- Symbol pre-resolution bug in add_global_symbol
+- Stub moved to $3F0 (vector table, safe from OS overwrite)
+- TRAP #6 vector installed for MMU programming
 
-### Kernel module expansion:
-6. **15+ OS modules added** — MM1-MM4, MMPRIM2, DS2-DS3, DEVCONTROL, FSINIT1-2,
-   LOAD1, LOADER, EXCEPRES, EXCEPNR1, PMCNTRL, PMSPROCS, GDATALIST, etc.
+### Codegen (2 fixes):
+- VAR param nested scope in 3 code paths
+- Cross-library {$I} include search across all LIBS/ subdirs
 
-### MMU implementation:
-7. **5 contexts** (0=start, 1-4=normal) with segment1/segment2 selection
-8. **Context latches** at $FCE008-$FCE00E
-9. **MMU register writes** detected at $8000+seg*$20000 during setup mode
-10. **Boot ROM identity mapping** — 16 segments + I/O + ROM before setup exit
-11. **Translation** enabled on setup mode exit, uses SOR-based page origin
+### MMU (5 fixes):
+- 5 contexts with segment1/segment2 control
+- Context latches at $FCE008-$FCE00E
+- SOR/SLR register writes at $8000+seg*$20000
+- Boot ROM identity mapping (16 RAM + I/O + ROM segments)
+- Pre-programmed OS segments (102, 103, 104, 105, 85-100, 17-20)
 
-## Root Cause of Current Failure
+### Boot environment (6 fixes):
+- SGLOBAL at $200 = b_sysglobal address
+- DRIVRJT at $210 = driver jump table (32 RTS entries)
+- I/O board type ($FCC031 = $80 = Pepsi/Lisa 2)
+- Internal disk type ($FCC015 = 1 = Sony/ProFile)
+- 15+ kernel modules added (MM1-4, FSINIT, etc.)
+- Source patch script (scripts/patch_source.sh)
 
-The OS at $0627CC loads a pointer via `MOVEA.L (abs),A0; JMP offset(A0)`.
-The pointer ($180018) was never initialized because the function responsible
-for setting it up resolves to the stub ($3F0) and returns 0.
+## Cascade Failure Root Cause
 
-**This is a resolved-symbol-count problem.** Only 1956 of 8634 symbols resolve
-to real code. The rest go to a stub that returns 0. Critical data structures
-like jump tables, vtables, and function pointers are never initialized.
+At frame ~260, a FOR loop in compiled OS code writes to array elements
+via `MOVE.W D0,(A0)` where A0 is computed from uninitialized data.
+The write overflows into the stack frame, corrupting the saved A6.
+Subsequent UNLK restores garbage A6, RTS returns to garbage address.
+
+The uninitialized data comes from stubbed functions returning 0.
+**Fix: resolve more symbols** to prevent uninitialized data structures.
 
 ## Immediate Task: Increase Resolved Symbols
 
-### Strategy 1: Source preprocessing script
-Apply the 56 patches from LisaSourceCompilation project's `scripts/patch_files.py`
-automatically before compilation. Key patches:
-- DRIVERDEFS.TEXT: DEBUG1=FALSE, TWIGGYBUILD=FALSE
-- PASCALDEFS.TEXT: DEBUG1=0, TWIGGYBUILD=0
-- LIBOS/SYSCALL.TEXT: replace with SOURCE/SYSCALL.TEXT
-- Various typo and path fixes
+### Most impactful targets:
+1. **POOL_INIT / GETSPACE** — memory allocation. If these don't work,
+   ALL data structures are garbage. Check if they resolve correctly.
+2. **INIT_TRAPV** — installs real trap vectors. Without it, exception
+   handlers may be wrong.
+3. **Functions in the boot critical path** (lines 2146-2184 of STARTUP):
+   INTSOFF, GETLDMAP, REG_TO_MAPPED, INIT_PE, POOL_INIT, INIT_TRAPV,
+   DB_INIT, AVAIL_INIT, INIT_PROCESS, INIT_EM, INIT_EC, INIT_SCTAB,
+   BOOT_IO_INIT, SYS_PROC_INIT
 
-### Strategy 2: Identify critical boot-path functions
-The exact escape is at $0627CC. Find which function this is (by matching
-the linked offset to a module) and trace what initialized the pointer.
-
-### Strategy 3: More kernel modules
-Check which OS modules export symbols used by the boot path. The linker
-logs show 2746 unique unresolved symbols — filter to those called from
-kernel modules only.
-
-## Lisa MMU Architecture (from source + LisaEm analysis)
-
-### Segment Layout (from MMPRIM.TEXT):
-```
-kernelmmu  = 17    → OS code at logical $220000 (seg 17 * $20000)
-realmemmmu = 85    → physical RAM at logical $AA0000
-sysglobmmu = 102   → system global at logical $CC0000
-```
-
-### Hardware Registers:
-```
-SLIM base = $8000 + seg * $20000   (Segment Limit Register)
-SORG base = $8008 + seg * $20000   (Segment Origin Register)
-SLR values: $0700=RW mem, $0900=I/O, $0F00=SIO/ROM
-```
-
-### Context Control (I/O latches):
-```
-$FCE008: segment1 = 0     $FCE00A: segment1 = 1
-$FCE00C: segment2 = 0     $FCE00E: segment2 = 2
-$FCE010: setup mode ON    $FCE012: setup mode OFF
-Context = start ? 0 : (1 + segment1 | segment2)
-```
-
-### DO_AN_MMU (TRAP #6 handler):
-- Reads SMT entries: origin(16) | access(8) | length(8)
-- Toggles setup mode per segment write
-- Writes SLIM then SORG for each segment
-- Uses CXASEL (ignores start flag) for target context
+### Strategy:
+- Check which of these functions resolve to real code vs stub
+- For those going to stub, find what module defines them
+- Add missing modules to kernel list or fix compilation
 
 ## Key Files
 
-- `src/lisa_mmu.h/c` — MMU with 5 contexts, register writes, translation
-- `src/toolchain/bootrom.c` — Identity mapping, setup mode exit
-- `src/toolchain/linker.c` — Non-kernel symbol isolation, stub at $3F0
-- `src/toolchain/pascal_codegen.c` — VAR param nested scope fix
+- `src/lisa_mmu.h/c` — MMU: 5 contexts, register writes, translation
+- `src/toolchain/bootrom.c` — Identity mapping, I/O board detection
+- `src/toolchain/linker.c` — Non-kernel isolation, stub at $3F0
+- `src/toolchain/pascal_lexer.c` — Cross-library {$I} include search
+- `src/toolchain/pascal_codegen.c` — VAR param nested scope
 - `src/toolchain/toolchain_bridge.c` — Kernel module list
-- `src/m68k.c` — Code escape trace, stub call trace
+- `src/lisa.c` — SGLOBAL, DRIVRJT, MMU segments, I/O regs, interrupt hack
+- `scripts/patch_source.sh` — Source preprocessing (10 patches)
 
 ## Reference Projects (in _inspiration/)
 
-### LisaEm (Ray Arachelian, GPL v3)
-Full Lisa hardware emulator. Key files for us:
-- `src/lisa/cpu_board/mmu.c` — MMU translation tables, context switching
-- `src/lisa/cpu_board/memory.c` — Memory dispatch, SIO handlers
-- `src/lisa/io_board/via6522.c` — VIA emulation
-- `src/lisa/io_board/cops.c` — Keyboard/mouse
-- `src/storage/profile.c` — ProFile hard disk
-
-### LisaSourceCompilation (AlexTheCat123)
-How to compile Lisa OS from source. Key files:
-- `scripts/patch_files.py` — 56 source patches (typos, paths, flags)
-- `src/LIBPL/*.TEXT` — Recreated missing assembly (PASMEM, PWRII)
-- `src/LIBFP/STR2DEC.TEXT` — Recreated FP string conversion
-- `src/MAKE/*.TEXT` — Build order scripts
-- `glue.c` — LisaEm OS detection patch
+See memory files for detailed notes:
+- LisaEm (Ray Arachelian, GPL v3) — hardware emulation reference
+- LisaSourceCompilation (AlexTheCat123) — 56 patches, build system, boot chain
 
 ## Toolchain Metrics
 ```
-Parser:    405 Pascal, 360 OK (99.5%)
-Assembler: 105 files, 100% success
-Codegen:   Proc sigs, CONST, nested scope, VAR params, array bounds
-Linker:    Non-kernel isolation, 1956 resolved, 2746 stub symbols
-Output:    ~434KB system.os (848 blocks), boots with identity MMU
+Parser:    405 Pascal, 2 parse errors (MATHLIB, LCUT — non-kernel)
+Assembler: 98 files, 100% success
+Codegen:   Proc sigs, CONST, nested scope, VAR params, cross-lib includes
+Linker:    Non-kernel isolation, 1949 resolved, 2742 unique stub symbols
+Output:    ~433KB system.os (846 blocks)
+Boot:      Reaches scheduler, screen draws, runs 250 frames actively
 ```
