@@ -824,7 +824,13 @@ static ast_node_t *parse_type(parser_t *p) {
     if (match(p, TOK_STRING_KW)) {
         ast_node_t *n = ast_new(AST_TYPE_STRING, p->lex.line);
         if (match(p, TOK_LBRACKET)) {
-            n->int_val = CUR(p).int_val;
+            if (CUR(p).type == TOK_INTEGER) {
+                n->int_val = CUR(p).int_val;
+            } else if (CUR(p).type == TOK_IDENT) {
+                /* CONST identifier for string length — store name for codegen lookup */
+                strncpy(n->name, CUR(p).str_val, sizeof(n->name) - 1);
+                n->int_val = 0;
+            }
             advance(p);
             expect(p, TOK_RBRACKET);
         } else {

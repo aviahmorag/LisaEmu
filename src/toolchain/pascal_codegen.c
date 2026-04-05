@@ -124,6 +124,10 @@ static int type_size(type_desc_t *t) {
     return t->size;
 }
 
+/* Forward declarations for symbol lookup (used in resolve_type for CONST) */
+static cg_symbol_t *find_global(codegen_t *cg, const char *name);
+static cg_symbol_t *find_imported(codegen_t *cg, const char *name);
+
 /* Resolve a type from an AST type node */
 static type_desc_t *resolve_type(codegen_t *cg, ast_node_t *node) {
     if (!node) return find_type(cg, "integer");
@@ -139,16 +143,34 @@ static type_desc_t *resolve_type(codegen_t *cg, ast_node_t *node) {
         }
 
         case AST_TYPE_STRING: {
-            type_desc_t *t = add_type(cg, "", TK_STRING, (int)(node->int_val + 1));
-            t->max_length = (int)node->int_val;
+            int str_len = (int)node->int_val;
+            /* Resolve CONST identifier for string length: string[max_ename] */
+            if (str_len == 0 && node->name[0]) {
+                /* Look up the constant value by name */
+                cg_symbol_t *csym = find_global(cg, node->name);
+                if (!csym) csym = find_imported(cg, node->name);
+                if (csym) str_len = csym->offset; /* CONST value stored in offset */
+                if (str_len <= 0) str_len = 255;  /* Fallback to max string */
+            }
+            type_desc_t *t = add_type(cg, "", TK_STRING, str_len + 1);
+            t->max_length = str_len;
             return t;
         }
 
         case AST_TYPE_SUBRANGE: {
             type_desc_t *t = add_type(cg, "", TK_SUBRANGE, 2);
             if (node->num_children >= 2) {
+                /* Resolve CONST identifiers in subrange bounds */
                 t->range_low = (int)node->children[0]->int_val;
                 t->range_high = (int)node->children[1]->int_val;
+                for (int bi = 0; bi < 2; bi++) {
+                    ast_node_t *bound = node->children[bi];
+                    if (bound->type == AST_IDENT_EXPR && bound->int_val == 0 && bound->name[0]) {
+                        cg_symbol_t *cs = find_global(cg, bound->name);
+                        if (!cs) cs = find_imported(cg, bound->name);
+                        if (cs) { if (bi==0) t->range_low = cs->offset; else t->range_high = cs->offset; }
+                    }
+                }
                 int range = t->range_high - t->range_low;
                 if (range <= 255) t->size = 1;
                 else if (range <= 65535) t->size = 2;
@@ -240,8 +262,6 @@ static void push_scope(codegen_t *cg) {
         cg->scopes[cg->scope_depth].num_locals = 0;
         cg->scopes[cg->scope_depth].frame_size = 0;
         cg->scope_depth++;
-    } else {
-                cg->scope_depth, cg->current_file);
     }
 }
 
@@ -423,12 +443,6 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                 } else if (sym->is_param || !sym->is_global) {
                     /* Local/param: size-aware load from stack frame */
                     int sz = sym->type ? sym->type->size : 2;
-                    if (strcasestr(cg->current_file, "STARTUP") && sz == 4) {
-                        fprintf(stderr, "  CODEGEN: MOVE.L %s offset=%d sz=%d type=%s global=%d param=%d\n",
-                                sym->name, sym->offset, sz,
-                                sym->type ? sym->type->name : "null",
-                                sym->is_global, sym->is_param);
-                    }
                     if (sz == 4) {
                         emit16(cg, 0x202E);  /* MOVE.L offset(A6),D0 */
                     } else if (sz == 1) {
@@ -1255,11 +1269,7 @@ static void process_var_decl(codegen_t *cg, ast_node_t *node, bool is_global) {
                 if (sz >= 2 && (sc->frame_size % 2)) sc->frame_size++;
                 sc->frame_size += sz;
                 cg_symbol_t *s = add_local(cg, tok, type, false, false);
-                if (s) {
-                    s->offset = -(int)sc->frame_size;
-                    if (strcasestr(cg->current_file, "STARTUP") && sc->frame_size > 10000)
-                                tok, s->offset, sc->frame_size, sz, cg->scope_depth);
-                }
+                if (s) s->offset = -(int)sc->frame_size;
             }
         }
         tok = strtok(NULL, ",");
