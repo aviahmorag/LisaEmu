@@ -967,10 +967,13 @@ int lisa_run_frame(lisa_t *lisa) {
     /* Debug: log CPU/VIA/vector state once after significant execution */
     static int frame_count = 0;
     frame_count++;
-    /* The OS reaches its scheduler loop with interrupts masked ($2700).
-     * INTSON(0) should fire during BOOT_IO_INIT case 4 (ProFile), but
-     * the init chain may not complete fully. For now, leave interrupts
-     * as-is — the OS runs its init loop without interrupts. */
+    /* Force-unmask interrupts if OS is stuck with level 7 mask.
+     * The OS should call INTSON(0) during BOOT_IO_INIT but may not
+     * reach it. This lets the vretrace drive the scheduler forward. */
+    if (frame_count == 30 && (lisa->cpu.sr & 0x0700) >= 0x0600 &&
+        lisa->cpu.pc >= 0x400 && lisa->cpu.pc < LISA_RAM_SIZE) {
+        lisa->cpu.sr = (lisa->cpu.sr & ~0x0700);
+    }
     if ((frame_count >= 120 && frame_count <= 900 && (frame_count % 120) == 0) || frame_count == 60) {
         fprintf(stderr, "DIAG frame %d: PC=$%06X SR=$%04X stopped=%d pending_irq=%d setup=%d\n",
                 frame_count, lisa->cpu.pc, lisa->cpu.sr, lisa->cpu.stopped,
