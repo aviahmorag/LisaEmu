@@ -8,77 +8,96 @@ build/lisaemu Lisa_Source   # Run from source directory (builds + boots)
 make audit                  # Full toolchain report
 ```
 
-## Current State: OS boots deep into INITSYS with 1 minor exception
+## Current State: OS boots deep into INITSYS, A6 corruption FIXED
 
 The CPU boot path works:
 ```
 ROM ($FE0400) → set SP/A5/A6/SR → JMP $400 → STARTUP → PASCALINIT
 → copy runtime data to sysglobal → set A5 → return param ptr
 → INITSYS(ldmapbase) → INTSOFF (TRAP #7 works) → GETLDMAP (copies loader params)
-→ REG_TO_MAPPED → deeper init → ... → 1 illegal instruction at $6D
+→ REG_TO_MAPPED → deeper init → exception vectors → heap init
+→ MM_INIT (→stub) → ... → illegal instruction at $054104
 ```
 
 ### Runtime output:
 ```
-Exception counts: v4=1 (single illegal instruction)
-DIAG frame 120: PC=$04B87C SR=$2700 stopped=0 pending_irq=0 setup=0
-A6=$4D7E9000 (corrupt frame pointer — likely another nested scope issue)
-Vectors (RAM): TRAP1=$00050D82 TRAP2=$00050AE2 INT1=$00052CC0
+Linker: patched 3 JSR $000000 to stub at $52D58
+Exception counts: v4=1 (illegal at $054104)
+Exception: vector 5 (Zero Divide) at PC=$00077A
+DIAG frame 120: PC=$04B942 SR=$2700 stopped=0 pending_irq=0 setup=0
+A6=$00079004 (VALID - frame pointer intact!)
+Vectors (RAM): TRAP1=$00050E1A TRAP2=$00050B7A
 SGLOBAL@$2A0=$00000000 (b_sysglobal_ptr not yet set)
 ```
 
-## Session 2 Fixes (11 commits)
+## Session 3 Fixes (3 major bugs)
 
-1. **Vector table installed by linker** — 17 exception vectors in output binary $0-$FF
-2. **VAR parameter passing** — `cg_proc_sig_t` tracks VAR/size/external per parameter
-3. **Callee-clean push order** — external assembly routines get left-to-right push
-4. **Parameter size tracking** — MOVE.W for 2-byte value params, MOVE.L for 4-byte
-5. **CONST resolution** — `is_const` flag, emit MOVEQ/MOVE.L #imm (not A5-relative load)
-6. **Zero-arg function calls** — PASCALINIT correctly called as function-as-value
-7. **Stack return convention** — external functions get MOVE.L (SP)+,D0 after JSR
-8. **Loader parameter block** — version=22 at $53100, downward layout, 48-element arrays
-9. **Boot ROM** — sets A5=$70000 (user area) and A6=$79000 (frame pointer sentinel)
-10. **Array CONST bounds** — resolves identifiers like `maxsegments` in array[1..maxsegments]
-11. **Nested scope variable access** — frame pointer chain walk for outer-scope vars
-    - ROOT CAUSE of code corruption: GETLDMAP wrote through pointers using wrong A6
-    - `find_local_depth()` + `emit_frame_access()` generate MOVEA.L (A6),A0 chain
+### 1. Linker: non-kernel symbol collision (ROOT CAUSE of A6 corruption)
+Non-kernel modules (libraries, apps) had `base_addr=0`. Their symbols were still
+"resolved" during linking, so functions like `MM_INIT` (from MM4 module, offset 1242)
+resolved to address $4DA — which landed INSIDE GETLDMAP's body in STARTUP.
+JSR to MM_INIT jumped past GETLDMAP's LINK A6, and the subsequent UNLK A6 popped
+garbage from the uninitialized frame, corrupting A6.
 
-## Immediate Task: Fix Remaining A6 Corruption
+**Fix**: Two changes in `linker.c`:
+- `add_global_symbol()`: Don't pre-resolve LSYM_ENTRY symbols (removed `resolved=true`)
+- `linker_link()` Phase 2: Only resolve symbols from `is_kernel` modules; non-kernel
+  symbols remain unresolved and get the stub address in Phase 4
 
-### The problem
-A6=$4D7E9000 at DIAG time — corrupt frame pointer. This causes the illegal instruction
-at $6D (UNLK restores bad A6, SP goes to vector table area). Same pattern as the
-GETLDMAP corruption but in a different function deeper in init.
+### 2. Codegen: VAR parameter nested scope access
+Three places accessed VAR parameters using A6 directly, without checking if the
+variable was from an outer scope. Fixed `gen_lvalue_addr`, `gen_expression`, and
+`gen_statement(AST_ASSIGN)` to call `find_local_depth()` and `emit_frame_access()`
+for VAR params from outer scopes.
 
-### What to investigate
-1. **Which function corrupts A6?** — Add trace for when A6 leaves valid range ($070000-$07A000).
-   The nested scope fix handles reads/writes/addr-of, but there may be other code paths
-   that access outer-scope variables (e.g., pointer dereference through a frame variable,
-   WITH statements, or the VAR-param case in gen_lvalue_addr).
+### 3. WITH statements (identified, not yet fixed)
+The codegen accepts WITH nodes but ignores the WITH context — it just generates the
+body. Field accesses inside WITH blocks fall through to other symbol resolution.
+Not yet causing crashes but will need fixing for correct field access.
 
-2. **WITH statements** — Not implemented in codegen. Lisa OS uses WITH extensively for
-   record field access. `WITH rec DO field := val` is syntactic sugar that the codegen
-   needs to handle. Check if the parser creates AST nodes for WITH.
+## Immediate Task: Investigate New Exceptions
 
-3. **b_sysglobal_ptr still $0** — SGLOBAL@$2A0=$00000000. INIT_TRAPV should set this
-   (it does `MOVE.L A2,SGLOBAL` where SGLOBAL EQU $2A0). Either INIT_TRAPV hasn't run
-   yet, or the parameter (b_sysglobal_ptr) passed to it is 0.
+### 1. Illegal instruction at $054104 (opcode $4146)
+$4146 is not a standard 68000 instruction our emulator recognizes. This could be:
+- An unimplemented 68000 instruction (CHK variant?)
+- Bad code generated by our codegen at that address
+- Code from an assembly module that uses an instruction we haven't implemented
 
-4. **Loader parameter block validation** — The params at $53100 (downward) may have
-   wrong values for some fields. GETLDMAP copies them to INITSYS locals. Check if
-   key values (b_sys_global, b_superstack, etc.) match what the OS expects.
+### 2. Zero divide at $77A
+Offset $77A - $400 = $37A (890) from STARTUP base. Inside a nested function.
+May happen during exception handling for #1.
+
+### 3. SGLOBAL@$2A0 still $0
+b_sysglobal_ptr not set. INIT_TRAPV should set this. Either hasn't run yet
+or the parameter passed to it is 0.
+
+## What to investigate next
+1. **Decode opcode $4146** — check if this is CHK, TRAP, or another valid 68000
+   instruction we haven't implemented. Add it to m68k.c if valid.
+2. **Trace $054104** — which module is at that address? Is it codegen output or
+   assembly? Check if the code is correct.
+3. **WITH statement codegen** — implement proper WITH handling for record field access.
+4. **Apply source patches** — the LisaSourceCompilation project documents 80+ patches
+   to the Lisa source code. Some may fix compilation issues in our pipeline.
 
 ## Key Files
 
-- `src/toolchain/pascal_codegen.c` — All codegen: CONST, proc sigs, nested scope, alignment
-- `src/toolchain/pascal_codegen.h` — `cg_proc_sig_t`, `is_const` flag on symbols
-- `src/toolchain/linker.c` — Vector table installation, debug symbols, stub patching
+- `src/toolchain/pascal_codegen.c` — VAR param nested scope fix, WITH stub
+- `src/toolchain/linker.c` — Non-kernel symbol resolution fix (major)
 - `src/toolchain/toolchain_bridge.c` — Shared proc_sigs, shared globals propagation
 - `src/toolchain/bootrom.c` — Boot ROM with SP/A5/A6/SR init
 - `src/lisa.c` — Loader parameter block (downward layout from $53100), system.os loader
-- `src/lisa_mmu.c` — Memory write watchpoint at $4EE (can repurpose for other addresses)
-- `src/m68k.c` — TRAP tracing, odd-PC detection, kernel escape detection, 256-entry ring buffer
+- `src/m68k.c` — TRAP tracing, odd-PC detection, kernel escape detection
 - `src/main_sdl.c` — Toolchain-aware SDL frontend
+
+## External References
+
+- **LisaSourceCompilation** (AlexTheCat123) — ~/Library/Mobile Documents/.../Downloads/
+  LisaSourceCompilation-main/ — Documents 80+ source patches, full boot process, segment
+  structure (32 segments × 32K), build flags, intrinsic library structure.
+  Uses original Workshop on emulated Lisa. Completely different approach from ours.
+- **LisaEm** (Ray Arachelian) — github.com/rayarachelian/lisaem — GPL v3 traditional
+  emulator, requires pre-built ROMs/disk images. No code usable by us.
 
 ## Architecture Notes
 
@@ -92,6 +111,13 @@ GETLDMAP corruption but in a different function deeper in init.
 - `find_local_depth()` returns 0 for current scope, 1 for parent, etc.
 - `emit_frame_access(depth)` generates A0 = chain of (A6) dereferences
 - Used in gen_expression (read), gen_lvalue_addr (address-of), gen_statement (assign)
+- **Now also used for VAR params** in all three locations
+
+### Linker Symbol Resolution (fixed)
+- Symbols only resolved for kernel modules (is_kernel=true)
+- Non-kernel module symbols → stub address ($52D58)
+- Prevents raw codegen offsets from colliding with kernel code addresses
+- `add_global_symbol()` no longer pre-resolves; Phase 2 handles resolution
 
 ### Memory Layout
 ```
@@ -112,7 +138,7 @@ $07A000-$0FF800: Screen buffer + free memory
 ```
 Parser:    405 Pascal, 360 OK (99.5%)
 Assembler: 105 files, 100% success
-Codegen:   Proc signatures, CONST resolution, nested scope, array bounds
-Linker:    97.2% JSR to real code, 17 vectors, ~83 stub symbols
-Output:    ~331KB system.os, boots with 1 minor exception
+Codegen:   Proc signatures, CONST, nested scope, VAR params, array bounds
+Linker:    Non-kernel symbol isolation, 3 JSR stubs, ~83 stub symbols
+Output:    ~331KB system.os, boots with A6 intact, 1 illegal instruction deep in init
 ```

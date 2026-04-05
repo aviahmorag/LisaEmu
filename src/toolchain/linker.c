@@ -198,12 +198,13 @@ static int add_global_symbol(linker_t *lk, const char *name, link_sym_type_t typ
     if (existing >= 0) {
         /* Update existing symbol — allow redefinition (last one wins).
          * In Lisa OS, the same method names (CREATE, Draw, etc.) appear in
-         * different compilation units for different classes. */
+         * different compilation units for different classes.
+         * Don't pre-resolve — Phase 2 resolves symbols from kernel modules only. */
         if (type == LSYM_ENTRY) {
             lk->symbols[existing].type = LSYM_ENTRY;
             lk->symbols[existing].value = value;
             lk->symbols[existing].module_idx = module_idx;
-            lk->symbols[existing].resolved = true;
+            /* resolved will be set in Phase 2 based on is_kernel */
         }
         return existing;
     }
@@ -218,7 +219,7 @@ static int add_global_symbol(linker_t *lk, const char *name, link_sym_type_t typ
     lk->symbols[idx].type = type;
     lk->symbols[idx].value = value;
     lk->symbols[idx].module_idx = module_idx;
-    lk->symbols[idx].resolved = (type == LSYM_ENTRY);
+    lk->symbols[idx].resolved = false;  /* Phase 2 resolves kernel module symbols */
     return idx;
 }
 
@@ -432,13 +433,20 @@ bool linker_link(linker_t *lk) {
 
     lk->segments[0].size = current_addr;
 
-    /* Phase 2: Resolve symbols — update entry point addresses with base offsets */
+    /* Phase 2: Resolve symbols — update entry point addresses with base offsets.
+     * Only resolve symbols from kernel modules (which are placed in the output).
+     * Non-kernel modules have base_addr=0, so their raw offsets would collide
+     * with kernel code. Those symbols go to the stub in Phase 4 instead. */
     for (int i = 0; i < lk->num_symbols; i++) {
         link_symbol_t *sym = &lk->symbols[i];
         if (sym->type == LSYM_ENTRY && sym->module_idx >= 0 &&
             sym->module_idx < lk->num_modules) {
-            sym->value += lk->modules[sym->module_idx]->base_addr;
-            sym->resolved = true;
+            link_module_t *mod = lk->modules[sym->module_idx];
+            if (mod->is_kernel) {
+                sym->value += mod->base_addr;
+                sym->resolved = true;
+            }
+            /* Non-kernel symbols remain unresolved → stub in Phase 4 */
         }
     }
 
@@ -459,7 +467,6 @@ bool linker_link(linker_t *lk) {
 
             int32_t target = lk->symbols[sym_idx].value;
 
-            /* (Phase 3 trace removed) */
 
             /* Patch the code */
             uint32_t abs_offset = mod->base_addr + offset;

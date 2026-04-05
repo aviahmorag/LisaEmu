@@ -393,9 +393,14 @@ static void gen_lvalue_addr(codegen_t *cg, ast_node_t *node) {
         cg_symbol_t *sym = find_symbol_any(cg, node->name);
         if (sym) {
             if (sym->is_param && sym->is_var_param) {
-                /* VAR param: A6 + offset contains pointer */
-                /* MOVEA.L offset(A6),A0 */
-                emit16(cg, 0x206E);
+                /* VAR param: frame + offset contains pointer */
+                int depth = find_local_depth(cg, node->name);
+                if (depth > 0) {
+                    emit_frame_access(cg, depth);  /* parent FP → A0 */
+                    emit16(cg, 0x2068);  /* MOVEA.L offset(A0),A0 */
+                } else {
+                    emit16(cg, 0x206E);  /* MOVEA.L offset(A6),A0 */
+                }
                 emit16(cg, (uint16_t)(int16_t)sym->offset);
             } else if (sym->is_param || !sym->is_global) {
                 /* Local/param: LEA offset(A6),A0 or offset(A0) for outer scope */
@@ -526,8 +531,14 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                         emit32(cg, (uint32_t)val);
                     }
                 } else if (sym->is_param && sym->is_var_param) {
-                    /* VAR param: dereference pointer at offset(A6) */
-                    emit16(cg, 0x206E);  /* MOVEA.L offset(A6),A0 */
+                    /* VAR param: dereference pointer at frame + offset */
+                    int depth = find_local_depth(cg, node->name);
+                    if (depth > 0) {
+                        emit_frame_access(cg, depth);  /* parent FP → A0 */
+                        emit16(cg, 0x2068);  /* MOVEA.L offset(A0),A0 */
+                    } else {
+                        emit16(cg, 0x206E);  /* MOVEA.L offset(A6),A0 */
+                    }
                     emit16(cg, (uint16_t)(int16_t)sym->offset);
                     emit16(cg, 0x3010);  /* MOVE.W (A0),D0 */
                 } else if (sym->is_param || !sym->is_global) {
@@ -1111,9 +1122,18 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
             cg_symbol_t *sym = find_symbol_any(cg, lhs->name);
             if (sym) {
                 if (sym->is_param && sym->is_var_param) {
-                    emit16(cg, 0x206E);  /* MOVEA.L offset(A6),A0 */
-                    emit16(cg, (uint16_t)(int16_t)sym->offset);
-                    emit16(cg, 0x3080);  /* MOVE.W D0,(A0) */
+                    int depth = find_local_depth(cg, lhs->name);
+                    if (depth > 0) {
+                        emit16(cg, 0x2200);  /* MOVE.L D0,D1 — save value */
+                        emit_frame_access(cg, depth);  /* parent FP → A0 */
+                        emit16(cg, 0x2068);  /* MOVEA.L offset(A0),A0 */
+                        emit16(cg, (uint16_t)(int16_t)sym->offset);
+                        emit16(cg, 0x3081);  /* MOVE.W D1,(A0) */
+                    } else {
+                        emit16(cg, 0x206E);  /* MOVEA.L offset(A6),A0 */
+                        emit16(cg, (uint16_t)(int16_t)sym->offset);
+                        emit16(cg, 0x3080);  /* MOVE.W D0,(A0) */
+                    }
                 } else if (sym->is_param || !sym->is_global) {
                     int depth = find_local_depth(cg, lhs->name);
                     int sz = sym->type ? sym->type->size : 2;

@@ -2613,6 +2613,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             }
         }
 
+
         /* Log TRAP exceptions with call context */
         static int trap_detail_count = 0;
         if (trap_detail_count < 10) {
