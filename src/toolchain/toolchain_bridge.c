@@ -259,6 +259,26 @@ static bool is_kernel_module(const char *path) {
         "libhw-DRIVERS.", "LIBHW-DRIVERS.",
         "LibHW-HARDWARE.", "libhw-HARDWARE.",
         "LibHW-HWINT.", "libhw-HWINT.",
+        /* Memory manager (all parts) */
+        "SOURCE-MM1.", "source-MM2.", "source-MM3.", "source-MM4.",
+        "SOURCE-MMPRIM2.",
+        /* Disk/device subsystems */
+        "source-DS2.", "source-DS3.",
+        "SOURCE-DEVCONTROL.", "SOURCE-ICDD.",
+        /* Exception/process management */
+        "SOURCE-EXCEPRES.", "source-EXCEPNR1.",
+        /* File system init */
+        "SOURCE-FSINIT1.", "SOURCE-FSINIT2.",
+        /* Loader */
+        "source-LOAD1.", "source-LOADER.", "source-LDEQU.",
+        /* Power/PRAM management */
+        "source-PMCNTRL.", "source-PMSPROCS.", "SOURCE-PMMAKE.",
+        /* GData, unpack */
+        "SOURCE-GDATALIST.", "source-UNPACK.",
+        /* Config */
+        "source-cdCONFIG.", "SOURCE-ARCHIVE.",
+        /* System global part 2 */
+        "source-SYSG1.",
         /* OS library files needed for boot */
         "source-PASCALDEFS.", "source-POSLIB.", "source-oslib.",
         "source-parms.",
