@@ -968,17 +968,15 @@ int lisa_run_frame(lisa_t *lisa) {
         lisa->cpu.pc >= 0x400 && lisa->cpu.pc < 0x6B000) {
         lisa->cpu.sr = (lisa->cpu.sr & ~0x0700);
     }
-    if (frame_count == 120) {
-        /* Dump code around the stuck PC */
-        fprintf(stderr, "Code at DIAG PC:\n");
-        for (int off = -16; off <= 16; off += 2) {
-            uint32_t addr = lisa->cpu.pc + off;
-            fprintf(stderr, "  %s$%06X: $%04X\n",
-                    off == 0 ? ">>>" : "   ", addr,
-                    (uint16_t)(lisa->mem.ram[addr] << 8 | lisa->mem.ram[addr+1]));
+    if (frame_count == 120 || frame_count == 250) {
+        /* Check screen content */
+        int nonwhite = 0;
+        for (int i = 0; i < LISA_SCREEN_BYTES; i++) {
+            if (lisa->mem.ram[0x7A000 + i] != 0x00) nonwhite++;
         }
+        fprintf(stderr, "  Screen: %d non-zero bytes of %d\n", nonwhite, LISA_SCREEN_BYTES);
     }
-    if (frame_count >= 250 && frame_count <= 310 && (frame_count % 5) == 0) {
+    if (frame_count == 120) {
         fprintf(stderr, "DIAG frame %d: PC=$%06X SR=$%04X stopped=%d pending_irq=%d setup=%d\n",
                 frame_count, lisa->cpu.pc, lisa->cpu.sr, lisa->cpu.stopped,
                 lisa->cpu.pending_irq, lisa->mem.setup_mode);

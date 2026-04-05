@@ -2649,22 +2649,6 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         static bool line_f_logged = false;
         pc_ring[pc_ring_idx++ & 255] = cpu->pc;
 
-        /* Monitor A6 for corruption */
-        {
-            static uint32_t prev_a6 = 0;
-            static int a6_bad_count = 0;
-            uint32_t a6 = cpu->a[6];
-            if (prev_a6 != 0 && prev_a6 < 0x100000 && a6 > 0x100000 && a6_bad_count < 2) {
-                a6_bad_count++;
-                fprintf(stderr, "=== A6 CORRUPT: $%08X (was $%08X) at PC=$%06X\n",
-                        a6, prev_a6, cpu->pc);
-                for (int ri = 10; ri > 0; ri--) {
-                    uint32_t rpc = pc_ring[(pc_ring_idx - ri) & 255];
-                    fprintf(stderr, "    PC=$%06X op=$%04X\n", rpc, cpu_read16(cpu, rpc));
-                }
-            }
-            prev_a6 = a6;
-        }
         /* Log calls to stub ($3F0) — shows which functions are missing */
         if (cpu->pc == 0x3F0) {
             static int stub_call_count = 0;
