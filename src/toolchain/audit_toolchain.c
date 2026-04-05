@@ -70,8 +70,7 @@ static bool should_skip_file(const char *name) {
         if (strcasestr(name, skip_patterns[i]) != NULL) return true;
     }
     /* LIBFP handled in find_source_files after content detection */
-    /* LIBQD: STRETCH is an include fragment */
-    if (strcasestr(name, "STRETCH") != NULL && strcasestr(name, "libqd") != NULL) return true;
+    /* LIBQD: STRETCH was incorrectly skipped — it's standalone assembly */
     return false;
 }
 

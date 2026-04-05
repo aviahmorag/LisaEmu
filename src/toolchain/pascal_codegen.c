@@ -822,7 +822,13 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
             if (find_type(cg, fn) != NULL ||
                 str_eq_nocase(fn, "LONGINT") || str_eq_nocase(fn, "INTEGER") ||
                 str_eq_nocase(fn, "BOOLEAN") || str_eq_nocase(fn, "CHAR") ||
-                str_eq_nocase(fn, "BYTE")) {
+                str_eq_nocase(fn, "BYTE") ||
+                /* Common pointer/handle type aliases used as casts */
+                str_eq_nocase(fn, "Ptr") || str_eq_nocase(fn, "Handle") ||
+                str_eq_nocase(fn, "WordPtr") || str_eq_nocase(fn, "WindowPtr") ||
+                str_eq_nocase(fn, "PicHandle") || str_eq_nocase(fn, "FuncHandle") ||
+                str_eq_nocase(fn, "TpInteger") || str_eq_nocase(fn, "TpLONGINT") ||
+                str_eq_nocase(fn, "QDPtr") || str_eq_nocase(fn, "GrafPtr")) {
                 /* Type cast = evaluate the argument, result stays in D0 */
                 if (node->num_children > 0)
                     gen_expression(cg, node->children[0]);

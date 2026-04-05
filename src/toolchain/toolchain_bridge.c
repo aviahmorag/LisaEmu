@@ -86,7 +86,7 @@ static bool should_skip_file(const char *name) {
     if (strcasestr(name, "FASTLINE") != NULL) return true;
     if (strcasestr(name, "LINE2") != NULL) return true;
     if (strcasestr(name, "GRAFTYPES") != NULL) return true;
-    if (strcasestr(name, "STRETCH") != NULL && strcasestr(name, "libqd") != NULL) return true;
+    /* LIBQD: STRETCH is standalone assembly, not an include fragment */
     /* Phrase/resource files, documentation, code generator templates */
     if (strcasestr(name, "PABC") != NULL) return true;
     if (strcasestr(name, "PASGEN") != NULL) return true;

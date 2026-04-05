@@ -1398,6 +1398,7 @@ static bool handle_directive(asm68k_t *as, const char *directive, const char *ar
                 int idx = find_symbol(as, name);
                 if (idx >= 0) {
                     as->symbols[idx].exported = true;
+                    as->symbols[idx].external = false;  /* .DEF means defined HERE */
                 } else {
                     add_symbol(as, name, SYM_DEF, 0);
                 }
