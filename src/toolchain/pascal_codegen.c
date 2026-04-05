@@ -291,6 +291,9 @@ static void pop_scope(codegen_t *cg) {
     if (cg->scope_depth > 0) cg->scope_depth--;
 }
 
+/* Find local variable and return its scope depth.
+ * out_depth is set to the scope level where the variable was found
+ * (0 = innermost/current, 1 = one level up, etc.) */
 static cg_symbol_t *find_local(codegen_t *cg, const char *name) {
     for (int d = cg->scope_depth - 1; d >= 0; d--) {
         cg_scope_t *sc = &cg->scopes[d];
@@ -300,6 +303,31 @@ static cg_symbol_t *find_local(codegen_t *cg, const char *name) {
         }
     }
     return NULL;
+}
+
+static int find_local_depth(codegen_t *cg, const char *name) {
+    for (int d = cg->scope_depth - 1; d >= 0; d--) {
+        cg_scope_t *sc = &cg->scopes[d];
+        for (int i = 0; i < sc->num_locals; i++) {
+            if (str_eq_nocase(sc->locals[i].name, name))
+                return (cg->scope_depth - 1) - d;  /* 0=current, 1=parent, etc. */
+        }
+    }
+    return -1;
+}
+
+/* Emit code to load the frame pointer for a variable at a given nesting depth.
+ * depth=0: current scope → A6 is correct
+ * depth=1: parent scope → A0 = (A6) (saved A6 from LINK)
+ * depth=2: grandparent → A0 = ((A6))
+ * Result in A6 (for depth 0) or A0 (for depth > 0). */
+static void emit_frame_access(codegen_t *cg, int depth) {
+    if (depth <= 0) return;  /* Current scope, A6 is fine */
+    /* Follow static link chain through saved A6 values */
+    emit16(cg, 0x2056);  /* MOVEA.L (A6),A0 — get parent's A6 */
+    for (int i = 1; i < depth; i++) {
+        emit16(cg, 0x2050);  /* MOVEA.L (A0),A0 — follow chain */
+    }
 }
 
 static cg_symbol_t *find_global(codegen_t *cg, const char *name) {
@@ -370,8 +398,14 @@ static void gen_lvalue_addr(codegen_t *cg, ast_node_t *node) {
                 emit16(cg, 0x206E);
                 emit16(cg, (uint16_t)(int16_t)sym->offset);
             } else if (sym->is_param || !sym->is_global) {
-                /* Local/param: LEA offset(A6),A0 */
-                emit16(cg, 0x41EE);
+                /* Local/param: LEA offset(A6),A0 or offset(A0) for outer scope */
+                int depth = find_local_depth(cg, node->name);
+                if (depth > 0) {
+                    emit_frame_access(cg, depth);
+                    emit16(cg, 0x41E8);  /* LEA offset(A0),A0 */
+                } else {
+                    emit16(cg, 0x41EE);  /* LEA offset(A6),A0 */
+                }
                 emit16(cg, (uint16_t)(int16_t)sym->offset);
             } else {
                 /* Global: LEA offset(A5),A0 */
@@ -497,14 +531,20 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                     emit16(cg, (uint16_t)(int16_t)sym->offset);
                     emit16(cg, 0x3010);  /* MOVE.W (A0),D0 */
                 } else if (sym->is_param || !sym->is_global) {
-                    /* Local/param: size-aware load from stack frame */
+                    /* Local/param: size-aware load from stack frame.
+                     * For outer-scope variables, follow frame chain first. */
+                    int depth = find_local_depth(cg, node->name);
                     int sz = sym->type ? sym->type->size : 2;
-                    if (sz == 4) {
-                        emit16(cg, 0x202E);  /* MOVE.L offset(A6),D0 */
-                    } else if (sz == 1) {
-                        emit16(cg, 0x102E);  /* MOVE.B offset(A6),D0 */
+                    if (depth > 0) {
+                        /* Outer scope: follow static link chain into A0, then use A0 */
+                        emit_frame_access(cg, depth);
+                        if (sz == 4)      emit16(cg, 0x2028);  /* MOVE.L offset(A0),D0 */
+                        else if (sz == 1) emit16(cg, 0x1028);  /* MOVE.B offset(A0),D0 */
+                        else              emit16(cg, 0x3028);  /* MOVE.W offset(A0),D0 */
                     } else {
-                        emit16(cg, 0x302E);  /* MOVE.W offset(A6),D0 */
+                        if (sz == 4)      emit16(cg, 0x202E);  /* MOVE.L offset(A6),D0 */
+                        else if (sz == 1) emit16(cg, 0x102E);  /* MOVE.B offset(A6),D0 */
+                        else              emit16(cg, 0x302E);  /* MOVE.W offset(A6),D0 */
                     }
                     emit16(cg, (uint16_t)(int16_t)sym->offset);
                 } else {
@@ -1075,10 +1115,20 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                     emit16(cg, (uint16_t)(int16_t)sym->offset);
                     emit16(cg, 0x3080);  /* MOVE.W D0,(A0) */
                 } else if (sym->is_param || !sym->is_global) {
+                    int depth = find_local_depth(cg, lhs->name);
                     int sz = sym->type ? sym->type->size : 2;
-                    if (sz == 4) emit16(cg, 0x2D40);         /* MOVE.L D0,offset(A6) */
-                    else if (sz == 1) emit16(cg, 0x1D40);    /* MOVE.B D0,offset(A6) */
-                    else emit16(cg, 0x3D40);                  /* MOVE.W D0,offset(A6) */
+                    if (depth > 0) {
+                        /* Outer scope: save D0, get frame, write via A0 */
+                        emit16(cg, 0x2200);  /* MOVE.L D0,D1 — save value */
+                        emit_frame_access(cg, depth);
+                        if (sz == 4)      emit16(cg, 0x2141);  /* MOVE.L D1,offset(A0) */
+                        else if (sz == 1) emit16(cg, 0x1141);  /* MOVE.B D1,offset(A0) */
+                        else              emit16(cg, 0x3141);  /* MOVE.W D1,offset(A0) */
+                    } else {
+                        if (sz == 4)      emit16(cg, 0x2D40);  /* MOVE.L D0,offset(A6) */
+                        else if (sz == 1) emit16(cg, 0x1D40);  /* MOVE.B D0,offset(A6) */
+                        else              emit16(cg, 0x3D40);  /* MOVE.W D0,offset(A6) */
+                    }
                     emit16(cg, (uint16_t)(int16_t)sym->offset);
                 } else {
                     int sz = sym->type ? sym->type->size : 2;
