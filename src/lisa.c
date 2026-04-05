@@ -746,6 +746,60 @@ void lisa_reset(lisa_t *lisa) {
 
         printf("Loader params: param_block=$%X-%X, os_end=$%X, sysglobal=$%X-%X\n",
                p, version_addr, os_end, b_sysglobal, b_sysglobal + l_sysglobal);
+
+        /* Pre-program OS-critical MMU segments in context 1.
+         * The OS uses logical addresses computed as seg_num * $20000.
+         * These segments need to map to the physical data areas.
+         * From MMPRIM.TEXT: kernelmmu=17, realmemmmu=85, sysglobmmu=102 */
+        {
+            /* Helper: program an MMU segment directly in our data structures */
+            #define SET_MMU_SEG(ctx, seg, slr_val, sor_val) do { \
+                lisa->mem.segments[ctx][seg].slr = (slr_val); \
+                lisa->mem.segments[ctx][seg].sor = (sor_val); \
+                lisa->mem.segments[ctx][seg].changed = 3; \
+            } while(0)
+
+            int ctx = 1;  /* Normal context */
+
+            /* sysglobmmu (102): maps $CC0000 → physical sysglobal */
+            SET_MMU_SEG(ctx, 102, 0x0700, (uint16_t)(b_sysglobal >> 9));
+
+            /* syslocmmu (103): maps $CE0000 → physical syslocal */
+            uint32_t b_syslocal = b_sgheap + l_sgheap;
+            uint32_t l_syslocal = 0x4000;
+            SET_MMU_SEG(ctx, 103, 0x0700, (uint16_t)(b_syslocal >> 9));
+
+            /* stackmmu (104): maps $D00000 → physical user stack */
+            uint32_t b_stack = b_syslocal + l_syslocal;
+            SET_MMU_SEG(ctx, 104, 0x0600, (uint16_t)(b_stack >> 9)); /* stack type */
+
+            /* screenmmu (105): maps $D20000 → physical screen */
+            SET_MMU_SEG(ctx, 105, 0x0700, (uint16_t)(b_screen >> 9));
+
+            /* realmemmmu (85-100): identity map first 2MB as real memory */
+            for (int s = 85; s <= 100; s++) {
+                SET_MMU_SEG(ctx, s, 0x0700, (uint16_t)((s - 85) * 256));
+            }
+
+            /* kernelmmu (17-48): map OS code segments to physical code */
+            /* OS code is at physical $400-$6A000. Each segment is 128KB.
+             * Map segment 17 → physical $0, segment 18 → $20000, etc. */
+            for (int s = 17; s <= 20; s++) {
+                SET_MMU_SEG(ctx, s, 0x0500, (uint16_t)((s - 17) * 256)); /* read-only */
+            }
+
+            /* Also map segments in context 0 (start mode) for safety */
+            for (int s = 0; s < 128; s++) {
+                if (lisa->mem.segments[1][s].changed) {
+                    lisa->mem.segments[0][s] = lisa->mem.segments[1][s];
+                }
+            }
+
+            fprintf(stderr, "MMU: pre-programmed sysglobmmu(102)=$%03X, realmemmmu(85-100), kernelmmu(17-20)\n",
+                    lisa->mem.segments[1][102].sor);
+
+            #undef SET_MMU_SEG
+        }
         /* Verify RAM at $4EC matches linker output */
         printf("RAM at $4E8-$4FF: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X\n",
                lisa->mem.ram[0x4E8], lisa->mem.ram[0x4E9], lisa->mem.ram[0x4EA], lisa->mem.ram[0x4EB],
@@ -896,6 +950,14 @@ int lisa_run_frame(lisa_t *lisa) {
     /* Debug: log CPU/VIA/vector state once after significant execution */
     static int frame_count = 0;
     frame_count++;
+    /* If CPU has interrupts fully masked and is in OS code,
+     * lower the mask to allow vretrace and VIA interrupts through.
+     * The OS should have called INTSON but may not have reached it. */
+    if (frame_count == 30 && (lisa->cpu.sr & 0x0700) == 0x0700 &&
+        lisa->cpu.pc >= 0x400 && lisa->cpu.pc < 0x6B000) {
+        lisa->cpu.sr = (lisa->cpu.sr & ~0x0700);  /* Lower to level 0 — allow all */
+        fprintf(stderr, "MMU: Force-lowered interrupt mask to level 2 at frame %d\n", frame_count);
+    }
     if (frame_count == 120) {
         /* Dump code around the stuck PC */
         fprintf(stderr, "Code at DIAG PC:\n");
