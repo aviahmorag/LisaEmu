@@ -92,6 +92,7 @@ typedef struct {
     bool is_var_param;      /* VAR parameter (passed by reference) */
     bool is_external;
     bool is_forward;
+    bool is_const;          /* CONST declaration — offset holds value, not address */
 } cg_symbol_t;
 
 /* Local scope for variables */

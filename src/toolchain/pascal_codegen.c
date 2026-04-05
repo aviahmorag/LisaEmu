@@ -437,7 +437,16 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
         case AST_IDENT_EXPR: {
             cg_symbol_t *sym = find_symbol_any(cg, node->name);
             if (sym) {
-                if (sym->is_param && sym->is_var_param) {
+                if (sym->is_const) {
+                    /* CONST: emit immediate value */
+                    int val = sym->offset;
+                    if (val >= -128 && val <= 127) {
+                        emit16(cg, 0x7000 | (val & 0xFF));  /* MOVEQ #val,D0 */
+                    } else {
+                        emit16(cg, 0x203C);  /* MOVE.L #imm,D0 */
+                        emit32(cg, (uint32_t)val);
+                    }
+                } else if (sym->is_param && sym->is_var_param) {
                     /* VAR param: dereference pointer at offset(A6) */
                     emit16(cg, 0x206E);  /* MOVEA.L offset(A6),A0 */
                     emit16(cg, (uint16_t)(int16_t)sym->offset);
@@ -1324,6 +1333,7 @@ static void process_declarations(codegen_t *cg, ast_node_t *node, bool is_global
                 cg_symbol_t *s = add_global_sym(cg, child->name, t);
                 if (s && child->num_children > 0) {
                     s->offset = (int)child->children[0]->int_val; /* Store value in offset */
+                    s->is_const = true;
                 }
                 break;
             }
