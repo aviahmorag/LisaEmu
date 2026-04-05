@@ -84,6 +84,13 @@ static type_desc_t *find_type(codegen_t *cg, const char *name) {
         if (str_eq_nocase(cg->types[i].name, name))
             return &cg->types[i];
     }
+    /* Also search imported types from previously compiled units */
+    if (cg->imported_types) {
+        for (int i = 0; i < cg->imported_types_count; i++) {
+            if (str_eq_nocase(cg->imported_types[i].name, name))
+                return &cg->imported_types[i];
+        }
+    }
     return NULL;
 }
 
@@ -200,6 +207,18 @@ static type_desc_t *resolve_type(codegen_t *cg, ast_node_t *node) {
         case AST_TYPE_ENUM: {
             type_desc_t *t = add_type(cg, "", TK_ENUM, 2);
             return t;
+        }
+
+        case AST_TYPE_CLASS: {
+            /* Clascal SUBCLASS OF — objects are pointer-sized (4 bytes).
+             * Register as a pointer type so TYPE_NAME(expr) casts work. */
+            type_desc_t *t = add_type(cg, "", TK_POINTER, 4);
+            return t;
+        }
+
+        case AST_METHODS: {
+            /* METHODS OF classname — method declarations, no type to create */
+            return find_type(cg, "integer");
         }
 
         default:
@@ -792,6 +811,24 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                 break;
             }
 
+            /* InClass(obj, TFoo): Clascal class membership test.
+             * Original compiler emits JSR %_InObCP or %_InObCN.
+             * These runtime functions use % prefix which our lexer can't parse yet.
+             * TODO: Add % identifier support to lexer, then this resolves to %_InObCN.
+             * For now, falls through to generic call → linker stub. */
+
+            /* Type cast: TYPE_NAME(expr) — identity operation in Lisa Pascal.
+             * Also handle common built-in type names that may not be in our type table. */
+            if (find_type(cg, fn) != NULL ||
+                str_eq_nocase(fn, "LONGINT") || str_eq_nocase(fn, "INTEGER") ||
+                str_eq_nocase(fn, "BOOLEAN") || str_eq_nocase(fn, "CHAR") ||
+                str_eq_nocase(fn, "BYTE")) {
+                /* Type cast = evaluate the argument, result stays in D0 */
+                if (node->num_children > 0)
+                    gen_expression(cg, node->children[0]);
+                break;
+            }
+
             /* Generic function call — not an intrinsic */
             for (int i = node->num_children - 1; i >= 0; i--) {
                 gen_expression(cg, node->children[i]);
@@ -910,6 +947,13 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
         }
 
         case AST_CALL: {
+            /* No-op procedure calls (debug/trace stubs) */
+            if (str_eq_nocase(node->name, "LogCall") ||
+                str_eq_nocase(node->name, "LogSeg")) {
+                /* Debug tracing — guarded by {$IFC fTraceSM} in source.
+                 * We don't evaluate conditionals, so emit NOP. */
+                break;
+            }
             /* Procedure call with no args */
             emit16(cg, 0x4EB9);
             emit32(cg, 0);

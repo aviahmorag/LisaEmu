@@ -21,24 +21,58 @@ It is freely available under an Apple Academic License but **cannot be redistrib
 ```
 /
 ├── Lisa_Source/           # Apple's source (NOT in git, user-supplied)
-├── src/                   # C emulator core (shared between frontends)
+├── src/                   # C emulator core + toolchain (canonical source)
 │   ├── m68k.h/c           # Motorola 68000 CPU emulator
 │   ├── lisa_mmu.h/c       # Memory controller + MMU
 │   ├── via6522.h/c        # VIA 6522 chip emulation (x2)
 │   ├── lisa.h/c           # Main machine integration
 │   ├── lisa_bridge.h/c    # C-to-Swift bridge API
-│   └── main_sdl.c         # Standalone SDL2 frontend (for testing)
+│   ├── main_sdl.c         # Standalone SDL2 frontend (for testing)
+│   └── toolchain/         # Cross-compilation pipeline
+│       ├── pascal_lexer.h/c      # Lisa Pascal tokenizer
+│       ├── pascal_parser.h/c     # Recursive descent parser → AST
+│       ├── pascal_codegen.h/c    # AST → 68000 machine code
+│       ├── asm68k.h/c            # Two-pass 68000 cross-assembler
+│       ├── linker.h/c            # Multi-module linker
+│       ├── bootrom.c             # Boot ROM generator
+│       ├── diskimage.h/c         # Disk image builder
+│       ├── toolchain_bridge.h/c  # Orchestrates full compile pipeline
+│       ├── audit_toolchain.c     # Diagnostic tool (make audit)
+│       └── test_*.c              # Per-component test tools
 ├── lisaOS/                # Xcode macOS app (SwiftUI, Swift 6)
 │   └── lisaOS/
-│       ├── Emulator/      # C files + bridging header (copies of src/)
+│       ├── Emulator/      # SYMLINKS to src/ (not copies!)
 │       ├── ContentView.swift
 │       ├── EmulatorViewModel.swift
 │       ├── LisaDisplayView.swift
 │       └── lisaOSApp.swift
 ├── docs/                  # Documentation (Lisa_Source reference, hardware specs)
-├── Makefile               # Standalone SDL2 build
-└── CLAUDE.md              # This file
+├── build/                 # Build output (gitignored)
+├── Makefile               # Standalone SDL2 build + audit targets
+├── CLAUDE.md              # This file
+└── NEXT_SESSION.md        # Current status and prioritized fix list
 ```
+
+## Key Commands
+
+```bash
+# Build standalone emulator (SDL2)
+make
+
+# Run toolchain audit — the primary diagnostic tool
+make audit              # Full report (all 4 stages)
+make audit-parser       # Stage 1: Parser only
+make audit-codegen      # Stage 2: Codegen only
+make audit-asm          # Stage 3: Assembler only
+make audit-linker       # Stage 4: Full pipeline + linker
+
+# Xcode build (or just open in Xcode)
+cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' build 2>&1 | grep -E "(error:|BUILD)"
+```
+
+## Current Status
+
+See `NEXT_SESSION.md` for the full prioritized fix list. Run `make audit` for live metrics.
 
 ## Lisa_Source Reference
 
@@ -72,24 +106,12 @@ Key facts:
 | Keyboard | 128 keys via COPS microcontroller, event queue |
 | Mouse | Delta tracking via COPS, hardware cursor |
 
-## Build Instructions
-
-### Standalone (SDL2, for quick testing)
-```bash
-brew install sdl2   # if not installed
-make
-./build/lisaemu [rom_file] [profile_image] [floppy_image]
-```
-
-### Xcode (native macOS app)
-Open `lisaOS/lisaOS.xcodeproj` in Xcode. Build and run. The C emulator core is in `lisaOS/lisaOS/Emulator/` with a bridging header.
-
 ## Code Conventions
 
 - **Swift**: Swift 6, `@Observable` (not ObservableObject), `@State` (not @StateObject), modern SwiftUI APIs (`.foregroundStyle`, `fileImporter`, etc.)
 - **C**: C17, `-Wall -Wextra`, no external dependencies beyond SDL2 (standalone) or AppKit (Xcode)
 - **Target**: Apple Silicon (arm64-apple-darwin), macOS 15+
-- **Keep C files in sync**: After editing files in `src/`, copy them to `lisaOS/lisaOS/Emulator/`
+- **Emulator/ files are SYMLINKS**: `lisaOS/lisaOS/Emulator/` contains symlinks to `src/`. No copying needed — edit `src/` and Xcode picks it up automatically.
 
 ## Git Conventions
 

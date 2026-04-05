@@ -56,3 +56,38 @@ lib: $(OBJECTS) $(TOOL_OBJECTS)
 # Run
 run: $(TARGET)
 	./$(TARGET)
+
+# ======================================================================
+# Toolchain Audit — run `make audit` to check all stages
+# ======================================================================
+
+AUDIT_SRC = $(TOOLDIR)/audit_toolchain.c \
+            $(TOOLDIR)/pascal_parser.c \
+            $(TOOLDIR)/pascal_lexer.c \
+            $(TOOLDIR)/pascal_codegen.c \
+            $(TOOLDIR)/asm68k.c \
+            $(TOOLDIR)/linker.c
+
+AUDIT = $(BUILDDIR)/audit_toolchain
+
+$(AUDIT): $(AUDIT_SRC) | $(BUILDDIR)
+	$(CC) $(CFLAGS) -o $@ $(AUDIT_SRC)
+
+# Full audit (all 4 stages)
+audit: $(AUDIT)
+	@echo "Running toolchain audit..."
+	@./$(AUDIT) ./Lisa_Source 2>$(BUILDDIR)/audit_errors.txt
+	@echo "Detailed errors in $(BUILDDIR)/audit_errors.txt"
+
+# Individual stages
+audit-parser: $(AUDIT)
+	@./$(AUDIT) ./Lisa_Source parser 2>/dev/null
+
+audit-codegen: $(AUDIT)
+	@./$(AUDIT) ./Lisa_Source codegen 2>/dev/null
+
+audit-asm: $(AUDIT)
+	@./$(AUDIT) ./Lisa_Source asm 2>$(BUILDDIR)/audit_asm_errors.txt
+
+audit-linker: $(AUDIT)
+	@./$(AUDIT) ./Lisa_Source linker 2>$(BUILDDIR)/audit_linker_errors.txt

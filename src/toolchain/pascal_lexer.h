@@ -89,6 +89,17 @@ typedef struct {
     bool value;
 } lex_symbol_t;
 
+/* Include stack for {$I filename} */
+#define LEX_MAX_INCLUDE_DEPTH 16
+
+typedef struct {
+    const char *source;     /* Source buffer (must be freed on pop) */
+    const char *pos;        /* Position in buffer */
+    const char *filename;   /* Filename for error reporting */
+    int line;
+    int col;
+} lex_include_frame_t;
+
 /* Lexer state */
 typedef struct {
     const char *source;
@@ -110,6 +121,12 @@ typedef struct {
     /* Compile-time symbols ({$SETC name := value}) */
     lex_symbol_t symbols[LEX_MAX_SYMBOLS];
     int num_symbols;
+
+    /* Include stack for {$I filename} */
+    lex_include_frame_t include_stack[LEX_MAX_INCLUDE_DEPTH];
+    int include_depth;
+    char base_dir[512];      /* Base directory for resolving includes */
+    char source_root[512];   /* Lisa_Source root for cross-library includes */
 } lexer_t;
 
 /* Public API */

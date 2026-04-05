@@ -85,7 +85,15 @@ static int add_symbol(asm68k_t *as, const char *name, sym_type_t type, int32_t v
         }
         as->symbols[idx].value = value;
         as->symbols[idx].defined = true;
-        if (type != SYM_REF) as->symbols[idx].type = type;
+        if (type != SYM_REF) {
+            as->symbols[idx].type = type;
+            /* When upgrading from REF to PROC/FUNC/DEF, fix the flags.
+             * A .REF followed by .PROC means "this symbol IS defined here". */
+            if (type == SYM_PROC || type == SYM_FUNC || type == SYM_DEF) {
+                as->symbols[idx].exported = true;
+                as->symbols[idx].external = false;
+            }
+        }
         return idx;
     }
 

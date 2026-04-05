@@ -69,8 +69,9 @@ static bool should_skip_file(const char *name) {
     if (strcasestr(name, "APPENDIX") != NULL) return true;
     if (strcasestr(name, "INSTRUCT") != NULL) return true;
     if (strcasestr(name, "RELEASE") != NULL) return true;
-    /* LIBFP: only NEWFPSUB should be assembled (it includes all others) */
-    if (strcasestr(name, "libfp-") != NULL && !strcasestr(name, "NEWFPSUB")) return true;
+    /* LIBFP: assembly include fragments are assembled via NEWFPSUB master.
+     * Pascal files in LIBFP should be compiled normally.
+     * Content detection handles asm vs Pascal classification. */
     /* QSORT is assembly but starts with EQU constants — force assembly detection below */
     /* Documentation / release notes */
     if (strcasestr(name, "relmemo") != NULL) return true;
@@ -105,8 +106,9 @@ static bool should_skip_file(const char *name) {
     if (strcasestr(name, "LETTERCODES") != NULL) return true;
     if (strcasestr(name, "KEYWORDS") != NULL) return true;
     if (strcasestr(name, "FKEYWORDS") != NULL) return true;
-    if (strcasestr(name, "MENUS.TEXT") != NULL) return true;
-    if (strcasestr(name, "DBOX.TEXT") != NULL) return true;
+    /* Note: MENUS.TEXT and DBOX.TEXT patterns removed — they were catching
+     * LIBWM-MENUS.TEXT (real source with GetItem, CheckItem, etc.).
+     * App-level menu/dialog data files are already excluded by skip_dir(APPS). */
     if (strcasestr(name, "CNBUILD") != NULL) return true;
     if (strcasestr(name, "CIBUILD") != NULL) return true;
     if (strcasestr(name, "BUILDPR") != NULL) return true;
@@ -171,6 +173,13 @@ static int find_source_files(const char *dir, source_file_t *files, int max_file
                 }
             }
 
+            /* LIBFP: skip assembly include-fragments (assembled via NEWFPSUB).
+             * Keep NEWFPSUB itself and all Pascal files in LIBFP. */
+            if (is_asm && strcasestr(entry->d_name, "libfp-") != NULL &&
+                !strcasestr(entry->d_name, "NEWFPSUB")) {
+                continue;  /* Assembly include fragment — skip */
+            }
+
             strncpy(files[count].path, path, sizeof(files[count].path) - 1);
             files[count].is_assembly = is_asm;
             count++;
@@ -203,6 +212,11 @@ static char *read_file(const char *path) {
 static cg_symbol_t shared_globals[MAX_SHARED_GLOBALS];
 static int num_shared_globals = 0;
 
+/* Shared types accumulated from all previously compiled units */
+#define MAX_SHARED_TYPES 8192
+static type_desc_t shared_types[MAX_SHARED_TYPES];
+static int num_shared_types = 0;
+
 static bool compile_pascal_file(const char *path, linker_t *lk) {
     char *source = read_file(path);
     if (!source) return false;
@@ -211,6 +225,20 @@ static bool compile_pascal_file(const char *path, linker_t *lk) {
 
     parser_t parser;
     parser_init(&parser, source, path);
+
+    /* Set source_root for {$I} include resolution.
+     * Derive from path: .../Lisa_Source/LISA_OS/LIBS/FOO/file → .../Lisa_Source */
+    {
+        const char *marker = strcasestr(path, "/LISA_OS/");
+        if (marker) {
+            size_t rlen = (size_t)(marker - path);
+            if (rlen < sizeof(parser.lex.source_root))  {
+                memcpy(parser.lex.source_root, path, rlen);
+                parser.lex.source_root[rlen] = '\0';
+            }
+        }
+    }
+
     ast_node_t *ast = parser_parse(&parser);
 
     if (is_startup && ast) {
@@ -254,6 +282,8 @@ static bool compile_pascal_file(const char *path, linker_t *lk) {
     strncpy(cg->current_file, path, sizeof(cg->current_file) - 1);
     cg->imported_globals = shared_globals;
     cg->imported_globals_count = num_shared_globals;
+    cg->imported_types = shared_types;
+    cg->imported_types_count = num_shared_types;
 
     /* Debug: log AST type for every file to trace symbol issues */
     if (ast && (strcasestr(path, "UNITHZ") || strcasestr(path, "UNITSTD"))) {
@@ -289,6 +319,13 @@ static bool compile_pascal_file(const char *path, linker_t *lk) {
     for (int i = 0; i < cg->num_globals && num_shared_globals < MAX_SHARED_GLOBALS; i++) {
         if (!cg->globals[i].is_external && !cg->globals[i].is_forward) {
             shared_globals[num_shared_globals++] = cg->globals[i];
+        }
+    }
+
+    /* Export this file's types to the shared table for cross-unit type casts */
+    for (int i = 0; i < cg->num_types && num_shared_types < MAX_SHARED_TYPES; i++) {
+        if (cg->types[i].name[0]) {
+            shared_types[num_shared_types++] = cg->types[i];
         }
     }
 
@@ -336,10 +373,12 @@ static bool assemble_file(const char *path, linker_t *lk, const char *source_roo
 
     if (ok && as->output_size > 0) {
         /* Convert assembler symbols to codegen format for the linker.
-         * Export .PROC, .FUNC, .DEF symbols and import .REF symbols. */
+         * Export .PROC, .FUNC, .DEF symbols AND .REF symbols.
+         * .PROC/.FUNC are entry points even without a .DEF directive. */
         int num_exported = 0;
         for (int i = 0; i < as->num_symbols; i++) {
-            if (as->symbols[i].exported || as->symbols[i].external)
+            if (as->symbols[i].exported || as->symbols[i].external ||
+                as->symbols[i].type == SYM_PROC || as->symbols[i].type == SYM_FUNC)
                 num_exported++;
         }
 
@@ -352,10 +391,13 @@ static bool assemble_file(const char *path, linker_t *lk, const char *source_roo
             if (syms) {
                 for (int i = 0; i < as->num_symbols; i++) {
                     asm_symbol_t *s = &as->symbols[i];
-                    if (!s->exported && !s->external) continue;
+                    if (!s->exported && !s->external &&
+                        s->type != SYM_PROC && s->type != SYM_FUNC) continue;
                     strncpy(syms[nsyms].name, s->name, 63);
                     syms[nsyms].offset = s->value;
-                    syms[nsyms].is_global = s->exported;
+                    /* .PROC/.FUNC are global entry points even without .DEF */
+                    syms[nsyms].is_global = s->exported ||
+                        s->type == SYM_PROC || s->type == SYM_FUNC;
                     syms[nsyms].is_external = s->external;
                     nsyms++;
                 }
@@ -446,6 +488,15 @@ build_result_t toolchain_build(const char *source_dir,
     char subdir[512];
     snprintf(subdir, sizeof(subdir), "%s/LISA_OS", source_dir);
     num_files += find_source_files(subdir, files + num_files, MAX_SOURCE_FILES - num_files);
+
+    /* Sort files: base units before numbered fragments (case-insensitive).
+     * Ensures types defined in UNIT INTERFACE are available for fragments. */
+    for (int a = 0; a < num_files - 1; a++)
+        for (int b = a + 1; b < num_files; b++)
+            if (strcasecmp(files[a].path, files[b].path) > 0) {
+                source_file_t tmp = files[a]; files[a] = files[b]; files[b] = tmp;
+            }
+
     if (progress) progress("Found source files", 1, 100);
 
     /* Create linker */

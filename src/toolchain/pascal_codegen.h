@@ -152,6 +152,10 @@ typedef struct {
     /* Imported globals from previously compiled units (set by toolchain bridge) */
     cg_symbol_t *imported_globals;
     int imported_globals_count;
+
+    /* Imported types from previously compiled units (set by toolchain bridge) */
+    type_desc_t *imported_types;
+    int imported_types_count;
 } codegen_t;
 
 /* Public API */

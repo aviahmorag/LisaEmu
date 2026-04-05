@@ -59,6 +59,174 @@ void lexer_init(lexer_t *lex, const char *source, const char *filename) {
     lex->filename = filename;
     lex->line = 1;
     lex->col = 1;
+
+    /* Set base_dir from filename for {$I} resolution */
+    if (filename) {
+        const char *slash = strrchr(filename, '/');
+        if (slash) {
+            size_t len = (size_t)(slash - filename);
+            if (len >= sizeof(lex->base_dir)) len = sizeof(lex->base_dir) - 1;
+            memcpy(lex->base_dir, filename, len);
+            lex->base_dir[len] = '\0';
+        }
+    }
+}
+
+/* {$I filename} include file support */
+
+static char *lexer_read_file(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *buf = malloc(sz + 1);
+    if (!buf) { fclose(f); return NULL; }
+    fread(buf, 1, sz, f);
+    buf[sz] = '\0';
+    fclose(f);
+    return buf;
+}
+
+/* Resolve a Lisa-style include path to an actual file.
+ * Lisa paths: "libfp/externals.text" or "l:vlsup0.text"
+ * Actual paths: "Lisa_Source/LISA_OS/LIBS/LIBFP/libfp-externals.text.unix.txt"
+ *
+ * Strategy:
+ * 1. Try relative to base_dir: base_dir/lib-filename.TEXT.unix.txt
+ * 2. Try relative to source_root: source_root/LIBS/path.TEXT.unix.txt
+ * 3. Try parent dir patterns
+ */
+static char *lexer_resolve_include(lexer_t *lex, const char *inc_path) {
+    char path[512], prefix[64], name[256];
+    char *content;
+
+    /* Parse "libfp/externals.text" → prefix="libfp", name="externals" */
+    const char *slash = strchr(inc_path, '/');
+    const char *colon = strchr(inc_path, ':');
+    const char *sep = slash ? slash : colon;
+
+    if (sep) {
+        size_t plen = (size_t)(sep - inc_path);
+        if (plen >= sizeof(prefix)) plen = sizeof(prefix) - 1;
+        memcpy(prefix, inc_path, plen);
+        prefix[plen] = '\0';
+        strncpy(name, sep + 1, sizeof(name) - 1);
+    } else {
+        prefix[0] = '\0';
+        strncpy(name, inc_path, sizeof(name) - 1);
+    }
+
+    /* Strip .text extension if present */
+    char *dot = strrchr(name, '.');
+    if (dot && (strcasecmp(dot, ".text") == 0 || strcasecmp(dot, ".txt") == 0))
+        *dot = '\0';
+
+    /* Try 1: base_dir/prefix-name.text.unix.txt (same directory) */
+    if (prefix[0] && lex->base_dir[0]) {
+        snprintf(path, sizeof(path), "%s/%s-%s.text.unix.txt", lex->base_dir, prefix, name);
+        content = lexer_read_file(path);
+        if (content) return content;
+        /* Try uppercase */
+        snprintf(path, sizeof(path), "%s/%s-%s.TEXT.unix.txt", lex->base_dir, prefix, name);
+        content = lexer_read_file(path);
+        if (content) return content;
+    }
+
+    /* Try 2: source_root/LIBS/PREFIX/prefix-name.text.unix.txt */
+    if (prefix[0] && lex->source_root[0]) {
+        char up_prefix[64];
+        strncpy(up_prefix, prefix, sizeof(up_prefix) - 1);
+        for (char *c = up_prefix; *c; c++) *c = toupper((unsigned char)*c);
+
+        snprintf(path, sizeof(path), "%s/LISA_OS/LIBS/%s/%s-%s.text.unix.txt",
+                 lex->source_root, up_prefix, prefix, name);
+        content = lexer_read_file(path);
+        if (content) return content;
+        snprintf(path, sizeof(path), "%s/LISA_OS/LIBS/%s/%s-%s.TEXT.unix.txt",
+                 lex->source_root, up_prefix, prefix, name);
+        content = lexer_read_file(path);
+        if (content) return content;
+    }
+
+    /* Try 3: base_dir/../prefix/prefix-name (go up one level) */
+    if (prefix[0] && lex->base_dir[0]) {
+        char parent[512];
+        strncpy(parent, lex->base_dir, sizeof(parent) - 1);
+        char *pslash = strrchr(parent, '/');
+        if (pslash) {
+            *pslash = '\0';
+            char up_prefix[64];
+            strncpy(up_prefix, prefix, sizeof(up_prefix) - 1);
+            for (char *c = up_prefix; *c; c++) *c = toupper((unsigned char)*c);
+
+            snprintf(path, sizeof(path), "%s/%s/%s-%s.text.unix.txt",
+                     parent, up_prefix, prefix, name);
+            content = lexer_read_file(path);
+            if (content) return content;
+            snprintf(path, sizeof(path), "%s/%s/%s-%s.TEXT.unix.txt",
+                     parent, up_prefix, prefix, name);
+            content = lexer_read_file(path);
+            if (content) return content;
+        }
+    }
+
+    /* Try 4: no prefix — base_dir/name.text.unix.txt */
+    if (lex->base_dir[0]) {
+        snprintf(path, sizeof(path), "%s/%s.text.unix.txt", lex->base_dir, name);
+        content = lexer_read_file(path);
+        if (content) return content;
+        snprintf(path, sizeof(path), "%s/%s.TEXT.unix.txt", lex->base_dir, name);
+        content = lexer_read_file(path);
+        if (content) return content;
+    }
+
+    return NULL;
+}
+
+/* Push current lexer state and switch to included file */
+static bool lexer_push_include(lexer_t *lex, const char *inc_path) {
+    if (lex->include_depth >= LEX_MAX_INCLUDE_DEPTH) return false;
+
+    char *content = lexer_resolve_include(lex, inc_path);
+    if (!content) return false;
+
+    /* Save current state */
+    lex_include_frame_t *frame = &lex->include_stack[lex->include_depth++];
+    frame->source = lex->source;
+    frame->pos = lex->pos;
+    frame->filename = lex->filename;
+    frame->line = lex->line;
+    frame->col = lex->col;
+
+    /* Switch to included content */
+    lex->source = content;
+    lex->pos = content;
+    /* lex->filename stays for error reporting — we could change it */
+    lex->line = 1;
+    lex->col = 1;
+    lex->has_lookahead = false;
+
+    return true;
+}
+
+/* Pop back to parent file after included file EOF */
+static bool lexer_pop_include(lexer_t *lex) {
+    if (lex->include_depth <= 0) return false;
+
+    /* Free the included content */
+    free((void *)lex->source);
+
+    lex->include_depth--;
+    lex_include_frame_t *frame = &lex->include_stack[lex->include_depth];
+    lex->source = frame->source;
+    lex->pos = frame->pos;
+    lex->filename = frame->filename;
+    lex->line = frame->line;
+    lex->col = frame->col;
+    lex->has_lookahead = false;
+
+    return true;
 }
 
 /* Conditional compilation helpers */
@@ -109,18 +277,57 @@ static void lexer_handle_setc(lexer_t *lex, const char *directive) {
     /* Skip := */
     while (*p == ' ' || *p == ':' || *p == '=') p++;
 
-    /* Parse value — TRUE, FALSE, or a symbol name */
-    char val_str[64];
-    int vi = 0;
-    while (*p && *p != ' ' && *p != '}' && vi < 63) {
-        val_str[vi++] = *p++;
-    }
-    val_str[vi] = '\0';
+    /* Parse value expression: TRUE, FALSE, symbol, or boolean expression
+     * Supports: value AND value, value OR value, NOT value */
+    bool value = false;
+    bool first = true;
+    int pending_op = 0; /* 0=none, 1=AND, 2=OR */
 
-    bool value;
-    if (str_eq_upper(val_str, "TRUE")) value = true;
-    else if (str_eq_upper(val_str, "FALSE")) value = false;
-    else value = lexer_lookup_symbol(lex, val_str); /* $SETC a := b */
+    while (*p && *p != '}' && *p != '*') {
+        while (*p == ' ') p++;
+        if (!*p || *p == '}' || *p == '*') break;
+
+        /* Check for NOT */
+        bool negate = false;
+        if ((p[0] == 'N' || p[0] == 'n') &&
+            (p[1] == 'O' || p[1] == 'o') &&
+            (p[2] == 'T' || p[2] == 't') &&
+            (p[3] == ' ' || p[3] == '\t')) {
+            negate = true;
+            p += 3;
+            while (*p == ' ') p++;
+        }
+
+        /* Parse operand */
+        char val_str[64];
+        int vi = 0;
+        while (*p && *p != ' ' && *p != '}' && *p != '*' && vi < 63) {
+            val_str[vi++] = *p++;
+        }
+        val_str[vi] = '\0';
+        if (vi == 0) break;
+
+        /* Check for AND/OR operators (they're operands, not values) */
+        if (str_eq_upper(val_str, "AND")) { pending_op = 1; continue; }
+        if (str_eq_upper(val_str, "OR"))  { pending_op = 2; continue; }
+
+        bool operand;
+        if (str_eq_upper(val_str, "TRUE")) operand = true;
+        else if (str_eq_upper(val_str, "FALSE")) operand = false;
+        else operand = lexer_lookup_symbol(lex, val_str);
+
+        if (negate) operand = !operand;
+
+        if (first) {
+            value = operand;
+            first = false;
+        } else {
+            if (pending_op == 1) value = value && operand;
+            else if (pending_op == 2) value = value || operand;
+            else value = operand;
+        }
+        pending_op = 0;
+    }
 
     lexer_set_symbol(lex, name, value);
 }
@@ -192,6 +399,26 @@ static bool lexer_handle_directive(lexer_t *lex, const char *dir) {
         (dir[4] == 'C' || dir[4] == 'c')) {
         if (lexer_is_active(lex)) {
             lexer_handle_setc(lex, dir);
+        }
+        return true;
+    }
+
+    /* $I filename — include file */
+    if ((dir[1] == 'I' || dir[1] == 'i') &&
+        (dir[2] == ' ' || dir[2] == '\t')) {
+        if (lexer_is_active(lex)) {
+            const char *p = dir + 2;
+            while (*p == ' ' || *p == '\t') p++;
+            char inc_path[256];
+            int pi = 0;
+            while (*p && *p != '}' && *p != '*' && *p != ' ' && pi < 255) {
+                inc_path[pi++] = *p++;
+            }
+            inc_path[pi] = '\0';
+            if (inc_path[0]) {
+                lexer_push_include(lex, inc_path);
+                /* Silently skip if file not found — some includes are optional */
+            }
         }
         return true;
     }
@@ -302,6 +529,11 @@ static token_t lexer_raw_next(lexer_t *lex) {
     skip_whitespace_and_comments(lex);
 
     if (!*lex->pos) {
+        /* If we're inside an included file, pop back to parent */
+        if (lex->include_depth > 0) {
+            lexer_pop_include(lex);
+            continue;  /* Retry from the parent file's position */
+        }
         return make_token(lex, TOK_EOF);
     }
 

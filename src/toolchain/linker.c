@@ -63,6 +63,25 @@ static int find_global_symbol(linker_t *lk, const char *name) {
                 return i;
         }
     }
+    /* Clascal method match: "AddImage" → "TDialogImage.AddImage"
+     * When a method call uses just the method name, try to find an ENTRY
+     * whose name ends with ".MethodName" */
+    if (len >= 3) {
+        char suffix[70];
+        snprintf(suffix, sizeof(suffix), ".%s", name);
+        size_t slen = strlen(suffix);
+        int method_match = -1;
+        for (int i = 0; i < lk->num_symbols; i++) {
+            if (lk->symbols[i].type != LSYM_ENTRY) continue;
+            size_t symlen = strlen(lk->symbols[i].name);
+            if (symlen > slen &&
+                strncasecmp(lk->symbols[i].name + symlen - slen, suffix, slen) == 0) {
+                method_match = i;
+                break;  /* Take first match — imperfect but functional */
+            }
+        }
+        if (method_match >= 0) return method_match;
+    }
     return extern_match;  /* Fall back to EXTERN if no ENTRY found */
 }
 
@@ -378,16 +397,38 @@ bool linker_link(linker_t *lk) {
     /* Re-apply ALL relocations — resolved symbols get their address,
      * unresolved ones get the stub address (never leave JSR $000000) */
     int total_relocs_applied = 0;
+    int relocs_to_stub = 0;
+    /* Track which symbols go to stub */
+    typedef struct { char name[64]; int count; } stub_sym_t;
+    stub_sym_t *stub_syms = calloc(4096, sizeof(stub_sym_t));
+    int num_stub_syms = 0;
+
     for (int m = 0; m < lk->num_modules; m++) {
         link_module_t *mod = lk->modules[m];
         for (int r = 0; r < mod->num_relocs; r++) {
             total_relocs_applied++;
             int sym_idx = find_global_symbol(lk, mod->relocs[r].symbol);
             int32_t target;
-            if (sym_idx >= 0 && lk->symbols[sym_idx].resolved) {
+            if (sym_idx >= 0 && lk->symbols[sym_idx].resolved &&
+                lk->symbols[sym_idx].value != (int32_t)stub_addr) {
                 target = lk->symbols[sym_idx].value;
             } else {
                 target = stub_addr;  /* Unknown symbol → stub, never 0 */
+                relocs_to_stub++;
+                /* Track stub symbol */
+                bool found = false;
+                for (int s = 0; s < num_stub_syms; s++) {
+                    if (strcasecmp(stub_syms[s].name, mod->relocs[r].symbol) == 0) {
+                        stub_syms[s].count++;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found && num_stub_syms < 4096) {
+                    strncpy(stub_syms[num_stub_syms].name, mod->relocs[r].symbol, 63);
+                    stub_syms[num_stub_syms].count = 1;
+                    num_stub_syms++;
+                }
             }
             uint32_t offset = mod->relocs[r].offset;
             int size = mod->relocs[r].size;
@@ -414,6 +455,24 @@ bool linker_link(linker_t *lk) {
             memcpy(lk->output + mod->base_addr, mod->code, mod->code_size);
         }
     }
+
+    /* Dump stub symbol report */
+    if (num_stub_syms > 0) {
+        /* Sort by count descending */
+        for (int i = 0; i < num_stub_syms - 1; i++)
+            for (int j = i + 1; j < num_stub_syms; j++)
+                if (stub_syms[j].count > stub_syms[i].count) {
+                    stub_sym_t tmp = stub_syms[i];
+                    stub_syms[i] = stub_syms[j];
+                    stub_syms[j] = tmp;
+                }
+        fprintf(stderr, "Linker: %d relocations to stub (%d unique symbols):\n",
+                relocs_to_stub, num_stub_syms);
+        int show = num_stub_syms < 300 ? num_stub_syms : 300;
+        for (int i = 0; i < show; i++)
+            fprintf(stderr, "  %4d x  %s\n", stub_syms[i].count, stub_syms[i].name);
+    }
+    free(stub_syms);
 
     /* Final safety: scan output for JSR $000000 patterns and patch to stub.
      * This catches any relocations that were dropped due to limits. */
@@ -454,7 +513,7 @@ bool linker_link(linker_t *lk) {
     fprintf(stderr, "Linker: %d symbols total (%d entries, %d externs), %d resolved, %d unresolved\n",
             lk->num_symbols, entries, externs, resolved, unresolved);
     /* Search for specific symbols to debug */
-    const char *debug_syms[] = {"INIT_TRAPV", "INIT_TRA", "TRAP1", "SCHDTRAP", "ENTER_SC", "HAllocate", "SCHEDENA", "PASCALIN", "BUS_ERR", NULL};
+    const char *debug_syms[] = {NULL};
     for (int d = 0; debug_syms[d]; d++) {
         int idx = find_global_symbol(lk, debug_syms[d]);
         if (idx >= 0) {
