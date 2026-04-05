@@ -1,4 +1,4 @@
-# LisaEmu — Next Session Plan (April 5, 2026)
+# LisaEmu — Next Session Plan (April 6, 2026)
 
 ## Quick Start
 
@@ -7,106 +7,103 @@ make                        # Build standalone emulator
 build/lisaemu Lisa_Source   # Run from source directory (builds + boots)
 ```
 
-## Current State
+## Current State: PASCALINIT local label relocation fix needed
 
-The Lisa OS cross-compiles from source and boots through INITSYS with
-zero SYSTEM_ERROR calls. The OS runs stably at PC=$0D9242 for 480+ frames.
-One zero-divide exception at the end. Screen buffer is blank (OS hasn't
-reached display code yet — needs ProFile disk I/O to complete FS_INIT).
+The OS cross-compiles with zero parse errors, zero SYSTEM_ERRORs,
+and the correct 46-module kernel from the reference project. But
+PASCALINIT never returns because `LEA trap7hand,A1` assembles with
+a raw section offset ($44) instead of the linked address.
 
-```
-Linker: 8701 symbols, 3106 kernel-resolved, 5595 non-kernel (correct)
-Kernel: 46 OS modules + LIBPL + LIBHW + LIBFP + LIBOS (matching real Lisa)
-DIAG: PC=$0D9242 SR=$2218 stopped=0 — stable, no crashes
-Exceptions: 1 zero-divide (non-fatal)
-Screen: blank — init chain blocked before display drawing code
-ProFile: zero disk reads — OS hasn't reached FS_INIT disk I/O yet
-```
+### The blocking bug:
+Assembly local labels (like `trap7hand` in starasm1.text) use absolute
+addressing with section-relative offsets. Without linker relocations,
+`LEA trap7hand,A1` puts $44 in A1 instead of the real address. The
+TRAP #7 handler is installed at vector $9C pointing to $44 (vector
+table data), not the handler code. When %initstdio calls TRAP #7,
+it jumps into garbage.
 
-## Session 3 Summary (40 commits)
+### Fix in progress (commit 3971cb3):
+- Assembler generates relocations for ALL local label references
+- Bridge code adds local symbols to the linker's symbol table
+- Linker resolves them to base_addr + label_offset
+
+### Issue with current fix:
+DRIVERS.TEXT generates 173 exported symbols (was 1) due to every
+local label getting a relocation. This makes linking extremely slow.
+Need to optimize: only generate relocations for labels used in
+absolute addressing mode (LEA/JSR/MOVE.L abs, not BSR/BRA/d16(PC)).
+
+## Session 3 Summary (46 commits)
 
 ### Critical bugs fixed:
-1. **Multi-parameter parsing** — `(a, b, c: type)` created 1 param named "a,b,c"
-   instead of 3 separate params. Affected EVERY multi-param function. POOL_INIT
-   got 1 param instead of 6 → SYSTEM_ERROR(610) "no space". FIXED.
-2. **FOR loop MOVE.L→MOVE.W** — 4-byte write into 2-byte slot corrupted saved A6.
-   Caused cascade failure after 260 frames. FIXED.
-3. **Linker non-kernel symbol collision** — non-kernel module symbols at base_addr=0
-   resolved to addresses inside kernel code. Root cause of original A6 corruption. FIXED.
-4. **LIBHW directory skip** — should_skip_dir("LIBHW") always returned true because
-   it checked if "LIBHW" contains "LIBS" (it doesn't). 74 COPS symbols missing. FIXED.
+1. **Multi-parameter parsing** — `(a, b, c: type)` collapsed to 1 param.
+   Affected EVERY function. POOL_INIT got 1 of 6 params. FIXED.
+2. **FOR loop MOVE.L→MOVE.W** — 4-byte write into 2-byte slot. FIXED.
+3. **Linker non-kernel symbol collision** — base_addr=0 collision. FIXED.
+4. **LIBHW directory skip** — 74 COPS symbols missing. FIXED.
+5. **Local label absolute addressing** — LEA/JSR to local labels wrong. IN PROGRESS.
 
-### Other fixes:
-- Symbol pre-resolution in add_global_symbol (resolved=true set too early)
-- Stub moved from end-of-code to $3F0 (safe from OS overwrite)
-- VAR param nested scope in 3 codegen paths
-- Cross-library {$I} include search across all LIBS/ subdirs
-- MATHLIB proc-param semicolon tolerance
-- CONST section semicolon tolerance (Lisa Pascal quirk)
-- Array bounds default to 64 for unresolved CONST
-- Screen buffer moved to $1F8000 (top of 2MB RAM)
-- All screen pointers updated ($110/$160/$170/$174)
-- I/O board type ($FCC031=$80=Pepsi Lisa 2)
-- Internal disk type ($FCC015=1=Sony/ProFile)
-- Boot device ($1B3=2=ProFile)
-- SGLOBAL at $200 = b_sysglobal
-- DRIVRJT at $210 = 32-entry driver jump table
-- MMU: 5 contexts, register writes, identity mapping + OS segments
-- Boot ROM: 16 identity segments + I/O + ROM before setup exit
-- TRAP #6 vector installed for MMU programming
-- Vretrace interrupt at level 2
+### Architecture (from LisaSourceCompilation reference):
+- Kernel = 46 OS modules (ALEX-LINK-SYSTEMOS.TEXT) + LIBPL/LIBHW/LIBFP/LIBOS
+- Binary ~918KB, fits in 2MB RAM with screen at $1F8000
+- MMU: 5 contexts, identity + OS segments pre-programmed
+- ProFile: protocol-accurate module written (src/profile.c/h)
 
-### Architecture (matching real Lisa from LisaSourceCompilation):
-- Kernel = 46 OS modules from SOURCE/ + HWINTL (from ALEX-LINK-SYSTEMOS.TEXT)
-- Runtime libs: LIBPL, LIBHW, LIBFP, LIBOS (normally loaded as IOSPASLIB etc.)
-- UI libs (LIBWM, LIBTK, LIBQD, etc.) = non-kernel (would be intrinsic libs on disk)
-- Apps = non-kernel (separate files on disk)
+### Key metrics:
+- 3106 kernel-resolved symbols (kernel complete)
+- Zero SYSTEM_ERROR calls
+- Zero parse errors (420 source files)
+- PASCALINIT called but doesn't return (local label bug)
 
-## What's Blocking: ProFile Disk I/O
+## What needs to happen (in order):
 
-The OS init chain goes: INITSYS → ... → BOOT_IO_INIT → INIT_BOOT_CDS → ProFile
-driver init. The ProFile driver does a VIA1 handshake to initialize the disk.
+### 1. Fix local label relocations (IMMEDIATE)
+Optimize the assembler to only generate relocations for labels used
+in absolute addressing mode. Current approach adds ALL local labels
+as symbols, making linking too slow.
 
-From the FS_INIT research agent, three issues remain:
+Alternative: use PC-relative addressing for local labels in LEA/PEA
+instructions (on pass 1, reserve 4 bytes for abs.L; on pass 2,
+emit d16(PC) + 2 bytes padding if within range).
 
-### 1. ProFile VIA handshake protocol
-The real ProFile protocol (SOURCE-PROFILEASM.TEXT) is a multi-step VIA handshake:
-- Set CMD via ORB, wait for BSY on CA1 interrupt
-- Send $55 response, wait for not-busy
-- Send 6 command bytes on ORA
-- Read 4 status bytes + 20-byte header + 512 data bytes
+### 2. PASCALINIT returns → INITSYS runs
+Once trap7hand is correctly addressed, %initstdio and mapiospace
+will work. PASCALINIT returns, INITSYS is called, and the full
+init chain runs: INTSOFF → GETLDMAP → REG_TO_MAPPED → POOL_INIT →
+INIT_TRAPV → ... → BOOT_IO_INIT → FS_INIT → ENTER_SCHEDULER.
 
-Our emulator uses a simplified command-buffer approach that doesn't match this
-protocol. The OS driver will time out or get wrong responses.
+### 3. ProFile VIA handshake
+Protocol-accurate module ready (src/profile.c). Needs testing once
+BOOT_IO_INIT reaches the ProFile driver initialization code.
+Key: BSY via CA1, CMD via ORB bit 4, data on PORTA.
 
-### 2. MDDF format
-Our disk image's MDDF may have wrong filesystem version. The OS checks fsversion
-against REL1_VERSION, PEPSI_VERSION, or CUR_VERSION.
+### 4. MDDF filesystem format
+Our diskimage.c sets fsversion=$1000. Must be 14, 15, or 17.
+Full MDDF structure documented in memory file.
 
-### 3. After disk I/O works
-FS_INIT → FS_Mount → read MDDF → mount filesystem → SYS_PROC_INIT → create
-system processes → PR_CLEANUP → ENTER_SCHEDULER → OS draws to screen
+### 5. Intrinsic library loading
+OS expects to load SYS1LIB, IOSFPLIB etc. from disk. Need either
+virtual disk files or HLE stubs.
 
 ## Key Files
 
 ```
-src/toolchain/pascal_parser.c   — Multi-param fix, semicolon tolerance
-src/toolchain/pascal_codegen.c  — FOR loop MOVE.W, VAR nested scope, array bounds
-src/toolchain/pascal_lexer.c    — Cross-library {$I} search, %_ identifiers
-src/toolchain/linker.c          — Non-kernel isolation, stub at $3F0, builtins
-src/toolchain/toolchain_bridge.c — Kernel module selection (OS + LIBPL/HW/FP/OS)
-src/toolchain/bootrom.c         — Identity MMU mapping, screen clear
-src/lisa_mmu.h/c                — 5 contexts, register writes, translation
-src/lisa.c                      — Boot env, SGLOBAL, DRIVRJT, I/O regs, ProFile
-src/m68k.c                      — SYSTEM_ERROR trace, code escape trace
-scripts/patch_source.sh         — Source preprocessing (10 patches)
+src/toolchain/asm68k.c          — Local label relocation fix (WIP)
+src/toolchain/toolchain_bridge.c — Kernel selection, local symbol export
+src/toolchain/pascal_parser.c    — Multi-param fix, semicolon tolerance
+src/toolchain/pascal_codegen.c   — FOR loop MOVE.W, VAR nested scope
+src/toolchain/pascal_lexer.c     — Cross-library {$I} search
+src/toolchain/linker.c           — Non-kernel isolation, stub at $3F0
+src/toolchain/bootrom.c          — MMU identity mapping, screen clear
+src/toolchain/diskimage.c        — MDDF needs fsversion=17
+src/profile.c/h                  — Protocol-accurate ProFile emulation
+src/lisa_mmu.h/c                 — 5 contexts, register writes, translation
+src/lisa.c                       — Boot env, SGLOBAL, DRIVRJT, I/O regs
+src/m68k.c                       — TRAP trace, SYSTEM_ERROR trace
+scripts/patch_source.sh          — Source preprocessing (10 patches)
 ```
 
-## Toolchain Metrics
-```
-Parser:    420 source files, 1 parse error (BUILDLLD — not compilable)
-Assembler: 100+ files, 100% success
-Codegen:   Multi-param, proc sigs, CONST, nested scope, VAR params, FOR loop
-Linker:    3106 kernel-resolved, zero SYSTEM_ERROR calls
-Output:    ~918KB system.os, boots through INITSYS, 480+ stable frames
-```
+## Reference Projects (in _inspiration/)
+- LisaEm: ProFile protocol, Z8530 serial, MMU, COPS
+- LisaSourceCompilation: 46-module kernel list, 56 patches, MDDF format
+- See memory files for detailed notes
