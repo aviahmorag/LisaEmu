@@ -74,17 +74,71 @@ static int find_global_symbol(linker_t *lk, const char *name) {
         {"READLN",    "%_ReadLn"},
         {"NEW",       "%_New"},
         {"DISPOSE",   "%_Dispose"},
-        /* FPLIB wrappers → NEWFPSUB assembly (2-operand form) */
+        /* FPLIB 3-operand extended wrappers → NEWFPSUB 2-operand */
         {"fpaddx",    "%f_ADD"},
         {"fpsubx",    "%f_SUB"},
         {"fpmulx",    "%f_MUL"},
         {"fpdivx",    "%f_DIV"},
-        {"fpcomx",    "%f_EQ"},     /* compare → equality test (close enough) */
-        {"fpmovex",   "%f_ADD"},    /* move via add-zero approximation */
+        {"fpcomx",    "%f_EQ"},
+        {"fpmovex",   "FP68K"},     /* move extended via FP dispatch */
         {"fpnegx",    "%f_neg"},
         {"fpabsx",    "%f_abs"},
+        {"fpremx",    "FP68K"},     /* remainder via FP dispatch */
+        {"fpintx",    "FP68K"},     /* integral part via FP dispatch */
+        {"fpsqrtx",   "%_SQRT"},
+        /* FPLIB register-based ops (no args, operate on fpcb) */
         {"fpadd",     "%f_ADD"},
         {"fpmul",     "%f_MUL"},
+        {"fpdiv",     "%f_DIV"},
+        {"fpint",     "FP68K"},
+        {"fpsqrt",    "%_SQRT"},
+        /* FPLIB move/convert functions */
+        {"xmovefp",   "FP68K"},     /* extended → FP register */
+        {"xmovefp1",  "FP68K"},     /* extended → FP1 register */
+        {"smovex",    "FP68K"},     /* single → extended */
+        {"wmovex",    "%I_FLT"},    /* integer → extended (float int) */
+        {"dmovex",    "FP68K"},     /* double → extended */
+        {"cmovefp",   "FP68K"},     /* BCD → FP register */
+        {"xmoves",    "FP68K"},     /* extended → single */
+        {"xmovew",    "%_trunc"},   /* extended → integer (truncate) */
+        {"xmoved",    "FP68K"},     /* extended → double */
+        {"xmovel",    "%_trunc"},   /* extended → longint */
+        {"wmovefp1",  "FP68K"},     /* integer → FP1 */
+        {"fpmoved",   "FP68K"},     /* FP0 → double */
+        /* FPLIB internal helpers */
+        {"fp%normalize",  "FP68K"},
+        {"fp%cnormalize", "FP68K"},
+        {"fp%execute",    "FP68K"},
+        {"fp%hex",        "FP68K"},
+        {"fp%i64",        "FP68K"},
+        {"i64neg",        "%f_neg"},
+        {"f32_minus",     "%f_neg"},
+        {"f32_kind",      "FP68K"},
+        {"f32_integral",  "FP68K"},
+        {"f32_fraction",  "FP68K"},
+        {"x80_break",     "FP68K"},
+        {"x80_integral",  "FP68K"},
+        {"x80%paddr",     "FP68K"},
+        {"x80%todec",     "FP68K"},
+        {"x48%todec",     "FP68K"},
+        {"str2dec",       "FP68K"},
+        /* X48 internal arithmetic (48-bit packed decimal) */
+        {"x%pot",     "FP68K"},
+        {"x%int",     "FP68K"},
+        {"x%tos",     "FP68K"},
+        {"x%sto",     "FP68K"},
+        {"x%mul",     "FP68K"},
+        {"x%div",     "FP68K"},
+        {"x%dec",     "FP68K"},
+        {"x%comp",    "FP68K"},
+        /* MATHLIB fetch/store helpers */
+        {"afetch",    "FP68K"},
+        {"bfetch",    "FP68K"},
+        {"xfetch",    "FP68K"},
+        {"xstore",    "FP68K"},
+        {"bstore",    "FP68K"},
+        {"rstore",    "FP68K"},
+        {"payment",   "FP68K"},     /* financial function */
         /* Math functions */
         {"SINx",      "%_SIN"},
         {"COSx",      "%_COS"},
