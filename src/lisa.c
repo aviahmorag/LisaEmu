@@ -607,6 +607,10 @@ void lisa_reset(lisa_t *lisa) {
             lisa->mem.ram[(addr)+1] = (val) & 0xFF; \
         } while(0)
 
+        /* Boot device and low-memory parameters */
+        lisa->mem.ram[0x1B3] = 2;      /* adr_bootdev: 2 = parallel ProFile */
+        WRITE32(0x2A4, 0);             /* adr_lowcore: physical byte 0 = 0 */
+
         /* Screen pointers (from LDEQU) */
         {
             uint32_t scr = LISA_RAM_SIZE - 0x8000;  /* $1F8000 */
@@ -818,6 +822,9 @@ void lisa_reset(lisa_t *lisa) {
 
             fprintf(stderr, "MMU: pre-programmed sysglobmmu(102)=$%03X, realmemmmu(85-100), kernelmmu(17-20)\n",
                     lisa->mem.segments[1][102].sor);
+            /* Note: MMU translation is not active yet (setup mode).
+             * After the boot ROM exits setup mode, segment 102 will
+             * map $CC0000 → $E2000 for POOL_INIT and GETSPACE. */
 
             #undef SET_MMU_SEG
         }
@@ -988,6 +995,21 @@ int lisa_run_frame(lisa_t *lisa) {
         fprintf(stderr, "  VIA2: t1_run=%d t1_cnt=%d t1_latch=%d ier=$%02X ifr=$%02X\n",
                 lisa->via2.t1_running, lisa->via2.t1_counter, lisa->via2.t1_latch,
                 lisa->via2.ier, lisa->via2.ifr);
+        /* Verify MMU translation at runtime */
+        if (frame_count == 120) {
+            uint32_t test_addr = 0xCC0000;
+            uint32_t phys = 0;
+            int seg = (test_addr >> 17) & 0x7F;
+            int ctx = lisa->mem.current_context;
+            fprintf(stderr, "  MMU state: enabled=%d ctx=%d seg102: sor=$%03X slr=$%03X changed=%d\n",
+                    lisa->mem.mmu_enabled, ctx,
+                    lisa->mem.segments[ctx][102].sor,
+                    lisa->mem.segments[ctx][102].slr,
+                    lisa->mem.segments[ctx][102].changed);
+            uint8_t val = lisa_mem_read8(&lisa->mem, test_addr);
+            fprintf(stderr, "  MMU read $CC0000 = $%02X (phys $E2000 = $%02X)\n",
+                    val, lisa->mem.ram[0xE2000]);
+        }
         /* Check screen content */
         {
             uint32_t saddr = lisa->mem.video_addr;

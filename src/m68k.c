@@ -2649,6 +2649,17 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         static bool line_f_logged = false;
         pc_ring[pc_ring_idx++ & 255] = cpu->pc;
 
+        /* Detect SYSTEM_ERROR calls */
+        if (cpu->pc == 0xD8CDE) {
+            static int syserr_count = 0;
+            if (syserr_count++ < 5) {
+                /* Error number is on the stack as parameter */
+                uint16_t errnum = cpu_read16(cpu, cpu->a[7] + 4);
+                fprintf(stderr, "=== SYSTEM_ERROR(%d) called from $%06X\n",
+                        (int16_t)errnum,
+                        cpu_read32(cpu, cpu->a[7]) - 6);
+            }
+        }
         /* Log calls to stub ($3F0) — shows which functions are missing */
         if (cpu->pc == 0x3F0) {
             static int stub_call_count = 0;
