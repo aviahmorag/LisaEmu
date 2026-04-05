@@ -2636,6 +2636,70 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             }
         }
 
+        /* Trace PASCALINIT entry and critical values */
+        static int pascalinit_logged = 0;
+        {
+            /* Detect PASCALINIT by its first instruction: MOVE.L $218.L,A2 (opcode $2479) */
+            uint16_t pi_op = cpu_read16(cpu, cpu->pc);
+            if (!pascalinit_logged && pi_op == 0x2479 && cpu->pc >= 0x50000) {
+                uint32_t addr = cpu_read32(cpu, cpu->pc + 2);
+                if (addr == 0x218) {
+                    uint32_t paramptr = cpu_read32(cpu, 0x218);
+                    uint32_t version = cpu_read16(cpu, paramptr);
+                    uint32_t esysg_addr = paramptr - 28;
+                    uint32_t esysg_val = cpu_read32(cpu, esysg_addr);
+                    fprintf(stderr, ">>> PASCALINIT: PC=$%06X A5=$%08X SP=$%08X\n", cpu->pc, cpu->a[5], cpu->a[7]);
+                    fprintf(stderr, "  adrparamptr($218)=$%08X version=%d\n", paramptr, version);
+                    fprintf(stderr, "  esysglobal @$%X = $%08X (end of globals)\n", esysg_addr, esysg_val);
+                    fprintf(stderr, "  A5-32 data: ");
+                    for (int i = 0; i < 32; i += 4)
+                        fprintf(stderr, "$%08X ", cpu_read32(cpu, cpu->a[5] - 32 + i));
+                    fprintf(stderr, "\n");
+                    pascalinit_logged = 1;
+                }
+            }
+        }
+
+        /* Trace GETLDMAP — check case selector value */
+        static int getldmap_logged = 0;
+        if (!getldmap_logged && cpu->pc == 0x45A) {
+            fprintf(stderr, ">>> GETLDMAP entry: PC=$%06X A5=$%08X A6=$%08X SP=$%08X\n",
+                    cpu->pc, cpu->a[5], cpu->a[6], cpu->a[7]);
+            /* The parameter (ldmapbase) is on the stack */
+            fprintf(stderr, "  ldmapbase (param) = $%08X\n", cpu_read32(cpu, cpu->a[7] + 4));
+            uint32_t lm = cpu_read32(cpu, cpu->a[7] + 4);
+            if (lm > 0 && lm < 0x100000)
+                fprintf(stderr, "  ldmapbase^ (version) = $%04X (%d)\n",
+                        cpu_read16(cpu, lm), cpu_read16(cpu, lm));
+            getldmap_logged = 1;
+        }
+
+        /* Trace SYSTEM_ERROR call */
+        static int syserr_logged = 0;
+        if (!syserr_logged && cpu->pc >= 0x4AF00 && cpu->pc <= 0x4AF20) {
+            uint16_t op = cpu_read16(cpu, cpu->pc);
+            if (op == 0x2079) {
+                uint16_t errnum = cpu_read16(cpu, cpu->a[7] + 4);
+                fprintf(stderr, ">>> SYSTEM_ERROR(%d) at PC=$%06X SP=$%08X\n",
+                        (int16_t)errnum, cpu->pc, cpu->a[7]);
+                fprintf(stderr, "  D0=$%08X D3=$%08X A5=$%08X A6=$%08X\n",
+                        cpu->d[0], cpu->d[3], cpu->a[5], cpu->a[6]);
+                /* Unwind stack to find call chain */
+                uint32_t sp = cpu->a[7];
+                fprintf(stderr, "  Stack: ");
+                for (int i = 0; i < 20; i += 4)
+                    fprintf(stderr, "$%08X ", cpu_read32(cpu, sp + i));
+                fprintf(stderr, "\n");
+                /* Show 30 PCs */
+                fprintf(stderr, "  Last 30 PCs:\n");
+                for (int ri = 30; ri > 0; ri--) {
+                    uint32_t rpc = pc_ring[(pc_ring_idx - ri) & 255];
+                    fprintf(stderr, "    PC=$%06X op=$%04X\n", rpc, cpu_read16(cpu, rpc));
+                }
+                syserr_logged = 1;
+            }
+        }
+
         /* Trace when A7 goes to 0 or near 0 */
         static int a7_zero_logged = 0;
         if (!a7_zero_logged && cpu->a[7] < 0x100 && cpu->pc >= 0x400) {

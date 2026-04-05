@@ -703,8 +703,26 @@ bool linker_link(linker_t *lk) {
     }
     fprintf(stderr, "Linker: %d symbols total (%d entries, %d externs), %d resolved, %d unresolved\n",
             lk->num_symbols, entries, externs, resolved, unresolved);
+    /* Find nearest symbol to the escape address $4AF14 */
+    {
+        uint32_t target = 0x4AF14;
+        const char *nearest = NULL;
+        int32_t nearest_dist = 0x7FFFFFFF;
+        for (int i = 0; i < lk->num_symbols; i++) {
+            if (lk->symbols[i].type == LSYM_ENTRY && lk->symbols[i].resolved) {
+                int32_t dist = (int32_t)target - lk->symbols[i].value;
+                if (dist >= 0 && dist < nearest_dist) {
+                    nearest_dist = dist;
+                    nearest = lk->symbols[i].name;
+                }
+            }
+        }
+        if (nearest)
+            fprintf(stderr, "  NEAREST to $%X: '%s' at $%X (+%d)\n",
+                    target, nearest, target - nearest_dist, nearest_dist);
+    }
     /* Search for specific symbols to debug */
-    const char *debug_syms[] = {"INIT_TRAPV", "INTSOFF", "INITSYS", "TRAP1", "TRAP7", "BUS_ERR", "SCHDTRAP", "INIT_NMI_TRAPV", "INTSON", "PASCALINIT", "GETLDMAP", "REG_TO_MAPPED", NULL};
+    const char *debug_syms[] = {"INIT_TRAPV", "INTSOFF", "INITSYS", "TRAP1", "TRAP7", "BUS_ERR", "SCHDTRAP", "INIT_NMI_TRAPV", "INTSON", "PASCALINIT", "GETLDMAP", "REG_TO_MAPPED", "SYSTEM_ERROR", "POOL_INIT", "INIT_SCTAB", "SCTAB1", "BAD_SCALL", NULL};
     for (int d = 0; debug_syms[d]; d++) {
         int idx = find_global_symbol(lk, debug_syms[d]);
         if (idx >= 0) {

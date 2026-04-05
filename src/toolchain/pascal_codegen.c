@@ -1044,6 +1044,7 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
         case AST_BLOCK:
             for (int i = 0; i < node->num_children; i++) {
                 gen_statement(cg, node->children[i]);
+                align_code(cg);  /* Ensure even PC after every statement */
             }
             break;
 

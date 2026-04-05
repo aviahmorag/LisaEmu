@@ -147,10 +147,12 @@ uint8_t *bootrom_generate(void) {
     emit16(&b, 0x0000);
     emit32(&b, 0x00FCE012);
 
-    /* 6. Set A5 and A6 — PASCALINIT expects A5 in user stack area.
-     * A6 must be valid (frame pointer) before STARTUP's LINK A6. */
+    /* 6. Set A5 and A6 — PASCALINIT expects A5 in user area with
+     * 32 bytes of Pascal runtime data below it (IORESULT, console ptrs).
+     * These are all zeros for initial boot. A5 points to end of this area.
+     * Use $70000 = top of user stack region (well above OS code). */
     emit16(&b, 0x2A7C);          /* MOVEA.L #imm,A5 */
-    emit32(&b, 0x00014000);
+    emit32(&b, 0x00070000);
     emit16(&b, 0x2C7C);          /* MOVEA.L #imm,A6 */
     emit32(&b, 0x00079000);      /* A6 = top of stack (valid frame ptr sentinel) */
 

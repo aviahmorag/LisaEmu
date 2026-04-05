@@ -651,7 +651,10 @@ void lisa_reset(lisa_t *lisa) {
          * Subsequent fields are at DECREASING addresses below version.
          *
          * We place version at $A00 and write fields downward from there. */
-        uint32_t version_addr = 0xA00;
+        /* Place param block ABOVE OS code — the binary at $0 would overwrite
+         * anything below os_end. Use os_end + $100 for the top of the block. */
+        uint32_t version_addr = os_end + 0x100;
+        if (version_addr & 1) version_addr++;  /* word-align */
         WRITE16(version_addr, 22);  /* version = 22 */
 
         /* Write fields downward: p starts just below version, decreases */
