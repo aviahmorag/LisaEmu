@@ -2649,6 +2649,22 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         static bool line_f_logged = false;
         pc_ring[pc_ring_idx++ & 255] = cpu->pc;
 
+        /* Monitor A6 for corruption */
+        {
+            static uint32_t prev_a6 = 0;
+            static int a6_bad_count = 0;
+            uint32_t a6 = cpu->a[6];
+            if (prev_a6 != 0 && prev_a6 < 0x100000 && a6 > 0x100000 && a6_bad_count < 2) {
+                a6_bad_count++;
+                fprintf(stderr, "=== A6 CORRUPT: $%08X (was $%08X) at PC=$%06X\n",
+                        a6, prev_a6, cpu->pc);
+                for (int ri = 10; ri > 0; ri--) {
+                    uint32_t rpc = pc_ring[(pc_ring_idx - ri) & 255];
+                    fprintf(stderr, "    PC=$%06X op=$%04X\n", rpc, cpu_read16(cpu, rpc));
+                }
+            }
+            prev_a6 = a6;
+        }
         /* Log calls to stub ($3F0) — shows which functions are missing */
         if (cpu->pc == 0x3F0) {
             static int stub_call_count = 0;
@@ -2659,8 +2675,11 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         }
         /* Trace first escape past loaded OS code ($6B000) */
         {
-            static bool code_escape_logged = false;
-            if (!code_escape_logged && cpu->pc >= 0x6B000 && cpu->pc < 0xFC0000) {
+            static int code_escape_count = 0;
+            uint32_t masked_pc = cpu->pc & 0xFFFFFF;
+            if (code_escape_count < 3 &&
+                ((masked_pc >= 0x6B000 && masked_pc < 0xFC0000) || cpu->pc > 0xFFFFFF)) {
+                code_escape_count++;
                 fprintf(stderr, "=== CODE ESCAPE: PC=$%06X SP=$%08X A6=$%08X\n",
                         cpu->pc, cpu->a[7], cpu->a[6]);
                 fprintf(stderr, "  A0=$%08X A1=$%08X D0=$%08X D1=$%08X\n",
@@ -2690,7 +2709,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                     }
                     fprintf(stderr, "\n");
                 }
-                code_escape_logged = true;
+                /* keep counting */
             }
         }
 
