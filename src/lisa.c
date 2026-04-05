@@ -716,6 +716,11 @@ void lisa_reset(lisa_t *lisa) {
         #undef W32D
         #undef W16D
 
+        /* Low-memory system pointers (PASCALDEFS.TEXT EQU definitions) */
+        WRITE32(0x200, b_sysglobal);   /* SGLOBAL/B_SYSGLOBAL: ptr to sysglobal base */
+        WRITE32(0x204, 0);             /* loader_link: ptr to loader boot drivers */
+        WRITE32(0x208, 0);             /* C_DOMAIN_PTR: ptr to current domain cell */
+
         /* Low-memory pointers for PASCALINIT */
         WRITE32(0x218, version_addr);  /* adrparamptr → version */
         WRITE32(0x21C, 0x00020000); /* ldbaseptr: loader base */
@@ -928,9 +933,9 @@ int lisa_run_frame(lisa_t *lisa) {
                 trap1_vec, trap2_vec, int1_vec);
         /* Also read via CPU path to compare */
         uint32_t trap1_cpu = lisa_mem_read32(&lisa->mem, 0x84);
-        fprintf(stderr, "  Vectors (CPU): TRAP1=$%08X  SGLOBAL@$2A0=$%08X\n",
+        fprintf(stderr, "  Vectors (CPU): TRAP1=$%08X  SGLOBAL@$200=$%08X\n",
                 trap1_cpu,
-                lisa_mem_read32(&lisa->mem, 0x2A0));
+                lisa_mem_read32(&lisa->mem, 0x200));
     }
 
     /* Vertical retrace: pulse the IRQ for one instruction only.
