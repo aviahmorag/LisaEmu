@@ -65,8 +65,15 @@ static bool should_skip_file(const char *name) {
     if (strcasestr(name, "INSTALL.TEXT") != NULL) return true;
     if (strcasestr(name, "DOC.TEXT") != NULL) return true;
     if (strcasestr(name, "REL.TEXT") != NULL && strncasecmp(name, "libhw-REL", 9) == 0) return true;
-    if (strcasestr(name, "LEGENDS") != NULL) return true;
     if (strcasestr(name, "APPENDIX") != NULL) return true;
+    /* LIBHW include fragments — assembled via DRIVERS.TEXT master */
+    if (strcasestr(name, "libhw-CURSOR") != NULL) return true;
+    if (strcasestr(name, "libhw-KEYBD") != NULL) return true;
+    if (strcasestr(name, "libhw-LEGENDS") != NULL) return true;
+    if (strcasestr(name, "libhw-MACHINE") != NULL) return true;
+    if (strcasestr(name, "libhw-MOUSE") != NULL) return true;
+    if (strcasestr(name, "libhw-SPRKEYBD") != NULL) return true;
+    if (strcasestr(name, "libhw-TIMERS") != NULL) return true;
     if (strcasestr(name, "INSTRUCT") != NULL) return true;
     if (strcasestr(name, "RELEASE") != NULL) return true;
     /* LIBFP: assembly include fragments are assembled via NEWFPSUB master.

@@ -64,6 +64,9 @@ static bool should_skip_file(const char *name) {
         "CNBUILD", "CIBUILD", "BUILDPR",
         "DWBTN", "ciBTN", "PARBTN", "CNBTN",
         "PASLIBDOC", "PASLIBCDOC", "linkmap-",
+        /* LIBHW include fragments — assembled via DRIVERS.TEXT master */
+        "libhw-CURSOR", "libhw-KEYBD", "libhw-LEGENDS",
+        "libhw-MACHINE", "libhw-MOUSE", "libhw-SPRKEYBD", "libhw-TIMERS",
         NULL
     };
     for (int i = 0; skip_patterns[i]; i++) {
