@@ -454,7 +454,7 @@ bool linker_link(linker_t *lk) {
 
             int32_t target = lk->symbols[sym_idx].value;
 
-            /* Debug traces removed — use targeted tracing when needed */
+            /* (Phase 3 trace removed) */
 
             /* Patch the code */
             uint32_t abs_offset = mod->base_addr + offset;
@@ -541,6 +541,12 @@ bool linker_link(linker_t *lk) {
             }
             uint32_t offset = mod->relocs[r].offset;
             int size = mod->relocs[r].size;
+            /* Log STARTUP INTSOFF in re-apply */
+            if (m == 0 && offset >= 0x4750 && offset <= 0x4760) {
+                fprintf(stderr, "  REAPPLY STARTUP@$%X: sym='%s' → $%X (sym_idx=%d type=%d)\n",
+                        offset, mod->relocs[r].symbol, target, sym_idx,
+                        sym_idx >= 0 ? lk->symbols[sym_idx].type : -1);
+            }
             if (strcasecmp(mod->relocs[r].symbol, "TRAP1") == 0) {
                 fprintf(stderr, "  LINKER PATCH: TRAP1 target=$%08X at module offset %u (code_size=%u, base=$%X)\n",
                         target, offset, mod->code_size, mod->base_addr);
