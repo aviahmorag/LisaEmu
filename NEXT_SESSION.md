@@ -8,7 +8,7 @@ build/lisaemu Lisa_Source   # Run from source directory (builds + boots)
 make audit                  # Full toolchain report
 ```
 
-## Current State: OS boots deep into INITSYS, A6 corruption FIXED
+## Current State: OS boots into INITSYS, screen draws, A6 intact
 
 The CPU boot path works:
 ```
