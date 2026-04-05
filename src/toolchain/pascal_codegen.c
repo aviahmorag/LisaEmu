@@ -1298,10 +1298,14 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
             /* For var := start to/downto end do body */
             cg_symbol_t *var = find_symbol_any(cg, node->name);
 
-            /* Initialize loop variable */
+            /* Initialize loop variable (size-aware store) */
             gen_expression(cg, node->children[0]);
             if (var) {
-                emit16(cg, 0x2D40);  /* MOVE.L D0,offset(A6) */
+                int sz = var->type ? var->type->size : 2;
+                if (sz == 4)
+                    emit16(cg, 0x2D40);  /* MOVE.L D0,offset(A6) */
+                else
+                    emit16(cg, 0x3D40);  /* MOVE.W D0,offset(A6) */
                 emit16(cg, (uint16_t)(int16_t)(var ? var->offset : 0));
             }
 
