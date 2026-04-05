@@ -895,6 +895,12 @@ void linker_init(linker_t *lk) {
         "InsFirst", "InsLast", "Scan", "ClipFurtherTo",
         "NewBreakLocation", "DistinguishScreenFeedback", "DoOnAPage",
         "StrUpperCased",
+        /* Alert Manager / Font Catalog asm helper */
+        "CallProc",
+        /* Database recovery (LIBDB) */
+        "MarksRevenge",
+        /* MathLib sort callback */
+        "sorted",
         NULL
     };
     for (int i = 0; builtins[i]; i++) {
