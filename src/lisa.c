@@ -995,7 +995,22 @@ int lisa_run_frame(lisa_t *lisa) {
         fprintf(stderr, "  VIA2: t1_run=%d t1_cnt=%d t1_latch=%d ier=$%02X ifr=$%02X\n",
                 lisa->via2.t1_running, lisa->via2.t1_counter, lisa->via2.t1_latch,
                 lisa->via2.ier, lisa->via2.ifr);
-        /* Verify MMU translation at runtime */
+        /* Verify A5 and sysglobal at runtime */
+        if (frame_count == 120) {
+            fprintf(stderr, "  A5=$%08X A6=$%08X SP=$%08X\n",
+                    lisa->cpu.a[5], lisa->cpu.a[6], lisa->cpu.a[7]);
+            /* Check b_sysglobal_ptr at $200 */
+            uint32_t bsg = lisa_mem_read32(&lisa->mem, 0x200);
+            fprintf(stderr, "  b_sysglobal_ptr(@$200)=$%08X\n", bsg);
+            /* Check if sysglobal has been written (first 16 bytes) */
+            fprintf(stderr, "  sysglobal@$CC0000:");
+            for (int i = 0; i < 16; i++)
+                fprintf(stderr, " %02X", lisa_mem_read8(&lisa->mem, 0xCC0000 + i));
+            fprintf(stderr, "\n  physical@$E2000:");
+            for (int i = 0; i < 16; i++)
+                fprintf(stderr, " %02X", lisa->mem.ram[0xE2000 + i]);
+            fprintf(stderr, "\n");
+        }
         if (frame_count == 120) {
             uint32_t test_addr = 0xCC0000;
             uint32_t phys = 0;

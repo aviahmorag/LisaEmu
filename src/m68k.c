@@ -2649,6 +2649,20 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         static bool line_f_logged = false;
         pc_ring[pc_ring_idx++ & 255] = cpu->pc;
 
+        /* Monitor A5 for corruption */
+        {
+            static uint32_t last_a5 = 0;
+            static int a5_log = 0;
+            if (a5_log < 3 && cpu->a[5] != last_a5 && last_a5 != 0) {
+                if ((last_a5 < 0x200000 && cpu->a[5] > 0x200000) ||
+                    (last_a5 > 0x200000 && cpu->a[5] < 0x200000 && cpu->a[5] != 0)) {
+                    fprintf(stderr, "=== A5 CHANGED: $%08X → $%08X at PC=$%06X\n",
+                            last_a5, cpu->a[5], cpu->pc);
+                    a5_log++;
+                }
+            }
+            last_a5 = cpu->a[5];
+        }
         /* Detect SYSTEM_ERROR calls */
         if (cpu->pc == 0xD8CDE) {
             static int syserr_count = 0;
