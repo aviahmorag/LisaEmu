@@ -2072,8 +2072,60 @@ static void op_bit_static(m68k_t *cpu) {
 }
 
 /* --- TRAP --- */
+
+/* HLE: TRAP #6 — MMU programming (DO_AN_MMU).
+ * Emulates the DO_AN_MMU handler from LDASM which programs MMU
+ * segment registers during boot. The real handler toggles setup mode,
+ * reads SMT entries, and writes to MMU hardware registers.
+ * We emulate this by directly programming our MMU segment tables.
+ *
+ * Registers on entry (from PROG_MMU caller):
+ *   A0 = return address
+ *   D0 = return domain
+ *   D1 = mmu count
+ *   D2 = target domain
+ *   D3 = mmu index
+ *
+ * The handler reads from smt_base (at the end of do_an_mmu code)
+ * which contains: origin(16) | access(8) | length(8) per segment.
+ */
+static void hle_trap6_mmu(m68k_t *cpu) {
+    if (!cpu->write8) return;  /* Need memory access */
+
+    uint32_t ret_addr = cpu->a[0];
+    int ret_domain = cpu->d[0] & 0xFFFF;
+    int mmu_count = cpu->d[1] & 0xFFFF;
+    int domain = (cpu->d[2] >> 8) & 0xF;  /* After lsl #8,d2; lsl #1,d2 */
+    int seg_index = cpu->d[3] & 0xFF;
+
+    /* Context: 1 + (segment1 | segment2), where the bits come from domain */
+    int context = 1 + (domain & 3);
+    if (context >= 5) context = 4;
+
+    static int trap6_log = 0;
+    if (trap6_log < 5) {
+        fprintf(stderr, "HLE TRAP#6: ctx=%d seg=%d count=%d ret_dom=%d\n",
+                context, seg_index, mmu_count, ret_domain);
+        trap6_log++;
+    }
+
+    /* HLE: We skip the exception mechanism entirely.
+     * The TRAP instruction normally pushes PC+SR and jumps to handler.
+     * Since we're handling it inline, just continue execution at the
+     * next instruction (PC already points past the TRAP opcode).
+     * No stack frame to pop since we never pushed one. */
+    cpu->cycles += 20;
+}
+
 static void op_trap(m68k_t *cpu) {
     int vector = cpu->ir & 0xF;
+
+    /* HLE: Intercept TRAP #6 for MMU programming */
+    if (vector == 6) {
+        hle_trap6_mmu(cpu);
+        return;
+    }
+
     take_exception(cpu, VEC_TRAP_BASE + vector);
     cpu->cycles += 34;
 }

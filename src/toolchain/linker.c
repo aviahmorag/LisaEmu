@@ -635,6 +635,7 @@ bool linker_link(linker_t *lk) {
         /* TRAP vectors */
         INSTALL_VEC(0x84, "TRAP1");              /* TRAP #1 (OS syscall) */
         INSTALL_VEC(0x88, "SCHDTRAP");           /* TRAP #2 (scheduler) */
+        INSTALL_VEC(0x98, "do_an_mmu");          /* TRAP #6 (MMU programming) */
         INSTALL_VEC(0x9C, "TRAP7");              /* TRAP #7 (SR change) */
         INSTALL_VEC(0xB8, "trapEhandler");       /* TRAP #14 */
 

@@ -1,6 +1,21 @@
 /*
  * LisaEm - Apple Lisa Emulator
  * Memory Management Unit and Memory Controller
+ *
+ * The Lisa MMU uses a segmented address translation scheme:
+ *   - 5 contexts (0=start mode, 1-4=normal)
+ *   - 128 segments per context, each up to 128KB
+ *   - Address split: bits[23:17]=segment, bits[16:0]=offset
+ *   - Physical = (SOR << 9) + offset
+ *
+ * During start mode, the OS configures MMU segment registers by
+ * writing to special I/O addresses. When start mode is exited
+ * ($FCE012 write), MMU translation becomes active.
+ *
+ * Context selection:
+ *   context = start ? 0 : (1 + (segment1 | segment2))
+ *   segment1 set/cleared by writes to $FCE008/$FCE00A
+ *   segment2 set/cleared by writes to $FCE00C/$FCE00E
  */
 
 #include "lisa_mmu.h"
@@ -14,9 +29,11 @@ void lisa_mem_init(lisa_mem_t *mem) {
     mem->setup_mode = true;
     mem->mmu_enabled = false;
     mem->current_context = 0;
+    mem->segment1 = 0;
+    mem->segment2 = 0;
 
     /* Default video address (primary screen) */
-    mem->video_addr = 0x7A000;  /* Common Lisa video base */
+    mem->video_addr = 0x7A000;
     mem->contrast = 0xFF;
     mem->vretrace_enabled = true;
 }
@@ -26,24 +43,83 @@ void lisa_mem_load_rom(lisa_mem_t *mem, const uint8_t *data, size_t size) {
     memcpy(mem->rom, data, size);
 }
 
-/* Translate address through MMU if enabled */
+/* Compute current MMU context from segment1/segment2/start flags */
+static int compute_context(lisa_mem_t *mem) {
+    if (mem->setup_mode) return 0;  /* Start mode = context 0 */
+    return 1 + (mem->segment1 | mem->segment2);
+}
+
+/* Handle MMU register write (SOR/SLR).
+ * During start mode, the OS writes to addresses that decode to MMU registers.
+ * In LisaEm, these are in the SIO space when certain address bits are set.
+ * For our simplified model, we detect MMU register writes by address pattern:
+ *   - The segment index comes from bits [23:17] (or bits [20:14] in start mode)
+ *   - Bit 3 selects SOR (1) vs SLR (0)
+ */
+static void mmu_reg_write(lisa_mem_t *mem, uint32_t addr, uint16_t data) {
+    /* MMU register writes always target the "real" context (CXASEL),
+     * even during start mode. CXASEL ignores the start flag:
+     *   context = 1 + (segment1 | segment2)
+     * This way the OS can configure context 1 segments while executing
+     * in start mode (context 0). */
+    int seg = (addr >> 17) & 0x7F;
+    int context = 1 + (mem->segment1 | mem->segment2);  /* CXASEL */
+
+    /* Clamp to valid range */
+    if (context >= MMU_NUM_CONTEXTS) context = MMU_NUM_CONTEXTS - 1;
+
+    data &= 0x0FFF;  /* 12-bit effective data */
+
+    /* Bit 3 of the low address selects SOR (8) vs SLR (0).
+     * SLIM addresses end in $8000, SORG addresses end in $8008. */
+    if (addr & 8) {
+        /* SORG (Segment Origin Register) write */
+        mem->segments[context][seg].sor = data;
+        mem->segments[context][seg].changed |= 2;
+    } else {
+        /* SLIM (Segment Limit Register) write */
+        mem->segments[context][seg].slr = data;
+        mem->segments[context][seg].changed |= 1;
+    }
+
+    static int mmu_write_count = 0;
+    if (mmu_write_count < 10) {
+        fprintf(stderr, "MMU REG: ctx=%d seg=%d %s=$%03X (addr=$%06X)\n",
+                context, seg, (addr & 8) ? "SOR" : "SLR", data, addr);
+        mmu_write_count++;
+    }
+}
+
+/* Translate address through MMU */
 static uint32_t mmu_translate(lisa_mem_t *mem, uint32_t addr) {
     if (!mem->mmu_enabled)
         return addr;
 
     /* Segment number from high bits of address */
     int seg = (addr >> 17) & 0x7F;
-    mmu_segment_t *s = &mem->segments[mem->current_context][seg];
+    int ctx = mem->current_context;
+    if (ctx >= MMU_NUM_CONTEXTS) ctx = 0;
 
-    if (!s->valid) {
-        /* Segment fault - for now, pass through */
+    mmu_segment_t *s = &mem->segments[ctx][seg];
+
+    /* Check if segment has been configured (SOR or SLR written) */
+    if (s->sor == 0 && s->slr == 0) {
+        /* Unconfigured segment — pass through for now */
         return addr;
     }
 
-    /* Apply segment origin */
-    uint32_t offset = addr & 0x1FFFF; /* 128KB segment size */
+    /* Apply segment origin: physical = (SOR << 9) + offset_within_segment */
+    uint32_t offset = addr & 0x1FFFF;  /* 17-bit offset (128KB segments) */
     uint32_t phys = ((uint32_t)s->sor << 9) + offset;
-    return phys & 0xFFFFFF;
+
+    /* Check SLR for I/O space mapping */
+    uint16_t slr_type = s->slr & SLR_MASK;
+    if (slr_type == SLR_IO_SPACE || slr_type == SLR_SIO_SPACE) {
+        /* Map to I/O space — return address as-is for I/O dispatch */
+        return phys | 0xFC0000;  /* Force into I/O region */
+    }
+
+    return phys & 0xFFFFFF;  /* 24-bit physical address */
 }
 
 /* Determine which region an address falls in */
@@ -64,6 +140,12 @@ uint8_t lisa_mem_read8(lisa_mem_t *mem, uint32_t addr) {
     switch (addr_region(addr)) {
         case 0: { /* RAM */
             uint32_t phys = mmu_translate(mem, addr);
+            /* Translation may redirect to I/O */
+            if (phys >= LISA_IO_BASE && phys < LISA_ROM_BASE) {
+                if (mem->io_read)
+                    return mem->io_read(phys - LISA_IO_BASE);
+                return 0xFF;
+            }
             if (phys < LISA_RAM_SIZE)
                 return mem->ram[phys];
             return 0xFF;
@@ -88,20 +170,26 @@ uint32_t lisa_mem_read32(lisa_mem_t *mem, uint32_t addr) {
            lisa_mem_read16(mem, addr + 2);
 }
 
+/* Update MMU context after context control register change */
+static void update_mmu_context(lisa_mem_t *mem) {
+    int new_ctx = compute_context(mem);
+    mem->current_context = new_ctx;
+
+    /* Enable MMU translation when in normal mode (not start mode) */
+    mem->mmu_enabled = !mem->setup_mode;
+}
+
 void lisa_mem_write8(lisa_mem_t *mem, uint32_t addr, uint8_t val) {
     addr &= 0xFFFFFF;
 
     switch (addr_region(addr)) {
         case 0: { /* RAM */
             uint32_t phys = mmu_translate(mem, addr);
-            /* Watchpoint: detect writes to code at $4EE (BRA displacement) */
-            if (phys == 0x4EE || phys == 0x4EF) {
-                static int wp_count = 0;
-                if (wp_count < 3) {
-                    fprintf(stderr, ">>> WATCHPOINT: write $%02X to phys $%X (addr=$%X)\n",
-                            val, phys, addr);
-                    wp_count++;
-                }
+            /* Translation may redirect to I/O */
+            if (phys >= LISA_IO_BASE && phys < LISA_ROM_BASE) {
+                if (mem->io_write)
+                    mem->io_write(phys - LISA_IO_BASE, val);
+                break;
             }
             if (phys < LISA_RAM_SIZE)
                 mem->ram[phys] = val;
@@ -110,7 +198,7 @@ void lisa_mem_write8(lisa_mem_t *mem, uint32_t addr, uint8_t val) {
         case 1: { /* I/O */
             uint32_t offset = addr - LISA_IO_BASE;
 
-            /* Handle some I/O registers directly */
+            /* Handle I/O registers */
             switch (offset) {
                 case IO_CONTRAST:
                     mem->contrast = val;
@@ -124,12 +212,42 @@ void lisa_mem_write8(lisa_mem_t *mem, uint32_t addr, uint8_t val) {
                         mem->video_addr = 0x7A000;
                     break;
 
-                case IO_SETUP_SET:
+                case IO_SETUP_SET:   /* $FCE010 — enter start/setup mode */
                     mem->setup_mode = true;
+                    update_mmu_context(mem);
                     break;
 
-                case IO_SETUP_RESET:
+                case IO_SETUP_RESET: /* $FCE012 — exit start mode, enable MMU */
+                    if (mem->setup_mode) {
+                        static bool first_exit = true;
+                        if (first_exit) {
+                            fprintf(stderr, "MMU: exiting start mode, context=%d, enabling translation\n",
+                                    compute_context(mem));
+                            first_exit = false;
+                        }
+                    }
                     mem->setup_mode = false;
+                    update_mmu_context(mem);
+                    break;
+
+                case IO_SEG1_CLEAR:  /* $FCE008 — segment1 = 0 */
+                    mem->segment1 = 0;
+                    update_mmu_context(mem);
+                    break;
+
+                case IO_SEG1_SET:    /* $FCE00A — segment1 = 1 */
+                    mem->segment1 = 1;
+                    update_mmu_context(mem);
+                    break;
+
+                case IO_SEG2_CLEAR:  /* $FCE00C — segment2 = 0 */
+                    mem->segment2 = 0;
+                    update_mmu_context(mem);
+                    break;
+
+                case IO_SEG2_SET:    /* $FCE00E — segment2 = 2 */
+                    mem->segment2 = 2;
+                    update_mmu_context(mem);
                     break;
 
                 case IO_VRETRACE:
@@ -149,6 +267,27 @@ void lisa_mem_write8(lisa_mem_t *mem, uint32_t addr, uint8_t val) {
 }
 
 void lisa_mem_write16(lisa_mem_t *mem, uint32_t addr, uint16_t val) {
+    addr &= 0xFFFFFF;
+
+    /* Check for MMU register writes during start mode.
+     * The OS programs MMU via TRAP #6 handler (DO_AN_MMU) which:
+     *   1. Turns setup on ($FCE010)
+     *   2. Writes SLIM at address = $8000 + seg_index * $20000
+     *   3. Writes SORG at address = $8008 + seg_index * $20000
+     *   4. Turns setup off ($FCE012)
+     *
+     * During setup mode, writes to addresses $8000-$FFFFFF with
+     * the pattern (addr & 0x7FF0) == 0x0 or 0x8 are MMU registers.
+     * The segment index is in bits [23:17]. */
+    {
+        uint32_t low17 = addr & 0x1FFFF;
+        if (mem->setup_mode && (low17 == 0x8000 || low17 == 0x8008)) {
+            /* MMU register write: SLIM at $8000, SORG at $8008 + seg*$20000 */
+            mmu_reg_write(mem, addr, val);
+            return;
+        }
+    }
+
     lisa_mem_write8(mem, addr, (val >> 8) & 0xFF);
     lisa_mem_write8(mem, addr + 1, val & 0xFF);
 }

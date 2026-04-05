@@ -41,11 +41,27 @@
 typedef struct {
     uint16_t slr;    /* Segment Limit Register */
     uint16_t sor;    /* Segment Origin Register */
-    bool valid;
+    uint8_t  changed; /* Dirty flags: bit 0=SLR, bit 1=SOR */
 } mmu_segment_t;
 
 #define MMU_NUM_SEGMENTS  128
-#define MMU_NUM_CONTEXTS  4
+#define MMU_NUM_CONTEXTS  5   /* 4 normal + 1 start mode (context 0) */
+
+/* SLR type values (bits 11:8) */
+#define SLR_RO_STK      0x400
+#define SLR_RO_MEM      0x500
+#define SLR_RW_STK      0x600
+#define SLR_RW_MEM      0x700
+#define SLR_IO_SPACE     0x900
+#define SLR_UNUSED_PAGE  0xC00
+#define SLR_SIO_SPACE    0xF00
+#define SLR_MASK         0xF00
+
+/* I/O latch addresses for context switching */
+#define IO_SEG1_CLEAR    0xE008
+#define IO_SEG1_SET      0xE00A
+#define IO_SEG2_CLEAR    0xE00C
+#define IO_SEG2_SET      0xE00E
 
 /* Memory controller state */
 typedef struct {
@@ -54,9 +70,11 @@ typedef struct {
 
     /* MMU */
     mmu_segment_t segments[MMU_NUM_CONTEXTS][MMU_NUM_SEGMENTS];
-    int current_context;
+    int current_context;    /* Active context (0=start, 1-4=normal) */
     bool mmu_enabled;
     bool setup_mode;        /* When true, ROM is mapped to low memory */
+    int segment1;           /* Context selector bit 0 (0 or 1) */
+    int segment2;           /* Context selector bit 1 (0 or 2) */
 
     /* Video */
     uint32_t video_addr;    /* Base address of video RAM */
