@@ -227,8 +227,31 @@ static int num_shared_proc_sigs = 0;
 /* All compiled modules are treated as kernel — they all get linked into the
  * output and their symbols are available for cross-module resolution. */
 static bool is_kernel_module(const char *path) {
-    (void)path;
-    return true;
+    /* From LisaSourceCompilation ALEX-LINK-SYSTEMOS.TEXT:
+     * system.os contains exactly 46 modules from SOURCE/ + HWINTL + PASMATH.
+     * NO libraries. Libraries are loaded as intrinsic libs from disk.
+     *
+     * But we also need LIBPL (Pascal runtime) and LIBHW (hardware interface)
+     * because on the real Lisa these are in IOSPASLIB.OBJ and SYSTEM.LLD
+     * which are loaded by the boot loader before the OS starts. */
+
+    /* OS source files (the 46 kernel modules) */
+    if (strcasestr(path, "/OS/") != NULL) return true;
+
+    /* LIBPL — Pascal runtime (normally IOSPASLIB.OBJ, loaded by boot loader) */
+    if (strcasestr(path, "LIBPL") != NULL) return true;
+
+    /* LIBHW — Hardware interface (normally SYSTEM.LLD, loaded before MMU) */
+    if (strcasestr(path, "LIBHW") != NULL) return true;
+
+    /* LIBFP — Floating point (normally IOSFPLIB.OBJ, loaded early) */
+    if (strcasestr(path, "LIBFP") != NULL) return true;
+
+    /* LIBOS — OS syscall interface (part of kernel interface) */
+    if (strcasestr(path, "LIBOS") != NULL) return true;
+
+    /* Everything else (apps, UI libs) → non-kernel */
+    return false;
 }
 
 /* Shared types accumulated from all previously compiled units */
@@ -393,7 +416,8 @@ static bool compile_pascal_file(const char *path, linker_t *lk) {
                                   cg->code, cg->code_size,
                                   cg->globals, cg->num_globals,
                                   cg->relocs, cg->num_relocs);
-        /* All modules are kernel — no need to untag */
+        if (ok && lk->num_modules > 0 && !is_kernel_module(path))
+            lk->modules[lk->num_modules - 1]->is_kernel = false;
     }
 
     codegen_free(cg);
@@ -488,7 +512,8 @@ static bool assemble_file(const char *path, linker_t *lk, const char *source_roo
         linker_load_codegen(lk, path,
                             asm68k_get_output(as, NULL), as->output_size,
                             syms, nsyms, rels, nrels);
-        /* All modules are kernel — no need to untag */
+        if (lk->num_modules > 0 && !is_kernel_module(path))
+            lk->modules[lk->num_modules - 1]->is_kernel = false;
         free(syms);
         free(rels);
     }
