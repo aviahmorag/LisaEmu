@@ -149,25 +149,24 @@ static int find_source_files(const char *dir, source_file_t *files, int max_file
             bool is_asm = (strcasestr(entry->d_name, "ASM") != NULL) ||
                           (strcasestr(entry->d_name, "QSORT") != NULL);
             if (!is_asm) {
-                /* Check first non-empty line: assembly starts with ; or . or tab+instruction */
+                /* Check first few non-empty lines for assembly indicators */
                 FILE *probe = fopen(path, "r");
                 if (probe) {
                     char line[256];
-                    while (fgets(line, sizeof(line), probe)) {
-                        /* Skip empty lines */
+                    int lines_checked = 0;
+                    while (fgets(line, sizeof(line), probe) && lines_checked < 5) {
                         const char *p = line;
                         while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
                         if (*p == '\0') continue;
-                        /* Assembly indicators */
+                        lines_checked++;
                         if (*p == ';') { is_asm = true; break; }
-                        if (*p == '.' && (p[1] == 'I' || p[1] == 'i' || p[1] == 'P' || p[1] == 'p' ||
-                                          p[1] == 'D' || p[1] == 'd' || p[1] == 'T' || p[1] == 't' ||
-                                          p[1] == 'M' || p[1] == 'm' || p[1] == 'S' || p[1] == 's' ||
-                                          p[1] == 'E' || p[1] == 'e' || p[1] == 'R' || p[1] == 'r' ||
-                                          p[1] == 'F' || p[1] == 'f' || p[1] == 'B' || p[1] == 'b')) {
+                        if (*p == '.' && strchr("IiPpDdTtMmSsEeRrFfBb", p[1])) {
                             is_asm = true; break;
                         }
-                        break; /* First non-empty line wasn't assembly */
+                        /* PAGE directive (common asm formatting) */
+                        if (strncasecmp(p, "PAGE", 4) == 0 && (p[4]=='\0'||p[4]==' '||p[4]=='\n'||p[4]=='\r'))
+                            continue;
+                        break;
                     }
                     fclose(probe);
                 }

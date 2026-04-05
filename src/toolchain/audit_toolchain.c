@@ -99,15 +99,20 @@ static int find_source_files(const char *dir, source_file_t *files, int max_file
                 FILE *probe = fopen(path, "r");
                 if (probe) {
                     char line[256];
-                    while (fgets(line, sizeof(line), probe)) {
+                    int lines_checked = 0;
+                    while (fgets(line, sizeof(line), probe) && lines_checked < 5) {
                         const char *p = line;
                         while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
                         if (*p == '\0') continue;
+                        lines_checked++;
                         if (*p == ';') { is_asm = true; break; }
                         if (*p == '.' && strchr("IiPpDdTtMmSsEeRrFfBb", p[1])) {
                             is_asm = true; break;
                         }
-                        break;
+                        /* PAGE directive (common asm formatting) */
+                        if (strncasecmp(p, "PAGE", 4) == 0 && (p[4] == '\0' || p[4] == ' ' || p[4] == '\n' || p[4] == '\r'))
+                            continue;  /* Skip PAGE, check next line */
+                        break;  /* Non-asm line, stop */
                     }
                     fclose(probe);
                 }

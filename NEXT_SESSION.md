@@ -1,78 +1,79 @@
-# LisaEmu — Toolchain Status (April 5, 2026)
+# LisaEmu — Status (April 5, 2026)
 
-## How to Audit
+## Quick Commands
 
 ```bash
-make audit              # Full report (all 4 stages)
-make audit-linker       # Just linker (fastest for iterating)
+make audit              # Full toolchain report (all 4 stages)
+make audit-linker       # Just linker stage (fastest)
+make                    # Build SDL2 standalone emulator
 ```
 
-## Current Metrics
+## Toolchain Status: 96.9% JSR Resolution
 
 ```
-STAGE 4: LINKER (full pipeline) — the key metric
-  Modules:     435 (338 Pascal + 97 Assembly)
-  Symbols:     10,822 total
-  JSR analysis:
-    Total:     33,685
-    Real code: 32,239 (95.7%)  ← UP FROM 88.6% AT SESSION START
-    Stub:       1,265 (3.8%)
-    Other:        181
+Modules:     436 (338 Pascal + 98 Assembly)
+Symbols:     10,823
+JSR analysis:
+  Total:     33,602
+  Real code: 32,575 (96.9%)
+  Stub:         837 (2.5%)
+  Other:        190
 
-  Stub breakdown (537 relocations, 130 unique symbols):
-    49 FP_NOBODY:     ~300 refs — pre-compiled FP internals, no source
-    33 TRULY_MISSING:  ~80 refs — not in released source (Pr*, SU*, etc.)
-    48 HAS_SOURCE:    ~100 refs — source exists, linker matching issue
+Stub detail: 108 relocations, 39 unique symbols — all truly missing or intractable
 ```
 
-## Remaining Work
+## Phase 2: Runtime Correctness (NEXT)
 
-### 1. Synthesize FP internal wrappers (~300 refs)
-49 FPLIB functions (xmovefp, fp%normalize, x%pot, fpintx, etc.) are declared
-in INTERFACE but have no implementation body. They were pre-compiled by Apple.
-These are thin wrappers around FP68K calls. Can be synthesized:
-- xmovefp: move extended to FP register (MOVE to f[0])
-- fp%normalize: normalize extended float
-- x%pot: power of ten
-- x%int: integer part
-- fpintx: round to integer
+The toolchain produces a ~2.7 MB linked binary. The emulator needs to:
 
-### 2. Fix remaining 48 HAS_SOURCE symbols (~100 refs)
-These have implementations in source but the linker can't match:
-- Type names used as calls: TGraphView, WordPtr, TpInteger, PicHandle
-- Assembly table refs: xDownTbl, xWeakTbl, EXTFLD, DEPFLD
-- Short method names: BP(7), EP(7), DoToObject(7)
-- Clascal methods: sorted, doProc, ImageProc
+### Boot sequence to verify
+1. **ROM** → jumps to $400 (STARTUP entry)
+2. **STARTUP** → calls PASCALINIT (runtime init)
+3. **PASCALINIT** → sets up A5 (globals), A6 (frame), stack
+4. **INITSYS** → OS initialization, memory setup
+5. **INIT_TRAPV** → installs TRAP exception vectors
+6. **ENTER_SCHEDULER** → starts the process scheduler
+7. **Desktop** → eventually renders display at $7A000
 
-### 3. The 33 truly missing symbols (~80 refs)
-Not in Apple's released source:
-- Print system: PrSetSpool, PrMetrics, PrSysDbg, PrStartPage, PrEndPage, etc.
-- Runtime: SUInit, SUAddExtension, SUErrText, SUStopExec
-- Types: TXLRect, TOffsets, TPMouseEvent, ThByte
-- Misc: HRule(13), VRule(11), PsCheckError(9), eoln(5), ObjInCat(4)
+### Known runtime issues from previous sessions
+- TRAP vectors write wrong values ($08000000 instead of handler addresses)
+  - Root cause: b_sysglobal_ptr is a cross-unit variable resolved to 0
+  - The shared globals mechanism should now provide it (needs verification)
+- VIA timers tick but are never loaded by OS code
+- Display shows artifacts but nothing recognizable
+- STOP instruction halts CPU waiting for interrupts that never arrive
 
-### 4. Phase 2 preparation: Runtime correctness
-Once toolchain is stable, focus shifts to:
-- TRAP vector installation
-- Boot sequence verification
-- Interrupt system
-- Display rendering
+### What to do
+1. Rebuild the emulator with current toolchain (`make` or Xcode)
+2. Run and capture boot log (first 1M cycles)
+3. Check if TRAP vectors are now correct
+4. Trace execution path: does it reach INITSYS? ENTER_SCHEDULER?
+5. If stuck, identify the exact instruction/address where it fails
 
-## Fixes Applied This Session (14 total)
+## Toolchain Fixes Applied (this session, 20+ commits)
 
-1. Unified audit tool (`make audit`)
-2. `.PROC/.FUNC` exported to linker without `.DEF`
-3. Assembler `.REF→.PROC` flag upgrade
-4. `MENUS.TEXT`/`DBOX.TEXT` skip patterns removed
-5. Type casts as inline + shared types + SUBCLASS registration
-6. LogCall no-op
-7. File sorting (units before fragments)
-8. Clascal method suffix matching in linker
-9. LIBFP content-based asm/Pascal split
-10. `{$I filename}` include directive (+6,294 real JSRs)
-11. `{$SETC}` AND/OR/NOT expression support
-12. Linker name mapping (InClass→%_InObCN, HALT→%_HALT, FP→%f_*)
-13. **Critical: strict exact-match for symbol ADD** (8-char prefix was destroying 915 symbols)
-14. Math function mappings (SINx→%_SIN, etc.)
+Key infrastructure:
+- `make audit` — unified diagnostic tool for all 4 stages
+- `{$I filename}` include directive in lexer
+- `{$SETC}` AND/OR/NOT boolean expressions
+- Shared types + shared globals across compilation units
+- File sorting: units before fragments
 
-Session progress: 88.6% → 95.7% JSR resolution (+7.1pp)
+Key linker fixes:
+- .PROC/.FUNC exported without .DEF
+- .REF→.PROC/.DEF flag upgrade (cleared external flag)
+- Strict exact-match for symbol add (8-char prefix was destroying 915 symbols)
+- Clascal method suffix matching
+- Name mapping table: InClass→%_InObCN, HALT→%_HALT, FP→%f_*, math→%_SIN etc.
+
+Key codegen fixes:
+- Type casts as inline (not JSR) + shared type table
+- LogCall/LogSeg as no-op
+- SUBCLASS types registered
+- Procedure parameter indirect calls via JSR (A0)
+- EOF/EOLN as intrinsics
+
+Key skip list fixes:
+- MENUS.TEXT/DBOX.TEXT removed (caught real source)
+- LIBFP content-based asm/Pascal split
+- libqd-STRETCH.TEXT restored (standalone, not include fragment)
