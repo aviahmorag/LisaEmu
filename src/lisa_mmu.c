@@ -199,12 +199,18 @@ void lisa_mem_write8(lisa_mem_t *mem, uint32_t addr, uint8_t val) {
                         fprintf(stderr, ">>> SYSGLOBAL WRITE: phys=$%06X val=$%02X (addr=$%06X)\n",
                                 phys, val, addr);
                 }
-                /* Watch for writes to STARTUP code area ($400-$4FF) */
-                if (phys >= 0x4F0 && phys <= 0x4F3) {
+                /* Watch for CHANGING writes to STARTUP code area.
+                 * Skip initial load (old=0) — only catch overwrites. */
+                if (phys >= 0x4F0 && phys <= 0x4F3 && mem->ram[phys] != val && mem->ram[phys] != 0) {
                     static int code_write = 0;
-                    if (code_write++ < 5)
-                        fprintf(stderr, "!!! CODE OVERWRITE: phys=$%06X val=$%02X (addr=$%06X) old=$%02X\n",
-                                phys, val, addr, mem->ram[phys]);
+                    if (code_write++ < 3) {
+                        /* Access CPU PC via the lisa_t struct — mem is at a known offset from lisa_t */
+                        /* lisa_t has: m68k_t cpu (first member after mem at known offset) */
+                        /* Simpler: use a global variable set by the CPU loop */
+                        extern uint32_t g_last_cpu_pc;
+                        fprintf(stderr, "!!! CODE OVERWRITE: phys=$%06X val=$%02X addr=$%06X old=$%02X CPU_PC=$%06X\n",
+                                phys, val, addr, mem->ram[phys], g_last_cpu_pc);
+                    }
                 }
                 mem->ram[phys] = val;
             }

@@ -1885,13 +1885,15 @@ static void process_var_decl(codegen_t *cg, ast_node_t *node, bool is_global) {
         if (is_global) {
             cg_symbol_t *s = add_global_sym(cg, tok, type);
             if (s) {
-                /* Assign global offset (grow from A5).
-                 * Uses a process-wide counter because all Lisa Pascal units
+                /* Assign global offset (grow DOWNWARD from A5).
+                 * Lisa Pascal convention: A5 points to the top of the global
+                 * data area. Globals use negative offsets: A5-2, A5-4, etc.
+                 * Uses a process-wide counter because all kernel units
                  * share the same A5-relative global data area. */
                 static int global_offset = 0;
                 if (sz >= 2 && (global_offset % 2)) global_offset++;
-                s->offset = global_offset;
                 global_offset += sz;
+                s->offset = -global_offset;
             }
         } else {
             cg_scope_t *sc = current_scope(cg);

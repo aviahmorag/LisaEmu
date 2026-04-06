@@ -453,6 +453,7 @@ static uint32_t read_ea_mode(m68k_t *cpu, int mode, int reg, int size) {
 
 static int exception_count = 0;
 static uint32_t pascalinit_addr = 0;
+uint32_t g_last_cpu_pc = 0;  /* Visible to lisa_mmu.c for write watchpoints */
 
 static int exception_histogram[256] = {0};
 
@@ -2684,6 +2685,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         static int pc_ring_idx = 0;
         static bool line_f_logged = false;
         pc_ring[pc_ring_idx++ & 255] = cpu->pc;
+        g_last_cpu_pc = cpu->pc;
 
         /* Trace INITSYS call sequence */
         {
@@ -2761,15 +2763,26 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 }
             }
         }
-        /* Trace instruction at PC=$4F0 — it jumps to $FFFF9533 somehow */
-        if ((cpu->pc & 0xFFFFFF) == 0x4F0) {
-            static int trace_4f0 = 0;
-            if (trace_4f0 < 3) {
-                uint16_t op = cpu_read16(cpu, cpu->pc);
-                fprintf(stderr, ">>> PC=$4F0 #%d: op=$%04X ir=$%04X next=$%04X SR=$%04X D0=$%08X A5=$%08X\n",
-                        ++trace_4f0, op, cpu->ir,
-                        cpu_read16(cpu, cpu->pc + 2), cpu->sr, cpu->d[0], cpu->a[5]);
+        /* Watch A5: catch when it drops from normal range (>$10000) to small value */
+        {
+            static uint32_t prev_a5 = 0;
+            static int a5_drop = 0;
+            if (prev_a5 > 0x10000 && cpu->a[5] < 0x1000 && a5_drop < 3) {
+                a5_drop++;
+                fprintf(stderr, "!!! A5 DROP: $%08X → $%08X at PC=$%06X op=$%04X (ir=$%04X)\n",
+                        prev_a5, cpu->a[5], cpu->pc, cpu_read16(cpu, cpu->pc), cpu->ir);
+                fprintf(stderr, "    Last 30 PCs:");
+                for (int ri = 30; ri > 0; ri--)
+                    fprintf(stderr, " $%06X", pc_ring[(pc_ring_idx - ri) & 255]);
+                fprintf(stderr, "\n    SR=$%04X SP=$%08X A6=$%08X D0=$%08X\n",
+                        cpu->sr, cpu->a[7], cpu->a[6], cpu->d[0]);
+                /* Stack top */
+                fprintf(stderr, "    Stack:");
+                for (int si = 0; si < 8; si++)
+                    fprintf(stderr, " $%08X", cpu_read32(cpu, (cpu->a[7] + si*4) & 0xFFFFFF));
+                fprintf(stderr, "\n");
             }
+            prev_a5 = cpu->a[5];
         }
         /* Detect when PC enters non-code I/O space ($FF0000+, excluding ROM $FE0000-$FEFFFF) */
         {
@@ -2779,8 +2792,8 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 io_exec++;
                 fprintf(stderr, "!!! PC IN I/O SPACE: PC=$%06X op=$%04X SR=$%04X SP=$%08X\n",
                         cpu->pc, cpu_read16(cpu, cpu->pc), cpu->sr, cpu->a[7]);
-                fprintf(stderr, "    Last 60 PCs:");
-                for (int ri = 60; ri > 0; ri--)
+                fprintf(stderr, "    Last 120 PCs:");
+                for (int ri = 120; ri > 0; ri--)
                     fprintf(stderr, " $%06X", pc_ring[(pc_ring_idx - ri) & 255]);
                 fprintf(stderr, "\n    A6=$%08X D0=$%08X\n", cpu->a[6], cpu->d[0]);
             }
