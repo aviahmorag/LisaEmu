@@ -1303,9 +1303,14 @@ static bool assemble_instruction(asm68k_t *as, const char *mnemonic, const char 
             bool force_short = (mnemonic[strlen(mnemonic) - 1] == 'S' || mnemonic[strlen(mnemonic) - 1] == 's')
                                && mnemonic[strlen(mnemonic) - 2] == '.';
 
-            if (force_short || (disp >= -128 && disp <= 127 && disp != 0)) {
+            if (force_short) {
+                /* Explicit .S — always byte displacement */
                 emit16(as, 0x6000 | (cc << 8) | (disp & 0xFF));
             } else {
+                /* Always use word displacement (4 bytes) to ensure
+                 * consistent sizes between pass 1 and pass 2. Auto-
+                 * optimizing to byte would cause size changes when
+                 * forward @-label references resolve on pass 2. */
                 emit16(as, 0x6000 | (cc << 8));
                 emit16(as, (uint16_t)(int16_t)disp);
             }
@@ -1990,26 +1995,6 @@ static void assemble_line(asm68k_t *as, const char *raw_line) {
             /* Non-@ labels start a new local scope for @-labels */
             if (label[0] != '@') {
                 as->local_scope++;
-            }
-            /* Debug: find PC mismatch between passes in osintpaslib */
-            if (strstr(as->current_file, "osintpaslib") && label[0] != '@') {
-                static uint32_t p1[300];
-                static char p1n[300][32];
-                static int p1i = 0, p2i = 0;
-                if (as->pass == 1) {
-                    if (p1i < 300) {
-                        p1[p1i] = as->pc;
-                        strncpy(p1n[p1i], label, 31);
-                        p1i++;
-                    }
-                } else {
-                    if (p2i < p1i && p1[p2i] != as->pc) {
-                        fprintf(stderr, "  PC DRIFT at '%s' line %d: p1=$%04X p2=$%04X (delta=%d)\n",
-                                label, as->line_num, p1[p2i], as->pc,
-                                (int)as->pc - (int)p1[p2i]);
-                    }
-                    p2i++;
-                }
             }
             add_symbol(as, label, SYM_LABEL, as->pc);
         }
