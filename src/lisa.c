@@ -775,9 +775,16 @@ void lisa_reset(lisa_t *lisa) {
             uint32_t l_syslocal = 0x4000;
             SET_MMU_SEG(ctx, 103, 0x0700, (uint16_t)(b_syslocal >> 9));
 
-            /* stackmmu (104): maps $D00000 → physical user stack */
+            /* superstkmmu (101): maps $CA0000 → physical supervisor stack */
+            SET_MMU_SEG(ctx, 101, 0x0600, (uint16_t)(b_superstack >> 9));
+
+            /* stackmmu (123): maps $F60000 → physical user stack + jump table */
             uint32_t b_stack = b_syslocal + l_syslocal;
-            SET_MMU_SEG(ctx, 104, 0x0600, (uint16_t)(b_stack >> 9)); /* stack type */
+            uint32_t b_opustack = b_stack;
+            SET_MMU_SEG(ctx, 123, 0x0600, (uint16_t)(b_opustack >> 9));
+
+            /* Also map segment 104 for legacy compatibility */
+            SET_MMU_SEG(ctx, 104, 0x0600, (uint16_t)(b_stack >> 9));
 
             /* screenmmu (105): maps $D20000 → physical screen */
             SET_MMU_SEG(ctx, 105, 0x0700, (uint16_t)(b_screen >> 9));
@@ -1063,7 +1070,7 @@ int lisa_run_frame(lisa_t *lisa) {
     if (lisa->mem.vretrace_enabled) {
         lisa->mem.vretrace_irq = true;
         lisa->irq_vretrace = 1;
-        int level = 2;  /* vretrace at level 2 to break through mask level 1 */
+        int level = 3;  /* vretrace at level 3 to break through mask level 2 */
         if (lisa->irq_via2) level = 2;
         m68k_set_irq(&lisa->cpu, level);
 
