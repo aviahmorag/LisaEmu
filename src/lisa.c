@@ -1004,6 +1004,29 @@ int lisa_run_frame(lisa_t *lisa) {
     /* Don't force-unmask interrupts or generate vretrace during init.
      * The OS must complete INITSYS before interrupt handlers are ready.
      * INTSON(0) at the end of BOOT_IO_INIT enables interrupts naturally. */
+    if (frame_count == 5) {
+        /* Dump MMU mapping for the CALLDRIVER wait loop address */
+        uint32_t vaddr = 0xCBFFE0;
+        int seg = (vaddr >> 17) & 0x7F;  /* segment 101 */
+        int ctx = lisa->mem.current_context;
+        mmu_segment_t *s = &lisa->mem.segments[ctx][seg];
+        uint32_t offset = vaddr & 0x1FFFF;
+        uint32_t phys = ((uint32_t)s->sor << 9) + offset;
+        fprintf(stderr, "MMU: vaddr=$%06X seg=%d ctx=%d SOR=$%04X SLR=$%04X changed=%d\n",
+                vaddr, seg, ctx, s->sor, s->slr, s->changed);
+        fprintf(stderr, "  Physical=$%06X ram[phys]=%02X%02X%02X%02X %02X%02X%02X%02X\n",
+                phys, lisa->mem.ram[phys], lisa->mem.ram[phys+1],
+                lisa->mem.ram[phys+2], lisa->mem.ram[phys+3],
+                lisa->mem.ram[phys+4], lisa->mem.ram[phys+5],
+                lisa->mem.ram[phys+6], lisa->mem.ram[phys+7]);
+        /* Also check SP mapping */
+        uint32_t sp = lisa->cpu.a[7];
+        int sp_seg = (sp >> 17) & 0x7F;
+        mmu_segment_t *ss = &lisa->mem.segments[ctx][sp_seg];
+        uint32_t sp_phys = ((uint32_t)ss->sor << 9) + (sp & 0x1FFFF);
+        fprintf(stderr, "  SP=$%08X seg=%d SOR=$%04X → phys=$%06X\n",
+                sp, sp_seg, ss->sor, sp_phys);
+    }
     if (frame_count == 10 || frame_count == 60 || frame_count == 300 || frame_count == 800) {
         fprintf(stderr, "DIAG frame %d: PC=$%06X SR=$%04X stopped=%d pending_irq=%d setup=%d\n",
                 frame_count, lisa->cpu.pc, lisa->cpu.sr, lisa->cpu.stopped,

@@ -2824,8 +2824,16 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             }
             prev_a5 = cpu->a[5];
         }
+        /* Trace the wait loop at $D0A6A (CALLDRIVER polling) */
+        if ((cpu->pc & 0xFFFFFF) == 0xD0A6A) {
+            static int cd_trace = 0;
+            if (cd_trace < 5) {
+                fprintf(stderr, "WAIT@$D0A6A #%d: D0=$%08X D4=$%08X D5=$%08X SR=$%04X\n",
+                        ++cd_trace, cpu->d[0], cpu->d[4], cpu->d[5], cpu->sr);
+            }
+        }
         /* Detect SYSTEM_ERROR calls */
-        if (cpu->pc == 0xD8F00) {
+        if (cpu->pc == 0xD8FAC) {
             static int syserr_count = 0;
             if (syserr_count++ < 5) {
                 /* Error number is on the stack as parameter */
