@@ -10,114 +10,108 @@ build/lisaemu Lisa_Source   # Takes ~15s to compile+link+boot
 ## Where We Are
 
 The Apple Lisa OS cross-compiles from 420+ source files and boots
-through PASCALINIT (including %initstdio) and into INITSYS with
-screen output visible. No runtime patches — the code runs natively.
+cleanly through PASCALINIT, %initstdio, and deep into INITSYS.
+No runtime patches — the code runs natively.
 
-**What you see**: SDL window with Lisa display. Screen is very active
-with changing artifacts during boot — the OS is writing to the display
-as init code runs.
+**What you see**: SDL window with white screen and a black box in
+the lower-left corner. The OS has cleared the display and drawn
+a cursor or dialog element. No artifacts, no crashes.
 
-**Boot chain progress** (this session):
-- PASCALINIT + %initstdio: fully working (was bypassed, now fixed)
-- INITSYS: enters and runs
-- POOL_INIT: runs
-- INTSOFF: runs  
-- INIT_NMI_TRAPV: runs
-- REG_TO_MAPPED: runs
-- INIT_TRAPV: pending investigation
-- BOOT_IO_INIT: not yet reached
+**CPU state**: Stable at PC=$D0A6A (waiting for I/O or interrupt).
+Only 4 total exceptions during boot, all normal TRAPs. SR=$2719
+(supervisor mode, IPL=7).
 
 ## What Was Fixed This Session
 
-### 1. MOVEM register list parsing (assembler bug)
+### 1. MOVEM register list parsing (assembler)
+`D0-D7/A0-A6` was parsed as single register D0. Generated $4CC0 $0000
+instead of $48E7 $FFFE. Fix: check register lists before single registers.
 
-**Root cause**: `parse_operand()` in asm68k.c checked for data registers
-BEFORE register lists. When parsing `MOVEM.L D0-D7/A0-A6,-(SP)`,
-`parse_data_reg("D0-D7/A0-A6")` matched `D0` (since `-` is not alphanumeric
-and terminates the register name check). This caused the MOVEM to be encoded
-as memory-to-register ($4CC0) instead of register-to-memory ($48E7), and with
-an empty register mask ($0000 instead of $FFFE).
+### 2. @-label scoping (assembler)
+Local labels (@1, @3) were global instead of scoped per major label.
+Fix: scope counter incremented at .PROC/.FUNC/major labels, @-labels
+mangled with scope ID.
 
-**Fix**: Moved the register list check (checking for `/` or `-` with register
-names) BEFORE the single data/address register checks in `parse_operand()`.
+### 3. Branch size consistency (assembler — ROOT CAUSE OF CRASH)
+Bcc/BRA/BSR auto-optimized to byte displacement when target fit in
+-128..+127. On pass 1, forward @-label refs → 0 → 4-byte branch.
+On pass 2, real value → fits byte → 2-byte branch. This caused ALL
+subsequent labels to drift by 2+ bytes between passes.
 
-### 2. @-label (local label) scoping (assembler bug)
+The `initio` label pointed 2 bytes past `move.l (SP)+,a1`, so the
+return address was never saved. Stack corruption → vector table
+execution → Line-F/Trace exception loop → total crash.
 
-**Root cause**: The Lisa assembler scopes @-labels (like @1, @3) between major
-labels — each major label starts a new scope. Our assembler stored all @-labels
-globally, so the LAST @3 in a file would overwrite all previous @3 definitions.
+Fix: only use byte displacement with explicit `.S` suffix. Otherwise
+always use word displacement (4 bytes).
 
-In `initio` (source-osintpaslib.text), `BEQ.S @3` was supposed to branch to
-the @3 label 3 lines below. But there were 5 different @3 labels in the file,
-and the branch resolved to the wrong one (122 bytes away instead of ~20).
+### 4. Line-F exception handler
+OS's LINE1111_TRAP handler calls system_error (not ready). Overridden
+with ROM skip handler during early boot. Also added recursion guard
+in take_exception for safety.
 
-**Fix**: Added `local_scope` counter to the assembler. It increments at each
-major label (.PROC, .FUNC, non-@ labels). @-labels are mangled with the scope
-counter (e.g., `@3` becomes `@3__42`) to make them unique per scope.
+### 5. ProFile protocol rewrite
+Five critical fixes: proper two-phase handshake, block $FFFFFF spare
+table, correct state transitions, PORTA direction, VIA CA1 BSY edges.
 
 ## What Still Needs Fixing (in priority order)
 
-### 1. SYSTEM_ERROR(0) during init
+### 1. CPU waiting at $D0A6A — identify what it's waiting for
 
-**Status**: Called 5 times from $06C90C during early boot (during
-%initstdio execution). Error code 0 may indicate a writeln/readln
-to an uninitialized console channel, or a codegen issue.
+The boot reaches deep into INITSYS (POOL_INIT confirmed). The CPU
+is now in a stable wait loop. Likely causes:
+- BOOT_IO_INIT trying to access ProFile (VIA handshake not triggering)
+- Waiting for a VIA interrupt that never fires
+- STOP #$2000 instruction waiting for scheduler interrupt
 
-**To investigate**: Find what function is at $06C90C. Check if it's
-a SETCUR-related call trying to write cursor to screen. May be benign
-(the OS continues executing despite these errors).
+**To investigate**: Decode what's at $D0A6A. Check if it's a BTST
+loop polling a VIA register or a STOP instruction.
 
-### 2. Boot chain continuation after REG_TO_MAPPED
+### 2. ProFile disk I/O testing
 
-The boot reaches REG_TO_MAPPED but we need to trace further:
-- INIT_TRAPV should install real exception handlers
-- BOOT_IO_INIT should initialize the ProFile driver
-- FS_INIT should mount the boot volume
+The rewritten ProFile protocol hasn't been exercised yet. Once the
+wait loop is resolved, BOOT_IO_INIT should try to read from ProFile.
+The VIA handshake and spare table read need real testing.
 
-### 3. ProFile Disk I/O Protocol
+### 3. INTRINSIC.LIB missing from disk image
 
-**Status**: Protocol-accurate module written (`src/profile.c/h`)
-but never tested — the OS hasn't reached BOOT_IO_INIT's ProFile
-initialization code yet.
-
-**What we have**: Full state machine matching SOURCE-PROFILEASM.TEXT:
-BSY/CMD/DIR signaling, 6-byte command, 4-byte status, 532-byte
-sector transfer. From LisaEm reference: exact VIA handshake protocol.
+INITSYS calls Setup_IUInfo which opens INTRINSIC.LIB. Without it,
+SYSTEM_ERROR(10100) will halt the boot. Need to:
+- Compile library sources (LIBQD, LIBWM, LIBSM, etc.)
+- Link them per BUILD/ALEX-LINK-*.TEXT scripts
+- Package into INTRINSIC.LIB with proper directory structure
+- Add to disk image
 
 ### 4. MDDF / Filesystem Mount
 
-**Status**: MDDF fsversion changed from $1000 to 17 (correct).
-Full field layout implemented in diskimage.c.
+MDDF layout verified correct (fsversion=17, MDDFaddr=0, all fields
+match OS validation). Should work once ProFile reads succeed.
 
-### 5. Intrinsic Library Loading
+### 5. VIA Timer Interrupts / Scheduler
 
-After FS_INIT mounts the boot volume, the OS needs to find library files
-on the ProFile disk. Our disk image has system.os but no library files.
-
-### 6. VIA Timer Interrupts / Scheduler
-
-**Status**: Vretrace disabled during first 200 frames to prevent
-SYSTEM_ERROR(10605) from uninitialized interrupt handlers.
+Vretrace disabled during first 200 frames. After INIT_TRAPV installs
+real handlers, vretrace should be enabled. The scheduler uses
+STOP #$2000 to wait for level-1 interrupts.
 
 ## Architecture Summary
 
 ### Toolchain
 ```
 Parser:    420+ files, 0 parse errors (except BUILDLLD which isn't code)
-Assembler: 100+ files, MOVEM fixed, @-labels scoped, PC-relative *+N
+Assembler: MOVEM fixed, @-labels scoped, branch sizes consistent, PC-relative *+N
 Codegen:   Multi-param, proc sigs, nested scope, FOR MOVE.W, CONST propagation
-Linker:    3106 kernel-resolved, 46-module kernel from ALEX-LINK-SYSTEMOS.TEXT
-Output:    ~918KB system.os
+Linker:    3106 kernel-resolved, 46-module kernel, LINE1111_TRAP excluded
+Output:    ~919KB system.os (slightly larger with word-size branches)
 ```
 
 ### Emulator
 ```
-CPU:       68000 with TRAP handling, exception frames
+CPU:       68000 with TRAP handling, exception frames, Line-F recursion guard
 MMU:       5 contexts, segments 0-20, 85-105, 123 pre-programmed
-VIA:       Timer interrupts, ProFile parallel port
-ProFile:   Protocol-accurate state machine (untested)
+VIA:       Timer interrupts, ProFile parallel port, CA1 BSY edge detection
+ProFile:   Protocol-accurate state machine with two-phase handshake
 Display:   720x364 monochrome at $1F8000 (top of 2MB RAM)
-Boot ROM:  Identity MMU, TRAP #5/#7/#8 handlers, screen clear
+Boot ROM:  Identity MMU, TRAP #5/#7/#8, Line-A/F skip handlers, screen clear
 ```
 
 ### Boot Sequence (how far we get)
@@ -127,36 +121,33 @@ Boot ROM:  Identity MMU, TRAP #5/#7/#8 handlers, screen clear
  Exit setup mode -> JMP $400
  BRA.W to main body
  MOVE.L D0,-(SP); JSR PASCALINIT
- PASCALINIT: copy runtime data, set A5=$E7FFC, TRAP #7 handler
- %initstdio: WORKING (console init, cursor setup)
+ PASCALINIT: copy runtime data, set A5, TRAP #7 handler
+ %initstdio: console init, cursor setup (FULLY WORKING)
  BSR.S mapiospace: install TRAP #8 handler
- PASCALINIT return -> MOVE.L A2,(SP); JMP (A0)
- Main body: MOVE.L D0,-(SP); JSR INITSYS
- INITSYS entry: LINK A6,#-684
- POOL_INIT, INTSOFF, INIT_NMI_TRAPV, REG_TO_MAPPED
- SYSTEM_ERROR(0) x 5 -- init chain partially fails
- INIT_TRAPV -- pending
- BOOT_IO_INIT -- not reached yet
- FS_INIT -- not reached
- SYS_PROC_INIT -- not reached
- ENTER_SCHEDULER -- not reached
- Desktop drawing -- not reached
+ PASCALINIT return -> JMP main body
+ MOVE.L D0,-(SP); JSR INITSYS
+ INITSYS: INTSOFF, GETLDMAP, REG_TO_MAPPED
+ INIT_PE, POOL_INIT (confirmed)
+ Screen cleared, cursor box drawn
+ Waiting at $D0A6A (I/O or interrupt wait)
+--- not yet reached ---
+ INIT_TRAPV, DB_INIT, AVAIL_INIT
+ INIT_PROCESS, INIT_EM, INIT_EC
+ INIT_SCTAB, INIT_MEASINFO
+ BOOT_IO_INIT -> FS_INIT -> mount ProFile
+ SYS_PROC_INIT -> ENTER_SCHEDULER
+ Desktop drawing
 ```
 
 ## Key Files
 
 ```
-src/toolchain/asm68k.c           -- MOVEM fix, @-label scoping, PC-relative *+N
-src/toolchain/pascal_parser.c    -- Multi-param fix, semicolon tolerance
-src/toolchain/pascal_codegen.c   -- FOR MOVE.W, VAR nested scope, array bounds
-src/toolchain/pascal_lexer.c     -- Cross-library {$I} search
-src/toolchain/linker.c           -- Non-kernel isolation, $SELF handling
-src/toolchain/toolchain_bridge.c -- Kernel selection, MAX_SHARED_GLOBALS=65536
-src/toolchain/bootrom.c          -- MMU mapping, TRAP #5 handler
-src/toolchain/diskimage.c        -- MDDF fsversion=17
-src/profile.c/h                  -- ProFile VIA handshake protocol
-src/lisa_mmu.h/c                 -- 5 contexts, register writes, translation
-src/lisa.c                       -- Boot env, I/O regs
-src/m68k.c                       -- CPU, exception handling, traces
-scripts/patch_source.sh          -- Source preprocessing (10 patches)
+src/toolchain/asm68k.c           -- 3 bug fixes: MOVEM, @-labels, branch sizes
+src/toolchain/asm68k.h           -- local_scope field for @-label scoping
+src/toolchain/linker.c           -- LINE1111_TRAP excluded from pre-install
+src/toolchain/bootrom.c          -- MMU mapping, TRAP #5/#7/#8, Line-A/F handlers
+src/toolchain/diskimage.c        -- MDDF fsversion=17 (verified correct)
+src/profile.c/h                  -- Rewritten: two-phase handshake, spare table
+src/lisa.c                       -- Line-A/F vector overrides, VIA CA1 BSY edges
+src/m68k.c                       -- Line-F recursion guard, trace infrastructure
 ```
