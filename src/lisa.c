@@ -564,6 +564,13 @@ void lisa_reset(lisa_t *lisa) {
             lisa->mem.ram[(addr)+1] = (val) & 0xFF; \
         } while(0)
 
+        /* Install minimal TRAP handlers for traps used before INIT_TRAPV.
+         * TRAP #5 = TRAPTOHW (hardware interface) — used by %initstdio
+         * TRAP #8 = mapiospace — used for I/O space mapping
+         * Both need to be functional before the OS installs real handlers. */
+        WRITE32(0x94, 0x00FE0300);  /* TRAP #5 → ROM RTE handler */
+        WRITE32(0xA0, 0x00FE0300);  /* TRAP #8 → ROM RTE handler */
+
         /* Boot device and low-memory parameters */
         lisa->mem.ram[0x1B3] = 2;      /* adr_bootdev: 2 = parallel ProFile */
         WRITE32(0x2A4, 0);             /* adr_lowcore: physical byte 0 = 0 */
