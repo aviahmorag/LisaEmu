@@ -181,6 +181,15 @@ typedef struct {
     /* Imported procedure signatures from previously compiled units */
     cg_proc_sig_t *imported_proc_sigs;
     int imported_proc_sigs_count;
+
+    /* WITH statement context stack.
+     * Each active WITH pushes the record expression's base address
+     * and type so field names can be resolved implicitly. */
+    struct {
+        type_desc_t *record_type;   /* Record type for field lookup */
+        ast_node_t  *record_expr;   /* AST node for the record expression */
+    } with_stack[16];
+    int with_depth;
 } codegen_t;
 
 /* Public API */

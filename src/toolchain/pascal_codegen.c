@@ -416,6 +416,44 @@ static cg_symbol_t *add_global_sym(codegen_t *cg, const char *name, type_desc_t 
 
 static void gen_expression(codegen_t *cg, ast_node_t *node);
 static void gen_statement(codegen_t *cg, ast_node_t *node);
+static void gen_lvalue_addr(codegen_t *cg, ast_node_t *node);
+
+/* Check if an identifier is a field of an active WITH record.
+ * Returns the field index and sets *out_type to the record type,
+ * or returns -1 if not found. Searches from innermost WITH outward. */
+static int with_lookup_field(codegen_t *cg, const char *name,
+                             type_desc_t **out_type, int *out_with_idx) {
+    for (int w = cg->with_depth - 1; w >= 0; w--) {
+        type_desc_t *rt = cg->with_stack[w].record_type;
+        if (!rt || rt->kind != TK_RECORD) continue;
+        for (int fi = 0; fi < rt->num_fields; fi++) {
+            if (str_eq_nocase(rt->fields[fi].name, name)) {
+                if (out_type) *out_type = rt;
+                if (out_with_idx) *out_with_idx = w;
+                return fi;
+            }
+        }
+    }
+    return -1;
+}
+
+/* Generate code to load WITH record base address into A0.
+ * This evaluates the record expression from the WITH context. */
+static void gen_with_base(codegen_t *cg, int with_idx) {
+    ast_node_t *expr = cg->with_stack[with_idx].record_expr;
+    if (!expr) return;
+    /* The record expression is typically a variable or pointer deref.
+     * For pointer deref (ptr^): evaluate pointer, load into A0.
+     * For variable: get its address into A0. */
+    if (expr->type == AST_DEREF) {
+        /* WITH ptr^ DO ... → evaluate ptr, move to A0 */
+        gen_expression(cg, expr->children[0]);
+        emit16(cg, 0x2040);  /* MOVEA.L D0,A0 */
+    } else {
+        /* WITH var DO ... → LEA var,A0 */
+        gen_lvalue_addr(cg, expr);
+    }
+}
 
 /* Determine the byte size of an expression's result type.
  * Returns 1 (byte), 2 (word), or 4 (long). Used for size-aware MOVE,
@@ -436,6 +474,13 @@ static int expr_size(codegen_t *cg, ast_node_t *node) {
             /* Check built-in identifiers */
             if (str_eq_nocase(node->name, "nil")) return 4;
             if (str_eq_nocase(node->name, "true") || str_eq_nocase(node->name, "false")) return 2;
+            /* Check WITH context for field size */
+            if (cg->with_depth > 0) {
+                type_desc_t *wrt = NULL;
+                int fld = with_lookup_field(cg, node->name, &wrt, NULL);
+                if (fld >= 0 && wrt && wrt->fields[fld].type)
+                    return wrt->fields[fld].type->size > 0 ? wrt->fields[fld].type->size : 2;
+            }
             return 2;
         }
         case AST_FIELD_ACCESS: {
@@ -547,6 +592,22 @@ static void gen_lvalue_addr(codegen_t *cg, ast_node_t *node) {
                 /* Global: LEA offset(A5),A0 */
                 emit16(cg, 0x41ED);
                 emit16(cg, (uint16_t)(int16_t)sym->offset);
+            }
+        } else if (cg->with_depth > 0) {
+            /* Check WITH context for field name */
+            type_desc_t *wrt = NULL;
+            int widx = -1;
+            int fld = with_lookup_field(cg, node->name, &wrt, &widx);
+            if (fld >= 0 && wrt) {
+                gen_with_base(cg, widx);
+                int foff = wrt->fields[fld].offset;
+                if (foff != 0) {
+                    emit16(cg, 0xD0FC);  /* ADDA.W #offset,A0 */
+                    emit16(cg, (uint16_t)(int16_t)foff);
+                }
+            } else {
+                emit16(cg, 0x41F9);  /* LEA abs.L,A0 */
+                emit32(cg, 0);
             }
         } else {
             /* Unknown symbol — emit placeholder with relocation */
@@ -784,6 +845,26 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                         emit16(cg, 0x302D);  /* MOVE.W offset(A5),D0 */
                     }
                     emit16(cg, (uint16_t)(int16_t)sym->offset);
+                }
+            } else if (cg->with_depth > 0) {
+                /* Check WITH context: is this identifier a field of an active WITH record? */
+                type_desc_t *wrt = NULL;
+                int widx = -1;
+                int fld = with_lookup_field(cg, node->name, &wrt, &widx);
+                if (fld >= 0 && wrt) {
+                    /* Generate: load WITH record base into A0, add field offset, read */
+                    gen_with_base(cg, widx);
+                    int foff = wrt->fields[fld].offset;
+                    if (foff != 0) {
+                        emit16(cg, 0xD0FC);  /* ADDA.W #offset,A0 */
+                        emit16(cg, (uint16_t)(int16_t)foff);
+                    }
+                    int fsz = (wrt->fields[fld].type) ? wrt->fields[fld].type->size : 2;
+                    emit_read_a0_to_d0(cg, fsz);
+                } else {
+                    /* Not a WITH field — fall through to unknown/constant */
+                    emit16(cg, 0x303C);  /* MOVE.W #0,D0 placeholder */
+                    emit16(cg, 0);
                 }
             } else {
                 /* Check for built-in constants */
@@ -1337,7 +1418,37 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
             gen_expression(cg, node->children[1]);
             /* Store to LHS */
             ast_node_t *lhs = node->children[0];
-            cg_symbol_t *sym = find_symbol_any(cg, lhs->name);
+            cg_symbol_t *sym = NULL;
+            /* Check if LHS is a WITH field before normal lookup */
+            if (lhs->type == AST_IDENT_EXPR && cg->with_depth > 0) {
+                type_desc_t *wrt = NULL;
+                int widx = -1;
+                int fld = with_lookup_field(cg, lhs->name, &wrt, &widx);
+                if (fld >= 0 && wrt) {
+                    /* WITH field assignment: save RHS, load base, add offset, store */
+                    int fsz = (wrt->fields[fld].type) ? wrt->fields[fld].type->size : 2;
+                    if (fsz == 4) {
+                        emit16(cg, 0x2F00);  /* MOVE.L D0,-(SP) save RHS */
+                    } else {
+                        emit16(cg, 0x3F00);  /* MOVE.W D0,-(SP) save RHS */
+                    }
+                    gen_with_base(cg, widx);
+                    int foff = wrt->fields[fld].offset;
+                    if (foff != 0) {
+                        emit16(cg, 0xD0FC);  /* ADDA.W #offset,A0 */
+                        emit16(cg, (uint16_t)(int16_t)foff);
+                    }
+                    if (fsz == 4) {
+                        emit16(cg, 0x201F);  /* MOVE.L (SP)+,D0 */
+                    } else {
+                        emit16(cg, 0x301F);  /* MOVE.W (SP)+,D0 */
+                    }
+                    emit_write_d0_to_a0(cg, fsz);
+                    break;  /* Done with this assignment */
+                }
+            }
+            if (lhs->type == AST_IDENT_EXPR)
+                sym = find_symbol_any(cg, lhs->name);
             if (sym) {
                 if (sym->is_param && sym->is_var_param) {
                     int sz = sym->type ? sym->type->size : 2;
@@ -1630,12 +1741,62 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
             break;
         }
 
-        case AST_WITH:
-            /* Simplified: just execute the body */
-            if (node->num_children > 0) {
-                gen_statement(cg, node->children[node->num_children - 1]);
+        case AST_WITH: {
+            /* WITH record1, record2, ... DO body
+             * Push each record expression onto the WITH context stack
+             * so field names are resolved implicitly. */
+            int body_idx = node->num_children - 1;
+            int num_withs = body_idx;  /* All children except last are records */
+            int saved_depth = cg->with_depth;
+
+            for (int wi = 0; wi < num_withs && cg->with_depth < 16; wi++) {
+                ast_node_t *rec_expr = node->children[wi];
+                type_desc_t *rt = NULL;
+
+                /* Determine the record type from the expression */
+                if (rec_expr->type == AST_DEREF && rec_expr->children[0]) {
+                    /* WITH ptr^ DO ... — get pointed-to type */
+                    ast_node_t *ptr_node = rec_expr->children[0];
+                    if (ptr_node->type == AST_IDENT_EXPR) {
+                        cg_symbol_t *sym = find_symbol_any(cg, ptr_node->name);
+                        if (sym && sym->type && sym->type->kind == TK_POINTER && sym->type->base_type)
+                            rt = sym->type->base_type;
+                    }
+                } else if (rec_expr->type == AST_IDENT_EXPR) {
+                    /* WITH var DO ... — get variable's type */
+                    cg_symbol_t *sym = find_symbol_any(cg, rec_expr->name);
+                    if (sym && sym->type) {
+                        rt = sym->type;
+                        if (rt->kind == TK_POINTER && rt->base_type)
+                            rt = rt->base_type;
+                    }
+                } else if (rec_expr->type == AST_ARRAY_ACCESS && rec_expr->children[0]) {
+                    /* WITH arr[i] DO ... — get element type */
+                    if (rec_expr->children[0]->type == AST_IDENT_EXPR) {
+                        cg_symbol_t *sym = find_symbol_any(cg, rec_expr->children[0]->name);
+                        if (sym && sym->type && sym->type->kind == TK_ARRAY && sym->type->element_type)
+                            rt = sym->type->element_type;
+                    }
+                } else if (rec_expr->type == AST_FIELD_ACCESS) {
+                    /* WITH rec.subfield DO ... — resolve nested field type */
+                    int es = expr_size(cg, rec_expr);
+                    (void)es; /* type resolution is complex; push NULL and hope for the best */
+                }
+
+                cg->with_stack[cg->with_depth].record_type = (rt && rt->kind == TK_RECORD) ? rt : NULL;
+                cg->with_stack[cg->with_depth].record_expr = rec_expr;
+                cg->with_depth++;
             }
+
+            /* Generate body */
+            if (body_idx >= 0) {
+                gen_statement(cg, node->children[body_idx]);
+            }
+
+            /* Pop WITH context */
+            cg->with_depth = saved_depth;
             break;
+        }
 
         case AST_CASE: {
             /* Evaluate selector into D0, save in D3 (size-aware) */

@@ -2774,6 +2774,60 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 fprintf(stderr, "\n");
             }
         }
+        /* Detect PC=$2A specifically — "Illegal Instruction at PC=$2A" debug.
+         * $2A is 2 bytes into the Line-A vector entry at $28. Something is
+         * jumping/returning here. Dump full ring buffer, regs, and stack. */
+        {
+            static int pc2a_count = 0;
+            uint32_t masked = cpu->pc & 0xFFFFFF;
+            if (masked == 0x2A && pc2a_count < 5) {
+                pc2a_count++;
+                fprintf(stderr, "\n!!! PC=$00002A HIT (#%d) — in Line-A vector entry\n", pc2a_count);
+                fprintf(stderr, "    op=$%04X SP=$%08X SR=$%04X\n",
+                        cpu_read16(cpu, cpu->pc), cpu->a[7], cpu->sr);
+                fprintf(stderr, "    Last 30 PCs (oldest→newest):\n");
+                for (int ri = 30; ri > 0; ri--) {
+                    uint32_t rpc = pc_ring[(pc_ring_idx - ri) & 255];
+                    uint16_t rop = cpu_read16(cpu, rpc);
+                    fprintf(stderr, "      PC=$%06X op=$%04X", rpc, rop);
+                    if (rop == 0x4E75) fprintf(stderr, "  RTS");
+                    else if (rop == 0x4E73) fprintf(stderr, "  RTE");
+                    else if ((rop & 0xFFC0) == 0x4EC0) fprintf(stderr, "  JMP");
+                    else if ((rop & 0xFFC0) == 0x4E80) fprintf(stderr, "  JSR");
+                    else if ((rop & 0xFF00) == 0x6000) fprintf(stderr, "  BRA");
+                    else if ((rop & 0xFF00) == 0x6100) fprintf(stderr, "  BSR");
+                    else if ((rop & 0xF0F8) == 0x50C8) fprintf(stderr, "  DBcc");
+                    else if ((rop & 0xF000) == 0xA000) fprintf(stderr, "  Line-A ($%04X)", rop);
+                    fprintf(stderr, "\n");
+                }
+                fprintf(stderr, "    Registers:\n");
+                fprintf(stderr, "      D0=$%08X D1=$%08X D2=$%08X D3=$%08X\n",
+                        cpu->d[0], cpu->d[1], cpu->d[2], cpu->d[3]);
+                fprintf(stderr, "      D4=$%08X D5=$%08X D6=$%08X D7=$%08X\n",
+                        cpu->d[4], cpu->d[5], cpu->d[6], cpu->d[7]);
+                fprintf(stderr, "      A0=$%08X A1=$%08X A2=$%08X A3=$%08X\n",
+                        cpu->a[0], cpu->a[1], cpu->a[2], cpu->a[3]);
+                fprintf(stderr, "      A4=$%08X A5=$%08X A6=$%08X A7=$%08X\n",
+                        cpu->a[4], cpu->a[5], cpu->a[6], cpu->a[7]);
+                fprintf(stderr, "      SR=$%04X\n", cpu->sr);
+                fprintf(stderr, "    Stack (16 words from SP):\n      ");
+                for (int si = 0; si < 16; si++) {
+                    fprintf(stderr, " $%04X", cpu_read16(cpu, (cpu->a[7] + si*2) & 0xFFFFFF));
+                    if (si == 7) fprintf(stderr, "\n      ");
+                }
+                fprintf(stderr, "\n");
+                /* Also show what the Line-A vector ($28) currently points to */
+                uint32_t line_a_handler = cpu_read32(cpu, 0x28);
+                uint32_t illegal_handler = cpu_read32(cpu, 0x10);
+                fprintf(stderr, "    Vector table: Line-A($28)=$%08X  Illegal($10)=$%08X\n",
+                        line_a_handler, illegal_handler);
+                fprintf(stderr, "    Memory at $28: %02X %02X %02X %02X %02X %02X %02X %02X\n",
+                        cpu_read8(cpu, 0x28), cpu_read8(cpu, 0x29),
+                        cpu_read8(cpu, 0x2A), cpu_read8(cpu, 0x2B),
+                        cpu_read8(cpu, 0x2C), cpu_read8(cpu, 0x2D),
+                        cpu_read8(cpu, 0x2E), cpu_read8(cpu, 0x2F));
+            }
+        }
         /* Detect PC in unmapped RAM ($200000-$FBFFFF) — past 2MB, before I/O */
         {
             static int unmapped_trace_count = 0;
