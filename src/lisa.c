@@ -218,16 +218,23 @@ static void profile_write_block(lisa_t *lisa, uint32_t block);
  *   Bit 3: host direction (0=host writing, 1=host reading)
  */
 static uint8_t last_via1_orb = 0;
+static bool last_via1_bsy = false;
 static void via1_portb_write(uint8_t val, uint8_t ddr, void *ctx) {
     lisa_t *lisa = (lisa_t *)ctx;
     (void)ddr;
+    bool bsy_before = profile_bsy(&lisa->prof);
     profile_orb_write(&lisa->prof, val, last_via1_orb);
-    /* Update CA1 (BSY line) based on profile state */
-    bool bsy = profile_bsy(&lisa->prof);
-    if (bsy) {
-        /* BSY asserted → CA1 transition → set IFR bit 1 */
+    bool bsy_after = profile_bsy(&lisa->prof);
+    /* Detect BSY transitions → CA1 interrupt flag */
+    if (bsy_after && !bsy_before) {
+        /* BSY asserted (falling edge) → set CA1 flag */
         lisa->via1.ifr |= 0x02;
     }
+    if (!bsy_after && bsy_before) {
+        /* BSY deasserted (rising edge) → also set CA1 flag */
+        lisa->via1.ifr |= 0x02;
+    }
+    last_via1_bsy = bsy_after;
     last_via1_orb = val;
 }
 
@@ -247,10 +254,13 @@ static uint8_t via1_portb_read(void *ctx) {
 static void via1_porta_write(uint8_t val, uint8_t ddr, void *ctx) {
     lisa_t *lisa = (lisa_t *)ctx;
     (void)ddr;
+    bool bsy_before = profile_bsy(&lisa->prof);
     profile_porta_write(&lisa->prof, val);
-    /* Check if BSY changed */
-    if (profile_bsy(&lisa->prof))
-        lisa->via1.ifr |= 0x02;  /* CA1 flag */
+    bool bsy_after = profile_bsy(&lisa->prof);
+    if (bsy_after != bsy_before) {
+        lisa->via1.ifr |= 0x02;  /* CA1 transition → set flag */
+    }
+    last_via1_bsy = bsy_after;
 }
 
 static uint8_t via1_porta_read(void *ctx) {

@@ -19,15 +19,16 @@
 
 /* ProFile protocol states (matches OS driver S1-S7) */
 typedef enum {
-    PSTATE_IDLE,        /* Waiting for host CMD */
-    PSTATE_WAIT_CMD,    /* CMD asserted, waiting to go busy */
-    PSTATE_GOT_CMD,     /* Went busy, waiting for host to read response */
-    PSTATE_WAIT_55,     /* Sent response=1, waiting for host $55 ack */
-    PSTATE_RECV_CMD,    /* Receiving 6 command bytes */
-    PSTATE_SEND_STATUS, /* Sending 4 status bytes */
-    PSTATE_SEND_DATA,   /* Sending 532 bytes (20 tag + 512 data) */
-    PSTATE_RECV_DATA,   /* Receiving 532 bytes for write */
-    PSTATE_DONE,        /* Operation complete */
+    PSTATE_IDLE,                /* Waiting for host CMD */
+    PSTATE_GOT_CMD,             /* S1: went busy, host can read response byte */
+    PSTATE_WAIT_CMD_DEASSERT,   /* S2: got $55 ack, waiting for CMD deassert */
+    PSTATE_RECV_CMD,            /* S3: receiving 6 command bytes */
+    PSTATE_HANDSHAKE2,          /* S1A: second handshake after command */
+    PSTATE_GOT_CMD2,            /* S200: second handshake busy, host reads response */
+    PSTATE_WAIT_CMD_DEASSERT2,  /* Got $55, waiting for CMD deassert */
+    PSTATE_SEND_STATUS,         /* S6: sending 4 status bytes */
+    PSTATE_SEND_DATA,           /* S7: sending 532 bytes (20 tag + 512 data) */
+    PSTATE_RECV_DATA,           /* S7: receiving 532 bytes for write */
 } profile_state_t;
 
 typedef struct {
