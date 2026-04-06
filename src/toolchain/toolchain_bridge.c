@@ -85,7 +85,10 @@ static bool should_skip_file(const char *name) {
     if (strcasestr(name, "relmemo") != NULL) return true;
     /* Standalone programs — user utilities, not OS kernel components */
     if (strcasestr(name, "KEYBOARD.TEXT") != NULL) return true;
+    if (strcasestr(name, "STUNTS") != NULL) return true;
+    if (strcasestr(name, "DRVRMAIN") != NULL) return true;
     if (strcasestr(name, "PEPSITESTS") != NULL) return true;
+    if (strcasestr(name, "SUMMARY") != NULL) return true;
     if (strcasestr(name, "MAINBAUD") != NULL) return true;
     if (strcasestr(name, "copymaster") != NULL) return true;
     if (strcasestr(name, "bless") != NULL) return true;
