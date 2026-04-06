@@ -639,7 +639,10 @@ bool linker_link(linker_t *lk) {
         INSTALL_VEC(0x18, "VALUEOOB_TRAP");      /* CHK instruction */
         INSTALL_VEC(0x1C, "OVERFLOW_TRAP");      /* TRAPV instruction */
         INSTALL_VEC(0x20, "PRIVIOLATION_TRAP");  /* Privilege violation */
-        INSTALL_VEC(0x2C, "LINE1111_TRAP");      /* Line-F emulator */
+        /* LINE1111_TRAP: NOT pre-installed. The OS handler (line1111_trap
+         * in EXCEPASM) calls system_error, which isn't ready during early
+         * boot. The bootrom's Line-F handler at $FE0310 safely skips the
+         * opcode. INIT_TRAPV installs the real handler when ready. */
 
         /* Spurious + autovector interrupts */
         INSTALL_VEC(0x60, "SPURINTR_TRAP");      /* Spurious interrupt */

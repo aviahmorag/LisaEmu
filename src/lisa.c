@@ -571,6 +571,12 @@ void lisa_reset(lisa_t *lisa) {
         WRITE32(0x94, 0x00FE0330);  /* TRAP #5 → ROM TRAPTOHW handler */
         WRITE32(0xA0, 0x00FE0300);  /* TRAP #8 → ROM RTE handler */
 
+        /* Override exception vectors that call system_error (which isn't
+         * initialized yet). Use ROM handlers that safely skip/return.
+         * INIT_TRAPV will install the real OS handlers when ready. */
+        WRITE32(0x28, 0x00FE0320);  /* Line-A → ROM skip handler */
+        WRITE32(0x2C, 0x00FE0310);  /* Line-F → ROM skip handler */
+
         /* Fill ALL zero TRAP vectors ($80-$BC) with the ROM RTE handler.
          * TRAP #0-#15 map to vectors $80,$84,...$BC. The OS installs real
          * handlers via INIT_TRAPV during boot, but if any TRAP is called
