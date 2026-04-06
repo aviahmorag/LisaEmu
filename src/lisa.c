@@ -527,9 +527,9 @@ void lisa_reset(lisa_t *lisa) {
 
         printf("Pre-loaded %d boot blocks at RAM $20000\n", boot_blocks);
 
-        /* Dump PASCALINIT code (first 60 bytes) */
+        /* Dump PASCALINIT code (first 80 bytes) */
         fprintf(stderr, "PASCALINIT @$DFD38:\n");
-        for (int di = 0; di < 60; di += 2) {
+        for (int di = 0; di < 80; di += 2) {
             uint32_t a = 0xDFD38 + di;
             fprintf(stderr, " $%04X", (lisa->mem.ram[a]<<8)|lisa->mem.ram[a+1]);
             if ((di % 20) == 18) fprintf(stderr, "\n");
@@ -953,7 +953,7 @@ int lisa_run_frame(lisa_t *lisa) {
         lisa->cpu.pc >= 0x400 && lisa->cpu.pc < LISA_RAM_SIZE) {
         lisa->cpu.sr = (lisa->cpu.sr & ~0x0700);
     }
-    if ((frame_count >= 120 && frame_count <= 900 && (frame_count % 120) == 0) || frame_count == 60) {
+    if (frame_count == 10 || frame_count == 60 || frame_count == 120 || frame_count == 300) {
         fprintf(stderr, "DIAG frame %d: PC=$%06X SR=$%04X stopped=%d pending_irq=%d setup=%d\n",
                 frame_count, lisa->cpu.pc, lisa->cpu.sr, lisa->cpu.stopped,
                 lisa->cpu.pending_irq, lisa->mem.setup_mode);

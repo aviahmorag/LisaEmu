@@ -2704,7 +2704,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             last_a5 = cpu->a[5];
         }
         /* Detect SYSTEM_ERROR calls */
-        if (cpu->pc == 0xD8CDE) {
+        if (cpu->pc == 0xD8FE0) {
             static int syserr_count = 0;
             if (syserr_count++ < 5) {
                 /* Error number is on the stack as parameter */
