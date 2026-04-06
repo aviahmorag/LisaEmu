@@ -2716,18 +2716,45 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 }
             }
             /* Once we know PASCALINIT's address, trace key points */
-            if (pascalinit_addr > 0 && pi_trace < 20) {
+            if (pascalinit_addr > 0 && pi_trace < 60) {
                 /* Trace when PC is within PASCALINIT's code (assume ~100 bytes) */
                 if (cpu->pc >= pascalinit_addr && cpu->pc < pascalinit_addr + 120) {
                     uint32_t offset = cpu->pc - pascalinit_addr;
                     /* Only trace at key offsets: entry, after copy loop, after JSR, return */
-                    if (offset <= 0x50 && (offset % 2) == 0) { /* trace every instruction */
-                        fprintf(stderr, ">>> PI+$%02X: PC=$%06X op=$%04X A5=$%08X SP=$%08X\n",
-                                offset, cpu->pc, cpu_read16(cpu, cpu->pc), cpu->a[5], cpu->a[7]);
+                    if (offset <= 0x50 && (offset % 2) == 0) {
+                        fprintf(stderr, ">>> PI+$%02X: PC=$%06X op=$%04X A0=$%08X A5=$%08X SP=$%08X\n",
+                                offset, cpu->pc, cpu_read16(cpu, cpu->pc),
+                                cpu->a[0], cpu->a[5], cpu->a[7]);
                         pi_trace++;
                     }
                 }
             }
+        }
+        /* Detect when PC returns to $4000-$5000 (INITSYS/main body) after PASCALINIT */
+        {
+            static int pi_state = 0;  /* 0=before, 1=in PASCALINIT, 2=left */
+            static int low_trace = 0;
+            if (pi_state == 0 && cpu->pc >= 0xDF000 && cpu->pc < 0xE0000) pi_state = 1;
+            if (pi_state == 1 && cpu->pc < 0xDF000) pi_state = 2;
+            if (pi_state == 2 && cpu->pc >= 0x4000 && cpu->pc < 0x5000 && low_trace < 5) {
+                fprintf(stderr, ">>> BACK LOW: PC=$%06X op=$%04X A5=$%08X SP=$%08X\n",
+                        cpu->pc, cpu_read16(cpu, cpu->pc), cpu->a[5], cpu->a[7]);
+                low_trace++;
+            }
+        }
+        /* Track large SP changes */
+        {
+            static uint32_t prev_sp = 0;
+            static int sp_trace = 0;
+            if (prev_sp > 0 && sp_trace < 3) {
+                int32_t delta = (int32_t)cpu->a[7] - (int32_t)prev_sp;
+                if (prev_sp > 0x1000 && cpu->a[7] < 0x1000 && cpu->a[7] > 0) {
+                    fprintf(stderr, ">>> SP JUMP: $%08X → $%08X (delta=%d) at PC=$%06X\n",
+                            prev_sp, cpu->a[7], delta, cpu->pc);
+                    sp_trace++;
+                }
+            }
+            prev_sp = cpu->a[7];
         }
         /* Track A5 corruption */
         {
@@ -2743,7 +2770,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             prev_a5 = cpu->a[5];
         }
         /* Detect SYSTEM_ERROR calls */
-        if (cpu->pc == 0xD8FE0) {
+        if (cpu->pc == 0xD8F1E) {
             static int syserr_count = 0;
             if (syserr_count++ < 5) {
                 /* Error number is on the stack as parameter */

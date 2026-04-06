@@ -970,13 +970,9 @@ int lisa_run_frame(lisa_t *lisa) {
     /* Debug: log CPU/VIA/vector state once after significant execution */
     static int frame_count = 0;
     frame_count++;
-    /* Force-unmask interrupts if OS is stuck with level 7 mask.
-     * The OS should call INTSON(0) during BOOT_IO_INIT but may not
-     * reach it. This lets the vretrace drive the scheduler forward. */
-    if (frame_count == 30 && (lisa->cpu.sr & 0x0700) >= 0x0600 &&
-        lisa->cpu.pc >= 0x400 && lisa->cpu.pc < LISA_RAM_SIZE) {
-        lisa->cpu.sr = (lisa->cpu.sr & ~0x0700);
-    }
+    /* Don't force-unmask interrupts or generate vretrace during init.
+     * The OS must complete INITSYS before interrupt handlers are ready.
+     * INTSON(0) at the end of BOOT_IO_INIT enables interrupts naturally. */
     if (frame_count == 10 || frame_count == 60 || frame_count == 120 || frame_count == 300) {
         fprintf(stderr, "DIAG frame %d: PC=$%06X SR=$%04X stopped=%d pending_irq=%d setup=%d\n",
                 frame_count, lisa->cpu.pc, lisa->cpu.sr, lisa->cpu.stopped,
@@ -1065,8 +1061,9 @@ int lisa_run_frame(lisa_t *lisa) {
     }
 
     /* Vertical retrace: pulse the IRQ for one instruction only.
-     * Set it, let CPU take it, immediately clear. */
-    if (lisa->mem.vretrace_enabled) {
+     * Only enable after the OS has initialized interrupt handlers
+     * (frame_count > 200 gives INITSYS time to complete). */
+    if (lisa->mem.vretrace_enabled && frame_count > 200) {
         lisa->mem.vretrace_irq = true;
         lisa->irq_vretrace = 1;
         int level = 3;  /* vretrace at level 3 to break through mask level 2 */
