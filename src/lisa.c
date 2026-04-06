@@ -656,7 +656,11 @@ void lisa_reset(lisa_t *lisa) {
          * $078000-$07A000: Screen data area
          * $07A000-$0FF800: Screen buffer + free memory
          * $0FF800-$100000: Top of RAM */
-        uint32_t b_sysjt     = os_end;
+        /* SMT (System Mapping Table): 512 entries × 4 bytes = 2048 bytes.
+         * Must be ABOVE os_end to avoid overlapping with OS code. */
+        uint32_t smt_base    = os_end;
+        uint32_t l_smt       = 0x800;     /* 2KB for 512 entries */
+        uint32_t b_sysjt     = smt_base + l_smt;
         uint32_t l_sysjt     = 0x1000;    /* 4KB jump table */
         uint32_t b_sysglobal = b_sysjt + l_sysjt;
         uint32_t l_sysglobal = 0x6000;    /* 24KB sysglobal */
@@ -728,7 +732,7 @@ void lisa_reset(lisa_t *lisa) {
         W32D(LISA_RAM_SIZE); /* l_physicalmem */
         W16D(24);            /* fs_block0 */
         W16D(0);             /* debugmode = false */
-        W32D(0x280);         /* smt_base */
+        W32D(smt_base);      /* smt_base — above OS code, not in vector table */
         W16D(1);             /* os_segs = 1 */
         W32D(0);             /* ld_sernum */
         /* b_oscode[1..32] */
@@ -766,7 +770,8 @@ void lisa_reset(lisa_t *lisa) {
          * Point to a block of RTS instructions in unused vector table area.
          * Each entry is 4 bytes (just RTS, returns cleanly). */
         {
-            uint32_t djt_base = 0x300;  /* Put driver JT at $300 in vector table */
+            uint32_t djt_base = smt_base + l_smt;  /* Driver JT above SMT, not in vector table */
+            b_sysjt = djt_base + 128;  /* System JT starts after driver JT */
             for (int j = 0; j < 32; j++) {
                 /* Each entry: RTS ($4E75) padded to 4 bytes */
                 lisa->mem.ram[djt_base + j * 4]     = 0x4E;
