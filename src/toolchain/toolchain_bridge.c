@@ -83,6 +83,20 @@ static bool should_skip_file(const char *name) {
     /* QSORT is assembly but starts with EQU constants — force assembly detection below */
     /* Documentation / release notes */
     if (strcasestr(name, "relmemo") != NULL) return true;
+    /* Standalone programs — user utilities, not OS kernel components */
+    if (strcasestr(name, "KEYBOARD.TEXT") != NULL) return true;
+    if (strcasestr(name, "PEPSITESTS") != NULL) return true;
+    if (strcasestr(name, "MAINBAUD") != NULL) return true;
+    if (strcasestr(name, "copymaster") != NULL) return true;
+    if (strcasestr(name, "bless") != NULL) return true;
+    if (strcasestr(name, "ALERTGEN") != NULL) return true;
+    if (strcasestr(name, "REALPASLIB") != NULL) return true;
+    if (strcasestr(name, "FPPASLIB") != NULL) return true;
+    if (strcasestr(name, "GDATALIST") != NULL) return true;
+    if (strcasestr(name, "cdchar") != NULL) return true;
+    if (strcasestr(name, "nwshell") != NULL) return true;
+    if (strcasestr(name, "cdCONFIG") != NULL) return true;
+    if (strcasestr(name, "TKALERT") != NULL) return true;
     /* Non-source data files in APPS */
     if (strcasestr(name, "T5LM") != NULL) return true;
     if (strcasestr(name, "t5dbc") != NULL) return true;
