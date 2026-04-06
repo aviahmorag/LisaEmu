@@ -2756,6 +2756,17 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             }
             prev_sp = cpu->a[7];
         }
+        /* Track when SP hits $78FBC (after %initstdio MOVEM push) going UP */
+        {
+            static uint32_t prev_sp2 = 0;
+            static int sp_up = 0;
+            if (sp_up < 3 && prev_sp2 < 0x78FBC && cpu->a[7] >= 0x78FBC && cpu->a[7] <= 0x78FFC) {
+                fprintf(stderr, ">>> SP UP TO $%08X at PC=$%06X (MOVEM restore?)\n",
+                        cpu->a[7], cpu->pc);
+                sp_up++;
+            }
+            prev_sp2 = cpu->a[7];
+        }
         /* Track A5 corruption */
         {
             static uint32_t prev_a5 = 0;

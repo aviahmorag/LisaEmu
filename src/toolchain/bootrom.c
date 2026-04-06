@@ -92,6 +92,29 @@ uint8_t *bootrom_generate(void) {
     emit16(&b, 0x4E73);  /* RTE */
 
     /* ================================================================
+     * TRAP #5 handler (TRAPTOHW) at $FE0330:
+     * Handles hardware interface calls during early boot.
+     * Function number is in D7.
+     * ScreenAddr ($18) / AltScreenAddr ($1A): return screen base in A0.
+     * CursorDisplay ($14) / CursorHide ($10): no-op.
+     * ================================================================ */
+    b.pc = 0x0330;
+    /* CMP.W #$18,D7 — is it ScreenAddr? */
+    emit16(&b, 0x0C47);          /* CMPI.W #imm,D7 */
+    emit16(&b, 0x0018);
+    emit16(&b, 0x6706);          /* BEQ.S +6 → load screen addr */
+    /* CMP.W #$1A,D7 — is it AltScreenAddr? */
+    emit16(&b, 0x0C47);
+    emit16(&b, 0x001A);
+    emit16(&b, 0x6604);          /* BNE.S +4 → just RTE (cursor ops etc.) */
+    /* Load screen address into A0.
+     * Screen base is at low memory $1F8 (ALTMSBASE) or $1F4 (MSBASE).
+     * For simplicity, load from $110 (prom_screen) which we initialize. */
+    emit16(&b, 0x2079);          /* MOVEA.L ($110).L,A0 */
+    emit32(&b, 0x00000110);
+    emit16(&b, 0x4E73);          /* RTE */
+
+    /* ================================================================
      * Line-F (SANE FP) handler at $FE0310:
      * The 68000 pushes PC of the Line-F opcode on the stack.
      * Skip past it (add 2 to stacked PC) and return.

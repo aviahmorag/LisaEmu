@@ -568,7 +568,7 @@ void lisa_reset(lisa_t *lisa) {
          * TRAP #5 = TRAPTOHW (hardware interface) — used by %initstdio
          * TRAP #8 = mapiospace — used for I/O space mapping
          * Both need to be functional before the OS installs real handlers. */
-        WRITE32(0x94, 0x00FE0300);  /* TRAP #5 → ROM RTE handler */
+        WRITE32(0x94, 0x00FE0330);  /* TRAP #5 → ROM TRAPTOHW handler */
         WRITE32(0xA0, 0x00FE0300);  /* TRAP #8 → ROM RTE handler */
 
         /* Fill ALL zero TRAP vectors ($80-$BC) with the ROM RTE handler.
@@ -585,6 +585,33 @@ void lisa_reset(lisa_t *lisa) {
                 WRITE32(vec, 0x00FE0300);
                 printf("  [TRAP safety] Vector $%03X (TRAP #%u) was zero → installed ROM RTE handler\n",
                        vec, (vec - 0x80) / 4);
+            }
+        }
+
+        /* TEMPORARY: Patch %initstdio to be a no-op (just return).
+         * %initstdio has issues with TRAP #5/SETCUR during early boot.
+         * By making it a NOP, PASCALINIT can return and INITSYS can run. */
+        {
+            /* Find %initstdio by reading the JSR target from PASCALINIT */
+            /* PASCALINIT's JSR to %initstdio is at PI+$36 (6-byte JSR abs.L) */
+            uint16_t bra_disp = (lisa->mem.ram[0x402] << 8) | lisa->mem.ram[0x403];
+            uint32_t body = 0x402 + (int16_t)bra_disp;
+            /* Main body: $2F00 $4EB9 XXXX → PASCALINIT addr at body+4 */
+            uint32_t pi_addr = ((uint32_t)lisa->mem.ram[body+4] << 24) |
+                               ((uint32_t)lisa->mem.ram[body+5] << 16) |
+                               ((uint32_t)lisa->mem.ram[body+6] << 8) |
+                               (uint32_t)lisa->mem.ram[body+7];
+            /* %initstdio JSR is at PI+$36: $4EB9 XXXX */
+            uint32_t initstdio_jsr = pi_addr + 0x36;
+            uint32_t initstdio_addr = ((uint32_t)lisa->mem.ram[initstdio_jsr+2] << 24) |
+                                      ((uint32_t)lisa->mem.ram[initstdio_jsr+3] << 16) |
+                                      ((uint32_t)lisa->mem.ram[initstdio_jsr+4] << 8) |
+                                      (uint32_t)lisa->mem.ram[initstdio_jsr+5];
+            if (initstdio_addr > 0x400 && initstdio_addr < 0x100000) {
+                /* Patch %initstdio: replace first instruction with RTS */
+                lisa->mem.ram[initstdio_addr]   = 0x4E;  /* RTS */
+                lisa->mem.ram[initstdio_addr+1] = 0x75;
+                fprintf(stderr, "PATCHED %%initstdio at $%06X to RTS\n", initstdio_addr);
             }
         }
 
