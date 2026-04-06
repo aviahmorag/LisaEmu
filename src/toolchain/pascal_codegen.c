@@ -191,6 +191,28 @@ static type_desc_t *resolve_type(codegen_t *cg, ast_node_t *node) {
         case AST_TYPE_ARRAY: {
             type_desc_t *t = add_type(cg, "", TK_ARRAY, 0);
             /* children: low, high, ..., element_type */
+            if (node->num_children < 3) {
+                /* Handle ARRAY[TypeName] OF ElemType (2 children: index type + element type) */
+                if (node->num_children == 2) {
+                    t->element_type = resolve_type(cg, node->children[1]);
+                    /* Try to resolve bounds from the index type name */
+                    if (node->children[0]->type == AST_IDENT_EXPR) {
+                        type_desc_t *idx_type = find_type(cg, node->children[0]->name);
+                        if (idx_type && idx_type->kind == TK_SUBRANGE) {
+                            t->array_low = idx_type->range_low;
+                            t->array_high = idx_type->range_high;
+                        } else if (idx_type && idx_type->kind == TK_ENUM) {
+                            t->array_low = 0;
+                            t->array_high = idx_type->size > 0 ? idx_type->size - 1 : 0;
+                        }
+                    }
+                    int count = t->array_high - t->array_low + 1;
+                    if (count <= 0) count = 64;
+                    int elem_sz = t->element_type ? t->element_type->size : 2;
+                    t->size = count * elem_sz;
+                    if (t->size < 2) t->size = 2;
+                }
+            } else
             if (node->num_children >= 3) {
                 /* Resolve array bounds — may be CONST identifiers */
                 int lo = (int)node->children[0]->int_val;
@@ -439,8 +461,14 @@ static int expr_size(codegen_t *cg, ast_node_t *node) {
         case AST_ARRAY_ACCESS: {
             if (node->children[0] && node->children[0]->type == AST_IDENT_EXPR) {
                 cg_symbol_t *arr = find_symbol_any(cg, node->children[0]->name);
-                if (arr && arr->type && arr->type->kind == TK_ARRAY && arr->type->element_type)
-                    return arr->type->element_type->size > 0 ? arr->type->element_type->size : 2;
+                if (arr && arr->type) {
+                    type_desc_t *at = arr->type;
+                    if (at->kind == TK_POINTER && at->base_type) at = at->base_type;
+                    if (at->kind == TK_ARRAY && at->element_type)
+                        return at->element_type->size > 0 ? at->element_type->size : 2;
+                    if (at->kind == TK_STRING)
+                        return 1;  /* string subscript returns a char */
+                }
             }
             return 2;
         }
@@ -544,7 +572,26 @@ static void gen_lvalue_addr(codegen_t *cg, ast_node_t *node) {
                         array_low = at->array_low;
                         if (at->element_type)
                             elem_size = type_size(at->element_type);
+                        else {
+                            static int arr_warn = 0;
+                            if (arr_warn++ < 20)
+                                fprintf(stderr, "  ARRAY_ACCESS: '%s' kind=TK_ARRAY but element_type=NULL (elem_size defaults to 2) in %s\n",
+                                        node->children[0]->name, cg->current_file);
+                        }
+                    } else if (at->kind == TK_STRING) {
+                        /* String subscript: s[i] accesses a character (1 byte) */
+                        elem_size = 1;
+                    } else {
+                        static int arr_warn2 = 0;
+                        if (arr_warn2++ < 20)
+                            fprintf(stderr, "  ARRAY_ACCESS: '%s' type->kind=%d (not TK_ARRAY=%d) (elem_size defaults to 2) in %s\n",
+                                    node->children[0]->name, at->kind, TK_ARRAY, cg->current_file);
                     }
+                } else {
+                    static int arr_warn3 = 0;
+                    if (arr_warn3++ < 20)
+                        fprintf(stderr, "  ARRAY_ACCESS: '%s' sym=%p type=%p (elem_size defaults to 2) in %s\n",
+                                node->children[0]->name, (void*)arr_sym, arr_sym ? (void*)arr_sym->type : NULL, cg->current_file);
                 }
             }
             /* SUB.W #low,D0 (adjust for array base) */
@@ -1716,7 +1763,23 @@ static void process_declarations(codegen_t *cg, ast_node_t *node, bool is_global
                 if (child->num_children > 0) {
                     type_desc_t *t = resolve_type(cg, child->children[0]);
                     if (t && child->name[0]) {
-                        strncpy(t->name, child->name, sizeof(t->name) - 1);
+                        /* If this type already has a different name, create a new
+                         * alias entry instead of overwriting the existing name.
+                         * Otherwise types like tenbite→fp_extended→extended
+                         * would lose intermediate names. */
+                        if (t->name[0] && !str_eq_nocase(t->name, child->name)) {
+                            type_desc_t *alias = add_type(cg, child->name, t->kind, t->size);
+                            if (alias) {
+                                /* Copy all type info from original */
+                                char saved_name[64];
+                                strncpy(saved_name, child->name, sizeof(saved_name) - 1);
+                                saved_name[63] = '\0';
+                                *alias = *t;
+                                strncpy(alias->name, saved_name, sizeof(alias->name) - 1);
+                            }
+                        } else {
+                            strncpy(t->name, child->name, sizeof(t->name) - 1);
+                        }
                     }
                 }
                 break;
@@ -1793,8 +1856,10 @@ static void gen_proc_or_func(codegen_t *cg, ast_node_t *node) {
 
     /* Process parameters */
     int param_offset = 8; /* After saved A6 and return address */
+    bool has_param_list = false;
     for (int i = 0; i < node->num_children; i++) {
         if (node->children[i]->type == AST_PARAM_LIST) {
+            has_param_list = true;
             ast_node_t *params = node->children[i];
             for (int j = 0; j < params->num_children; j++) {
                 ast_node_t *param = params->children[j];
@@ -1804,6 +1869,23 @@ static void gen_proc_or_func(codegen_t *cg, ast_node_t *node) {
                 if (s) {
                     s->offset = param_offset;
                     param_offset += is_var ? 4 : (ptype ? ptype->size : 2);
+                    if (param_offset % 2) param_offset++;
+                }
+            }
+        }
+    }
+    /* If IMPLEMENTATION body has no param list, reconstruct params from
+     * the INTERFACE/FORWARD declaration's stored signature */
+    if (!has_param_list) {
+        cg_proc_sig_t *sig = find_proc_sig(cg, node->name);
+        if (sig && sig->num_params > 0) {
+            for (int j = 0; j < sig->num_params; j++) {
+                type_desc_t *ptype = sig->param_type[j];
+                if (!ptype) ptype = find_type(cg, "integer");
+                cg_symbol_t *s = add_local(cg, sig->param_name[j], ptype, true, sig->param_is_var[j]);
+                if (s) {
+                    s->offset = param_offset;
+                    param_offset += sig->param_is_var[j] ? 4 : (ptype ? ptype->size : 2);
                     if (param_offset % 2) param_offset++;
                 }
             }
@@ -2003,13 +2085,15 @@ static void register_proc_sig(codegen_t *cg, const char *name, ast_node_t *param
     for (int i = 0; i < sig->num_params; i++) {
         /* str_val[0] != '\0' means VAR parameter (set by parser) */
         sig->param_is_var[i] = (params[i]->str_val[0] != '\0');
+        strncpy(sig->param_name[i], params[i]->name, 63);
+        /* Resolve and store the parameter type */
+        type_desc_t *ptype = NULL;
+        if (params[i]->num_children > 0)
+            ptype = resolve_type(cg, params[i]->children[0]);
+        sig->param_type[i] = ptype;
         if (sig->param_is_var[i]) {
             sig->param_size[i] = 4;  /* VAR params are always pointers */
         } else {
-            /* Determine size from type */
-            type_desc_t *ptype = NULL;
-            if (params[i]->num_children > 0)
-                ptype = resolve_type(cg, params[i]->children[0]);
             if (ptype && ptype->size == 4)
                 sig->param_size[i] = 4;  /* longint, pointer, etc. */
             else

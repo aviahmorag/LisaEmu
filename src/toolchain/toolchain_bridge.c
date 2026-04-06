@@ -412,17 +412,63 @@ static bool compile_pascal_file(const char *path, linker_t *lk) {
         }
     }
 
-    /* Export this file's types to the shared table for cross-unit type casts */
-    for (int i = 0; i < cg->num_types && num_shared_types < MAX_SHARED_TYPES; i++) {
-        if (cg->types[i].name[0]) {
+    /* Export this file's types to the shared table for cross-unit type casts.
+     * We must export ALL types (including anonymous ones like inline array types)
+     * because globals and named types may reference them via pointers
+     * (element_type, base_type, fields[].type, set_base). After copying,
+     * we remap all internal pointers from the old cg->types[] addresses
+     * to the new shared_types[] addresses so they survive codegen_free(). */
+    int types_base = num_shared_types;  /* index where this file's types start */
+    {
+        /* Phase 1: copy all types */
+        for (int i = 0; i < cg->num_types && num_shared_types < MAX_SHARED_TYPES; i++) {
             shared_types[num_shared_types++] = cg->types[i];
         }
+        /* Helper: check if a pointer is within the cg->types array */
+        #define IN_CG_TYPES(ptr) ((ptr) >= &cg->types[0] && (ptr) < &cg->types[cg->num_types])
+        #define REMAP_TYPE_PTR(ptr) do { \
+            if ((ptr) && IN_CG_TYPES(ptr)) { \
+                ptrdiff_t _idx = (ptr) - cg->types; \
+                (ptr) = &shared_types[types_base + _idx]; \
+            } \
+            /* If ptr is already in shared_types or elsewhere, leave it alone */ \
+        } while(0)
+
+        /* Phase 2: remap internal type pointers within the newly exported types */
+        for (int i = types_base; i < num_shared_types; i++) {
+            type_desc_t *t = &shared_types[i];
+            REMAP_TYPE_PTR(t->element_type);
+            REMAP_TYPE_PTR(t->base_type);
+            REMAP_TYPE_PTR(t->set_base);
+            for (int fi = 0; fi < t->num_fields; fi++) {
+                REMAP_TYPE_PTR(t->fields[fi].type);
+            }
+        }
+        /* Phase 3: remap type pointers in globals exported from this file.
+         * We need to fix globals that were just added (they point into cg->types). */
+        for (int i = 0; i < num_shared_globals; i++) {
+            REMAP_TYPE_PTR(shared_globals[i].type);
+        }
+        #undef IN_CG_TYPES
+        #undef REMAP_TYPE_PTR
     }
 
-    /* Export this file's procedure signatures to the shared table */
+    /* Export this file's procedure signatures to the shared table.
+     * Remap param_type pointers from cg->types[] to shared_types[]. */
     if (cg->proc_sigs) {
         for (int i = 0; i < cg->num_proc_sigs && num_shared_proc_sigs < MAX_SHARED_PROC_SIGS; i++) {
-            shared_proc_sigs[num_shared_proc_sigs++] = cg->proc_sigs[i];
+            cg_proc_sig_t *sig = &shared_proc_sigs[num_shared_proc_sigs++];
+            *sig = cg->proc_sigs[i];
+            for (int j = 0; j < sig->num_params; j++) {
+                if (sig->param_type[j]) {
+                    type_desc_t *pt = sig->param_type[j];
+                    if (pt >= &cg->types[0] && pt < &cg->types[cg->num_types]) {
+                        ptrdiff_t idx = pt - cg->types;
+                        sig->param_type[j] = &shared_types[types_base + idx];
+                    }
+                    /* If already in shared_types (imported), leave as-is */
+                }
+            }
         }
     }
 

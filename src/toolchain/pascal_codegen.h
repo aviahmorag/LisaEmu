@@ -110,6 +110,8 @@ typedef struct {
     int num_params;
     bool param_is_var[CODEGEN_MAX_PARAMS];  /* true = VAR parameter */
     int param_size[CODEGEN_MAX_PARAMS];     /* Parameter size in bytes (2 or 4) */
+    char param_name[CODEGEN_MAX_PARAMS][64]; /* Parameter names for forward-decl matching */
+    struct type_desc *param_type[CODEGEN_MAX_PARAMS]; /* Parameter types (for IMPL body reconstruction) */
     bool is_external;                       /* true = assembly/external (callee-clean) */
 } cg_proc_sig_t;
 
