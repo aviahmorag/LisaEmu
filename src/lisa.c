@@ -1004,8 +1004,7 @@ int lisa_run_frame(lisa_t *lisa) {
     /* Don't force-unmask interrupts or generate vretrace during init.
      * The OS must complete INITSYS before interrupt handlers are ready.
      * INTSON(0) at the end of BOOT_IO_INIT enables interrupts naturally. */
-    if (frame_count == 10 || frame_count == 60 || frame_count == 120 || frame_count == 300 ||
-        frame_count == 500 || frame_count == 800) {
+    if (frame_count == 10 || frame_count == 60 || frame_count == 300 || frame_count == 800) {
         fprintf(stderr, "DIAG frame %d: PC=$%06X SR=$%04X stopped=%d pending_irq=%d setup=%d\n",
                 frame_count, lisa->cpu.pc, lisa->cpu.sr, lisa->cpu.stopped,
                 lisa->cpu.pending_irq, lisa->mem.setup_mode);

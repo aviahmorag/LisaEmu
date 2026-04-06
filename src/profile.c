@@ -85,6 +85,13 @@ void profile_orb_write(profile_t *p, uint8_t orb, uint8_t old_orb) {
     bool cmd_now = !(orb & 0x10);   /* CMD active low */
     bool cmd_was = !(old_orb & 0x10);
 
+    static int orb_log = 0;
+    if (orb_log < 20 && (cmd_now != cmd_was)) {
+        fprintf(stderr, "ProFile ORB: $%02X→$%02X CMD=%d→%d state=%d BSY=%d\n",
+                old_orb, orb, cmd_was, cmd_now, p->state, p->busy);
+        orb_log++;
+    }
+
     /* CMD falling edge (host asserting CMD) */
     if (cmd_now && !cmd_was) {
         switch (p->state) {
