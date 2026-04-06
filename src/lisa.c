@@ -1005,27 +1005,44 @@ int lisa_run_frame(lisa_t *lisa) {
      * The OS must complete INITSYS before interrupt handlers are ready.
      * INTSON(0) at the end of BOOT_IO_INIT enables interrupts naturally. */
     if (frame_count == 5) {
-        /* Dump MMU mapping for the CALLDRIVER wait loop address */
-        uint32_t vaddr = 0xCBFFE0;
-        int seg = (vaddr >> 17) & 0x7F;  /* segment 101 */
-        int ctx = lisa->mem.current_context;
-        mmu_segment_t *s = &lisa->mem.segments[ctx][seg];
-        uint32_t offset = vaddr & 0x1FFFF;
-        uint32_t phys = ((uint32_t)s->sor << 9) + offset;
-        fprintf(stderr, "MMU: vaddr=$%06X seg=%d ctx=%d SOR=$%04X SLR=$%04X changed=%d\n",
-                vaddr, seg, ctx, s->sor, s->slr, s->changed);
-        fprintf(stderr, "  Physical=$%06X ram[phys]=%02X%02X%02X%02X %02X%02X%02X%02X\n",
-                phys, lisa->mem.ram[phys], lisa->mem.ram[phys+1],
-                lisa->mem.ram[phys+2], lisa->mem.ram[phys+3],
-                lisa->mem.ram[phys+4], lisa->mem.ram[phys+5],
-                lisa->mem.ram[phys+6], lisa->mem.ram[phys+7]);
-        /* Also check SP mapping */
-        uint32_t sp = lisa->cpu.a[7];
-        int sp_seg = (sp >> 17) & 0x7F;
-        mmu_segment_t *ss = &lisa->mem.segments[ctx][sp_seg];
-        uint32_t sp_phys = ((uint32_t)ss->sor << 9) + (sp & 0x1FFFF);
-        fprintf(stderr, "  SP=$%08X seg=%d SOR=$%04X → phys=$%06X\n",
-                sp, sp_seg, ss->sor, sp_phys);
+        /* Dump memory around PC=$3015C to decode the wait loop */
+        uint32_t pc = lisa->cpu.pc;
+        fprintf(stderr, "=== FRAME 5 DIAGNOSTIC DUMP ===\n");
+        fprintf(stderr, "PC=$%06X SR=$%04X stopped=%d pending_irq=%d\n",
+                pc, lisa->cpu.sr, lisa->cpu.stopped, lisa->cpu.pending_irq);
+
+        /* Dump bytes at $30150-$30170 (physical RAM, since PC is low) */
+        fprintf(stderr, "Memory $30150-$30170:");
+        for (uint32_t a = 0x30150; a <= 0x30170; a += 2)
+            fprintf(stderr, " %02X%02X", lisa->mem.ram[a], lisa->mem.ram[a+1]);
+        fprintf(stderr, "\n");
+
+        /* Also dump bytes around current PC */
+        fprintf(stderr, "Memory @PC-8..+16 ($%06X):", pc);
+        for (uint32_t a = (pc > 8 ? pc - 8 : 0); a < pc + 16; a += 2)
+            fprintf(stderr, " %02X%02X", lisa->mem.ram[a], lisa->mem.ram[a+1]);
+        fprintf(stderr, "\n");
+
+        /* All CPU registers */
+        fprintf(stderr, "D0=$%08X D1=$%08X D2=$%08X D3=$%08X\n",
+                lisa->cpu.d[0], lisa->cpu.d[1], lisa->cpu.d[2], lisa->cpu.d[3]);
+        fprintf(stderr, "D4=$%08X D5=$%08X D6=$%08X D7=$%08X\n",
+                lisa->cpu.d[4], lisa->cpu.d[5], lisa->cpu.d[6], lisa->cpu.d[7]);
+        fprintf(stderr, "A0=$%08X A1=$%08X A2=$%08X A3=$%08X\n",
+                lisa->cpu.a[0], lisa->cpu.a[1], lisa->cpu.a[2], lisa->cpu.a[3]);
+        fprintf(stderr, "A4=$%08X A5=$%08X A6=$%08X A7=$%08X\n",
+                lisa->cpu.a[4], lisa->cpu.a[5], lisa->cpu.a[6], lisa->cpu.a[7]);
+
+        /* VIA1 and VIA2 IER/IFR state */
+        fprintf(stderr, "VIA1: IER=$%02X IFR=$%02X PORTA=$%02X PORTB=$%02X DDRA=$%02X DDRB=$%02X\n",
+                lisa->via1.ier, lisa->via1.ifr,
+                lisa->via1.ora, lisa->via1.orb,
+                lisa->via1.ddra, lisa->via1.ddrb);
+        fprintf(stderr, "VIA2: IER=$%02X IFR=$%02X PORTA=$%02X PORTB=$%02X DDRA=$%02X DDRB=$%02X\n",
+                lisa->via2.ier, lisa->via2.ifr,
+                lisa->via2.ora, lisa->via2.orb,
+                lisa->via2.ddra, lisa->via2.ddrb);
+        fprintf(stderr, "=== END FRAME 5 DUMP ===\n");
     }
     if (frame_count == 10 || frame_count == 60 || frame_count == 300 || frame_count == 800) {
         fprintf(stderr, "DIAG frame %d: PC=$%06X SR=$%04X stopped=%d pending_irq=%d setup=%d\n",
@@ -1054,6 +1071,74 @@ int lisa_run_frame(lisa_t *lisa) {
             for (uint32_t a = body; a < body + 24; a += 2)
                 fprintf(stderr, " %02X%02X", lisa->mem.ram[a], lisa->mem.ram[a+1]);
             fprintf(stderr, "\n");
+
+            /* Decode instruction at current PC */
+            uint32_t pc = lisa->cpu.pc;
+            fprintf(stderr, "=== FRAME 60 INSTRUCTION DECODE at PC=$%06X ===\n", pc);
+            fprintf(stderr, "  Bytes at PC-16..+32:");
+            for (uint32_t a = (pc > 16 ? pc - 16 : 0); a < pc + 32 && a < LISA_RAM_SIZE; a += 2) {
+                if (a == pc) fprintf(stderr, " [");
+                fprintf(stderr, "%02X%02X", lisa->mem.ram[a], lisa->mem.ram[a+1]);
+                if (a == pc) fprintf(stderr, "]");
+                else fprintf(stderr, " ");
+            }
+            fprintf(stderr, "\n");
+
+            /* Decode the opcode word */
+            uint16_t opcode = (lisa->mem.ram[pc] << 8) | lisa->mem.ram[pc+1];
+            fprintf(stderr, "  Opcode=$%04X", opcode);
+            if (opcode == 0x4E72) {
+                uint16_t imm = (lisa->mem.ram[pc+2] << 8) | lisa->mem.ram[pc+3];
+                fprintf(stderr, " → STOP #$%04X (waiting for interrupt level > %d)\n",
+                        imm, (imm >> 8) & 7);
+            } else if ((opcode & 0xFFC0) == 0x0800) {
+                /* BTST #n,<ea> - static bit test */
+                uint16_t bit = (lisa->mem.ram[pc+2] << 8) | lisa->mem.ram[pc+3];
+                fprintf(stderr, " → BTST #%d,...\n", bit & 0x1F);
+            } else if ((opcode & 0xF1C0) == 0x0100) {
+                /* BTST Dn,<ea> - dynamic bit test */
+                int reg = (opcode >> 9) & 7;
+                fprintf(stderr, " → BTST D%d,...\n", reg);
+            } else if ((opcode & 0xFF00) == 0x4A00) {
+                /* TST */
+                fprintf(stderr, " → TST\n");
+            } else if ((opcode & 0xF000) == 0x6000) {
+                /* Bcc */
+                int cond = (opcode >> 8) & 0xF;
+                const char *cc[] = {"BRA","BSR","BHI","BLS","BCC","BCS","BNE","BEQ",
+                                    "BVC","BVS","BPL","BMI","BGE","BLT","BGT","BLE"};
+                int8_t disp8 = opcode & 0xFF;
+                if (disp8 == 0) {
+                    int16_t disp16 = (int16_t)((lisa->mem.ram[pc+2] << 8) | lisa->mem.ram[pc+3]);
+                    fprintf(stderr, " → %s.W $%06X (disp=%d)\n", cc[cond], pc + 2 + disp16, disp16);
+                } else {
+                    fprintf(stderr, " → %s.S $%06X (disp=%d)\n", cc[cond], pc + 2 + disp8, disp8);
+                }
+            } else if ((opcode & 0xFFF8) == 0x4E50) {
+                /* LINK */
+                fprintf(stderr, " → LINK A%d\n", opcode & 7);
+            } else if (opcode == 0x4E75) {
+                fprintf(stderr, " → RTS\n");
+            } else if (opcode == 0x4E73) {
+                fprintf(stderr, " → RTE\n");
+            } else {
+                fprintf(stderr, " → (unknown pattern, check 68000 manual)\n");
+            }
+
+            /* All registers at frame 60 */
+            fprintf(stderr, "  D0=$%08X D1=$%08X D2=$%08X D3=$%08X\n",
+                    lisa->cpu.d[0], lisa->cpu.d[1], lisa->cpu.d[2], lisa->cpu.d[3]);
+            fprintf(stderr, "  D4=$%08X D5=$%08X D6=$%08X D7=$%08X\n",
+                    lisa->cpu.d[4], lisa->cpu.d[5], lisa->cpu.d[6], lisa->cpu.d[7]);
+            fprintf(stderr, "  A0=$%08X A1=$%08X A2=$%08X A3=$%08X\n",
+                    lisa->cpu.a[0], lisa->cpu.a[1], lisa->cpu.a[2], lisa->cpu.a[3]);
+            fprintf(stderr, "  A4=$%08X A5=$%08X A6=$%08X A7=$%08X\n",
+                    lisa->cpu.a[4], lisa->cpu.a[5], lisa->cpu.a[6], lisa->cpu.a[7]);
+            fprintf(stderr, "  VIA1: IER=$%02X IFR=$%02X ORA=$%02X ORB=$%02X\n",
+                    lisa->via1.ier, lisa->via1.ifr, lisa->via1.ora, lisa->via1.orb);
+            fprintf(stderr, "  VIA2: IER=$%02X IFR=$%02X ORA=$%02X ORB=$%02X\n",
+                    lisa->via2.ier, lisa->via2.ifr, lisa->via2.ora, lisa->via2.orb);
+            fprintf(stderr, "=== END FRAME 60 DECODE ===\n");
         }
         if (frame_count == 120) {
             fprintf(stderr, "  A5=$%08X A6=$%08X SP=$%08X\n",

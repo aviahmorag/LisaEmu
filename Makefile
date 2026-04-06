@@ -92,3 +92,12 @@ audit-asm: $(AUDIT)
 
 audit-linker: $(AUDIT)
 	@./$(AUDIT) ./Lisa_Source linker 2>$(BUILDDIR)/audit_linker_errors.txt
+
+# Dump instruction at address from disk image
+DUMP_ADDR = $(BUILDDIR)/dump_addr
+
+$(DUMP_ADDR): $(TOOLDIR)/dump_addr.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) -o $@ $<
+
+dump: $(DUMP_ADDR)
+	@./$(DUMP_ADDR) $(BUILDDIR)/lisa_profile.image 3015C

@@ -433,6 +433,18 @@ bool linker_link(linker_t *lk) {
 
     lk->segments[0].size = current_addr;
 
+    /* Log module map for debugging */
+    fprintf(stderr, "=== MODULE MAP ===\n");
+    for (int i = 0; i < lk->num_modules; i++) {
+        link_module_t *mod = lk->modules[i];
+        if (!mod->is_kernel) continue;
+        fprintf(stderr, "  $%06X-$%06X (%6u bytes) %s\n",
+                mod->base_addr, mod->base_addr + mod->code_size - 1,
+                mod->code_size, mod->name);
+    }
+    fprintf(stderr, "=== END MODULE MAP (total $%X = %u bytes) ===\n",
+            current_addr, current_addr);
+
     /* Phase 2: Resolve symbols — update entry point addresses with base offsets.
      * Only resolve symbols from kernel modules (which are placed in the output).
      * Non-kernel modules have base_addr=0, so their raw offsets would collide

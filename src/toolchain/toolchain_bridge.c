@@ -707,6 +707,28 @@ build_result_t toolchain_build(const char *source_dir,
     if (link_data && link_size > 0) {
         disk_write_boot_track(db, link_data, link_size);
         disk_add_file(db, "system.os", FTYPE_CODE, link_data, link_size);
+
+        /* Dump bytes around $3015C to decode what the CPU gets stuck on */
+        if (link_size > 0x30170) {
+            fprintf(stderr, "=== LINK OUTPUT BYTES AT $30150-$30170 ===\n");
+            fprintf(stderr, "  ");
+            for (uint32_t a = 0x30150; a <= 0x30170; a += 2)
+                fprintf(stderr, "%04X:%02X%02X ", a, link_data[a], link_data[a+1]);
+            fprintf(stderr, "\n");
+
+            /* Also identify which module contains $3015C */
+            for (int m = 0; m < lk->num_modules; m++) {
+                link_module_t *mod = lk->modules[m];
+                if (!mod->is_kernel) continue;
+                if (0x3015C >= mod->base_addr &&
+                    0x3015C < mod->base_addr + mod->code_size) {
+                    fprintf(stderr, "  $3015C is in module '%s' (base=$%X, size=%u, offset=%u)\n",
+                            mod->name, mod->base_addr, mod->code_size,
+                            0x3015C - mod->base_addr);
+                }
+            }
+            fprintf(stderr, "=== END ===\n");
+        }
     }
 
     /* Add font files if present */
