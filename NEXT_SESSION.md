@@ -9,145 +9,94 @@ build/lisaemu Lisa_Source   # Takes ~15s to compile+link+boot
 
 ## Where We Are
 
-The Apple Lisa OS cross-compiles from 420+ source files and boots
-cleanly through PASCALINIT, %initstdio, and deep into INITSYS.
-No runtime patches — the code runs natively.
+Massive session: 18 commits fixing 3 assembler bugs, 21 codegen type-size
+issues, 4 cross-unit type resolution bugs, standalone program removal, and
+ProFile protocol rewrite. The OS boots cleanly through PASCALINIT and deep
+into INITSYS.
 
-**What you see**: SDL window with white screen and a black box in
-the lower-left corner. The OS has cleared the display and drawn
-a cursor or dialog element. No artifacts, no crashes.
+**What you see**: SDL window with white screen and cursor box. No artifacts.
 
-**CPU state**: Stable at PC=$D0A6A (waiting for I/O or interrupt).
-Only 4 total exceptions during boot, all normal TRAPs. SR=$2719
-(supervisor mode, IPL=7).
+**Current state**: CPU at $2F4BA (LIBFP area) with Illegal Instruction
+exceptions at $2A (vector table). The standalone program removal fixed the
+Line-F crash but exposed this new issue. Binary is 840KB (325 compiled,
+103 assembled).
 
 ## What Was Fixed This Session
 
-### 1. MOVEM register list parsing (assembler)
-`D0-D7/A0-A6` was parsed as single register D0. Generated $4CC0 $0000
-instead of $48E7 $FFFE. Fix: check register lists before single registers.
+### Assembler (3 bugs)
+1. MOVEM register list parsing (D0-D7/A0-A6 parsed as D0)
+2. @-label scoping (global → per-scope with counter)
+3. Branch size consistency (pass-1/pass-2 PC mismatch — ROOT CAUSE)
 
-### 2. @-label scoping (assembler)
-Local labels (@1, @3) were global instead of scoped per major label.
-Fix: scope counter incremented at .PROC/.FUNC/major labels, @-labels
-mangled with scope ID.
+### Pascal Codegen (21 issues, all addressed)
+4. Record field offsets (hardcoded 0 → type-resolved)
+5. Array element sizes (hardcoded 2 → type-resolved)
+6. VAR param read/write sizes (MOVE.W → size-aware)
+7. Array/field/deref read sizes (MOVE.W → size-aware)
+8. Complex LHS assignment sizes (save/restore/store correct)
+9. Binary ops .W → .L for longint/pointer operands
+10. Comparison ops CMP.W → CMP.L for longint
+11. Unary NEG/NOT .W → .L for longint
+12. Call parameter push sizes (signature-aware)
+13. Call stack cleanup (sum actual sizes, not assume 4)
+14. FOR loop .W → .L for longint variables
+15. CASE selector .W → .L for longint
+16. ABS/SUCC/PRED .W → .L for longint
 
-### 3. Branch size consistency (assembler — ROOT CAUSE OF CRASH)
-Bcc/BRA/BSR auto-optimized to byte displacement when target fit in
--128..+127. On pass 1, forward @-label refs → 0 → 4-byte branch.
-On pass 2, real value → fits byte → 2-byte branch. This caused ALL
-subsequent labels to drift by 2+ bytes between passes.
+### Cross-Unit Type Resolution (4 bugs)
+17. Dangling type pointers after codegen_free() (pointer remapping)
+18. Type alias name overwriting (create copies instead)
+19. Forward-declared procedure param reconstruction
+20. 2-child array and string subscript handling
 
-The `initio` label pointed 2 bytes past `move.l (SP)+,a1`, so the
-return address was never saved. Stack corruption → vector table
-execution → Line-F/Trace exception loop → total crash.
-
-Fix: only use byte displacement with explicit `.S` suffix. Otherwise
-always use word displacement (4 bytes).
-
-### 4. Line-F exception handler
-OS's LINE1111_TRAP handler calls system_error (not ready). Overridden
-with ROM skip handler during early boot. Also added recursion guard
-in take_exception for safety.
-
-### 5. ProFile protocol rewrite
-Five critical fixes: proper two-phase handshake, block $FFFFFF spare
-table, correct state transitions, PORTA direction, VIA CA1 BSY edges.
-
-## What Still Needs Fixing (in priority order)
-
-### 1. CPU waiting at $D0A6A — identify what it's waiting for
-
-The boot reaches deep into INITSYS (POOL_INIT confirmed). The CPU
-is now in a stable wait loop. Likely causes:
-- BOOT_IO_INIT trying to access ProFile (VIA handshake not triggering)
-- Waiting for a VIA interrupt that never fires
-- STOP #$2000 instruction waiting for scheduler interrupt
-
-**To investigate**: Decode what's at $D0A6A. Check if it's a BTST
-loop polling a VIA register or a STOP instruction.
-
-### 2. ProFile disk I/O testing
-
-The rewritten ProFile protocol hasn't been exercised yet. Once the
-wait loop is resolved, BOOT_IO_INIT should try to read from ProFile.
-The VIA handshake and spare table read need real testing.
-
-### 3. INTRINSIC.LIB missing from disk image
-
-INITSYS calls Setup_IUInfo which opens INTRINSIC.LIB. Without it,
-SYSTEM_ERROR(10100) will halt the boot. Need to:
-- Compile library sources (LIBQD, LIBWM, LIBSM, etc.)
-- Link them per BUILD/ALEX-LINK-*.TEXT scripts
-- Package into INTRINSIC.LIB with proper directory structure
-- Add to disk image
-
-### 4. MDDF / Filesystem Mount
-
-MDDF layout verified correct (fsversion=17, MDDFaddr=0, all fields
-match OS validation). Should work once ProFile reads succeed.
-
-### 5. VIA Timer Interrupts / Scheduler
-
-Vretrace disabled during first 200 frames. After INIT_TRAPV installs
-real handlers, vretrace should be enabled. The scheduler uses
-STOP #$2000 to wait for level-1 interrupts.
-
-## Architecture Summary
-
-### Toolchain
-```
-Parser:    420+ files, 0 parse errors (except BUILDLLD which isn't code)
-Assembler: MOVEM fixed, @-labels scoped, branch sizes consistent, PC-relative *+N
-Codegen:   Multi-param, proc sigs, nested scope, FOR MOVE.W, CONST propagation
-Linker:    3106 kernel-resolved, 46-module kernel, LINE1111_TRAP excluded
-Output:    ~919KB system.os (slightly larger with word-size branches)
-```
+### Module Filtering
+21. 13 standalone programs removed from kernel (KEYBOARD, STUNTS, etc.)
 
 ### Emulator
-```
-CPU:       68000 with TRAP handling, exception frames, Line-F recursion guard
-MMU:       5 contexts, segments 0-20, 85-105, 123 pre-programmed
-VIA:       Timer interrupts, ProFile parallel port, CA1 BSY edge detection
-ProFile:   Protocol-accurate state machine with two-phase handshake
-Display:   720x364 monochrome at $1F8000 (top of 2MB RAM)
-Boot ROM:  Identity MMU, TRAP #5/#7/#8, Line-A/F skip handlers, screen clear
-```
+22. Line-F/Line-A ROM skip handlers
+23. ProFile protocol rewrite (5 critical fixes)
+24. Exception vector overrides
+25. Line-F recursion guard
+26. Unmapped RAM jump trace
 
-### Boot Sequence (how far we get)
-```
- ROM ($FE0400) -> set SP/A5/A6/SR
- Program 16 MMU identity segments + I/O + ROM + OS segments
- Exit setup mode -> JMP $400
- BRA.W to main body
- MOVE.L D0,-(SP); JSR PASCALINIT
- PASCALINIT: copy runtime data, set A5, TRAP #7 handler
- %initstdio: console init, cursor setup (FULLY WORKING)
- BSR.S mapiospace: install TRAP #8 handler
- PASCALINIT return -> JMP main body
- MOVE.L D0,-(SP); JSR INITSYS
- INITSYS: INTSOFF, GETLDMAP, REG_TO_MAPPED
- INIT_PE, POOL_INIT (confirmed)
- Screen cleared, cursor box drawn
- Waiting at $D0A6A (I/O or interrupt wait)
---- not yet reached ---
- INIT_TRAPV, DB_INIT, AVAIL_INIT
- INIT_PROCESS, INIT_EM, INIT_EC
- INIT_SCTAB, INIT_MEASINFO
- BOOT_IO_INIT -> FS_INIT -> mount ProFile
- SYS_PROC_INIT -> ENTER_SCHEDULER
- Desktop drawing
-```
+### Verification
+27. Codegen verification tool (12 test patterns, all pass)
+28. Module map logging in linker
+
+## What Still Needs Fixing
+
+### 1. Illegal Instruction at $2A
+CPU executes in vector table again. Different pattern from the Line-F
+crash — now it's vector $2A (Line-A vector address). The OS handler
+at $C5E66 catches it but the loop continues. Similar root cause:
+execution reaches unmapped/incorrect code.
+
+### 2. ProFile Disk I/O
+Protocol rewritten and ready but never tested. Boot hasn't reached
+BOOT_IO_INIT yet.
+
+### 3. INTRINSIC.LIB
+Missing from disk image. INITSYS will halt with SYSTEM_ERROR(10100).
+Need to compile library sources and package into INTRINSIC.LIB.
+
+### 4. Codegen Edge Cases
+The verification tool passes 12 patterns but the boot still crashes.
+Likely remaining issues:
+- WITH statement record access
+- String operations
+- Procedure parameters as function pointers
+- Nested unit type imports in specific patterns
 
 ## Key Files
 
 ```
-src/toolchain/asm68k.c           -- 3 bug fixes: MOVEM, @-labels, branch sizes
-src/toolchain/asm68k.h           -- local_scope field for @-label scoping
-src/toolchain/linker.c           -- LINE1111_TRAP excluded from pre-install
-src/toolchain/bootrom.c          -- MMU mapping, TRAP #5/#7/#8, Line-A/F handlers
-src/toolchain/diskimage.c        -- MDDF fsversion=17 (verified correct)
-src/profile.c/h                  -- Rewritten: two-phase handshake, spare table
-src/lisa.c                       -- Line-A/F vector overrides, VIA CA1 BSY edges
-src/m68k.c                       -- Line-F recursion guard, trace infrastructure
+src/toolchain/asm68k.c              — 3 assembler fixes
+src/toolchain/pascal_codegen.c       — 21 codegen type-size fixes + expr_size()
+src/toolchain/pascal_codegen.h       — param_name/param_type in proc sigs
+src/toolchain/toolchain_bridge.c     — type pointer remapping, program skip list
+src/toolchain/test_codegen_verify.c  — 12-pattern verification tool
+src/toolchain/linker.c               — module map, LINE1111_TRAP exclusion
+src/profile.c/h                      — two-phase handshake, spare table
+src/lisa.c                           — vector overrides, VIA BSY edges
+src/m68k.c                           — Line-F guard, unmapped RAM trace
 ```
