@@ -2702,18 +2702,13 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             }
             last_a5 = cpu->a[5];
         }
-        /* Trace INITSYS entry and key functions */
-        if (cpu->pc == 0x4ABE) {
-            static int initsys_trace = 0;
-            if (initsys_trace++ < 2)
-                fprintf(stderr, ">>> INITSYS at PC=$%06X A5=$%08X SP=$%08X\n",
-                        cpu->pc, cpu->a[5], cpu->a[7]);
-        }
-        if (cpu->pc == 0xE0048) {
-            static int rtm = 0;
-            if (rtm++ < 2)
-                fprintf(stderr, ">>> REG_TO_MAPPED at PC=$%06X A5=$%08X A6=$%08X SP=$%08X\n",
-                        cpu->pc, cpu->a[5], cpu->a[6], cpu->a[7]);
+        /* Detect when execution enters $4000-$5000 range (INITSYS and main body) */
+        if (cpu->pc >= 0x4000 && cpu->pc < 0x5000) {
+            static int low_trace = 0;
+            if (low_trace++ < 5) {
+                fprintf(stderr, ">>> LOW CODE: PC=$%06X op=$%04X A5=$%08X SP=$%08X\n",
+                        cpu->pc, cpu_read16(cpu, cpu->pc), cpu->a[5], cpu->a[7]);
+            }
         }
         /* Track A5 corruption */
         {

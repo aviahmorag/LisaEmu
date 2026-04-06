@@ -529,7 +529,7 @@ void lisa_reset(lisa_t *lisa) {
 
         /* Dump PASCALINIT code (first 80 bytes) */
         fprintf(stderr, "PASCALINIT @$DFD38:\n");
-        for (int di = 0; di < 80; di += 2) {
+        for (int di = 0; di < 40; di += 2) {
             uint32_t a = 0xDFD38 + di;
             fprintf(stderr, " $%04X", (lisa->mem.ram[a]<<8)|lisa->mem.ram[a+1]);
             if ((di % 20) == 18) fprintf(stderr, "\n");
@@ -1000,11 +1000,10 @@ int lisa_run_frame(lisa_t *lisa) {
             /* Main body is at $400 + body_offset. BRA.W at $400 jumps there. */
             uint16_t bra_disp = (lisa->mem.ram[0x402] << 8) | lisa->mem.ram[0x403];
             uint32_t body = 0x402 + (int16_t)bra_disp;
-            fprintf(stderr, "Main body at $%06X:\n", body);
-            for (uint32_t a = body; a < body + 30; a += 2) {
-                uint16_t w = (lisa->mem.ram[a] << 8) | lisa->mem.ram[a+1];
-                fprintf(stderr, "  $%06X: $%04X\n", a, w);
-            }
+            fprintf(stderr, "Main body at $%06X:", body);
+            for (uint32_t a = body; a < body + 24; a += 2)
+                fprintf(stderr, " %02X%02X", lisa->mem.ram[a], lisa->mem.ram[a+1]);
+            fprintf(stderr, "\n");
         }
         if (frame_count == 120) {
             fprintf(stderr, "  A5=$%08X A6=$%08X SP=$%08X\n",
