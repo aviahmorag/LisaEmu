@@ -67,21 +67,49 @@ static void asm_error(asm68k_t *as, const char *fmt, ...) {
  * find_symbol lookups. */
 #define ASM_SYM_SIGCHARS 8
 
+/* @-labels (local labels like @1, @3) are scoped between major labels.
+ * We mangle them to include the scope counter, e.g. "@3" becomes "@3__42".
+ * This makes each @-label unique within its scope. */
+static void mangle_local_label(const char *name, int scope, char *out, int out_size) {
+    if (name[0] == '@') {
+        snprintf(out, out_size, "%s__%d", name, scope);
+    } else {
+        strncpy(out, name, out_size - 1);
+        out[out_size - 1] = '\0';
+    }
+}
+
 static int find_symbol(asm68k_t *as, const char *name) {
+    /* Mangle @-labels with scope */
+    char mangled[ASM_MAX_LABEL + 16];
+    mangle_local_label(name, as->local_scope, mangled, sizeof(mangled));
+    const char *lookup = mangled;
+
+    /* @-labels use full name match (mangled names are longer than 8 chars) */
+    int sigchars = (name[0] == '@') ? (int)strlen(lookup) : ASM_SYM_SIGCHARS;
+
     for (int i = 0; i < as->num_symbols; i++) {
-        if (strncasecmp(as->symbols[i].name, name, ASM_SYM_SIGCHARS) == 0)
+        if (strncasecmp(as->symbols[i].name, lookup, sigchars) == 0 &&
+            (name[0] != '@' || strlen(as->symbols[i].name) == strlen(lookup)))
             return i;
     }
     return -1;
 }
 
 static int add_symbol(asm68k_t *as, const char *name, sym_type_t type, int32_t value) {
-    int idx = find_symbol(as, name);
+    /* Mangle @-labels with scope */
+    char mangled[ASM_MAX_LABEL + 16];
+    mangle_local_label(name, as->local_scope, mangled, sizeof(mangled));
+    const char *effective_name = mangled;
+
+    int idx = find_symbol(as, name);  /* find_symbol already mangles */
     if (idx >= 0) {
         /* Update existing symbol */
         if (as->pass == 1 && as->symbols[idx].defined && type == SYM_LABEL) {
-            asm_error(as, "symbol '%s' already defined", name);
-            return idx;
+            /* @-labels with same name in same scope on same pass is a real duplicate */
+            if (name[0] != '@')
+                asm_error(as, "symbol '%s' already defined", name);
+            /* For @-labels, just update (they're now scope-mangled so real dupes are rare) */
         }
         as->symbols[idx].value = value;
         as->symbols[idx].defined = true;
@@ -103,7 +131,7 @@ static int add_symbol(asm68k_t *as, const char *name, sym_type_t type, int32_t v
     }
 
     idx = as->num_symbols++;
-    strncpy(as->symbols[idx].name, name, ASM_MAX_LABEL - 1);
+    strncpy(as->symbols[idx].name, effective_name, ASM_MAX_LABEL - 1);
     /* Note: symbol names are stored in full for linker export.
      * The 8-char significant comparison happens in find_symbol(). */
     as->symbols[idx].type = type;
@@ -477,6 +505,15 @@ static bool parse_operand(asm68k_t *as, const char *str, operand_t *op) {
         return true;
     }
 
+    /* Register list (for MOVEM) — must check BEFORE single register,
+     * otherwise "D0-D7/A0-A6" matches as data register D0 (since '-'
+     * terminates the register name check in parse_data_reg). */
+    if (strchr(buf, '/') || (strchr(buf, '-') && (buf[0] == 'D' || buf[0] == 'd' || buf[0] == 'A' || buf[0] == 'a'))) {
+        op->type = OP_REG_LIST;
+        op->regmask = parse_reglist(buf);
+        return true;
+    }
+
     /* Data register: Dn */
     int r = parse_data_reg(buf);
     if (r >= 0) { op->type = OP_DATA_REG; op->reg = r; return true; }
@@ -621,13 +658,6 @@ static bool parse_operand(asm68k_t *as, const char *str, operand_t *op) {
             op->disp = disp;
             return true;
         }
-    }
-
-    /* Register list (for MOVEM) - check if it contains / or - with register names */
-    if (strchr(buf, '/') || (strchr(buf, '-') && (buf[0] == 'D' || buf[0] == 'd' || buf[0] == 'A' || buf[0] == 'a'))) {
-        op->type = OP_REG_LIST;
-        op->regmask = parse_reglist(buf);
-        return true;
     }
 
     /* Absolute address or forward reference */
@@ -1412,6 +1442,7 @@ static bool handle_directive(asm68k_t *as, const char *directive, const char *ar
         if (comma) *comma = '\0';
         str_trim(name);
         if (name[0]) {
+            as->local_scope++;  /* New scope for @-labels */
             add_symbol(as, name, SYM_PROC, as->pc);
         }
         return true;
@@ -1425,6 +1456,7 @@ static bool handle_directive(asm68k_t *as, const char *directive, const char *ar
         if (comma) *comma = '\0';
         str_trim(name);
         if (name[0]) {
+            as->local_scope++;  /* New scope for @-labels */
             add_symbol(as, name, SYM_FUNC, as->pc);
         }
         return true;
@@ -1955,6 +1987,10 @@ static void assemble_line(asm68k_t *as, const char *raw_line) {
 
         /* Define label at current PC */
         if (label[0]) {
+            /* Non-@ labels start a new local scope for @-labels */
+            if (label[0] != '@') {
+                as->local_scope++;
+            }
             add_symbol(as, label, SYM_LABEL, as->pc);
         }
     }
@@ -2178,10 +2214,12 @@ bool asm68k_assemble_string(asm68k_t *as, const char *source, const char *filena
 
     /* Pass 1: collect symbols and sizes */
     as->pass = 1;
+    as->local_scope = 0;
     assemble_pass(as, source);
 
     /* Pass 2: generate code */
     as->pass = 2;
+    as->local_scope = 0;
     as->num_errors = 0;
     assemble_pass(as, source);
 

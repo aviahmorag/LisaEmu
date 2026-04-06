@@ -125,6 +125,7 @@ typedef struct {
     uint32_t pc;        /* Current program counter */
     int line_num;
     char current_file[256];
+    int local_scope;    /* Scope counter for @-labels (increments at each major label) */
 
     /* Include path for .INCLUDE resolution */
     char include_paths[ASM_MAX_INCLUDES][256];

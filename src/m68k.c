@@ -452,6 +452,7 @@ static uint32_t read_ea_mode(m68k_t *cpu, int mode, int reg, int size) {
  * ======================================================================== */
 
 static int exception_count = 0;
+static uint32_t pascalinit_addr = 0;
 
 static int exception_histogram[256] = {0};
 
@@ -2661,8 +2662,10 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             static const struct { uint32_t addr; const char *name; } trace_funcs[] = {
                 {0x4D88, "AFTER_PASCALINIT"}, {0x4BFE, "INITSYS"},
                 {0xDB580, "INTSOFF"}, {0xCB478, "POOL_INIT"},
-                {0xE010A, "REG_TO_MAPPED"}, {0xCB478, "POOL_INIT"},
-                {0xD981C, "INIT_TRAPV"}, {0, NULL}
+                {0xE010A, "REG_TO_MAPPED"},
+                {0xD9736, "INIT_TRAPV"},
+                {0xDB892, "INIT_NMI_TRAPV"},
+                {0, NULL}
             };
             for (int ti = 0; trace_funcs[ti].name; ti++) {
                 if (cpu->pc == trace_funcs[ti].addr) {
@@ -2704,7 +2707,6 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         }
         /* Trace PASCALINIT internals: monitor the $DFC00-$DFD00 range */
         {
-            static uint32_t pascalinit_addr = 0;
             static int pi_trace = 0;
             /* Detect PASCALINIT entry dynamically from the main body JSR */
             if (cpu->pc >= 0x4000 && cpu->pc < 0x5000 && pascalinit_addr == 0) {
@@ -2730,6 +2732,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 }
             }
         }
+        /* %initstdio: fixed — MOVEM register list parsing + @-label scoping */
         /* Detect when PC returns to $4000-$5000 (INITSYS/main body) after PASCALINIT */
         {
             static int pi_state = 0;  /* 0=before, 1=in PASCALINIT, 2=left */
@@ -2781,7 +2784,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             prev_a5 = cpu->a[5];
         }
         /* Detect SYSTEM_ERROR calls */
-        if (cpu->pc == 0xD8F1E) {
+        if (cpu->pc == 0xD8F00) {
             static int syserr_count = 0;
             if (syserr_count++ < 5) {
                 /* Error number is on the stack as parameter */

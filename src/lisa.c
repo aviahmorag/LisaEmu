@@ -588,32 +588,8 @@ void lisa_reset(lisa_t *lisa) {
             }
         }
 
-        /* TEMPORARY: Patch %initstdio to be a no-op (just return).
-         * %initstdio has issues with TRAP #5/SETCUR during early boot.
-         * By making it a NOP, PASCALINIT can return and INITSYS can run. */
-        {
-            /* Find %initstdio by reading the JSR target from PASCALINIT */
-            /* PASCALINIT's JSR to %initstdio is at PI+$36 (6-byte JSR abs.L) */
-            uint16_t bra_disp = (lisa->mem.ram[0x402] << 8) | lisa->mem.ram[0x403];
-            uint32_t body = 0x402 + (int16_t)bra_disp;
-            /* Main body: $2F00 $4EB9 XXXX → PASCALINIT addr at body+4 */
-            uint32_t pi_addr = ((uint32_t)lisa->mem.ram[body+4] << 24) |
-                               ((uint32_t)lisa->mem.ram[body+5] << 16) |
-                               ((uint32_t)lisa->mem.ram[body+6] << 8) |
-                               (uint32_t)lisa->mem.ram[body+7];
-            /* %initstdio JSR is at PI+$36: $4EB9 XXXX */
-            uint32_t initstdio_jsr = pi_addr + 0x36;
-            uint32_t initstdio_addr = ((uint32_t)lisa->mem.ram[initstdio_jsr+2] << 24) |
-                                      ((uint32_t)lisa->mem.ram[initstdio_jsr+3] << 16) |
-                                      ((uint32_t)lisa->mem.ram[initstdio_jsr+4] << 8) |
-                                      (uint32_t)lisa->mem.ram[initstdio_jsr+5];
-            if (initstdio_addr > 0x400 && initstdio_addr < 0x100000) {
-                /* Patch %initstdio: replace first instruction with RTS */
-                lisa->mem.ram[initstdio_addr]   = 0x4E;  /* RTS */
-                lisa->mem.ram[initstdio_addr+1] = 0x75;
-                fprintf(stderr, "PATCHED %%initstdio at $%06X to RTS\n", initstdio_addr);
-            }
-        }
+        /* %initstdio: no bypass — properly fixed via MOVEM register list
+         * parsing and @-label local scoping in the assembler. */
 
         /* Boot device and low-memory parameters */
         lisa->mem.ram[0x1B3] = 2;      /* adr_bootdev: 2 = parallel ProFile */
