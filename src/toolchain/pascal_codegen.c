@@ -443,9 +443,51 @@ static void gen_lvalue_addr(codegen_t *cg, ast_node_t *node) {
         }
     } else if (node->type == AST_FIELD_ACCESS) {
         gen_lvalue_addr(cg, node->children[0]); /* record addr in A0 */
-        /* ADDA.W #offset,A0 — field offset placeholder */
-        emit16(cg, 0xD0FC);
-        emit16(cg, 0);  /* field offset - would need type info */
+        /* Look up the field offset from the record type */
+        int field_off = 0;
+        if (node->children[0]->type == AST_IDENT_EXPR) {
+            cg_symbol_t *rec_sym = find_symbol_any(cg, node->children[0]->name);
+            if (rec_sym && rec_sym->type && rec_sym->type->kind == TK_RECORD) {
+                for (int fi = 0; fi < rec_sym->type->num_fields; fi++) {
+                    if (str_eq_nocase(rec_sym->type->fields[fi].name, node->name)) {
+                        field_off = rec_sym->type->fields[fi].offset;
+                        break;
+                    }
+                }
+            } else if (rec_sym && rec_sym->type && rec_sym->type->kind == TK_POINTER &&
+                       rec_sym->type->base_type && rec_sym->type->base_type->kind == TK_RECORD) {
+                /* Pointer to record — look up field in the pointed-to record */
+                type_desc_t *rt = rec_sym->type->base_type;
+                for (int fi = 0; fi < rt->num_fields; fi++) {
+                    if (str_eq_nocase(rt->fields[fi].name, node->name)) {
+                        field_off = rt->fields[fi].offset;
+                        break;
+                    }
+                }
+            }
+        } else if (node->children[0]->type == AST_DEREF) {
+            /* p^.field — the deref child has the pointer variable */
+            ast_node_t *ptr_node = node->children[0]->children[0];
+            if (ptr_node && ptr_node->type == AST_IDENT_EXPR) {
+                cg_symbol_t *ptr_sym = find_symbol_any(cg, ptr_node->name);
+                if (ptr_sym && ptr_sym->type && ptr_sym->type->kind == TK_POINTER &&
+                    ptr_sym->type->base_type && ptr_sym->type->base_type->kind == TK_RECORD) {
+                    type_desc_t *rt = ptr_sym->type->base_type;
+                    for (int fi = 0; fi < rt->num_fields; fi++) {
+                        if (str_eq_nocase(rt->fields[fi].name, node->name)) {
+                            field_off = rt->fields[fi].offset;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        /* ADDA.W #offset,A0 */
+        if (field_off != 0) {
+            emit16(cg, 0xD0FC);  /* ADDA.W #imm,A0 */
+            emit16(cg, (uint16_t)(int16_t)field_off);
+        }
+        /* If offset is 0, no ADDA needed */
     } else if (node->type == AST_DEREF) {
         gen_expression(cg, node->children[0]); /* pointer value in D0 */
         emit16(cg, 0x2040);  /* MOVEA.L D0,A0 */

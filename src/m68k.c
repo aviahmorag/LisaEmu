@@ -2824,12 +2824,17 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             }
             prev_a5 = cpu->a[5];
         }
-        /* Trace the wait loop at $D0A6A (CALLDRIVER polling) */
-        if ((cpu->pc & 0xFFFFFF) == 0xD0A6A) {
-            static int cd_trace = 0;
-            if (cd_trace < 5) {
-                fprintf(stderr, "WAIT@$D0A6A #%d: D0=$%08X D4=$%08X D5=$%08X SR=$%04X\n",
-                        ++cd_trace, cpu->d[0], cpu->d[4], cpu->d[5], cpu->sr);
+        /* Trace wait loops */
+        if ((cpu->pc & 0xFFFFFF) == 0xCB012) {
+            static int wait_trace = 0;
+            if (wait_trace < 3) {
+                fprintf(stderr, "WAIT@$CB012 #%d: D0=$%08X D7=$%08X SR=$%04X A0=$%08X A4=$%08X\n",
+                        ++wait_trace, cpu->d[0], cpu->d[7], cpu->sr, cpu->a[0], cpu->a[4]);
+                /* Dump code context */
+                fprintf(stderr, "  Code:");
+                for (int i = -8; i < 24; i += 2)
+                    fprintf(stderr, " %04X", cpu_read16(cpu, 0xCB012 + i));
+                fprintf(stderr, "\n");
             }
         }
         /* Detect SYSTEM_ERROR calls */
