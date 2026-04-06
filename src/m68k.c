@@ -2702,12 +2702,31 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             }
             last_a5 = cpu->a[5];
         }
-        /* Detect when execution enters $4000-$5000 range (INITSYS and main body) */
-        if (cpu->pc >= 0x4000 && cpu->pc < 0x5000) {
-            static int low_trace = 0;
-            if (low_trace++ < 5) {
-                fprintf(stderr, ">>> LOW CODE: PC=$%06X op=$%04X A5=$%08X SP=$%08X\n",
-                        cpu->pc, cpu_read16(cpu, cpu->pc), cpu->a[5], cpu->a[7]);
+        /* Trace PASCALINIT internals: monitor the $DFC00-$DFD00 range */
+        {
+            static uint32_t pascalinit_addr = 0;
+            static int pi_trace = 0;
+            /* Detect PASCALINIT entry dynamically from the main body JSR */
+            if (cpu->pc >= 0x4000 && cpu->pc < 0x5000 && pascalinit_addr == 0) {
+                /* Read the JSR target from the main body */
+                uint16_t op = cpu_read16(cpu, cpu->pc);
+                if (op == 0x4EB9) {
+                    pascalinit_addr = cpu_read32(cpu, cpu->pc + 2);
+                    fprintf(stderr, ">>> PASCALINIT detected at $%06X\n", pascalinit_addr);
+                }
+            }
+            /* Once we know PASCALINIT's address, trace key points */
+            if (pascalinit_addr > 0 && pi_trace < 20) {
+                /* Trace when PC is within PASCALINIT's code (assume ~100 bytes) */
+                if (cpu->pc >= pascalinit_addr && cpu->pc < pascalinit_addr + 120) {
+                    uint32_t offset = cpu->pc - pascalinit_addr;
+                    /* Only trace at key offsets: entry, after copy loop, after JSR, return */
+                    if (offset <= 0x50 && (offset % 2) == 0) { /* trace every instruction */
+                        fprintf(stderr, ">>> PI+$%02X: PC=$%06X op=$%04X A5=$%08X SP=$%08X\n",
+                                offset, cpu->pc, cpu_read16(cpu, cpu->pc), cpu->a[5], cpu->a[7]);
+                        pi_trace++;
+                    }
+                }
             }
         }
         /* Track A5 corruption */

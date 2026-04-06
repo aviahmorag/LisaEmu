@@ -634,23 +634,46 @@ static bool parse_operand(asm68k_t *as, const char *str, operand_t *op) {
     op->type = OP_ABS_LONG;
     op->disp = eval_expr(as, buf);
 
-    /* Check if this references a symbol */
+    /* Check if this references a symbol or uses * (current PC) */
     {
         char sym_name[ASM_MAX_LABEL];
         strncpy(sym_name, buf, ASM_MAX_LABEL - 1);
         sym_name[ASM_MAX_LABEL - 1] = '\0';
         str_trim(sym_name);
+
+        /* Check for * (current PC) in the expression — needs $SELF relocation */
+        bool has_star = false;
+        for (const char *c = buf; *c; c++) {
+            if (*c == '*' && (c == buf || !isalnum((unsigned char)c[-1]))) {
+                has_star = true;
+                break;
+            }
+        }
+
         int si = find_symbol(as, sym_name);
         if (si >= 0 && as->symbols[si].external) {
             /* External (.REF) symbol — need linker relocation */
             op->ref_sym_idx = si;
         } else if (si >= 0 && as->symbols[si].defined && !as->symbols[si].external &&
                    as->symbols[si].type == SYM_LABEL) {
-            /* Local CODE label — mark for base-address fixup.
-             * The code will contain the section-relative offset.
-             * The linker adds the module base address via a special
-             * "self-relocation" that doesn't need a global symbol lookup. */
+            /* Local CODE label — needs $SELF relocation */
             op->ref_sym_idx = si;
+        } else if (has_star) {
+            /* Expression uses * (current PC) — best as PC-relative.
+             * *+N is inherently relative to the current instruction.
+             * Using PC-relative encoding (4 bytes) matches what the
+             * original Lisa assembler produces, and makes *+6 return
+             * addresses correct for lea/pea instructions. */
+            int32_t pc_at_ext = as->pc + 2;  /* extension word follows opcode */
+            int32_t d16 = op->disp - pc_at_ext;
+            if (d16 >= -32768 && d16 <= 32767) {
+                op->type = OP_DISP_PC;
+                op->disp = d16;
+                op->ref_sym_idx = -1;  /* No relocation needed */
+            } else {
+                /* Out of range — use $SELF relocation as fallback */
+                op->ref_sym_idx = -2;
+            }
         }
     }
 
@@ -696,8 +719,17 @@ static void emit_ea_extension(asm68k_t *as, operand_t *op, int size) {
             emit16(as, (uint16_t)(int16_t)op->disp);
             break;
         case OP_ABS_LONG:
-            if (op->ref_sym_idx >= 0 && as->pass == 2) {
-                if (as->symbols[op->ref_sym_idx].external) {
+            if ((op->ref_sym_idx >= 0 || op->ref_sym_idx == -2) && as->pass == 2) {
+                if (op->ref_sym_idx == -2) {
+                    /* PC-relative expression (*+N) — $SELF relocation */
+                    if (as->num_relocs < ASM_MAX_RELOCS) {
+                        asm_reloc_t *r = &as->relocs[as->num_relocs++];
+                        r->offset = as->sections[as->current_section].size;
+                        r->symbol_idx = -2;
+                        r->size = 4;
+                        r->pc_relative = false;
+                    }
+                } else if (as->symbols[op->ref_sym_idx].external) {
                     /* External (.REF) — standard linker relocation */
                     if (as->num_relocs < ASM_MAX_RELOCS) {
                         asm_reloc_t *r = &as->relocs[as->num_relocs++];
