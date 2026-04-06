@@ -395,6 +395,101 @@ static cg_symbol_t *add_global_sym(codegen_t *cg, const char *name, type_desc_t 
 static void gen_expression(codegen_t *cg, ast_node_t *node);
 static void gen_statement(codegen_t *cg, ast_node_t *node);
 
+/* Determine the byte size of an expression's result type.
+ * Returns 1 (byte), 2 (word), or 4 (long). Used for size-aware MOVE,
+ * arithmetic, and parameter passing throughout the codegen. */
+static int expr_size(codegen_t *cg, ast_node_t *node) {
+    if (!node) return 2;
+    switch (node->type) {
+        case AST_INT_LITERAL:
+            return (node->int_val < -32768 || node->int_val > 32767) ? 4 : 2;
+        case AST_STRING_LITERAL:
+            return 4; /* pointer to string */
+        case AST_ADDR_OF:
+            return 4; /* pointer */
+        case AST_IDENT_EXPR: {
+            cg_symbol_t *sym = find_symbol_any(cg, node->name);
+            if (sym && sym->type) return sym->type->size > 0 ? sym->type->size : 2;
+            if (sym && sym->is_const) return 2;
+            /* Check built-in identifiers */
+            if (str_eq_nocase(node->name, "nil")) return 4;
+            if (str_eq_nocase(node->name, "true") || str_eq_nocase(node->name, "false")) return 2;
+            return 2;
+        }
+        case AST_FIELD_ACCESS: {
+            /* Look up the field type in the record */
+            if (node->children[0] && node->children[0]->type == AST_IDENT_EXPR) {
+                cg_symbol_t *rec = find_symbol_any(cg, node->children[0]->name);
+                if (rec && rec->type) {
+                    type_desc_t *rt = rec->type;
+                    if (rt->kind == TK_POINTER && rt->base_type) rt = rt->base_type;
+                    if (rt->kind == TK_RECORD) {
+                        for (int i = 0; i < rt->num_fields; i++) {
+                            if (str_eq_nocase(rt->fields[i].name, node->name)) {
+                                if (rt->fields[i].type)
+                                    return rt->fields[i].type->size > 0 ? rt->fields[i].type->size : 2;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            return 2;
+        }
+        case AST_ARRAY_ACCESS: {
+            if (node->children[0] && node->children[0]->type == AST_IDENT_EXPR) {
+                cg_symbol_t *arr = find_symbol_any(cg, node->children[0]->name);
+                if (arr && arr->type && arr->type->kind == TK_ARRAY && arr->type->element_type)
+                    return arr->type->element_type->size > 0 ? arr->type->element_type->size : 2;
+            }
+            return 2;
+        }
+        case AST_DEREF: {
+            if (node->children[0] && node->children[0]->type == AST_IDENT_EXPR) {
+                cg_symbol_t *ptr = find_symbol_any(cg, node->children[0]->name);
+                if (ptr && ptr->type && ptr->type->kind == TK_POINTER && ptr->type->base_type)
+                    return ptr->type->base_type->size > 0 ? ptr->type->base_type->size : 2;
+            }
+            return 2;
+        }
+        case AST_FUNC_CALL:
+            return 2; /* Default to word; full return type tracking is future work */
+        case AST_BINARY_OP:
+        case AST_UNARY_OP: {
+            /* Propagate from operands */
+            int s = 2;
+            for (int i = 0; i < node->num_children; i++) {
+                int cs = expr_size(cg, node->children[i]);
+                if (cs > s) s = cs;
+            }
+            return s;
+        }
+        default:
+            return 2;
+    }
+}
+
+/* Emit size-appropriate MOVE (A0),D0 — reads value from address in A0 */
+static void emit_read_a0_to_d0(codegen_t *cg, int sz) {
+    if (sz == 4)      emit16(cg, 0x2010);  /* MOVE.L (A0),D0 */
+    else if (sz == 1) emit16(cg, 0x1010);  /* MOVE.B (A0),D0 */
+    else              emit16(cg, 0x3010);  /* MOVE.W (A0),D0 */
+}
+
+/* Emit size-appropriate MOVE D0,(A0) — stores value from D0 to address in A0 */
+static void emit_write_d0_to_a0(codegen_t *cg, int sz) {
+    if (sz == 4)      emit16(cg, 0x2080);  /* MOVE.L D0,(A0) */
+    else if (sz == 1) emit16(cg, 0x1080);  /* MOVE.B D0,(A0) */
+    else              emit16(cg, 0x3080);  /* MOVE.W D0,(A0) */
+}
+
+/* Emit size-appropriate MOVE D1,(A0) */
+static void emit_write_d1_to_a0(codegen_t *cg, int sz) {
+    if (sz == 4)      emit16(cg, 0x2081);  /* MOVE.L D1,(A0) */
+    else if (sz == 1) emit16(cg, 0x1081);  /* MOVE.B D1,(A0) */
+    else              emit16(cg, 0x3081);  /* MOVE.W D1,(A0) */
+}
+
 /* Load a variable's address into A0 */
 static void gen_lvalue_addr(codegen_t *cg, ast_node_t *node) {
     if (node->type == AST_IDENT_EXPR) {
@@ -612,7 +707,8 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                         emit16(cg, 0x206E);  /* MOVEA.L offset(A6),A0 */
                     }
                     emit16(cg, (uint16_t)(int16_t)sym->offset);
-                    emit16(cg, 0x3010);  /* MOVE.W (A0),D0 */
+                    /* Size-aware dereference of VAR parameter */
+                    emit_read_a0_to_d0(cg, sym->type ? sym->type->size : 2);
                 } else if (sym->is_param || !sym->is_global) {
                     /* Local/param: size-aware load from stack frame.
                      * For outer-scope variables, follow frame chain first. */
@@ -665,27 +761,33 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
         case AST_UNARY_OP:
             gen_expression(cg, node->children[0]);
             if (node->op == TOK_MINUS) {
-                emit16(cg, 0x4440);  /* NEG.W D0 */
+                int sz = expr_size(cg, node->children[0]);
+                emit16(cg, (sz == 4) ? 0x4480 : 0x4440);  /* NEG.L/W D0 */
             } else if (node->op == TOK_NOT) {
-                emit16(cg, 0x4640);  /* NOT.W D0 */
+                int sz = expr_size(cg, node->children[0]);
+                emit16(cg, (sz == 4) ? 0x4680 : 0x4640);  /* NOT.L/W D0 */
             }
             break;
 
         case AST_BINARY_OP: {
+            /* Determine if 32-bit operation needed */
+            int opsz = expr_size(cg, node);
+            bool use_long = (opsz == 4);
+
             gen_expression(cg, node->children[0]);
             /* Save left in D2 */
-            emit16(cg, 0x3400);  /* MOVE.W D0,D2 */
+            emit16(cg, use_long ? 0x2400 : 0x3400);  /* MOVE.L/W D0,D2 */
             gen_expression(cg, node->children[1]);
             /* D2 = left, D0 = right */
-            emit16(cg, 0x3200);  /* MOVE.W D0,D1 (right in D1) */
-            emit16(cg, 0x3002);  /* MOVE.W D2,D0 (left in D0) */
+            emit16(cg, use_long ? 0x2200 : 0x3200);  /* MOVE.L/W D0,D1 */
+            emit16(cg, use_long ? 0x2002 : 0x3002);  /* MOVE.L/W D2,D0 */
 
             switch (node->op) {
                 case TOK_PLUS:
-                    emit16(cg, 0xD041);  /* ADD.W D1,D0 */
+                    emit16(cg, use_long ? 0xD081 : 0xD041);  /* ADD.L/W D1,D0 */
                     break;
                 case TOK_MINUS:
-                    emit16(cg, 0x9041);  /* SUB.W D1,D0 */
+                    emit16(cg, use_long ? 0x9081 : 0x9041);  /* SUB.L/W D1,D0 */
                     break;
                 case TOK_STAR:
                     emit16(cg, 0xC1C1);  /* MULS D1,D0 */
@@ -701,23 +803,19 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                     emit16(cg, 0x4840);  /* SWAP D0 (remainder in low word) */
                     break;
                 case TOK_AND:
-                    emit16(cg, 0xC041);  /* AND.W D1,D0 */
+                    emit16(cg, use_long ? 0xC081 : 0xC041);
                     break;
                 case TOK_OR:
-                    emit16(cg, 0x8041);  /* OR.W D1,D0 */
+                    emit16(cg, use_long ? 0x8081 : 0x8041);
                     break;
                 case TOK_XOR:
-                    emit16(cg, 0xB341);  /* EOR.W D1,D1... actually EOR.W D0,D1 then move */
-                    /* EOR.W D1,D0 */
-                    emit16(cg, 0xB340);
+                    emit16(cg, use_long ? 0xB380 : 0xB340);  /* EOR.L/W D1,D0 */
                     break;
                 case TOK_SHL:
-                    /* ASL.W D1,D0 — shift D0 left by D1 */
-                    emit16(cg, 0xE360);
+                    emit16(cg, use_long ? 0xE3A0 : 0xE360);  /* ASL.L/W D1,D0 */
                     break;
                 case TOK_SHR:
-                    /* LSR.W D1,D0 — shift D0 right by D1 */
-                    emit16(cg, 0xE268);
+                    emit16(cg, use_long ? 0xE2A8 : 0xE268);  /* LSR.L/W D1,D0 */
                     break;
                 case TOK_IN:
                     /* Set membership: D0 IN D1 (simplified — just emit BTST) */
@@ -727,43 +825,21 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                     emit16(cg, 0x0240); emit16(cg, 0x0001); /* ANDI.W #1,D0 */
                     break;
 
-                /* Comparisons: CMP and set condition */
-                case TOK_EQ:
-                    emit16(cg, 0xB041);  /* CMP.W D1,D0 */
-                    emit16(cg, 0x57C0);  /* SEQ D0 */
-                    emit16(cg, 0x4400);  /* NEG.B D0 (0 or 1) */
-                    emit16(cg, 0x0240); emit16(cg, 0x0001); /* ANDI.W #1,D0 */
-                    break;
-                case TOK_NE:
-                    emit16(cg, 0xB041);
-                    emit16(cg, 0x56C0);  /* SNE D0 */
-                    emit16(cg, 0x4400);
-                    emit16(cg, 0x0240); emit16(cg, 0x0001);
-                    break;
-                case TOK_LT:
-                    emit16(cg, 0xB041);
-                    emit16(cg, 0x5DC0);  /* SLT D0 */
-                    emit16(cg, 0x4400);
-                    emit16(cg, 0x0240); emit16(cg, 0x0001);
-                    break;
-                case TOK_LE:
-                    emit16(cg, 0xB041);
-                    emit16(cg, 0x5FC0);  /* SLE D0 */
-                    emit16(cg, 0x4400);
-                    emit16(cg, 0x0240); emit16(cg, 0x0001);
-                    break;
-                case TOK_GT:
-                    emit16(cg, 0xB041);
-                    emit16(cg, 0x5EC0);  /* SGT D0 */
-                    emit16(cg, 0x4400);
-                    emit16(cg, 0x0240); emit16(cg, 0x0001);
-                    break;
-                case TOK_GE:
-                    emit16(cg, 0xB041);
-                    emit16(cg, 0x5CC0);  /* SGE D0 */
-                    emit16(cg, 0x4400);
-                    emit16(cg, 0x0240); emit16(cg, 0x0001);
-                    break;
+                /* Comparisons: CMP.W/L and set condition */
+                #define EMIT_CMP_SCC(scc) \
+                    emit16(cg, use_long ? 0xB081 : 0xB041); \
+                    emit16(cg, scc); \
+                    emit16(cg, 0x4400); \
+                    emit16(cg, 0x0240); emit16(cg, 0x0001)
+
+                case TOK_EQ: EMIT_CMP_SCC(0x57C0); break;  /* SEQ */
+                case TOK_NE: EMIT_CMP_SCC(0x56C0); break;  /* SNE */
+                case TOK_LT: EMIT_CMP_SCC(0x5DC0); break;  /* SLT */
+                case TOK_LE: EMIT_CMP_SCC(0x5FC0); break;  /* SLE */
+                case TOK_GT: EMIT_CMP_SCC(0x5EC0); break;  /* SGT */
+                case TOK_GE: EMIT_CMP_SCC(0x5CC0); break;  /* SGE */
+
+                #undef EMIT_CMP_SCC
 
                 default:
                     cg_error(cg, node->line, "unsupported operator in expression");
@@ -1137,18 +1213,18 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
 
         case AST_ARRAY_ACCESS:
             gen_lvalue_addr(cg, node);
-            emit16(cg, 0x3010);  /* MOVE.W (A0),D0 */
+            emit_read_a0_to_d0(cg, expr_size(cg, node));
             break;
 
         case AST_FIELD_ACCESS:
             gen_lvalue_addr(cg, node);
-            emit16(cg, 0x3010);  /* MOVE.W (A0),D0 */
+            emit_read_a0_to_d0(cg, expr_size(cg, node));
             break;
 
         case AST_DEREF:
             gen_expression(cg, node->children[0]);
             emit16(cg, 0x2040);  /* MOVEA.L D0,A0 */
-            emit16(cg, 0x3010);  /* MOVE.W (A0),D0 */
+            emit_read_a0_to_d0(cg, expr_size(cg, node));
             break;
 
         case AST_ADDR_OF:
@@ -1194,17 +1270,18 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
             cg_symbol_t *sym = find_symbol_any(cg, lhs->name);
             if (sym) {
                 if (sym->is_param && sym->is_var_param) {
+                    int sz = sym->type ? sym->type->size : 2;
                     int depth = find_local_depth(cg, lhs->name);
                     if (depth > 0) {
                         emit16(cg, 0x2200);  /* MOVE.L D0,D1 — save value */
                         emit_frame_access(cg, depth);  /* parent FP → A0 */
                         emit16(cg, 0x2068);  /* MOVEA.L offset(A0),A0 */
                         emit16(cg, (uint16_t)(int16_t)sym->offset);
-                        emit16(cg, 0x3081);  /* MOVE.W D1,(A0) */
+                        emit_write_d1_to_a0(cg, sz);
                     } else {
                         emit16(cg, 0x206E);  /* MOVEA.L offset(A6),A0 */
                         emit16(cg, (uint16_t)(int16_t)sym->offset);
-                        emit16(cg, 0x3080);  /* MOVE.W D0,(A0) */
+                        emit_write_d0_to_a0(cg, sz);
                     }
                 } else if (sym->is_param || !sym->is_global) {
                     int depth = find_local_depth(cg, lhs->name);
@@ -1230,11 +1307,18 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                     emit16(cg, (uint16_t)(int16_t)sym->offset);
                 }
             } else if (lhs->type == AST_ARRAY_ACCESS || lhs->type == AST_FIELD_ACCESS || lhs->type == AST_DEREF) {
-                /* Complex LHS */
-                emit16(cg, 0x3F00);  /* MOVE.W D0,-(SP) save RHS */
-                gen_lvalue_addr(cg, lhs);
-                emit16(cg, 0x301F);  /* MOVE.W (SP)+,D0 restore RHS */
-                emit16(cg, 0x3080);  /* MOVE.W D0,(A0) */
+                /* Complex LHS: size-aware save/restore/store */
+                int sz = expr_size(cg, lhs);
+                if (sz == 4) {
+                    emit16(cg, 0x2F00);  /* MOVE.L D0,-(SP) */
+                    gen_lvalue_addr(cg, lhs);
+                    emit16(cg, 0x201F);  /* MOVE.L (SP)+,D0 */
+                } else {
+                    emit16(cg, 0x3F00);  /* MOVE.W D0,-(SP) */
+                    gen_lvalue_addr(cg, lhs);
+                    emit16(cg, 0x301F);  /* MOVE.W (SP)+,D0 */
+                }
+                emit_write_d0_to_a0(cg, sz);
             }
             break;
         }
