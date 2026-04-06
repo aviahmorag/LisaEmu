@@ -199,6 +199,13 @@ void lisa_mem_write8(lisa_mem_t *mem, uint32_t addr, uint8_t val) {
                         fprintf(stderr, ">>> SYSGLOBAL WRITE: phys=$%06X val=$%02X (addr=$%06X)\n",
                                 phys, val, addr);
                 }
+                /* Watch for writes to STARTUP code area ($400-$4FF) */
+                if (phys >= 0x4F0 && phys <= 0x4F3) {
+                    static int code_write = 0;
+                    if (code_write++ < 5)
+                        fprintf(stderr, "!!! CODE OVERWRITE: phys=$%06X val=$%02X (addr=$%06X) old=$%02X\n",
+                                phys, val, addr, mem->ram[phys]);
+                }
                 mem->ram[phys] = val;
             }
             break;

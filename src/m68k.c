@@ -1536,7 +1536,16 @@ static void op_bcc(m68k_t *cpu) {
 
     if (cond == 0) {
         /* BRA */
-        cpu->pc = base + disp;
+        uint32_t target = base + disp;
+        /* Debug: trace when BRA produces a bad target */
+        if ((target & 0xFFFFFF) >= 0x200000 && (target & 0xFFFFFF) < 0xFE0000) {
+            static int bra_bad = 0;
+            if (bra_bad++ < 3)
+                fprintf(stderr, "!!! BAD BRA: from PC=$%06X base=$%06X disp=%d($%04X) → target=$%08X op=$%04X\n",
+                        cpu->pc - (disp8 == 0 ? 4 : 2), base, disp,
+                        (uint16_t)(disp & 0xFFFF), target, op);
+        }
+        cpu->pc = target;
         cpu->cycles += 10;
     } else if (cond == 1) {
         /* BSR */
@@ -2750,6 +2759,30 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                         pi_trace++;
                     }
                 }
+            }
+        }
+        /* Trace instruction at PC=$4F0 — it jumps to $FFFF9533 somehow */
+        if ((cpu->pc & 0xFFFFFF) == 0x4F0) {
+            static int trace_4f0 = 0;
+            if (trace_4f0 < 3) {
+                uint16_t op = cpu_read16(cpu, cpu->pc);
+                fprintf(stderr, ">>> PC=$4F0 #%d: op=$%04X ir=$%04X next=$%04X SR=$%04X D0=$%08X A5=$%08X\n",
+                        ++trace_4f0, op, cpu->ir,
+                        cpu_read16(cpu, cpu->pc + 2), cpu->sr, cpu->d[0], cpu->a[5]);
+            }
+        }
+        /* Detect when PC enters non-code I/O space ($FF0000+, excluding ROM $FE0000-$FEFFFF) */
+        {
+            static int io_exec = 0;
+            uint32_t mpc = cpu->pc & 0xFFFFFF;
+            if (mpc >= 0xFF0000 && io_exec < 3) {
+                io_exec++;
+                fprintf(stderr, "!!! PC IN I/O SPACE: PC=$%06X op=$%04X SR=$%04X SP=$%08X\n",
+                        cpu->pc, cpu_read16(cpu, cpu->pc), cpu->sr, cpu->a[7]);
+                fprintf(stderr, "    Last 60 PCs:");
+                for (int ri = 60; ri > 0; ri--)
+                    fprintf(stderr, " $%06X", pc_ring[(pc_ring_idx - ri) & 255]);
+                fprintf(stderr, "\n    A6=$%08X D0=$%08X\n", cpu->a[6], cpu->d[0]);
             }
         }
         /* Detect PC entering vector table ($0-$3EF) — indicates stack corruption
