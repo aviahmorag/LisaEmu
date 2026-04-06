@@ -644,10 +644,12 @@ static bool parse_operand(asm68k_t *as, const char *str, operand_t *op) {
         if (si >= 0 && as->symbols[si].external) {
             /* External (.REF) symbol — need linker relocation */
             op->ref_sym_idx = si;
-        } else if (si >= 0 && as->symbols[si].defined && !as->symbols[si].external) {
-            /* Local defined label — generate relocation just like external.
-             * The symbol will be added to the linker's table by the bridge code,
-             * and the linker will resolve it to base_addr + label_offset. */
+        } else if (si >= 0 && as->symbols[si].defined && !as->symbols[si].external &&
+                   as->symbols[si].type == SYM_LABEL) {
+            /* Local CODE label — mark for base-address fixup.
+             * The code will contain the section-relative offset.
+             * The linker adds the module base address via a special
+             * "self-relocation" that doesn't need a global symbol lookup. */
             op->ref_sym_idx = si;
         }
     }
@@ -695,14 +697,26 @@ static void emit_ea_extension(asm68k_t *as, operand_t *op, int size) {
             break;
         case OP_ABS_LONG:
             if (op->ref_sym_idx >= 0 && as->pass == 2) {
-                /* Generate relocation — linker adds module base offset.
-                 * Works for both external (.REF) and local symbols. */
-                if (as->num_relocs < ASM_MAX_RELOCS) {
-                    asm_reloc_t *r = &as->relocs[as->num_relocs++];
-                    r->offset = as->sections[as->current_section].size;
-                    r->symbol_idx = op->ref_sym_idx;
-                    r->size = 4;
-                    r->pc_relative = false;
+                if (as->symbols[op->ref_sym_idx].external) {
+                    /* External (.REF) — standard linker relocation */
+                    if (as->num_relocs < ASM_MAX_RELOCS) {
+                        asm_reloc_t *r = &as->relocs[as->num_relocs++];
+                        r->offset = as->sections[as->current_section].size;
+                        r->symbol_idx = op->ref_sym_idx;
+                        r->size = 4;
+                        r->pc_relative = false;
+                    }
+                } else {
+                    /* Local label — use special "$SELF" relocation.
+                     * The code contains the section offset. The linker
+                     * adds the module base_addr to it. No symbol lookup. */
+                    if (as->num_relocs < ASM_MAX_RELOCS) {
+                        asm_reloc_t *r = &as->relocs[as->num_relocs++];
+                        r->offset = as->sections[as->current_section].size;
+                        r->symbol_idx = -2;  /* Special: self-relocation */
+                        r->size = 4;
+                        r->pc_relative = false;
+                    }
                 }
             }
             emit32(as, (uint32_t)op->disp);

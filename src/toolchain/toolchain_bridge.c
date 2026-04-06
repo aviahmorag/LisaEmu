@@ -495,29 +495,13 @@ static bool assemble_file(const char *path, linker_t *lk, const char *source_roo
                     rels[nrels].offset = as->relocs[i].offset;
                     rels[nrels].size = as->relocs[i].size;
                     rels[nrels].pc_relative = as->relocs[i].pc_relative;
-                    if (as->relocs[i].symbol_idx >= 0 &&
+                    if (as->relocs[i].symbol_idx == -2) {
+                        /* Self-relocation: linker adds module base_addr */
+                        strncpy(rels[nrels].symbol, "$SELF", 63);
+                    } else if (as->relocs[i].symbol_idx >= 0 &&
                         as->relocs[i].symbol_idx < as->num_symbols) {
-                        asm_symbol_t *rs = &as->symbols[as->relocs[i].symbol_idx];
-                        strncpy(rels[nrels].symbol, rs->name, 63);
-                        /* If the relocation references a local label, ensure
-                         * it's in the symbol list so the linker can find it */
-                        if (rs->defined && !rs->external && !rs->exported) {
-                            /* Check if already added */
-                            bool found_sym = false;
-                            for (int j = 0; j < nsyms; j++) {
-                                if (strcasecmp(syms[j].name, rs->name) == 0) {
-                                    found_sym = true;
-                                    break;
-                                }
-                            }
-                            if (!found_sym) {
-                                strncpy(syms[nsyms].name, rs->name, 63);
-                                syms[nsyms].offset = rs->value;
-                                syms[nsyms].is_global = false;
-                                syms[nsyms].is_external = false;
-                                nsyms++;
-                            }
-                        }
+                        strncpy(rels[nrels].symbol,
+                                as->symbols[as->relocs[i].symbol_idx].name, 63);
                     }
                     nrels++;
                 }

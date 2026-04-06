@@ -458,6 +458,9 @@ bool linker_link(linker_t *lk) {
             uint32_t offset = mod->relocs[r].offset;
             int size = mod->relocs[r].size;
 
+            /* $SELF relocation: handled in Phase 4 only (not Phase 3) */
+            if (strcmp(sym_name, "$SELF") == 0) continue;
+
             int sym_idx = find_global_symbol(lk, sym_name);
             if (sym_idx < 0 || !lk->symbols[sym_idx].resolved) {
                 link_error(lk, "unresolved symbol '%s' in module '%s'",
@@ -467,9 +470,7 @@ bool linker_link(linker_t *lk) {
 
             int32_t target = lk->symbols[sym_idx].value;
 
-
             /* Patch the code */
-            uint32_t abs_offset = mod->base_addr + offset;
             if (offset < mod->code_size) {
                 if (size == 4) {
                     mod->code[offset]     = (target >> 24) & 0xFF;
@@ -481,7 +482,6 @@ bool linker_link(linker_t *lk) {
                     mod->code[offset + 1] = target & 0xFF;
                 }
             }
-            (void)abs_offset;
         }
     }
 
@@ -532,6 +532,22 @@ bool linker_link(linker_t *lk) {
         link_module_t *mod = lk->modules[m];
         for (int r = 0; r < mod->num_relocs; r++) {
             total_relocs_applied++;
+            /* $SELF relocation: add module base_addr to existing value */
+            if (strcmp(mod->relocs[r].symbol, "$SELF") == 0) {
+                uint32_t offset = mod->relocs[r].offset;
+                if (offset + 3 < mod->code_size) {
+                    int32_t existing = ((int32_t)mod->code[offset] << 24) |
+                                       ((int32_t)mod->code[offset+1] << 16) |
+                                       ((int32_t)mod->code[offset+2] << 8) |
+                                       (int32_t)mod->code[offset+3];
+                    int32_t fixed = existing + (int32_t)mod->base_addr;
+                    mod->code[offset]     = (fixed >> 24) & 0xFF;
+                    mod->code[offset + 1] = (fixed >> 16) & 0xFF;
+                    mod->code[offset + 2] = (fixed >> 8)  & 0xFF;
+                    mod->code[offset + 3] = fixed & 0xFF;
+                }
+                continue;
+            }
             int sym_idx = find_global_symbol(lk, mod->relocs[r].symbol);
             int32_t target;
             if (sym_idx >= 0 && lk->symbols[sym_idx].resolved &&

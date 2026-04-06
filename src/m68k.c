@@ -2659,8 +2659,9 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         /* Trace INITSYS call sequence */
         {
             static const struct { uint32_t addr; const char *name; } trace_funcs[] = {
-                {0x4D88, "AFTER_PASCALINIT"}, {0x4D8C, "JSR_INITSYS"},
-                {0x4BFE, "INITSYS"}, {0xDB580, "INTSOFF"},
+                {0xDBF98, "%initstdio"}, {0x4D88, "AFTER_PASCALINIT"},
+                {0x4D8C, "JSR_INITSYS"}, {0x4BFE, "INITSYS"},
+                {0xDB580, "INTSOFF"},
                 {0xE010A, "REG_TO_MAPPED"}, {0xCB478, "POOL_INIT"},
                 {0xD981C, "INIT_TRAPV"}, {0, NULL}
             };
