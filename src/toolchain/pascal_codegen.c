@@ -435,10 +435,32 @@ static void gen_lvalue_addr(codegen_t *cg, ast_node_t *node) {
         gen_lvalue_addr(cg, node->children[0]); /* base in A0 */
         if (node->num_children > 1) {
             gen_expression(cg, node->children[1]); /* index in D0 */
+            /* Resolve element size from the array type */
+            int elem_size = 2;  /* default word */
+            int array_low = 0;
+            if (node->children[0]->type == AST_IDENT_EXPR) {
+                cg_symbol_t *arr_sym = find_symbol_any(cg, node->children[0]->name);
+                if (arr_sym && arr_sym->type) {
+                    type_desc_t *at = arr_sym->type;
+                    /* Follow pointer to get the array type */
+                    if (at->kind == TK_POINTER && at->base_type)
+                        at = at->base_type;
+                    if (at->kind == TK_ARRAY) {
+                        array_low = at->array_low;
+                        if (at->element_type)
+                            elem_size = type_size(at->element_type);
+                    }
+                }
+            }
+            /* SUB.W #low,D0 (adjust for array base) */
+            if (array_low != 0) {
+                emit16(cg, 0x0440);  /* SUBI.W #imm,D0 */
+                emit16(cg, (uint16_t)(int16_t)array_low);
+            }
             /* MOVE.W D0,D1; MULU #elemsize,D1; ADDA.L D1,A0 */
             emit16(cg, 0x3200);  /* MOVE.W D0,D1 */
             emit16(cg, 0xC2FC);  /* MULU #imm,D1 */
-            emit16(cg, 2);       /* element size placeholder */
+            emit16(cg, (uint16_t)elem_size);
             emit16(cg, 0xD1C1);  /* ADDA.L D1,A0 */
         }
     } else if (node->type == AST_FIELD_ACCESS) {
