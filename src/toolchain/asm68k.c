@@ -1991,6 +1991,26 @@ static void assemble_line(asm68k_t *as, const char *raw_line) {
             if (label[0] != '@') {
                 as->local_scope++;
             }
+            /* Debug: find PC mismatch between passes in osintpaslib */
+            if (strstr(as->current_file, "osintpaslib") && label[0] != '@') {
+                static uint32_t p1[300];
+                static char p1n[300][32];
+                static int p1i = 0, p2i = 0;
+                if (as->pass == 1) {
+                    if (p1i < 300) {
+                        p1[p1i] = as->pc;
+                        strncpy(p1n[p1i], label, 31);
+                        p1i++;
+                    }
+                } else {
+                    if (p2i < p1i && p1[p2i] != as->pc) {
+                        fprintf(stderr, "  PC DRIFT at '%s' line %d: p1=$%04X p2=$%04X (delta=%d)\n",
+                                label, as->line_num, p1[p2i], as->pc,
+                                (int)as->pc - (int)p1[p2i]);
+                    }
+                    p2i++;
+                }
+            }
             add_symbol(as, label, SYM_LABEL, as->pc);
         }
     }

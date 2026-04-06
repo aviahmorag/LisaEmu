@@ -581,9 +581,9 @@ void lisa_reset(lisa_t *lisa) {
         WRITE32(0x94, 0x00FE0330);  /* TRAP #5 → ROM TRAPTOHW handler */
         WRITE32(0xA0, 0x00FE0300);  /* TRAP #8 → ROM RTE handler */
 
-        /* Override exception vectors that call system_error (which isn't
-         * initialized yet). Use ROM handlers that safely skip/return.
-         * INIT_TRAPV will install the real OS handlers when ready. */
+        /* Override Line-A/Line-F vectors with safe ROM skip handlers.
+         * The OS's LINE1111_TRAP handler calls system_error which isn't
+         * initialized yet. INIT_TRAPV will install real handlers when ready. */
         WRITE32(0x28, 0x00FE0320);  /* Line-A → ROM skip handler */
         WRITE32(0x2C, 0x00FE0310);  /* Line-F → ROM skip handler */
 
@@ -607,8 +607,62 @@ void lisa_reset(lisa_t *lisa) {
         /* %initstdio: no bypass — properly fixed via MOVEM register list
          * parsing and @-label local scoping in the assembler. */
 
+        /* Debug: dump initio's BEQ.S @3 to verify @-label scoping */
+        {
+            uint16_t bra_disp = (lisa->mem.ram[0x402] << 8) | lisa->mem.ram[0x403];
+            uint32_t body = 0x402 + (int16_t)bra_disp;
+            uint32_t pi_addr = ((uint32_t)lisa->mem.ram[body+4] << 24) |
+                               ((uint32_t)lisa->mem.ram[body+5] << 16) |
+                               ((uint32_t)lisa->mem.ram[body+6] << 8) |
+                               (uint32_t)lisa->mem.ram[body+7];
+            /* JSR initstdio at PI+$36 */
+            uint32_t istdio_jsr = pi_addr + 0x36;
+            uint32_t istdio = ((uint32_t)lisa->mem.ram[istdio_jsr+2] << 24) |
+                              ((uint32_t)lisa->mem.ram[istdio_jsr+3] << 16) |
+                              ((uint32_t)lisa->mem.ram[istdio_jsr+4] << 8) |
+                              (uint32_t)lisa->mem.ram[istdio_jsr+5];
+            /* JSR initio at initstdio+4 (after MOVEM) */
+            uint32_t initio_jsr = istdio + 4;
+            uint32_t initio_addr = ((uint32_t)lisa->mem.ram[initio_jsr+2] << 24) |
+                                   ((uint32_t)lisa->mem.ram[initio_jsr+3] << 16) |
+                                   ((uint32_t)lisa->mem.ram[initio_jsr+4] << 8) |
+                                   (uint32_t)lisa->mem.ram[initio_jsr+5];
+            fprintf(stderr, "%%initstdio at $%06X, first 12 bytes:", istdio);
+            for (int i = 0; i < 12; i++)
+                fprintf(stderr, " %02X", lisa->mem.ram[istdio+i]);
+            /* Check 4 bytes BEFORE initio addr for the missing move.l */
+            fprintf(stderr, "\ninitio-4 bytes: %02X%02X %02X%02X",
+                    lisa->mem.ram[initio_addr-4], lisa->mem.ram[initio_addr-3],
+                    lisa->mem.ram[initio_addr-2], lisa->mem.ram[initio_addr-1]);
+            fprintf(stderr, "\ninitio at $%06X, code:", initio_addr);
+            for (int i = 0; i < 40; i += 2)
+                fprintf(stderr, " %02X%02X", lisa->mem.ram[initio_addr+i], lisa->mem.ram[initio_addr+i+1]);
+            fprintf(stderr, "\n");
+            /* Find BEQ.S: should be at initio+$18 (24 bytes in) */
+            for (int i = 0; i < 40; i += 2) {
+                uint8_t hi = lisa->mem.ram[initio_addr+i];
+                if (hi == 0x67) { /* BEQ.S */
+                    uint8_t disp = lisa->mem.ram[initio_addr+i+1];
+                    uint32_t target = initio_addr + i + 2 + (int8_t)disp;
+                    fprintf(stderr, "  BEQ.S at +$%02X: disp=$%02X → target=$%06X\n",
+                            i, disp, target);
+                }
+            }
+        }
+
         /* Boot device and low-memory parameters */
         lisa->mem.ram[0x1B3] = 2;      /* adr_bootdev: 2 = parallel ProFile */
+
+        /* Verify chan_select at $1F0 — must be 0 for screen console.
+         * The linker output may have data at this offset from code/relocs. */
+        {
+            uint32_t cs = (lisa->mem.ram[0x1F0] << 24) | (lisa->mem.ram[0x1F1] << 16) |
+                          (lisa->mem.ram[0x1F2] << 8) | lisa->mem.ram[0x1F3];
+            if (cs != 0) {
+                fprintf(stderr, "WARNING: chan_select at $1F0 = $%08X (expected 0), clearing\n", cs);
+                WRITE32(0x1F0, 0);  /* Force screen console */
+            }
+        }
         WRITE32(0x2A4, 0);             /* adr_lowcore: physical byte 0 = 0 */
 
         /* Screen pointers (from LDEQU) */
@@ -992,7 +1046,8 @@ int lisa_run_frame(lisa_t *lisa) {
     /* Don't force-unmask interrupts or generate vretrace during init.
      * The OS must complete INITSYS before interrupt handlers are ready.
      * INTSON(0) at the end of BOOT_IO_INIT enables interrupts naturally. */
-    if (frame_count == 10 || frame_count == 60 || frame_count == 120 || frame_count == 300) {
+    if (frame_count == 10 || frame_count == 60 || frame_count == 120 || frame_count == 300 ||
+        frame_count == 500 || frame_count == 800) {
         fprintf(stderr, "DIAG frame %d: PC=$%06X SR=$%04X stopped=%d pending_irq=%d setup=%d\n",
                 frame_count, lisa->cpu.pc, lisa->cpu.sr, lisa->cpu.stopped,
                 lisa->cpu.pending_irq, lisa->mem.setup_mode);

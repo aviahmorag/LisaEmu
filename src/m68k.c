@@ -502,7 +502,26 @@ static void take_exception(m68k_t *cpu, int vector) {
     push16(cpu, old_sr);
 
     /* Read new PC from vector table */
-    cpu->pc = cpu_read32(cpu, vector * 4);
+    uint32_t handler = cpu_read32(cpu, vector * 4);
+
+    /* Guard against recursive Line-F/Line-A exceptions: if the handler
+     * itself starts with a Line-F/Line-A opcode, it would loop forever.
+     * This happens when INIT_NMI_TRAPV installs an OS handler with a
+     * bad address (unresolved symbol). Use the ROM skip handler instead. */
+    if ((vector == 10 || vector == 11) && handler > 0 && handler < 0xFE0000) {
+        uint16_t handler_op = cpu_read16(cpu, handler & 0xFFFFFF);
+        if ((handler_op & 0xF000) == 0xA000 || (handler_op & 0xF000) == 0xF000) {
+            /* Handler starts with Line-A/F opcode — would recurse. Skip. */
+            handler = (vector == 10) ? 0x00FE0320 : 0x00FE0310;
+            static int recurse_warned = 0;
+            if (recurse_warned++ < 3)
+                fprintf(stderr, "WARNING: Line-%c handler at $%06X starts with $%04X (would recurse), using ROM handler\n",
+                        vector == 10 ? 'A' : 'F',
+                        cpu_read32(cpu, vector * 4) & 0xFFFFFF, handler_op);
+        }
+    }
+
+    cpu->pc = handler;
     cpu->cycles += 34;
 }
 
@@ -2661,16 +2680,17 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         {
             static const struct { uint32_t addr; const char *name; } trace_funcs[] = {
                 {0x4D88, "AFTER_PASCALINIT"}, {0x4BFE, "INITSYS"},
-                {0xDB580, "INTSOFF"}, {0xCB478, "POOL_INIT"},
-                {0xE010A, "REG_TO_MAPPED"},
+                {0xDB4A8, "INTSOFF"}, {0xCB3BC, "POOL_INIT"},
+                {0xE0008, "REG_TO_MAPPED"},
                 {0xD9736, "INIT_TRAPV"},
                 {0xDB892, "INIT_NMI_TRAPV"},
+                {0x2794, "INIT_SCTAB"},
                 {0, NULL}
             };
             for (int ti = 0; trace_funcs[ti].name; ti++) {
                 if (cpu->pc == trace_funcs[ti].addr) {
                     static int init_trace_count = 0;
-                    if (init_trace_count++ < 20)
+                    if (init_trace_count++ < 50)
                         fprintf(stderr, ">>> INIT: %s at PC=$%06X A5=$%08X SP=$%08X\n",
                                 trace_funcs[ti].name, cpu->pc, cpu->a[5], cpu->a[7]);
                 }
@@ -2732,7 +2752,28 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 }
             }
         }
-        /* %initstdio: fixed — MOVEM register list parsing + @-label scoping */
+        /* Detect PC entering vector table ($0-$3EF) — indicates stack corruption
+         * or null function pointer. $3F0 is the stub, so exclude that. */
+        {
+            static int vec_exec_count = 0;
+            uint32_t masked = cpu->pc & 0xFFFFFF;
+            if (masked < 0x3F0 && masked > 0 && vec_exec_count < 3) {
+                vec_exec_count++;
+                fprintf(stderr, "!!! PC IN VECTOR TABLE: PC=$%06X op=$%04X SP=$%08X SR=$%04X\n",
+                        cpu->pc, cpu_read16(cpu, cpu->pc), cpu->a[7], cpu->sr);
+                fprintf(stderr, "    A0=$%08X A5=$%08X A6=$%08X D0=$%08X\n",
+                        cpu->a[0], cpu->a[5], cpu->a[6], cpu->d[0]);
+                fprintf(stderr, "    Last 20 PCs:");
+                for (int ri = 20; ri > 0; ri--) {
+                    uint32_t rpc = pc_ring[(pc_ring_idx - ri) & 255];
+                    fprintf(stderr, " $%06X", rpc);
+                }
+                fprintf(stderr, "\n    Stack top:");
+                for (int si = 0; si < 8; si++)
+                    fprintf(stderr, " $%08X", cpu_read32(cpu, (cpu->a[7] + si*4) & 0xFFFFFF));
+                fprintf(stderr, "\n");
+            }
+        }
         /* Detect when PC returns to $4000-$5000 (INITSYS/main body) after PASCALINIT */
         {
             static int pi_state = 0;  /* 0=before, 1=in PASCALINIT, 2=left */
