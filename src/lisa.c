@@ -571,6 +571,23 @@ void lisa_reset(lisa_t *lisa) {
         WRITE32(0x94, 0x00FE0300);  /* TRAP #5 → ROM RTE handler */
         WRITE32(0xA0, 0x00FE0300);  /* TRAP #8 → ROM RTE handler */
 
+        /* Fill ALL zero TRAP vectors ($80-$BC) with the ROM RTE handler.
+         * TRAP #0-#15 map to vectors $80,$84,...$BC. The OS installs real
+         * handlers via INIT_TRAPV during boot, but if any TRAP is called
+         * before that (e.g. TRAP #6 for MMU, TRAP #7 for SR management),
+         * a zero vector would jump to address 0 and crash the CPU. */
+        for (uint32_t vec = 0x80; vec <= 0xBC; vec += 4) {
+            uint32_t val = (lisa->mem.ram[vec] << 24) |
+                           (lisa->mem.ram[vec+1] << 16) |
+                           (lisa->mem.ram[vec+2] << 8) |
+                            lisa->mem.ram[vec+3];
+            if (val == 0) {
+                WRITE32(vec, 0x00FE0300);
+                printf("  [TRAP safety] Vector $%03X (TRAP #%u) was zero → installed ROM RTE handler\n",
+                       vec, (vec - 0x80) / 4);
+            }
+        }
+
         /* Boot device and low-memory parameters */
         lisa->mem.ram[0x1B3] = 2;      /* adr_bootdev: 2 = parallel ProFile */
         WRITE32(0x2A4, 0);             /* adr_lowcore: physical byte 0 = 0 */
@@ -963,6 +980,15 @@ int lisa_run_frame(lisa_t *lisa) {
         fprintf(stderr, "  VIA2: t1_run=%d t1_cnt=%d t1_latch=%d ier=$%02X ifr=$%02X\n",
                 lisa->via2.t1_running, lisa->via2.t1_counter, lisa->via2.t1_latch,
                 lisa->via2.ier, lisa->via2.ifr);
+        /* Test MMU write at runtime */
+        if (frame_count == 10) {
+            /* Write $AB to logical $CC0000, check physical $E2000 */
+            lisa_mem_write8(&lisa->mem, 0xCC0000, 0xAB);
+            uint8_t got = lisa->mem.ram[0xE2000];
+            fprintf(stderr, "  MMU WRITE TEST: wrote $AB to $CC0000, phys $E2000 = $%02X (%s)\n",
+                    got, got == 0xAB ? "PASS" : "FAIL");
+            lisa_mem_write8(&lisa->mem, 0xCC0000, 0);  /* clean up */
+        }
         if (frame_count == 60) {
             /* Main body is at $400 + body_offset. BRA.W at $400 jumps there. */
             uint16_t bra_disp = (lisa->mem.ram[0x402] << 8) | lisa->mem.ram[0x403];

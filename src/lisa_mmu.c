@@ -191,8 +191,16 @@ void lisa_mem_write8(lisa_mem_t *mem, uint32_t addr, uint8_t val) {
                     mem->io_write(phys - LISA_IO_BASE, val);
                 break;
             }
-            if (phys < LISA_RAM_SIZE)
+            if (phys < LISA_RAM_SIZE) {
+                /* Watchpoint: first write to sysglobal area ($E2000) */
+                if (phys >= 0xE2000 && phys < 0xE8000) {
+                    static int wp_count = 0;
+                    if (wp_count++ < 3)
+                        fprintf(stderr, ">>> SYSGLOBAL WRITE: phys=$%06X val=$%02X (addr=$%06X)\n",
+                                phys, val, addr);
+                }
                 mem->ram[phys] = val;
+            }
             break;
         }
         case 1: { /* I/O */

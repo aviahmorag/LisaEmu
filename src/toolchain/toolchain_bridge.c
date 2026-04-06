@@ -215,7 +215,7 @@ static char *read_file(const char *path) {
 }
 
 /* Shared globals accumulated from all previously compiled units */
-#define MAX_SHARED_GLOBALS 16384
+#define MAX_SHARED_GLOBALS 65536
 static cg_symbol_t shared_globals[MAX_SHARED_GLOBALS];
 static int num_shared_globals = 0;
 
@@ -331,6 +331,22 @@ static bool compile_pascal_file(const char *path, linker_t *lk) {
     if (is_startup) {
         fprintf(stderr, "STARTUP: imported %d proc sigs, %d globals, %d types\n",
                 num_shared_proc_sigs, num_shared_globals, num_shared_types);
+        /* Check for critical constants */
+        {
+            const char *check_names[] = {"sysglobmmu", "syslocmmu", "maxpgmmu",
+                                          "hmempgsize", "maxmmusize", "mempgsize", NULL};
+            for (int ci = 0; check_names[ci]; ci++) {
+                int found = 0;
+                for (int i = 0; i < num_shared_globals; i++) {
+                    if (strcasecmp(shared_globals[i].name, check_names[ci]) == 0) {
+                        fprintf(stderr, "  CONST %s=%d\n", check_names[ci], shared_globals[i].offset);
+                        found = 1;
+                        break;
+                    }
+                }
+                if (!found) fprintf(stderr, "  MISSING CONST: %s\n", check_names[ci]);
+            }
+        }
         /* Check for key signatures */
         int found_intsoff = 0;
         for (int i = 0; i < num_shared_proc_sigs; i++) {

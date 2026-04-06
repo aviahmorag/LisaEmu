@@ -2659,9 +2659,8 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         /* Trace INITSYS call sequence */
         {
             static const struct { uint32_t addr; const char *name; } trace_funcs[] = {
-                {0xDBF98, "%initstdio"}, {0x4D88, "AFTER_PASCALINIT"},
-                {0x4D8C, "JSR_INITSYS"}, {0x4BFE, "INITSYS"},
-                {0xDB580, "INTSOFF"},
+                {0x4D88, "AFTER_PASCALINIT"}, {0x4BFE, "INITSYS"},
+                {0xDB580, "INTSOFF"}, {0xCB478, "POOL_INIT"},
                 {0xE010A, "REG_TO_MAPPED"}, {0xCB478, "POOL_INIT"},
                 {0xD981C, "INIT_TRAPV"}, {0, NULL}
             };
@@ -2702,6 +2701,19 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 }
             }
             last_a5 = cpu->a[5];
+        }
+        /* Track A5 corruption */
+        {
+            static uint32_t prev_a5 = 0;
+            static int a5_trace = 0;
+            if (a5_trace < 5 && prev_a5 != cpu->a[5] && prev_a5 != 0) {
+                if (cpu->a[5] > 0x100000 && prev_a5 < 0x100000) {
+                    fprintf(stderr, ">>> A5 CORRUPT: $%08X → $%08X at PC=$%06X\n",
+                            prev_a5, cpu->a[5], cpu->pc);
+                    a5_trace++;
+                }
+            }
+            prev_a5 = cpu->a[5];
         }
         /* Detect SYSTEM_ERROR calls */
         if (cpu->pc == 0xD8FE0) {
