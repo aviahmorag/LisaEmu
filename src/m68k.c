@@ -2774,6 +2774,43 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 fprintf(stderr, "\n");
             }
         }
+        /* Detect PC in unmapped RAM ($200000-$FBFFFF) — past 2MB, before I/O */
+        {
+            static int unmapped_trace_count = 0;
+            uint32_t masked = cpu->pc & 0xFFFFFF;
+            if (masked >= 0x200000 && masked < 0xFC0000 && unmapped_trace_count < 1) {
+                unmapped_trace_count++;
+                fprintf(stderr, "\n!!! PC IN UNMAPPED RAM: PC=$%06X op=$%04X\n", cpu->pc, cpu_read16(cpu, cpu->pc));
+                fprintf(stderr, "    Last 30 PCs (oldest first):\n");
+                for (int ri = 30; ri > 0; ri--) {
+                    uint32_t rpc = pc_ring[(pc_ring_idx - ri) & 255];
+                    uint16_t rop = cpu_read16(cpu, rpc);
+                    fprintf(stderr, "      PC=$%06X op=$%04X", rpc, rop);
+                    /* Decode common branch/jump opcodes */
+                    if ((rop & 0xFFC0) == 0x4EC0) fprintf(stderr, "  JMP");
+                    else if ((rop & 0xFFC0) == 0x4E80) fprintf(stderr, "  JSR");
+                    else if (rop == 0x4E75) fprintf(stderr, "  RTS");
+                    else if (rop == 0x4E73) fprintf(stderr, "  RTE");
+                    else if ((rop & 0xFF00) == 0x6000) fprintf(stderr, "  BRA");
+                    else if ((rop & 0xF0F8) == 0x50C8) fprintf(stderr, "  DBcc");
+                    fprintf(stderr, "\n");
+                }
+                fprintf(stderr, "    Registers:\n");
+                fprintf(stderr, "      D0=$%08X D1=$%08X D2=$%08X D3=$%08X\n",
+                        cpu->d[0], cpu->d[1], cpu->d[2], cpu->d[3]);
+                fprintf(stderr, "      D4=$%08X D5=$%08X D6=$%08X D7=$%08X\n",
+                        cpu->d[4], cpu->d[5], cpu->d[6], cpu->d[7]);
+                fprintf(stderr, "      A0=$%08X A1=$%08X A2=$%08X A3=$%08X\n",
+                        cpu->a[0], cpu->a[1], cpu->a[2], cpu->a[3]);
+                fprintf(stderr, "      A4=$%08X A5=$%08X A6=$%08X A7=$%08X\n",
+                        cpu->a[4], cpu->a[5], cpu->a[6], cpu->a[7]);
+                fprintf(stderr, "      SR=$%04X\n", cpu->sr);
+                fprintf(stderr, "    Stack top 8 words:\n      ");
+                for (int si = 0; si < 8; si++)
+                    fprintf(stderr, " $%04X", cpu_read16(cpu, (cpu->a[7] + si*2) & 0xFFFFFF));
+                fprintf(stderr, "\n");
+            }
+        }
         /* Detect when PC returns to $4000-$5000 (INITSYS/main body) after PASCALINIT */
         {
             static int pi_state = 0;  /* 0=before, 1=in PASCALINIT, 2=left */
