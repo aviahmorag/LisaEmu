@@ -672,7 +672,9 @@ bool linker_link(linker_t *lk) {
 
         /* Driver jump table: DRIVERASM base at $210.
          * CALLDRIVER reads this and dispatches through it. */
-        INSTALL_VEC(0x210, "CANCEL_REQ");  /* First entry in DRIVERASM = base */
+        /* DRIVRJT at $210: NOT pre-installed. The OS's INIT_CONFIG
+         * allocates driver JT space in sysglobal and writes it to $210.
+         * Pre-installing DRIVERASM's address causes a jump loop. */
 
         /* Fill unset vectors ($0-$FC) with stub to prevent crashes */
         for (int v = 2; v < 64; v++) {
