@@ -4,66 +4,85 @@
 
 ```bash
 make
-build/lisaemu Lisa_Source                    # Cross-compiled OS
-build/lisaemu build/lisa_boot.rom image.img  # Pre-compiled OS from disk image
+build/lisaemu Lisa_Source   # Cross-compiled OS (the main path)
 ```
 
 ## Where We Are
 
-**Clean boot from cross-compiled source — zero crashes, zero exceptions.**
-Stuck at CALLDRIVER because boot device config never created (config_ptr=NULL).
+**The OS draws on screen for the first time.** Asymmetric patterns visible —
+real OS code executing through the display system. The duplicate label fix
+unblocked the floating-point library and the OS now reaches driver init,
+filesystem code, and display output.
 
-**Pre-compiled disk image found** but not yet booting — needs prof_entry
-PROM routine to read blocks during LDRLDR boot.
+**Stops at:** SYSTEM_ERROR(0) triggered by sudden stack corruption.
+SP jumps from valid mapped address to $FFFFFFE6 (wraps through $0).
 
-## The Two Paths (continue both)
+## What Was Fixed (this session total: 40+ commits)
 
-### Path A: Cross-compiled OS (the vision)
-- 319 files compile, assemble, link into 855KB kernel
-- Boots cleanly through PASCALINIT → GETLDMAP → deep INITSYS
-- Blocked at CALLDRIVER: config_ptr=NULL, 3 specific blockers identified
-- Need: fix INIT_CONFIG/MAKE_BUILTIN to create boot device config
+### The breakthrough fix: duplicate labels across .include files
+NEWFPSUB includes mathsub, fpunpack, and size — all define UNPNRM,
+UNPZUN, UNP0, etc. with DIFFERENT code. Our assembler resolved
+fpunpack's `BMI.S UNPNRM` to mathsub's version (wrong code),
+causing the FP unpack loop to never terminate.
 
-### Path B: Pre-compiled OS (validation)
-- "AOS 3.0" disk image at _inspiration/LisaSourceCompilation-main/
-- Decompress: gunzip the .cpgz → cpio extract → 48MB raw ProFile
-- Format: 94,208 blocks × 532 bytes (20 tag + 512 data)
-- MDDF at block 46, system.os at sfile 25 (~276KB)
-- Need: implement prof_entry PROM routine for LDRLDR boot
-- This validates hardware emulation independently of codegen
+Fix: proximity-based label resolution. Multi-definition tracker
+records all PCs for labels defined more than once. On pass 2,
+get_symbol_value finds the nearest forward definition.
 
-## What Was Fixed This Session (35+ commits)
+### Other fixes this session
+- ORD() on pointers returned 2 not 4 (root cause of code overwrite)
+- WITH statement implemented (206 OS instances)
+- 30+ codegen type-size fixes
+- Cross-unit type resolution (dangling pointers, aliases, forward params)
+- smt_base and driver JT moved out of code space
+- Standalone programs removed from kernel
+- Negative global offsets from A5
+- prof_entry PROM routine for pre-compiled image boot
+- SYSTEM_ERROR HLE halts CPU instead of returning
 
-### Codegen (the big ones)
-- **ORD() on pointers** returned 2 not 4 → ROOT CAUSE of code overwrite
-- **WITH statement** completely missing → implemented (206 OS instances)
-- **30+ type-size fixes**: fields, arrays, ops, calls, FOR/CASE, intrinsics
-- **Cross-unit type resolution**: dangling pointers, aliases, forward params
+## Current Blocker: Sudden Stack Corruption
 
-### Assembler
-- MOVEM register list, @-label scoping, branch size consistency
+SP jumps from valid mapped value (~$CBFFxx) to $FFFFFFE6 in ONE
+instruction. Not a gradual stack leak — a single UNLK or MOVEA
+sets SP to garbage, then exception frames push it down through
+$000000 and wrap to $FFFFFF.
 
-### Boot/Loader
-- smt_base moved above OS code, driver JT wired to DRIVERASM
-- Loader stub with Lisa filesystem reader
-- COPS pram handler, bootdev fix, PROM checksum
+### Next step
+Add trace that fires when SP changes by >$1000 in one instruction.
+This catches the exact instruction that corrupts SP. Look for:
+- UNLK with corrupted A6
+- MOVEA.L loading garbage into A7
+- RTE popping corrupt stack frame
 
-### Key Architectural Findings
-- LisaEm uses pre-compiled OS, NOT cross-compilation
-- LisaEm HLE is speed optimization, not functional necessity
-- Pascal string[32] = 34 bytes (not 33) — shifts MDDF field layout
-- blocksize=536 (24-byte page labels), slist_packing=36
-- Lisa Pascal boolean = 1 byte in records
+### Pre-compiled image (side path, for validation)
+- "AOS 3.0" image at _inspiration/LisaSourceCompilation-main/
+- Decompress: gunzip .cpgz → cpio extract → 48MB raw ProFile
+- prof_entry at $FE0090 reads blocks (24 reads successful)
+- Needs more work (LDRLDR halts after spare table read)
 
-## Immediate Next Steps
+## Boot Sequence
+```
+✅ ROM → PASCALINIT → %initstdio → GETLDMAP (clean, zero exceptions)
+✅ INITSYS: POOL_INIT, INTSOFF, INIT_NMI_TRAPV, REG_TO_MAPPED
+✅ FP library (NEWFPSUB) — fixed via duplicate label resolution
+✅ DRIVERASM reached (driver framework)
+✅ Filesystem code reached ($06227C)
+✅ Display output — OS draws to screen (asymmetric patterns)
+💥 SYSTEM_ERROR(0) — stack corruption, CPU halted
+❌ BOOT_IO_INIT → ProFile handshake
+❌ FS_INIT → mount boot volume  
+❌ INTRINSIC.LIB loading
+❌ ENTER_SCHEDULER → Desktop
+```
 
-1. **For Path B**: Implement prof_entry at $FE0090 that reads a ProFile
-   block using our profile.c state machine (or direct image access).
-   Then LDRLDR can load the main loader → system.os boots natively.
-
-2. **For Path A**: Trace why INIT_CONFIG doesn't create device config.
-   The HLE CALLDRIVER intercept is at wrong address ($CBDF8 vs GENIO
-   entry). Fix intercept point or trace MAKE_BUILTIN codegen.
-
-3. **For both**: Fix diskimage.c MDDF layout to match real image
-   (34-byte strings, blocksize=536, slist_packing=36).
+## Key Files
+```
+src/toolchain/asm68k.c            — duplicate label resolution (multidef)
+src/toolchain/pascal_codegen.c    — WITH, expr_size, ORD(), 30+ fixes
+src/toolchain/toolchain_bridge.c  — type remapping, HLE export, program skip
+src/toolchain/linker.c            — module map, vectors
+src/toolchain/bootrom.c           — prof_entry, loader stub, PROM checksum
+src/profile.c/h                   — ProFile protocol (ready, untested)
+src/lisa.c                        — boot params, HLE handlers, loader fs
+src/m68k.c                        — HLE callback, traces, SP watermark
+```
