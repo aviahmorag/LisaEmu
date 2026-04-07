@@ -4,141 +4,66 @@
 
 ```bash
 make
-build/lisaemu Lisa_Source   # SDL standalone
-# OR open lisaOS/lisaOS.xcodeproj in Xcode and Run
+build/lisaemu Lisa_Source                    # Cross-compiled OS
+build/lisaemu build/lisa_boot.rom image.img  # Pre-compiled OS from disk image
 ```
 
 ## Where We Are
 
-**Clean boot — zero crashes, zero exceptions.** The OS boots through
-PASCALINIT, %initstdio, GETLDMAP, and deep into INITSYS. No code
-overwrites, no vector corruption, no A5 corruption.
+**Clean boot from cross-compiled source — zero crashes, zero exceptions.**
+Stuck at CALLDRIVER because boot device config never created (config_ptr=NULL).
 
-**Stuck at:** CALLDRIVER loop in BOOT_IO_INIT. The OS tries to init
-the boot device but `config_ptr=NULL` — the device configuration was
-never created by MAKE_BUILTIN/INIT_CONFIG.
+**Pre-compiled disk image found** but not yet booting — needs prof_entry
+PROM routine to read blocks during LDRLDR boot.
 
-**Screen:** White (bootrom clear). The OS hasn't drawn anything yet —
-it hasn't gotten far enough past disk init.
+## The Two Paths (continue both)
 
-## This Session: 30 commits
+### Path A: Cross-compiled OS (the vision)
+- 319 files compile, assemble, link into 855KB kernel
+- Boots cleanly through PASCALINIT → GETLDMAP → deep INITSYS
+- Blocked at CALLDRIVER: config_ptr=NULL, 3 specific blockers identified
+- Need: fix INIT_CONFIG/MAKE_BUILTIN to create boot device config
 
-### Assembler (3 bugs)
-1. MOVEM register list parsing
-2. @-label scoping
-3. Branch size consistency (pass-1/pass-2 mismatch)
+### Path B: Pre-compiled OS (validation)
+- "AOS 3.0" disk image at _inspiration/LisaSourceCompilation-main/
+- Decompress: gunzip the .cpgz → cpio extract → 48MB raw ProFile
+- Format: 94,208 blocks × 532 bytes (20 tag + 512 data)
+- MDDF at block 46, system.os at sfile 25 (~276KB)
+- Need: implement prof_entry PROM routine for LDRLDR boot
+- This validates hardware emulation independently of codegen
 
-### Codegen (30+ issues)
-4. Record field offsets (hardcoded 0)
-5. Array element sizes (hardcoded 2)
-6. Type-aware MOVE sizes (VAR params, arrays, fields, derefs)
-7. Binary/unary/comparison ops .W → .L for longint
-8. Call parameter push sizes (signature-aware)
-9. FOR/CASE .W → .L for longint
-10. ABS/SUCC/PRED .W → .L
-11. **WITH statement** — completely missing, now implemented (206 OS instances)
-12. Cross-unit type resolution (dangling pointers, aliases, forward params)
-13. **ORD() on pointers** — returned 2 instead of 4, truncating pointers.
-    This was the ROOT CAUSE of the code overwrite crash.
-14. expr_size() for intrinsic functions (ORD, ORD4, POINTER)
+## What Was Fixed This Session (35+ commits)
 
-### Loader/Linker
-15. smt_base moved above OS code (was in vector table at $280)
-16. Driver JT at $210 → DRIVERASM base (was RTS stubs)
-17. Global variable offsets: positive → negative (Lisa Pascal convention)
-18. Standalone programs removed (KEYBOARD, STUNTS, DRVRMAIN, etc.)
-19. LINE1111_TRAP not pre-installed
+### Codegen (the big ones)
+- **ORD() on pointers** returned 2 not 4 → ROOT CAUSE of code overwrite
+- **WITH statement** completely missing → implemented (206 OS instances)
+- **30+ type-size fixes**: fields, arrays, ops, calls, FOR/CASE, intrinsics
+- **Cross-unit type resolution**: dangling pointers, aliases, forward params
 
-### Emulator
-20. Line-F/Line-A ROM skip handlers + recursion guard
-21. ProFile protocol rewrite (two-phase handshake, spare table)
-22. Exception vector overrides
-23. Code write watchpoints, A5 tracking, unmapped RAM trace, SP watermark
+### Assembler
+- MOVEM register list, @-label scoping, branch size consistency
 
-### Tools
-24. Codegen verification tool (12+ test patterns)
-25. Module map logging in linker
+### Boot/Loader
+- smt_base moved above OS code, driver JT wired to DRIVERASM
+- Loader stub with Lisa filesystem reader
+- COPS pram handler, bootdev fix, PROM checksum
 
-## Current Blocker: Device Config Not Created
+### Key Architectural Findings
+- LisaEm uses pre-compiled OS, NOT cross-compilation
+- LisaEm HLE is speed optimization, not functional necessity
+- Pascal string[32] = 34 bytes (not 33) — shifts MDDF field layout
+- blocksize=536 (24-byte page labels), slist_packing=36
+- Lisa Pascal boolean = 1 byte in records
 
-CALLDRIVER in BOOT_IO_INIT loops with:
-- `config_ptr = NULL` (no device config for boot device)
-- `fnctn_code = 0` (dskunclamp — params uninitialized)
-- No VIA1 port B writes (ProFile CMD never asserted)
+## Immediate Next Steps
 
-The OS's INIT_CONFIG → MAKE_BUILTIN should create device configs
-during init, but it's not creating one for the ProFile (bootdev=2).
+1. **For Path B**: Implement prof_entry at $FE0090 that reads a ProFile
+   block using our profile.c state machine (or direct image access).
+   Then LDRLDR can load the main loader → system.os boots natively.
 
-### Root causes (from CALLDRIVER dispatch trace):
+2. **For Path A**: Trace why INIT_CONFIG doesn't create device config.
+   The HLE CALLDRIVER intercept is at wrong address ($CBDF8 vs GENIO
+   entry). Fix intercept point or trace MAKE_BUILTIN codegen.
 
-Three specific blockers in `src/lisa.c` prevent the boot device config
-from being created:
-
-1. **`loader_link` at $204 = 0** — ENTER_LOADER does `MOVE.L loader_link,A0;
-   JSR (A0)`. With $204=0, this jumps to address 0. LOADEM needs a loader
-   stub that can read blocks from the ProFile disk image.
-
-2. **No COPS parameter memory** — FIND_PM_IDS reads pram via INIT_READ_PM.
-   Without valid pram, fallback computes bootdev=3, which triggers
-   SYSTEM_ERROR(10738) "can't find boot CD".
-
-3. **I/O board type mismatch** — $FCC031 returns $80 (iob_pepsi). With
-   pepsi + bootdev=2, FIND_BOOT sets boot_slot = cd_intdisk (internal disk)
-   instead of cd_paraport (parallel port ProFile).
-
-### Full driver init call chain (when it works):
-```
-BOOT_IO_INIT → INIT_BOOT_CDS
-  → FIND_BOOT: reads adr_bootdev, determines boot slot
-  → FIND_PM_IDS: looks up COPS pram for CDD entries
-  → LOADEM: opens SYSTEM.CD_<name> via loader_link
-  → NEW_CONFIG: sets kres_addr = loaded driver
-  → UP: sets entry_pt, calls CALLDRIVER(dinit)
-    → PRODRIVER(dinit) → USE_HDISK → HDISKIO(dinit)
-    → HINITIT → CALLDRIVER(hdinit) → PRODRIVER(hdinit)
-    → PROF_INIT: sets up VIA1, enables interrupts (IER=$A2)
-```
-
-### Next session: parallel approach (A/B test)
-
-**Agent A: Fix native driver path** — fix the three blockers in lisa.c:
-- Set loader_link ($204) to a loader stub that reads ProFile blocks
-- Set up COPS parameter memory with a ProFile CDD entry
-- Fix I/O board type for Lisa 2/10 with parallel ProFile
-- This lets the OS load the driver and init ProFile natively
-
-**Agent B: HLE approach** — like LisaEm (_inspiration/lisaem-master/src/storage/hle.c):
-- Find disk read/write entry points in our linked binary via symbol lookup
-  (our addresses differ from LisaEm's hardcoded ones)
-- Patch with F-line traps ($F33D)
-- Implement hle_intercept() to perform disk I/O directly
-- Bypasses driver → VIA → ProFile path entirely
-
-Run both in parallel. Whichever gets disk reads working first wins.
-
-## Boot Sequence
-```
-✅ ROM → PASCALINIT → %initstdio → GETLDMAP (all clean, zero exceptions)
-✅ INITSYS: POOL_INIT, INTSOFF, INIT_NMI_TRAPV, REG_TO_MAPPED
-✅ Screen cleared by bootrom
-✅ A5 correctly set to mapped sysglobal ($CC5FFC)
-✅ No code overwrites, no vector corruption
-⏳ INIT_CONFIG / MAKE_BUILTIN — device config not created
-⏳ CALLDRIVER loop (config_ptr=NULL, no driver dispatch)
-❌ ProFile handshake (VIA1 CMD never asserted)
-❌ FS_INIT → mount boot volume
-❌ INTRINSIC.LIB loading
-❌ ENTER_SCHEDULER → Desktop
-```
-
-## Key Files
-```
-src/toolchain/pascal_codegen.c    — WITH, expr_size, 30+ type fixes
-src/toolchain/pascal_codegen.h    — WITH stack, param types
-src/toolchain/toolchain_bridge.c  — type remapping, program skip list
-src/toolchain/asm68k.c            — MOVEM, @-labels, branch sizes
-src/toolchain/linker.c            — module map, DRIVERASM JT, vectors
-src/profile.c/h                   — ProFile protocol (ready, untested)
-src/lisa.c                        — boot params, smt_base, diagnostics
-src/m68k.c                        — Line-F guard, traces, watchpoints
-```
+3. **For both**: Fix diskimage.c MDDF layout to match real image
+   (34-byte strings, blocksize=536, slist_packing=36).
