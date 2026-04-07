@@ -42,6 +42,10 @@ build_result_t toolchain_build(const char *source_dir,
                                 const char *output_dir,
                                 build_progress_fn progress);
 
+/* HLE addresses exported by toolchain_build (valid after successful build) */
+extern uint32_t hle_addr_calldriver;
+extern uint32_t hle_addr_system_error;
+
 /*
  * Quick check if a directory looks like a valid Lisa_Source tree.
  * Returns true if expected subdirectories exist.

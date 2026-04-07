@@ -24,6 +24,10 @@
 #include <dirent.h>
 #include <sys/stat.h>
 
+/* HLE address globals — populated during build, read by lisa.c after */
+uint32_t hle_addr_calldriver = 0;
+uint32_t hle_addr_system_error = 0;
+
 /* ========================================================================
  * File discovery
  * ======================================================================== */
@@ -738,8 +742,8 @@ build_result_t toolchain_build(const char *source_dir,
         result.files_linked = lk->num_modules;
     }
 
-    /* Export HLE addresses from linker symbol table */
-    if (link_ok) {
+    /* Export HLE addresses from linker symbol table (even if link had warnings) */
+    {
         struct { const char *name; const char *label; } hle_syms[] = {
             {"CALLDRIVER", "CALLDRIVER"},
             {"CALL_HDIS", "CALL_HDISK"},     /* 8-char truncated */
@@ -770,6 +774,11 @@ build_result_t toolchain_build(const char *source_dir,
                 if (idx >= 0) {
                     fprintf(hle_f, "%s 0x%X\n", hle_syms[h].label, lk->symbols[idx].value);
                     fprintf(stderr, "HLE: %s = $%X\n", hle_syms[h].label, lk->symbols[idx].value);
+                    /* Store in globals for direct use by lisa.c */
+                    if (strcmp(hle_syms[h].label, "CALLDRIVER") == 0)
+                        hle_addr_calldriver = lk->symbols[idx].value;
+                    else if (strcmp(hle_syms[h].label, "SYSTEM_ERROR") == 0)
+                        hle_addr_system_error = lk->symbols[idx].value;
                 } else {
                     fprintf(stderr, "HLE: %s NOT FOUND\n", hle_syms[h].name);
                 }

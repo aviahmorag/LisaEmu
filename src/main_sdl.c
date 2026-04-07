@@ -110,33 +110,15 @@ int main(int argc, char *argv[]) {
         /* Mount generated disk image */
         lisa_mount_profile(&lisa, "build/lisa_profile.image");
 
-        /* Load HLE addresses from linker output */
-        {
-            FILE *hf = fopen("build/hle_addrs.txt", "r");
-            if (hf) {
-                uint32_t hle_calldriver = 0, hle_call_hdisk = 0;
-                uint32_t hle_hdiskio = 0, hle_prodriver = 0;
-                uint32_t hle_system_error = 0, hle_badcall = 0;
-                uint32_t hle_parallel = 0, hle_use_hdisk = 0;
-                char name[64]; unsigned int addr;
-                while (fscanf(hf, "%63s 0x%X", name, &addr) == 2) {
-                    if (strcmp(name, "CALLDRIVER") == 0) hle_calldriver = addr;
-                    else if (strcmp(name, "CALL_HDISK") == 0) hle_call_hdisk = addr;
-                    else if (strcmp(name, "HDISKIO") == 0) hle_hdiskio = addr;
-                    else if (strcmp(name, "PRODRIVER") == 0) hle_prodriver = addr;
-                    else if (strcmp(name, "SYSTEM_ERROR") == 0) hle_system_error = addr;
-                    else if (strcmp(name, "BADCALL") == 0) hle_badcall = addr;
-                    else if (strcmp(name, "PARALLEL") == 0) hle_parallel = addr;
-                    else if (strcmp(name, "USE_HDISK") == 0) hle_use_hdisk = addr;
-                }
-                fclose(hf);
-                lisa_hle_set_addresses(&lisa, hle_calldriver, hle_call_hdisk,
-                                       hle_hdiskio, hle_prodriver,
-                                       hle_system_error, hle_badcall,
-                                       hle_parallel, hle_use_hdisk);
-            } else {
-                fprintf(stderr, "HLE: no address file found, HLE disabled\n");
-            }
+        /* Load HLE addresses from toolchain globals (set during linking) */
+        if (hle_addr_calldriver || hle_addr_system_error) {
+            lisa_hle_set_addresses(&lisa, hle_addr_calldriver, 0,
+                                   0, 0,
+                                   hle_addr_system_error, 0, 0, 0);
+            fprintf(stderr, "HLE: CALLDRIVER=$%X SYSTEM_ERROR=$%X\n",
+                    hle_addr_calldriver, hle_addr_system_error);
+        } else {
+            fprintf(stderr, "HLE: no addresses found, HLE disabled\n");
         }
     } else {
         /* Legacy: treat as ROM file */
