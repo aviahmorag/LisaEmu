@@ -670,6 +670,10 @@ bool linker_link(linker_t *lk) {
         INSTALL_VEC(0x9C, "TRAP7");              /* TRAP #7 (SR change) */
         INSTALL_VEC(0xB8, "trapEhandler");       /* TRAP #14 */
 
+        /* Driver jump table: DRIVERASM base at $210.
+         * CALLDRIVER reads this and dispatches through it. */
+        INSTALL_VEC(0x210, "CANCEL_REQ");  /* First entry in DRIVERASM = base */
+
         /* Fill unset vectors ($0-$FC) with stub to prevent crashes */
         for (int v = 2; v < 64; v++) {
             int off = v * 4;

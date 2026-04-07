@@ -219,6 +219,15 @@ static bool last_via1_bsy = false;
 static void via1_portb_write(uint8_t val, uint8_t ddr, void *ctx) {
     lisa_t *lisa = (lisa_t *)ctx;
     (void)ddr;
+    /* Trace first 10 ORB writes */
+    {
+        static int orb_trace_count = 0;
+        if (orb_trace_count < 10) {
+            fprintf(stderr, "VIA1_ORB_WRITE #%d: val=$%02X ddr=$%02X (CMD=%d DIR=%d)\n",
+                    ++orb_trace_count, val, ddr,
+                    (val >> 2) & 1, (val >> 3) & 1);
+        }
+    }
     bool bsy_before = profile_bsy(&lisa->prof);
     profile_orb_write(&lisa->prof, val, last_via1_orb);
     bool bsy_after = profile_bsy(&lisa->prof);
@@ -737,21 +746,9 @@ void lisa_reset(lisa_t *lisa) {
         WRITE32(0x218, version_addr);  /* adrparamptr → version */
         WRITE32(0x21C, 0x00020000); /* ldbaseptr: loader base */
         /* DRIVRJT ($210) — Driver Jump Table pointer.
-         * The OS reads this 32-bit pointer and calls through it.
-         * Point to a block of RTS instructions in unused vector table area.
-         * Each entry is 4 bytes (just RTS, returns cleanly). */
-        {
-            uint32_t djt_base = smt_base + l_smt;  /* Driver JT above SMT, not in vector table */
-            b_sysjt = djt_base + 128;  /* System JT starts after driver JT */
-            for (int j = 0; j < 32; j++) {
-                /* Each entry: RTS ($4E75) padded to 4 bytes */
-                lisa->mem.ram[djt_base + j * 4]     = 0x4E;
-                lisa->mem.ram[djt_base + j * 4 + 1] = 0x75;
-                lisa->mem.ram[djt_base + j * 4 + 2] = 0x4E;
-                lisa->mem.ram[djt_base + j * 4 + 3] = 0x71; /* NOP */
-            }
-            WRITE32(0x210, djt_base);
-        }
+         * The linker writes the DRIVERASM module base to $210.
+         * CALLDRIVER dispatches through this jump table. */
+        b_sysjt = smt_base + l_smt;
         WRITE16(0x22E, 1);         /* dev_type: profile */
 
         /* esysgloboff (offset 28 from param_block) points to end of sysglobal.

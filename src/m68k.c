@@ -2948,6 +2948,43 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 fprintf(stderr, "\n");
             }
         }
+        /* Trace CALLDRIVER loop at $C120E */
+        if (cpu->pc == 0xC120E) {
+            static int calldriver_count = 0;
+            if (calldriver_count++ < 20) {
+                uint32_t a3 = cpu->a[3];
+                fprintf(stderr, "=== CALLDRIVER #%d at PC=$%06X A3=$%08X A6=$%08X SP=$%08X\n",
+                        calldriver_count, cpu->pc, a3, cpu->a[6], cpu->a[7]);
+                /* Params record at A3: control(w), completion1(l), fnctn_code(w?), completion2(l) */
+                fprintf(stderr, "  Params[0..19]:");
+                for (int pi = 0; pi < 20; pi += 2) {
+                    fprintf(stderr, " %04X", cpu_read16(cpu, a3 + pi));
+                }
+                fprintf(stderr, "\n");
+                uint16_t control = cpu_read16(cpu, a3 + 0);
+                uint32_t comp1 = cpu_read32(cpu, a3 + 2);
+                uint16_t fnctn_code = cpu_read16(cpu, a3 + 4);
+                uint32_t comp2 = cpu_read32(cpu, a3 + 6);
+                fprintf(stderr, "  control=$%04X comp1=$%08X fnctn_code=$%04X comp2=$%08X\n",
+                        control, comp1, fnctn_code, comp2);
+                /* Registers at entry */
+                fprintf(stderr, "  D0=$%08X D4=$%08X D5=$%08X D7=$%08X\n",
+                        cpu->d[0], cpu->d[4], cpu->d[5], cpu->d[7]);
+                fprintf(stderr, "  A0=$%08X A1=$%08X A2=$%08X A4=$%08X A5=$%08X\n",
+                        cpu->a[0], cpu->a[1], cpu->a[2], cpu->a[4], cpu->a[5]);
+                /* Device config pointer from stack frame: A6+8 */
+                uint32_t config_ptr = cpu_read32(cpu, cpu->a[6] + 8);
+                fprintf(stderr, "  config_ptr(A6+8)=$%08X\n", config_ptr);
+                /* Read first 16 bytes of config record if accessible */
+                if (config_ptr > 0 && config_ptr < 0xFC0000) {
+                    fprintf(stderr, "  config[0..15]:");
+                    for (int ci = 0; ci < 16; ci += 2) {
+                        fprintf(stderr, " %04X", cpu_read16(cpu, config_ptr + ci));
+                    }
+                    fprintf(stderr, "\n");
+                }
+            }
+        }
         /* Detect SYSTEM_ERROR calls */
         if (cpu->pc == 0xD8FAC) {
             static int syserr_count = 0;
