@@ -2696,6 +2696,26 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                         cpu_read32(cpu, cpu->a[7]+24));
             }
         }
+        /* SP watermark: catch stack leak in both physical and mapped space */
+        {
+            static uint32_t lowest_sp = 0xFFFFFF;
+            uint32_t sp = cpu->a[7] & 0xFFFFFF;
+            if (sp < lowest_sp && sp > 0x100) {
+                lowest_sp = sp;
+                /* Trigger at various thresholds */
+                if ((sp < 0x20000 || (sp > 0xC00000 && sp < 0xCB0000)) && sp != 0) {
+                    static int sp_log = 0;
+                    if (sp_log++ < 5) {
+                        fprintf(stderr, "!!! SP LOW: $%06X at PC=$%06X A6=$%08X\n",
+                                sp, cpu->pc, cpu->a[6]);
+                        fprintf(stderr, "    Last 10 PCs:");
+                        for (int ri = 10; ri > 0; ri--)
+                            fprintf(stderr, " $%06X", pc_ring[(pc_ring_idx - ri) & 255]);
+                        fprintf(stderr, "\n");
+                    }
+                }
+            }
+        }
         /* Monitor A5 for corruption */
         {
             static uint32_t last_a5 = 0;
