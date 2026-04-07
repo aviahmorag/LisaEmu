@@ -2948,13 +2948,43 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 fprintf(stderr, "\n");
             }
         }
-        /* Trace CALLDRIVER loop at $C120E */
+        /* Trace the call FROM SYSGLOBAL to GENIO CALLDRIVER */
+        if (cpu->pc == 0xBAABC) {
+            static int sysg_trace = 0;
+            if (sysg_trace++ < 1) {
+                fprintf(stderr, "=== SYSGLOBAL $BAABC: op=$%04X next=$%04X A6=$%08X SP=$%08X\n",
+                        cpu_read16(cpu, cpu->pc), cpu_read16(cpu, cpu->pc+2),
+                        cpu->a[6], cpu->a[7]);
+                /* Dump code around $BAABC */
+                fprintf(stderr, "  Code $BAA90-$BAAE0:");
+                for (int i = 0; i < 80; i += 2)
+                    fprintf(stderr, " %04X", cpu_read16(cpu, 0xBAA90 + i));
+                fprintf(stderr, "\n");
+                /* Show return address on stack */
+                fprintf(stderr, "  Stack: ret=$%08X\n", cpu_read32(cpu, cpu->a[7]));
+            }
+        }
+        /* Trace CALLDRIVER loop — find who called it */
         if (cpu->pc == 0xC120E) {
             static int calldriver_count = 0;
-            if (calldriver_count++ < 20) {
+            if (calldriver_count < 1) {
+                calldriver_count++;
                 uint32_t a3 = cpu->a[3];
-                fprintf(stderr, "=== CALLDRIVER #%d at PC=$%06X A3=$%08X A6=$%08X SP=$%08X\n",
-                        calldriver_count, cpu->pc, a3, cpu->a[6], cpu->a[7]);
+                fprintf(stderr, "=== CALLDRIVER at PC=$%06X A3=$%08X A6=$%08X SP=$%08X\n",
+                        cpu->pc, a3, cpu->a[6], cpu->a[7]);
+                /* Walk the A6 frame chain to find callers */
+                fprintf(stderr, "  Frame chain:\n");
+                uint32_t frame = cpu->a[6];
+                for (int depth = 0; depth < 10 && frame > 0x1000 && frame < 0x200000; depth++) {
+                    uint32_t saved_a6 = cpu_read32(cpu, frame & 0xFFFFFF);
+                    uint32_t ret_addr = cpu_read32(cpu, (frame + 4) & 0xFFFFFF);
+                    fprintf(stderr, "    [%d] A6=$%08X ret=$%08X\n", depth, frame, ret_addr);
+                    frame = saved_a6;
+                }
+                fprintf(stderr, "  Last 40 PCs:");
+                for (int ri = 40; ri > 0; ri--)
+                    fprintf(stderr, " $%06X", pc_ring[(pc_ring_idx - ri) & 255]);
+                fprintf(stderr, "\n");
                 /* Params record at A3: control(w), completion1(l), fnctn_code(w?), completion2(l) */
                 fprintf(stderr, "  Params[0..19]:");
                 for (int pi = 0; pi < 20; pi += 2) {
