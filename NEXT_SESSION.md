@@ -69,35 +69,52 @@ CALLDRIVER in BOOT_IO_INIT loops with:
 The OS's INIT_CONFIG → MAKE_BUILTIN should create device configs
 during init, but it's not creating one for the ProFile (bootdev=2).
 
-### Possible causes:
-1. **DRIVERASM JT offset mismatch** — CALLDRIVER does `JMP 90(A0)`.
-   We write CANCEL_REQ (first DRIVERASM symbol) to $210, but offset
-   90 might not land on the CALLDRIVER implementation. Need to verify
-   the DRIVERASM internal layout.
+### Root causes (from CALLDRIVER dispatch trace):
 
-2. **MAKE_BUILTIN codegen issue** — the function might have a codegen
-   bug (wrong field offset, type size, etc.) causing it to fail silently.
+Three specific blockers in `src/lisa.c` prevent the boot device config
+from being created:
 
-3. **Boot device detection** — dev_type at $22E=1 (profile), but
-   MAKE_BUILTIN might check hardware (VIA1 OCD bit) and get wrong result.
+1. **`loader_link` at $204 = 0** — ENTER_LOADER does `MOVE.L loader_link,A0;
+   JSR (A0)`. With $204=0, this jumps to address 0. LOADEM needs a loader
+   stub that can read blocks from the ProFile disk image.
 
-4. **Missing driver init sequence** — the real Lisa boot loader runs
-   additional init steps before INITSYS that we skip.
+2. **No COPS parameter memory** — FIND_PM_IDS reads pram via INIT_READ_PM.
+   Without valid pram, fallback computes bootdev=3, which triggers
+   SYSTEM_ERROR(10738) "can't find boot CD".
 
-### Two approaches:
-**A. Fix MAKE_BUILTIN** — trace why it doesn't create a config. This
-   is the "proper" approach that uses our cross-compiled OS code.
+3. **I/O board type mismatch** — $FCC031 returns $80 (iob_pepsi). With
+   pepsi + bootdev=2, FIND_BOOT sets boot_slot = cd_intdisk (internal disk)
+   instead of cd_paraport (parallel port ProFile).
 
-**B. HLE approach** — like LisaEm, patch OS code with F-line traps
-   at known disk I/O addresses. This bypasses the driver/VIA path
-   entirely. Simpler but specific to LOS 3.1.
+### Full driver init call chain (when it works):
+```
+BOOT_IO_INIT → INIT_BOOT_CDS
+  → FIND_BOOT: reads adr_bootdev, determines boot slot
+  → FIND_PM_IDS: looks up COPS pram for CDD entries
+  → LOADEM: opens SYSTEM.CD_<name> via loader_link
+  → NEW_CONFIG: sets kres_addr = loaded driver
+  → UP: sets entry_pt, calls CALLDRIVER(dinit)
+    → PRODRIVER(dinit) → USE_HDISK → HDISKIO(dinit)
+    → HINITIT → CALLDRIVER(hdinit) → PRODRIVER(hdinit)
+    → PROF_INIT: sets up VIA1, enables interrupts (IER=$A2)
+```
 
-### Reference: How LisaEm does it
-LisaEm uses F-line HLE (High-Level Emulation):
-- Patches OS code at hardcoded addresses with `$F33D` (Line-F trap)
-- When CPU hits patched address, `hle_intercept()` performs disk I/O
-- Skips entire driver → VIA → ProFile path
-- Source: `_inspiration/lisaem-master/src/storage/hle.c`
+### Next session: parallel approach (A/B test)
+
+**Agent A: Fix native driver path** — fix the three blockers in lisa.c:
+- Set loader_link ($204) to a loader stub that reads ProFile blocks
+- Set up COPS parameter memory with a ProFile CDD entry
+- Fix I/O board type for Lisa 2/10 with parallel ProFile
+- This lets the OS load the driver and init ProFile natively
+
+**Agent B: HLE approach** — like LisaEm (_inspiration/lisaem-master/src/storage/hle.c):
+- Find disk read/write entry points in our linked binary via symbol lookup
+  (our addresses differ from LisaEm's hardcoded ones)
+- Patch with F-line traps ($F33D)
+- Implement hle_intercept() to perform disk I/O directly
+- Bypasses driver → VIA → ProFile path entirely
+
+Run both in parallel. Whichever gets disk reads working first wins.
 
 ## Boot Sequence
 ```
