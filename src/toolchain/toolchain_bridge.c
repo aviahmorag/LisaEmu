@@ -244,30 +244,11 @@ static int num_shared_proc_sigs = 0;
 /* All compiled modules are treated as kernel — they all get linked into the
  * output and their symbols are available for cross-module resolution. */
 static bool is_kernel_module(const char *path) {
-    /* From LisaSourceCompilation ALEX-LINK-SYSTEMOS.TEXT:
-     * system.os contains exactly 46 modules from SOURCE/ + HWINTL + PASMATH.
-     * NO libraries. Libraries are loaded as intrinsic libs from disk.
-     *
-     * But we also need LIBPL (Pascal runtime) and LIBHW (hardware interface)
-     * because on the real Lisa these are in IOSPASLIB.OBJ and SYSTEM.LLD
-     * which are loaded by the boot loader before the OS starts. */
-
-    /* OS source files (the 46 kernel modules) */
     if (strcasestr(path, "/OS/") != NULL) return true;
-
-    /* LIBPL — Pascal runtime (normally IOSPASLIB.OBJ, loaded by boot loader) */
     if (strcasestr(path, "LIBPL") != NULL) return true;
-
-    /* LIBHW — Hardware interface (normally SYSTEM.LLD, loaded before MMU) */
     if (strcasestr(path, "LIBHW") != NULL) return true;
-
-    /* LIBFP — Floating point (normally IOSFPLIB.OBJ, loaded early) */
     if (strcasestr(path, "LIBFP") != NULL) return true;
-
-    /* LIBOS — OS syscall interface (part of kernel interface) */
     if (strcasestr(path, "LIBOS") != NULL) return true;
-
-    /* Everything else (apps, UI libs) → non-kernel */
     return false;
 }
 

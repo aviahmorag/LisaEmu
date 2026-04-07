@@ -2119,33 +2119,7 @@ static void op_bit_static(m68k_t *cpu) {
  * The handler reads from smt_base (at the end of do_an_mmu code)
  * which contains: origin(16) | access(8) | length(8) per segment.
  */
-static void hle_trap6_mmu(m68k_t *cpu) {
-    if (!cpu->write8) return;  /* Need memory access */
-
-    uint32_t ret_addr = cpu->a[0];
-    int ret_domain = cpu->d[0] & 0xFFFF;
-    int mmu_count = cpu->d[1] & 0xFFFF;
-    int domain = (cpu->d[2] >> 8) & 0xF;  /* After lsl #8,d2; lsl #1,d2 */
-    int seg_index = cpu->d[3] & 0xFF;
-
-    /* Context: 1 + (segment1 | segment2), where the bits come from domain */
-    int context = 1 + (domain & 3);
-    if (context >= 5) context = 4;
-
-    static int trap6_log = 0;
-    if (trap6_log < 5) {
-        fprintf(stderr, "HLE TRAP#6: ctx=%d seg=%d count=%d ret_dom=%d\n",
-                context, seg_index, mmu_count, ret_domain);
-        trap6_log++;
-    }
-
-    /* HLE: We skip the exception mechanism entirely.
-     * The TRAP instruction normally pushes PC+SR and jumps to handler.
-     * Since we're handling it inline, just continue execution at the
-     * next instruction (PC already points past the TRAP opcode).
-     * No stack frame to pop since we never pushed one. */
-    cpu->cycles += 20;
-}
+/* HLE TRAP#6 removed — the OS handler handles MMU programming now. */
 
 static void op_trap(m68k_t *cpu) {
     int vector = cpu->ir & 0xF;
