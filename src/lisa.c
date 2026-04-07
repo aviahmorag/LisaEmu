@@ -8,6 +8,17 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* 68000 24-bit address masking */
+static inline uint32_t mask_24(uint32_t addr) { return addr & 0x00FFFFFF; }
+
+/* Read helpers for CPU memory (used by HLE) */
+static inline uint32_t cpu_read32(m68k_t *cpu, uint32_t addr) {
+    return cpu->read32(mask_24(addr));
+}
+static inline uint16_t cpu_read16(m68k_t *cpu, uint32_t addr) {
+    return cpu->read16(mask_24(addr));
+}
+
 /* Forward declarations for internal callbacks */
 static uint8_t  mem_read8_cb(uint32_t addr);
 static uint16_t mem_read16_cb(uint32_t addr);
@@ -20,6 +31,308 @@ static void     io_write_cb(uint32_t addr, uint8_t val);
 
 /* Global pointer for CPU memory callbacks (68000 uses function pointers) */
 static lisa_t *g_lisa = NULL;
+
+/* ========================================================================
+ * Loader Filesystem — C reimplementation of the Lisa OS loader's LDLFS unit.
+ * Provides file open/read/fill/move operations for the OS boot process.
+ * Reads directly from the ProFile disk image in memory.
+ * ======================================================================== */
+
+#define LDR_MAP_MAX 1024
+
+typedef struct {
+    int32_t address;    /* Absolute page on disk */
+    int16_t cpages;     /* Number of contiguous pages */
+} ldr_mapentry_t;
+
+typedef struct {
+    bool initialized;
+    int32_t fs_block0;
+    int16_t data_size;
+    int32_t slist_addr;
+    int16_t slist_packing;
+    int16_t map_offset;
+    int16_t smallmap_offset;
+    int16_t catentries;
+    int16_t fs_version;
+    int32_t root_page;
+    int16_t tree_depth;
+    int32_t rootsnum;
+
+    bool file_open;
+    ldr_mapentry_t filemap[LDR_MAP_MAX];
+    int32_t last_page;
+    int32_t curr_page;
+    int16_t next_byte;
+    uint8_t buf[512];
+} ldr_fs_t;
+
+static ldr_fs_t ldr_fs = { .initialized = false };
+
+static bool ldr_read_disk_block(lisa_t *lisa, uint32_t block, uint8_t *dst) {
+    if (!lisa->profile.mounted || !lisa->profile.data) return false;
+    size_t offset = (size_t)block * PROFILE_BLOCK_SIZE + PROFILE_TAG_SIZE;
+    if (offset + 512 > lisa->profile.data_size) return false;
+    memcpy(dst, lisa->profile.data + offset, 512);
+    return true;
+}
+
+static bool ldr_read_disk_tag(lisa_t *lisa, uint32_t block, uint8_t *dst) {
+    if (!lisa->profile.mounted || !lisa->profile.data) return false;
+    size_t offset = (size_t)block * PROFILE_BLOCK_SIZE;
+    if (offset + PROFILE_TAG_SIZE > lisa->profile.data_size) return false;
+    memcpy(dst, lisa->profile.data + offset, PROFILE_TAG_SIZE);
+    return true;
+}
+
+static int16_t ldr_get16(const uint8_t *p) {
+    return (int16_t)((p[0] << 8) | p[1]);
+}
+static int32_t ldr_get32(const uint8_t *p) {
+    return (int32_t)(((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                     ((uint32_t)p[2] << 8) | p[3]);
+}
+
+static bool ldr_fs_init(lisa_t *lisa) {
+    if (ldr_fs.initialized) return true;
+    memset(&ldr_fs, 0, sizeof(ldr_fs));
+
+    uint8_t mddf_buf[512];
+    uint32_t try_blocks[] = { 24, 0, 32, 16 };
+    bool found = false;
+    for (int i = 0; i < 4; i++) {
+        if (!ldr_read_disk_block(lisa, try_blocks[i], mddf_buf)) continue;
+        int16_t fsver = ldr_get16(mddf_buf);
+        if (fsver >= 10 && fsver <= 30) {
+            ldr_fs.fs_block0 = try_blocks[i];
+            found = true;
+            fprintf(stderr, "LDR_FS: MDDF at block %u, fsversion=%d\n",
+                    try_blocks[i], fsver);
+            break;
+        }
+    }
+    if (!found) { fprintf(stderr, "LDR_FS: no MDDF found\n"); return false; }
+
+    /* Parse MDDF fields per SOURCE-VMSTUFF.TEXT MDDFdb layout */
+    ldr_fs.fs_version = ldr_get16(mddf_buf + 0);
+    ldr_fs.data_size = ldr_get16(mddf_buf + 126);
+    if (ldr_fs.data_size <= 0 || ldr_fs.data_size > 512) ldr_fs.data_size = 512;
+    ldr_fs.slist_addr = ldr_get32(mddf_buf + 148);
+    ldr_fs.slist_packing = ldr_get16(mddf_buf + 152);
+    ldr_fs.map_offset = ldr_get16(mddf_buf + 172);
+    ldr_fs.catentries = ldr_get16(mddf_buf + 192);
+    ldr_fs.rootsnum = ldr_get16(mddf_buf + 190);
+    ldr_fs.smallmap_offset = ldr_get16(mddf_buf + 278);
+    ldr_fs.root_page = ldr_get32(mddf_buf + 304);
+    ldr_fs.tree_depth = ldr_get16(mddf_buf + 308);
+
+    fprintf(stderr, "LDR_FS: datasize=%d slist=%d packing=%d map_off=%d "
+            "catentries=%d rootsnum=%d block0=%d root_page=%d depth=%d smoff=%d\n",
+            ldr_fs.data_size, (int)ldr_fs.slist_addr, ldr_fs.slist_packing,
+            ldr_fs.map_offset, ldr_fs.catentries, ldr_fs.rootsnum,
+            (int)ldr_fs.fs_block0, (int)ldr_fs.root_page, ldr_fs.tree_depth,
+            ldr_fs.smallmap_offset);
+
+    ldr_fs.initialized = true;
+    ldr_fs.file_open = false;
+    ldr_fs.curr_page = -1;
+    ldr_fs.next_byte = ldr_fs.data_size;
+    return true;
+}
+
+static bool ldr_read_page(lisa_t *lisa, int32_t page, uint8_t *dst) {
+    return ldr_read_disk_block(lisa, ldr_fs.fs_block0 + page, dst);
+}
+
+static bool ldr_find_sentry(lisa_t *lisa, int16_t sfile_num,
+                             int32_t *hint_addr, int32_t *file_size) {
+    if (ldr_fs.slist_packing <= 0) return false;
+    int32_t spage = (sfile_num / ldr_fs.slist_packing) + ldr_fs.slist_addr;
+    int soffset = (sfile_num % ldr_fs.slist_packing) * 14;
+    uint8_t sbuf[512];
+    if (!ldr_read_page(lisa, spage, sbuf)) return false;
+    if (soffset + 14 > 512) return false;
+    *hint_addr = ldr_get32(sbuf + soffset);
+    *file_size = ldr_get32(sbuf + soffset + 8);
+    return true;
+}
+
+static bool ldr_build_filemap(lisa_t *lisa, int32_t hint_addr, int32_t file_size) {
+    for (int i = 0; i < LDR_MAP_MAX; i++) {
+        ldr_fs.filemap[i].address = 0;
+        ldr_fs.filemap[i].cpages = 0;
+    }
+    int bufsize = ldr_fs.data_size > 0 ? ldr_fs.data_size : 512;
+    ldr_fs.last_page = file_size > 0 ? (file_size - 1) / bufsize : 0;
+    ldr_fs.curr_page = -1;
+    ldr_fs.next_byte = bufsize;
+
+    int32_t map_page = hint_addr + ldr_fs.map_offset;
+    int fmap_offset = ldr_fs.smallmap_offset;
+    int ld_index = 0;
+    int32_t abs_page = 0;
+
+    for (int safety = 0; safety < 100; safety++) {
+        if (map_page <= 0) break;
+        uint8_t map_buf[512], tag_buf[24];
+        if (!ldr_read_page(lisa, map_page, map_buf)) break;
+        ldr_read_disk_tag(lisa, ldr_fs.fs_block0 + map_page, tag_buf);
+
+        int16_t max_entries = ldr_get16(map_buf + fmap_offset + 4);
+        uint8_t *entries = map_buf + fmap_offset + 8;
+
+        for (int i = 0; i <= max_entries && ld_index < LDR_MAP_MAX; i++) {
+            int eo = i * 6;
+            if (fmap_offset + 8 + eo + 6 > 512) break;
+            int32_t addr = ldr_get32(entries + eo);
+            int16_t cpg = ldr_get16(entries + eo + 4);
+            if (cpg <= 0) break;
+            ldr_fs.filemap[ld_index].address = addr;
+            ldr_fs.filemap[ld_index].cpages = cpg;
+            abs_page += cpg;
+            ld_index++;
+            if (abs_page > ldr_fs.last_page) goto fm_done;
+        }
+        /* fwdlink is int4 at offset 16 in pagelabel/tag */
+        int32_t fwdlink = ldr_get32(tag_buf + 16);
+        if (fwdlink <= 0) break;
+        map_page = fwdlink;
+        fmap_offset = 0;
+    }
+fm_done:
+    fprintf(stderr, "LDR_FS: filemap %d entries, last_page=%d\n",
+            ld_index, (int)ldr_fs.last_page);
+    return ld_index > 0;
+}
+
+static bool ldr_find_position(int32_t page, int32_t *blk, int32_t *len) {
+    int32_t ap = 0;
+    for (int i = 0; i < LDR_MAP_MAX; i++) {
+        if (ldr_fs.filemap[i].cpages <= 0) break;
+        int32_t end = ap + ldr_fs.filemap[i].cpages;
+        if (page < end) {
+            *blk = ldr_fs.filemap[i].address + (page - ap);
+            *len = end - page;
+            return true;
+        }
+        ap = end;
+    }
+    return false;
+}
+
+static bool ldr_fillbuf(lisa_t *lisa, int32_t byte_addr) {
+    int bufsize = ldr_fs.data_size > 0 ? ldr_fs.data_size : 512;
+    int32_t page = byte_addr / bufsize;
+    if (page < 0 || page > ldr_fs.last_page) return false;
+    ldr_fs.next_byte = byte_addr - page * bufsize;
+    if (page != ldr_fs.curr_page) {
+        int32_t block, length;
+        if (!ldr_find_position(page, &block, &length)) return false;
+        if (!ldr_read_page(lisa, block, ldr_fs.buf)) return false;
+        ldr_fs.curr_page = page;
+    }
+    return true;
+}
+
+static uint8_t ldr_getbyte(lisa_t *lisa) {
+    int bufsize = ldr_fs.data_size > 0 ? ldr_fs.data_size : 512;
+    if (ldr_fs.next_byte >= bufsize)
+        ldr_fillbuf(lisa, (ldr_fs.curr_page + 1) * bufsize);
+    uint8_t val = ldr_fs.buf[ldr_fs.next_byte];
+    ldr_fs.next_byte++;
+    return val;
+}
+
+static int16_t ldr_getword(lisa_t *lisa) {
+    uint8_t hi = ldr_getbyte(lisa);
+    uint8_t lo = ldr_getbyte(lisa);
+    return (int16_t)((hi << 8) | lo);
+}
+
+static int32_t ldr_getlong(lisa_t *lisa) {
+    int16_t hi = ldr_getword(lisa);
+    int16_t lo = ldr_getword(lisa);
+    return ((int32_t)(uint16_t)hi << 16) | (uint16_t)lo;
+}
+
+static void ldr_movemultiple(lisa_t *lisa, int32_t count, uint32_t dest) {
+    int bufsize = ldr_fs.data_size > 0 ? ldr_fs.data_size : 512;
+    while (count > 0) {
+        int avail = bufsize - ldr_fs.next_byte;
+        if (avail > count) avail = count;
+        if (avail > 0 && dest + avail <= LISA_RAM_SIZE) {
+            memcpy(&lisa->mem.ram[dest], &ldr_fs.buf[ldr_fs.next_byte], avail);
+            dest += avail;
+            count -= avail;
+            ldr_fs.next_byte += avail;
+        }
+        if (count > 0) {
+            if (!ldr_fillbuf(lisa, (ldr_fs.curr_page + 1) * bufsize)) break;
+        }
+    }
+}
+
+static bool ldr_open_file(lisa_t *lisa, const char *name) {
+    if (!ldr_fs.initialized && !ldr_fs_init(lisa)) return false;
+
+    int32_t cat_hint, cat_size;
+    if (!ldr_find_sentry(lisa, ldr_fs.rootsnum, &cat_hint, &cat_size))
+        return false;
+    if (!ldr_build_filemap(lisa, cat_hint, cat_size))
+        return false;
+    ldr_fs.file_open = true;
+
+    char upper[64];
+    int nlen = (int)strlen(name);
+    if (nlen > 32) nlen = 32;
+    for (int i = 0; i < nlen; i++)
+        upper[i] = (name[i] >= 'a' && name[i] <= 'z') ? name[i] - 32 : name[i];
+    upper[nlen] = '\0';
+
+    int centry_size = 54;
+    int bufsize = ldr_fs.data_size > 0 ? ldr_fs.data_size : 512;
+
+    for (int entry = 0; entry < ldr_fs.catentries; entry++) {
+        int32_t bpos = (int32_t)entry * centry_size;
+        if (!ldr_fillbuf(lisa, bpos)) break;
+
+        uint8_t eb[64];
+        int sp = ldr_fs.curr_page, sb = ldr_fs.next_byte;
+        for (int i = 0; i < centry_size && i < 64; i++)
+            eb[i] = ldr_getbyte(lisa);
+        ldr_fs.curr_page = sp;
+        ldr_fs.next_byte = sb;
+
+        int enl = eb[0];
+        if (enl <= 0 || enl > 32 || enl != nlen) continue;
+
+        bool match = true;
+        for (int i = 0; i < nlen; i++) {
+            char c = eb[1+i];
+            if (c >= 'a' && c <= 'z') c -= 32;
+            if (c != upper[i]) { match = false; break; }
+        }
+        if (!match) continue;
+
+        int16_t cetype = ldr_get16(eb + 34);
+        int16_t sfile = ldr_get16(eb + 36);
+        if (cetype != 3) continue; /* not fileentry */
+
+        fprintf(stderr, "LDR_FS: found '%s' sfile=%d\n", upper, sfile);
+
+        int32_t hint_addr, file_size;
+        if (!ldr_find_sentry(lisa, sfile, &hint_addr, &file_size)) return false;
+        fprintf(stderr, "LDR_FS: hint=%d size=%d\n", (int)hint_addr, (int)file_size);
+
+        if (!ldr_build_filemap(lisa, hint_addr, file_size)) return false;
+        ldr_fs.file_open = true;
+        ldr_fs.curr_page = -1;
+        ldr_fs.next_byte = bufsize;
+        return true;
+    }
+    fprintf(stderr, "LDR_FS: '%s' not found\n", upper);
+    return false;
+}
 
 /* ========================================================================
  * COPS queue management
@@ -119,14 +432,55 @@ static uint8_t io_read_cb(uint32_t offset) {
     }
 
     /* I/O board type register ($FCC031) — determines Lisa model.
-     * For Lisa 2/10 (Pepsi with ProFile): return < -96 (signed) */
+     * Return 0 → iob_lisa (Lisa 1 with parallel ProFile).
+     * With bootdev=2, FIND_BOOT maps this to cd_paraport.
+     * Previous value 0x80 (-128) → iob_pepsi → cd_intdisk which requires
+     * different driver loading that our HLE doesn't support yet. */
     if (offset == 0xC031) {
-        return 0x80;  /* -128 signed → enters Pepsi branch */
+        return 0x00;  /* 0 (positive) → iob_lisa */
     }
 
-    /* Internal disk type register ($FCC015) — 0=twiggy, nonzero=Sony/ProFile */
+    /* Internal disk type register ($FCC015) — 0=twiggy, nonzero=Sony/ProFile.
+     * With iob_lisa, this isn't checked for iomodel determination. */
     if (offset == 0xC015) {
-        return 0x01;  /* Non-zero → iob_pepsi (not iob_twiggy) */
+        return 0x00;  /* 0 = twiggy (default for Lisa 1) */
+    }
+
+    /* COPS parameter memory ($FCC181-$FCC1FF) — read via MOVEP.L in INIT_READ_PM.
+     * MOVEP reads every other byte, so addresses are at odd offsets.
+     * 16 iterations × 4 bytes = 64 bytes of pram data.
+     * Return default/empty pram: all zeros (checksum will fail → DEFAULTPM). */
+    if (offset >= 0xC181 && offset <= 0xC1FF) {
+        /* Return valid pram with a ProFile CDD entry.
+         * pram layout: see SOURCE-PMEM.TEXT.
+         * Packed CDD entry format: see SOURCE-CDCONFIGASM.TEXT.
+         * ProFile on parallel port: slot=9(→10), chan=6(→7=empty), dev=30(→31=empty), id=34 */
+        static const uint8_t pram[64] = {
+            0x00, 0x04,  /* [0-1] version = 4 (cd_pm_version) */
+            0x00, 0x01,  /* [2-3] timestamp = 1 */
+            0x27,        /* [4] bootVol=2, contrast=7 */
+            0x33,        /* [5] dim=3, beep=3 */
+            0xE3,        /* [6] mouseOn, extMem, scaleMouse, dblClick=3 */
+            0x33,        /* [7] fadeDelay=3, beginRepeat=3 */
+            0x30,        /* [8] subRepeat=3 */
+            0x01,        /* [9] cdCount=1 */
+            0x9C,        /* [10] CDD: [slot=9:4][chan=6:3][idsize=0:1] */
+            0xF0,        /* [11] CDD: [dev=30:5][nExt=0:2][hibit=0:1] */
+            0x22,        /* [12] CDD: driverID=34 byte */
+            0xF0,        /* [13] terminator: slot=15 */
+            0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, /* [14-29] */
+            0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, /* [30-45] */
+            0,0,0,0,0,0,0,0,0,0,0,0,0,0,     /* [46-59] */
+            0x00, 0x00,  /* [60-61] mem_loss */
+            /* [62-63] checksum: XOR of all 32 words must = 0.
+             * Words: 0004 0001 2733 E333 3001 9CF0 22F0 0000...0000
+             * XOR = 0x4A04. Checksum = 0x4A04 so total XOR = 0. */
+            0x4A, 0x04,
+        };
+        int byte_idx = (offset - 0xC181) / 2;
+        if (byte_idx >= 0 && byte_idx < 64)
+            return pram[byte_idx];
+        return 0;
     }
 
     /* Disk controller shared memory */
@@ -187,6 +541,161 @@ static void io_write_cb(uint32_t offset, uint8_t val) {
     }
     if (offset == 0xE012) {
         lisa->mem.setup_mode = false;
+        return;
+    }
+
+    /* Loader trap port ($FCC100) — the ROM loader stub writes the
+     * fake_parms pointer here to request disk I/O from the emulator.
+     * This is called byte-by-byte by the MOVE.L instruction, so we
+     * accumulate 4 bytes into a 32-bit address. The actual operation
+     * triggers on the last byte (offset 0xC103). */
+    if (offset >= 0xC100 && offset <= 0xC103) {
+        static uint32_t loader_parms_addr = 0;
+        int byte_pos = offset - 0xC100;
+        loader_parms_addr &= ~(0xFFU << (24 - byte_pos * 8));
+        loader_parms_addr |= ((uint32_t)val << (24 - byte_pos * 8));
+
+        if (byte_pos == 3) {
+            /* All 4 bytes received — process the loader call.
+             * fake_parms layout (from SOURCE-CD.TEXT):
+             *   offset 0: error (2 bytes, integer)
+             *   offset 2: opcode (2 bytes, integer)
+             *   offset 4: addr (4 bytes, longint)
+             *   offset 8: header (4 bytes, longint)
+             *   offset 12: blok (4 bytes, longint)
+             *   offset 16: count (4 bytes, longint)
+             *   offset 20: result (2 bytes, boolean — Pascal boolean = 2 bytes)
+             *   offset 22: longvalue (4 bytes)
+             *   offset 26: wordvalue (2 bytes)
+             *   offset 28: bytevalue (1 byte + pad)
+             *   offset 30: path (ld_filename = pascal string) */
+            uint32_t pa = loader_parms_addr;
+            if (pa + 30 >= LISA_RAM_SIZE) {
+                fprintf(stderr, "LOADER TRAP: invalid parms addr $%08X\n", pa);
+                return;
+            }
+
+            uint16_t opcode = (lisa->mem.ram[pa+2] << 8) | lisa->mem.ram[pa+3];
+            uint32_t addr   = (lisa->mem.ram[pa+4] << 24) | (lisa->mem.ram[pa+5] << 16) |
+                              (lisa->mem.ram[pa+6] << 8) | lisa->mem.ram[pa+7];
+            uint32_t blok   = (lisa->mem.ram[pa+12] << 24) | (lisa->mem.ram[pa+13] << 16) |
+                              (lisa->mem.ram[pa+14] << 8) | lisa->mem.ram[pa+15];
+            uint32_t count  = (lisa->mem.ram[pa+16] << 24) | (lisa->mem.ram[pa+17] << 16) |
+                              (lisa->mem.ram[pa+18] << 8) | lisa->mem.ram[pa+19];
+
+            fprintf(stderr, "LOADER TRAP: opcode=%u addr=$%08X blok=%u count=%u\n",
+                    opcode, addr, (unsigned)blok, (unsigned)count);
+
+            switch (opcode) {
+                case 0: { /* call_open — open a file on boot disk */
+                    /* Extract Pascal string from path field at offset 30 */
+                    int path_len = lisa->mem.ram[pa+30];
+                    if (path_len > 32) path_len = 32;
+                    char path_str[64];
+                    for (int i = 0; i < path_len; i++)
+                        path_str[i] = lisa->mem.ram[pa+31+i];
+                    path_str[path_len] = '\0';
+
+                    bool ok = ldr_open_file(lisa, path_str);
+                    /* result at offset 20 (Pascal boolean = 2 bytes) */
+                    lisa->mem.ram[pa+20] = 0;
+                    lisa->mem.ram[pa+21] = ok ? 1 : 0;
+                    lisa->mem.ram[pa+0] = 0;
+                    lisa->mem.ram[pa+1] = 0;
+                    fprintf(stderr, "LOADER: call_open '%s' → %s\n",
+                            path_str, ok ? "OK" : "FAIL");
+                    break;
+                }
+
+                case 1: { /* call_fill — position to byte offset in file */
+                    bool ok = ldr_fillbuf(lisa, (int32_t)addr);
+                    lisa->mem.ram[pa+0] = 0;
+                    lisa->mem.ram[pa+1] = ok ? 0 : 0xFF;
+                    break;
+                }
+
+                case 2: { /* call_byte — read next byte from file */
+                    uint8_t b = ldr_getbyte(lisa);
+                    lisa->mem.ram[pa+28] = b; /* bytevalue at offset 28 */
+                    lisa->mem.ram[pa+0] = 0;
+                    lisa->mem.ram[pa+1] = 0;
+                    break;
+                }
+
+                case 3: { /* call_word — read next word from file */
+                    int16_t w = ldr_getword(lisa);
+                    lisa->mem.ram[pa+26] = (w >> 8) & 0xFF; /* wordvalue at offset 26 */
+                    lisa->mem.ram[pa+27] = w & 0xFF;
+                    lisa->mem.ram[pa+0] = 0;
+                    lisa->mem.ram[pa+1] = 0;
+                    break;
+                }
+
+                case 4: { /* call_long — read next longint from file */
+                    int32_t l = ldr_getlong(lisa);
+                    lisa->mem.ram[pa+22] = (l >> 24) & 0xFF; /* longvalue at offset 22 */
+                    lisa->mem.ram[pa+23] = (l >> 16) & 0xFF;
+                    lisa->mem.ram[pa+24] = (l >> 8) & 0xFF;
+                    lisa->mem.ram[pa+25] = l & 0xFF;
+                    lisa->mem.ram[pa+0] = 0;
+                    lisa->mem.ram[pa+1] = 0;
+                    break;
+                }
+
+                case 5: { /* call_move — move bytes from file to memory */
+                    ldr_movemultiple(lisa, (int32_t)count, addr);
+                    lisa->mem.ram[pa+0] = 0;
+                    lisa->mem.ram[pa+1] = 0;
+                    fprintf(stderr, "LOADER: call_move %u bytes → $%08X\n",
+                            (unsigned)count, addr);
+                    break;
+                }
+
+                case 6: /* call_read — read blocks from boot disk.
+                         * Original loader adds block0 to blok internally. */
+                    if (lisa->profile.mounted && lisa->profile.data) {
+                        if (!ldr_fs.initialized) ldr_fs_init(lisa);
+                        uint32_t block0 = ldr_fs.initialized ? (uint32_t)ldr_fs.fs_block0 : 24;
+                        for (uint32_t b = 0; b < count; b++) {
+                            uint32_t block_num = block0 + blok + b;
+                            size_t src_offset = (size_t)block_num * PROFILE_BLOCK_SIZE + PROFILE_TAG_SIZE;
+                            uint32_t dst = addr + b * 512;
+                            if (src_offset + 512 <= lisa->profile.data_size &&
+                                dst + 512 <= LISA_RAM_SIZE) {
+                                memcpy(&lisa->mem.ram[dst],
+                                       lisa->profile.data + src_offset, 512);
+                            } else if (dst + 512 <= LISA_RAM_SIZE) {
+                                memset(&lisa->mem.ram[dst], 0, 512);
+                            }
+                        }
+                        /* Fill header/tag data */
+                        uint32_t hdr_addr = (lisa->mem.ram[pa+8] << 24) | (lisa->mem.ram[pa+9] << 16) |
+                                            (lisa->mem.ram[pa+10] << 8) | lisa->mem.ram[pa+11];
+                        if (hdr_addr > 0 && hdr_addr + PROFILE_TAG_SIZE <= LISA_RAM_SIZE) {
+                            size_t tag_offset = (size_t)(block0 + blok) * PROFILE_BLOCK_SIZE;
+                            if (tag_offset + PROFILE_TAG_SIZE <= lisa->profile.data_size)
+                                memcpy(&lisa->mem.ram[hdr_addr],
+                                       lisa->profile.data + tag_offset, PROFILE_TAG_SIZE);
+                        }
+                        lisa->mem.ram[pa+0] = 0;
+                        lisa->mem.ram[pa+1] = 0;
+                        fprintf(stderr, "LOADER: call_read %u blocks @%u (abs %u) → $%08X\n",
+                                (unsigned)count, (unsigned)blok, (unsigned)(block0+blok), addr);
+                    } else {
+                        lisa->mem.ram[pa+0] = 0xFF;
+                        lisa->mem.ram[pa+1] = 0xFF;
+                        fprintf(stderr, "LOADER: call_read FAIL — no disk\n");
+                    }
+                    break;
+
+                default:
+                    fprintf(stderr, "LOADER: unknown opcode %u\n", opcode);
+                    lisa->mem.ram[pa+0] = 0xFF;
+                    lisa->mem.ram[pa+1] = 0xFF;
+                    break;
+            }
+            loader_parms_addr = 0;
+        }
         return;
     }
 
@@ -402,6 +911,10 @@ static void render_framebuffer(lisa_t *lisa) {
 
 /* ProFile disk operations now in profile.c */
 
+/* HLE callback wrapper — adapts void* to typed call.
+ * Forward declaration; implementation at bottom of file. */
+static bool hle_cpu_check(void *ctx, void *cpu);
+
 /* ========================================================================
  * Public API
  * ======================================================================== */
@@ -424,6 +937,10 @@ void lisa_init(lisa_t *lisa) {
     lisa->cpu.write8 = mem_write8_cb;
     lisa->cpu.write16 = mem_write16_cb;
     lisa->cpu.write32 = mem_write32_cb;
+
+    /* Wire HLE intercept callback */
+    lisa->cpu.hle_check = hle_cpu_check;
+    lisa->cpu.hle_ctx = lisa;
 
     /* Wire memory I/O callbacks */
     lisa->mem.io_read = io_read_cb;
@@ -467,6 +984,10 @@ void lisa_reset(lisa_t *lisa) {
     lisa->mem.setup_mode = true;  /* ROM visible at address 0 */
     via_reset(&lisa->via1);
     via_reset(&lisa->via2);
+
+    /* Reset loader filesystem state for fresh boot */
+    memset(&ldr_fs, 0, sizeof(ldr_fs));
+    ldr_fs.initialized = false;
 
     /* Pre-load OS from ProFile disk image into RAM.
      * Read the disk catalog to find system.os, then load all its blocks.
@@ -589,7 +1110,7 @@ void lisa_reset(lisa_t *lisa) {
 
 
         /* Boot device and low-memory parameters */
-        lisa->mem.ram[0x1B3] = 2;      /* adr_bootdev: 2 = parallel ProFile */
+        lisa->mem.ram[0x1B3] = 0;      /* adr_bootdev: 0 = internal disk (Widget/ProFile on Pepsi) */
 
         /* Verify chan_select at $1F0 — must be 0 for screen console.
          * The linker output may have data at this offset from code/relocs. */
@@ -739,7 +1260,7 @@ void lisa_reset(lisa_t *lisa) {
 
         /* Low-memory system pointers (PASCALDEFS.TEXT EQU definitions) */
         WRITE32(0x200, b_sysglobal);   /* SGLOBAL/B_SYSGLOBAL: ptr to sysglobal base */
-        WRITE32(0x204, 0);             /* loader_link: ptr to loader boot drivers */
+        WRITE32(0x204, 0x00FE0600);    /* loader_link: ptr to loader stub in ROM */
         WRITE32(0x208, 0);             /* C_DOMAIN_PTR: ptr to current domain cell */
 
         /* Low-memory pointers for PASCALINIT */
@@ -1283,4 +1804,240 @@ int lisa_get_screen_width(void) {
 
 int lisa_get_screen_height(void) {
     return LISA_SCREEN_HEIGHT;
+}
+
+/* ========================================================================
+ * HLE (High-Level Emulation) — Disk I/O Bypass
+ *
+ * Intercepts OS disk I/O functions at the CPU level and performs reads/writes
+ * directly from/to the disk image, bypassing the ProFile driver/VIA path.
+ *
+ * Inspired by LisaEm's hle.c (Ray Arachelian, GPLv2) which patches byte-level
+ * transfer loops. Our approach intercepts at CALLDRIVER instead, since our
+ * cross-compiled binary has different addresses than LisaEm's LOS 3.1 offsets.
+ *
+ * CALLDRIVER stack (from SOURCE-MOVER.TEXT):
+ *   SP+0:  return address
+ *   SP+4:  parameters ptr (param_ptr)
+ *   SP+8:  config_ptr (ptrdevrec)
+ *   SP+12: errnum ptr (var integer)
+ * ======================================================================== */
+
+#define HLE_DINTERRUPT  0
+#define HLE_DINIT       1
+#define HLE_DDOWN       2
+#define HLE_DSKUNCLAMP  3
+#define HLE_DSKFORMAT   4
+#define HLE_SEQIO       5
+#define HLE_DSKIO       6
+#define HLE_DCONTROL    7
+#define HLE_REQRESTART  8
+#define HLE_DDISCON     9
+#define HLE_DATTACH     12
+#define HLE_HDINIT      13
+#define HLE_HDSKIO      14
+#define HLE_DUNATTACH   16
+#define HLE_DALARMS     17
+#define HLE_HDDOWN      18
+
+/* Request block field offsets (from driverdefs reqblk record) */
+#define REQ_OPERATN     12
+#define REQ_BUFF_ADDR   16
+#define REQ_LENGTH      20
+#define REQ_DISK_ADDR   22
+
+void lisa_hle_set_addresses(lisa_t *lisa, uint32_t calldriver, uint32_t call_hdisk,
+                            uint32_t hdiskio, uint32_t prodriver,
+                            uint32_t system_error, uint32_t badcall,
+                            uint32_t parallel, uint32_t use_hdisk) {
+    lisa->hle.calldriver = calldriver;
+    lisa->hle.call_hdisk = call_hdisk;
+    lisa->hle.hdiskio = hdiskio;
+    lisa->hle.prodriver = prodriver;
+    lisa->hle.system_error = system_error;
+    lisa->hle.badcall = badcall;
+    lisa->hle.parallel = parallel;
+    lisa->hle.use_hdisk = use_hdisk;
+    lisa->hle.active = (calldriver != 0 || system_error != 0);
+    lisa->hle.boot_config_done = false;
+    lisa->hle.reads = 0;
+    lisa->hle.writes = 0;
+    if (lisa->hle.active) {
+        fprintf(stderr, "HLE: Disk I/O intercepts ACTIVE\n");
+        fprintf(stderr, "  CALLDRIVER=$%06X  CALL_HDISK=$%06X\n", calldriver, call_hdisk);
+        fprintf(stderr, "  HDISKIO=$%06X  PRODRIVER=$%06X\n", hdiskio, prodriver);
+        fprintf(stderr, "  SYSTEM_ERROR=$%06X  BADCALL=$%06X\n", system_error, badcall);
+        fprintf(stderr, "  PARALLEL=$%06X  USE_HDISK=$%06X\n", parallel, use_hdisk);
+    }
+}
+
+static int hle_read_block(lisa_t *lisa, uint32_t block_num,
+                          uint8_t *data_out, uint8_t *tag_out) {
+    if (!lisa->profile.mounted || !lisa->profile.data) return -1;
+    size_t offset = (size_t)block_num * PROFILE_BLOCK_SIZE;
+    if (offset + PROFILE_BLOCK_SIZE > lisa->profile.data_size) return -2;
+    if (tag_out)  memcpy(tag_out, lisa->profile.data + offset, PROFILE_TAG_SIZE);
+    if (data_out) memcpy(data_out, lisa->profile.data + offset + PROFILE_TAG_SIZE, PROFILE_DATA_SIZE);
+    return 0;
+}
+
+static int hle_write_block(lisa_t *lisa, uint32_t block_num,
+                           const uint8_t *data_in, const uint8_t *tag_in) {
+    if (!lisa->profile.mounted || !lisa->profile.data) return -1;
+    size_t offset = (size_t)block_num * PROFILE_BLOCK_SIZE;
+    if (offset + PROFILE_BLOCK_SIZE > lisa->profile.data_size) return -2;
+    if (tag_in)  memcpy(lisa->profile.data + offset, tag_in, PROFILE_TAG_SIZE);
+    if (data_in) memcpy(lisa->profile.data + offset + PROFILE_TAG_SIZE, data_in, PROFILE_DATA_SIZE);
+    return 0;
+}
+
+static bool hle_handle_calldriver(lisa_t *lisa, m68k_t *cpu) {
+    uint32_t ret_addr   = cpu_read32(cpu, cpu->a[7]);
+    uint32_t params_ptr = cpu_read32(cpu, cpu->a[7] + 4);
+    uint32_t config_ptr = cpu_read32(cpu, cpu->a[7] + 8);
+    uint32_t errnum_ptr = cpu_read32(cpu, cpu->a[7] + 12);
+
+    int16_t fnctn_code = (int16_t)cpu_read16(cpu, params_ptr + 4);
+
+    /* For nil config_ptr: only intercept disk-related functions.
+     * Non-disk calls (SCC, keyboard) should use original error path. */
+    if (config_ptr == 0) {
+        if (fnctn_code != HLE_DINIT && fnctn_code != HLE_HDINIT &&
+            fnctn_code != HLE_DSKIO && fnctn_code != HLE_HDSKIO &&
+            fnctn_code != HLE_DSKUNCLAMP && fnctn_code != HLE_DDOWN &&
+            fnctn_code != HLE_HDDOWN && fnctn_code != HLE_DINTERRUPT &&
+            fnctn_code != HLE_DALARMS && fnctn_code != HLE_DCONTROL)
+            return false;
+    }
+
+    /* If config_ptr points to BADCALL device (bitbucket), intercept disk functions.
+     * Let real driver calls through. */
+    if (config_ptr != 0 && lisa->hle.badcall != 0) {
+        uint32_t entry_pt = cpu_read32(cpu, config_ptr);
+        if (entry_pt != 0 && entry_pt != lisa->hle.badcall &&
+            entry_pt != 0x000003F0)  /* stub address */
+            return false;  /* Real driver, let OS handle */
+    }
+
+    static int hle_trace = 0;
+    if (hle_trace < 50) {
+        hle_trace++;
+        fprintf(stderr, "HLE CALLDRIVER: fnctn=%d config=$%06X params=$%06X\n",
+                fnctn_code, config_ptr, params_ptr);
+    }
+
+    int16_t error = 0;
+
+    switch (fnctn_code) {
+    case HLE_DINIT:
+        fprintf(stderr, "HLE: dinit → success\n");
+        break;
+    case HLE_HDINIT:
+        fprintf(stderr, "HLE: hdinit → success\n");
+        break;
+    case HLE_DSKIO: {
+        uint32_t req_ptr = cpu_read32(cpu, params_ptr + 6);
+        if (req_ptr == 0) { error = 605; break; }
+        int16_t operatn   = (int16_t)cpu_read16(cpu, req_ptr + REQ_OPERATN);
+        uint32_t buf_addr = cpu_read32(cpu, req_ptr + REQ_BUFF_ADDR);
+        int16_t length    = (int16_t)cpu_read16(cpu, req_ptr + REQ_LENGTH);
+        uint32_t block_no = cpu_read32(cpu, req_ptr + REQ_DISK_ADDR);
+        if (hle_trace < 200)
+            fprintf(stderr, "HLE dskio: op=%d block=%u buf=$%06X len=%d\n",
+                    operatn, block_no, buf_addr, length);
+        if (operatn == 0) {
+            uint8_t data[PROFILE_DATA_SIZE];
+            int rc = hle_read_block(lisa, block_no, data, NULL);
+            if (rc == 0) {
+                for (int i = 0; i < PROFILE_DATA_SIZE && i < length; i++)
+                    cpu->write8(mask_24(buf_addr + i), data[i]);
+                lisa->hle.reads++;
+            } else { error = 654; }
+        } else if (operatn == 1) {
+            uint8_t data[PROFILE_DATA_SIZE];
+            for (int i = 0; i < PROFILE_DATA_SIZE && i < length; i++)
+                data[i] = cpu->read8(mask_24(buf_addr + i));
+            int rc = hle_write_block(lisa, block_no, data, NULL);
+            if (rc == 0) { lisa->hle.writes++; }
+            else { error = 654; }
+        } else { error = 605; }
+        break;
+    }
+    case HLE_HDSKIO:
+        fprintf(stderr, "HLE: hdskio → success\n");
+        break;
+    case HLE_DDOWN: case HLE_HDDOWN: case HLE_DSKUNCLAMP:
+    case HLE_DINTERRUPT: case HLE_DALARMS: case HLE_DCONTROL:
+        break;
+    default:
+        if (hle_trace < 200)
+            fprintf(stderr, "HLE: unhandled fnctn=%d, passing through\n", fnctn_code);
+        return false;
+    }
+
+    /* Simulate CALLDRIVER return sequence */
+    cpu->a[7] += 4;   /* skip return address */
+    cpu->a[7] += 8;   /* skip params_ptr + config_ptr */
+    errnum_ptr = cpu_read32(cpu, cpu->a[7]);
+    cpu->a[7] += 4;
+    cpu->write16(mask_24(errnum_ptr), (uint16_t)error);
+    cpu->pc = ret_addr;
+    cpu->cycles += 40;
+    return true;
+}
+
+/* Handle SYSTEM_ERROR intercept.
+ * SYSTEM_ERROR(integer) is called as: procedure SYSTEM_ERROR(err: integer).
+ * Lisa Pascal calling convention: parameter is on stack above return address.
+ * Stack: [return_addr(4)] [err(2)]
+ * SYSTEM_ERROR never returns normally, but our stub at $3F0 does return. */
+static bool hle_handle_system_error(lisa_t *lisa __attribute__((unused)), m68k_t *cpu) {
+    uint32_t ret_addr = cpu_read32(cpu, cpu->a[7]);
+    int16_t err_code = (int16_t)cpu_read16(cpu, cpu->a[7] + 4);
+
+    /* Log all SYSTEM_ERROR calls */
+    static int se_trace = 0;
+    if (se_trace < 30) {
+        se_trace++;
+        fprintf(stderr, "HLE SYSTEM_ERROR(%d) at ret=$%06X\n", err_code, ret_addr);
+    }
+
+    /* Error 10738 = stup_find_boot: can't find boot CD in pram.
+     * This is normal for us — we bypass pram entirely.
+     * Suppress the error and return to let INIT_BOOT_CDS continue.
+     * The EXIT(init_boot_cds) after SYSTEM_ERROR will return from the procedure. */
+    if (err_code >= 10738 && err_code <= 10741) {
+        fprintf(stderr, "HLE: Suppressing SYSTEM_ERROR(%d) — boot device handled by HLE\n",
+                err_code);
+        /* Simulate: pop return address + pop parameter, return */
+        cpu->a[7] += 4;  /* return address */
+        cpu->a[7] += 2;  /* err parameter (int2) */
+        cpu->pc = ret_addr;
+        cpu->cycles += 20;
+        return true;
+    }
+
+    /* All other errors: let the stub at $3F0 handle them */
+    return false;
+}
+
+bool lisa_hle_intercept(lisa_t *lisa, m68k_t *cpu) {
+    if (!lisa->hle.active) return false;
+    uint32_t pc = cpu->pc & 0x00FFFFFF;
+
+    /* Intercept CALLDRIVER */
+    if (pc == lisa->hle.calldriver) return hle_handle_calldriver(lisa, cpu);
+    if (lisa->hle.call_hdisk != 0 && pc == lisa->hle.call_hdisk)
+        return hle_handle_calldriver(lisa, cpu);
+
+    /* Intercept SYSTEM_ERROR for boot failure suppression */
+    if (lisa->hle.system_error != 0 && pc == lisa->hle.system_error)
+        return hle_handle_system_error(lisa, cpu);
+
+    return false;
+}
+
+/* HLE callback wrapper for m68k_t.hle_check */
+static bool hle_cpu_check(void *ctx, void *cpu) {
+    return lisa_hle_intercept((lisa_t *)ctx, (m68k_t *)cpu);
 }

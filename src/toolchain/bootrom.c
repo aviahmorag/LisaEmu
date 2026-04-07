@@ -86,6 +86,32 @@ uint8_t *bootrom_generate(void) {
     }
 
     /* ================================================================
+     * PROM checksum routine at $FE00BC
+     * Called by VERIFY_CKSUM (source-STARASM2.TEXT):
+     *   A0 = address of parameter memory image
+     *   D0 = word count - 1 (typically 31 for 32 words = 64 bytes)
+     *   D1 = 0 (memory image) or 1 (shared memory)
+     * Returns:
+     *   D3 = computed checksum (0 if valid)
+     *
+     * Algorithm: XOR all 16-bit words. If the checksum field (last word)
+     * is set correctly, XOR of all words including checksum = 0.
+     * ================================================================ */
+    b.pc = 0x00BC;
+    /* CLR.L D3 */
+    emit16(&b, 0x4283);
+    /* loop: MOVE.W (A0)+,D2 */
+    uint32_t cksum_loop = b.pc;
+    emit16(&b, 0x3418);         /* MOVE.W (A0)+,D2 */
+    /* EOR.W D2,D3 */
+    emit16(&b, 0xB543);         /* EOR.W D2,D3 */
+    /* DBRA D0,loop */
+    emit16(&b, 0x51C8);
+    emit16(&b, (uint16_t)((int16_t)(cksum_loop - b.pc)));
+    /* RTS */
+    emit16(&b, 0x4E75);
+
+    /* ================================================================
      * Default exception handler at $FE0300: just RTE
      * ================================================================ */
     b.pc = 0x0300;
@@ -272,6 +298,28 @@ uint8_t *bootrom_generate(void) {
 
     emit16(&b, 0x4E71);          /* NOP */
     emit16(&b, 0x60FC);          /* BRA.S self (halt) */
+
+    /* ================================================================
+     * Loader stub at $FE0600 — replacement for the boot loader's
+     * LDRTRAP/DRIVER_CALL interface.
+     *
+     * ENTER_LOADER (source-STARASM2.TEXT) calls through loader_link ($204).
+     * It passes D2 = pointer to fake_parms struct.
+     * The original loader's LDRTRAP pushes D2 and calls DRIVER_CALL.
+     *
+     * Our stub writes D2 to the special I/O port $FCC100-$FCC103.
+     * The emulator's io_write_cb intercepts this and processes the
+     * loader call directly (reading from the ProFile disk image).
+     * ================================================================ */
+    b.pc = 0x0600;
+
+    /* MOVE.L D2,$FCC100 — write fake_parms pointer to loader trap port.
+     * This is a MOVE.L Dn,(xxx).L instruction.
+     * Encoding: 0010 0011 1100 0010 = $23C2, followed by 32-bit address. */
+    emit16(&b, 0x23C2);          /* MOVE.L D2,abs.L */
+    emit32(&b, 0x00FCC100);      /* $FCC100 — loader trap port */
+
+    emit16(&b, 0x4E75);          /* RTS — return to ENTER_LOADER */
 
     printf("Boot ROM generated: %u bytes used of %u\n", b.pc, ROM_SIZE);
     uint32_t ssp = ((uint32_t)rom[0]<<24)|((uint32_t)rom[1]<<16)|((uint32_t)rom[2]<<8)|rom[3];

@@ -98,6 +98,22 @@ typedef struct {
     /* Machine state */
     bool         running;
     bool         power_on;
+
+    /* HLE (High-Level Emulation) disk I/O — bypasses ProFile driver */
+    struct {
+        uint32_t calldriver;       /* CALLDRIVER entry in DRIVERASM */
+        uint32_t call_hdisk;       /* CALL_HDISK entry in DRIVERASM */
+        uint32_t hdiskio;          /* HDISKIO function in HDISK unit */
+        uint32_t prodriver;        /* PRODRIVER in PROFILE unit */
+        uint32_t system_error;     /* SYSTEM_ERROR — intercept boot failures */
+        uint32_t badcall;          /* BADCALL — default driver entry */
+        uint32_t parallel;         /* PARALLEL — ProFile interrupt handler */
+        uint32_t use_hdisk;        /* USE_HDISK — sets up HDISK entry point */
+        bool     active;           /* HLE intercepts enabled */
+        bool     boot_config_done; /* Have we injected boot device config? */
+        int      reads;            /* Stats: blocks read */
+        int      writes;           /* Stats: blocks written */
+    } hle;
 } lisa_t;
 
 /* Public API */
@@ -125,5 +141,16 @@ void lisa_mouse_button(lisa_t *lisa, bool pressed);
 const uint32_t *lisa_get_framebuffer(lisa_t *lisa);
 int lisa_get_screen_width(void);
 int lisa_get_screen_height(void);
+
+/* HLE disk I/O — called from CPU execution loop when PC matches a known function.
+ * Returns true if the intercept handled the call (CPU should skip execution).
+ * Returns false if normal execution should continue. */
+bool lisa_hle_intercept(lisa_t *lisa, m68k_t *cpu);
+
+/* Set HLE addresses from linker symbol table */
+void lisa_hle_set_addresses(lisa_t *lisa, uint32_t calldriver, uint32_t call_hdisk,
+                            uint32_t hdiskio, uint32_t prodriver,
+                            uint32_t system_error, uint32_t badcall,
+                            uint32_t parallel, uint32_t use_hdisk);
 
 #endif /* LISA_H */

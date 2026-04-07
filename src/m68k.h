@@ -79,6 +79,12 @@ typedef struct {
     void     (*write8)(uint32_t addr, uint8_t val);
     void     (*write16)(uint32_t addr, uint16_t val);
     void     (*write32)(uint32_t addr, uint32_t val);
+
+    /* HLE callback — if set, called before each instruction.
+     * Returns true if the instruction was handled (skip normal execution).
+     * Both args are void* to avoid circular header dependency. */
+    bool     (*hle_check)(void *hle_ctx, void *cpu);
+    void     *hle_ctx;
 } m68k_t;
 
 /* Public API */

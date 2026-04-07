@@ -738,6 +738,46 @@ build_result_t toolchain_build(const char *source_dir,
         result.files_linked = lk->num_modules;
     }
 
+    /* Export HLE addresses from linker symbol table */
+    if (link_ok) {
+        struct { const char *name; const char *label; } hle_syms[] = {
+            {"CALLDRIVER", "CALLDRIVER"},
+            {"CALL_HDIS", "CALL_HDISK"},     /* 8-char truncated */
+            {"HDISKIO",   "HDISKIO"},
+            {"PRODRIVE",  "PRODRIVER"},       /* 8-char truncated */
+            {"SYSTEM_E",  "SYSTEM_ERROR"},   /* 8-char truncated */
+            {"BADCALL",   "BADCALL"},
+            {"PARALLEL",  "PARALLEL"},
+            {"USE_HDIS",  "USE_HDISK"},      /* 8-char truncated */
+            {NULL, NULL}
+        };
+        char hle_path[512];
+        snprintf(hle_path, sizeof(hle_path), "%s/hle_addrs.txt", output_dir);
+        FILE *hle_f = fopen(hle_path, "w");
+        if (hle_f) {
+            for (int h = 0; hle_syms[h].name; h++) {
+                int idx = -1;
+                size_t match_len = strlen(hle_syms[h].name);
+                if (match_len > 8) match_len = 8;
+                for (int s = 0; s < lk->num_symbols; s++) {
+                    if (lk->symbols[s].type == LSYM_ENTRY &&
+                        lk->symbols[s].resolved &&
+                        strncasecmp(lk->symbols[s].name, hle_syms[h].name, match_len) == 0) {
+                        idx = s;
+                        break;
+                    }
+                }
+                if (idx >= 0) {
+                    fprintf(hle_f, "%s 0x%X\n", hle_syms[h].label, lk->symbols[idx].value);
+                    fprintf(stderr, "HLE: %s = $%X\n", hle_syms[h].label, lk->symbols[idx].value);
+                } else {
+                    fprintf(stderr, "HLE: %s NOT FOUND\n", hle_syms[h].name);
+                }
+            }
+            fclose(hle_f);
+        }
+    }
+
     if (progress) progress("Building disk image...", 80, 100);
 
     /* Phase 4: Build disk image */

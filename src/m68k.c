@@ -3219,6 +3219,15 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         }
         if (cpu->pc >= 0x400) prev_pc = cpu->pc;
 
+        /* HLE intercept check — before executing the instruction,
+         * see if this PC should be handled by high-level emulation. */
+        if (cpu->hle_check && cpu->hle_check(cpu->hle_ctx, cpu)) {
+            /* HLE handler set cpu->pc and cpu->cycles directly */
+            if (cpu->cycles == 0) cpu->cycles = 4;
+            cpu->total_cycles += cpu->cycles;
+            continue;
+        }
+
         cpu->cycles = 0;
         execute_one(cpu);
         if (cpu->cycles == 0) cpu->cycles = 4; /* minimum */
