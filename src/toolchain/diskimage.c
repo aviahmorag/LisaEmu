@@ -194,63 +194,68 @@ bool disk_finalize(disk_builder_t *db) {
     /* Write MDDF (Master Directory Data File) at block BOOT_TRACK_BLOCKS (= disk block 24).
      * This is filesystem page 0 (MDDF_HOME = 0).
      *
-     * The MDDF layout must match the Lisa OS MDDFdb record (SOURCE-VMSTUFF.TEXT):
+     * The MDDF layout matches the Lisa OS MDDFdb record (SOURCE-VMSTUFF.TEXT).
+     * IMPORTANT: Lisa Pascal string[32] = 34 bytes (1 len + 32 chars + 1 pad
+     * for word alignment), verified against real "AOS 3.0" disk image.
+     *
      *   Offset  Field                  Type         Size
      *   0       fsversion              integer      2
      *   2       volid (UID: a,b)       2x longint   8
      *   10      volnum                 integer      2
-     *   12      volname                string[32]   33 (1 len + 32 chars)
-     *   45      password               string[32]   33
-     *   78      init_machine_id        longint      4
-     *   82      master_machine_id      longint      4
-     *   86      DT_created             longint      4
-     *   90      DT_copy_created        longint      4
-     *   94      DT_copied              longint      4
-     *   98      DT_scavenged           longint      4
-     *   102     copy_thread            longint      4
-     *   106     geography.firstblock   longint      4
-     *   110     geography.lastblock    longint      4
-     *   114     geography.lastfspage   longint      4
-     *   118     blockcount             longint      4
-     *   122     blocksize              integer      2
-     *   124     datasize               integer      2
-     *   126     cluster_size           integer      2
-     *   128     MDDFaddr               longint      4  (must be 0)
-     *   132     MDDFsize               integer      2
-     *   134     bitmap_addr            longint      4
-     *   138     bitmap_size            longint      4
-     *   142     bitmap_bytes           integer      2
-     *   144     bitmap_pages           integer      2
-     *   146     slist_addr             longint      4
-     *   150     slist_packing          integer      2
-     *   152     slist_block_count      integer      2
-     *   154     first_file             integer      2
-     *   156     empty_file             integer      2
-     *   158     maxfiles               integer      2
-     *   160     hintsize               integer      2
-     *   162     leader_offset          integer      2
-     *   164     leader_pages           integer      2
-     *   166     flabel_offset          integer      2
-     *   168     unusedi1               integer      2
-     *   170     map_offset             integer      2
-     *   172     map_size               integer      2
-     *   174     filecount              integer      2
-     *   176     freestart              longint      4
-     *   180     unusedl1               longint      4
-     *   184     freecount              longint      4
-     *   188     rootsnum               integer      2
-     *   190     rootmaxentries         integer      2
+     *   12      volname                string[32]   34 (1 len + 32 chars + 1 pad)
+     *   46      password               string[32]   34
+     *   80      init_machine_id        longint      4
+     *   84      master_machine_id      longint      4
+     *   88      DT_created             longint      4
+     *   92      DT_copy_created        longint      4
+     *   96      DT_copied              longint      4
+     *   100     DT_scavenged           longint      4
+     *   104     copy_thread            longint      4
+     *   108     geography.firstblock   longint      4
+     *   112     geography.lastblock    longint      4
+     *   116     geography.lastfspage   longint      4
+     *   120     blockcount             longint      4
+     *   124     blocksize              integer      2  (536 = 512 data + 24 label)
+     *   126     datasize               integer      2  (512)
+     *   128     cluster_size           integer      2
+     *   130     MDDFaddr               longint      4  (must be 0)
+     *   134     MDDFsize               integer      2
+     *   136     bitmap_addr            longint      4
+     *   140     bitmap_size            longint      4
+     *   144     bitmap_bytes           integer      2
+     *   146     bitmap_pages           integer      2
+     *   148     slist_addr             longint      4
+     *   152     slist_packing          integer      2
+     *   154     slist_block_count      integer      2
+     *   156     first_file             integer      2
+     *   158     empty_file             integer      2
+     *   160     maxfiles               integer      2
+     *   162     hintsize               integer      2
+     *   164     leader_offset          integer      2
+     *   166     leader_pages           integer      2
+     *   168     flabel_offset          integer      2
+     *   170     unusedi1               integer      2
+     *   172     map_offset             integer      2
+     *   174     map_size               integer      2
+     *   176     filecount              integer      2
+     *   178     freestart              longint      4
+     *   182     unusedl1               longint      4
+     *   186     freecount              longint      4
+     *   190     rootsnum               integer      2
+     *   192     rootmaxentries         integer      2
+     *   ...     (mountinfo, pmem, booleans, late fields)
+     *   276     smallmap_offset        integer      2
+     *   302     root_page              longint      4
+     *   306     tree_depth             integer      2
      *
      * The OS validates (source-sfileio2.text, real_mount):
      *   - fsversion must be 14, 15, or 17 (SPRING_VERSION=17 = CUR_VERSION)
-     *   - MDDFaddr must be 0  (check commented out in source but still good practice)
+     *   - MDDFaddr must be 0
      *   - length(volname) must not exceed 32
      */
 
-    /* MDDF_SIZE: approximate sizeof(MDDFdb) — the OS checks are commented out
-     * for MDDFsize, but we set it for correctness. The full record including
-     * pmem (66 bytes), booleans, and trailing fields is ~284 bytes. */
-    #define MDDF_RECORD_SIZE 284
+    /* sizeof(MDDFdb) including pmem(66), booleans, and trailing fields */
+    #define MDDF_RECORD_SIZE 314
 
     uint8_t mddf[PROFILE_DATA_SIZE];
     memset(mddf, 0, sizeof(mddf));
@@ -273,68 +278,79 @@ bool disk_finalize(disk_builder_t *db) {
     /* volnum */
     W16(mddf, 10, 1);
 
-    /* volname as Pascal string[32]: length byte at offset 12, chars at 13..44 */
+    /* volname as Pascal string[32]: 34 bytes (1 len + 32 chars + 1 pad for
+     * word alignment). This matches the Lisa Pascal record layout. */
     int namelen = (int)strlen(db->volume_name);
     if (namelen > 32) namelen = 32;
     mddf[12] = (uint8_t)namelen;
     memcpy(mddf + 13, db->volume_name, namelen);
+    /* string[32] occupies bytes 12..45 (34 bytes total) */
 
-    /* password — leave as empty string (length = 0 at offset 45) */
+    /* password — empty string at offset 46 (34 bytes: 46..79) */
+    mddf[46] = 0;
 
-    /* Filesystem geometry */
+    /* init_machine_id at offset 80 */
+    W32(mddf, 80, 0x00000001);  /* init_machine_id */
+    W32(mddf, 84, 0x00000001);  /* master_machine_id */
+
+    /* Filesystem geometry — corrected offsets (34-byte strings) */
     uint32_t total_fs_pages = db->total_blocks - BOOT_TRACK_BLOCKS;
     uint32_t last_fs_page = (total_fs_pages > 0) ? total_fs_pages - 1 : 0;
-    W32(mddf, 106, 0);                          /* geography.firstblock */
-    W32(mddf, 110, (uint32_t)(db->total_blocks - 1)); /* geography.lastblock */
-    W32(mddf, 114, last_fs_page);               /* geography.lastfspage */
+    W32(mddf, 108, BOOT_TRACK_BLOCKS);          /* geography.firstblock */
+    W32(mddf, 112, (uint32_t)(db->total_blocks - 1)); /* geography.lastblock */
+    W32(mddf, 116, last_fs_page);               /* geography.lastfspage */
 
     /* blockcount, blocksize, datasize, cluster_size */
-    W32(mddf, 118, db->total_blocks);           /* blockcount */
-    W16(mddf, 122, PROFILE_DATA_SIZE);          /* blocksize (512) */
-    W16(mddf, 124, PROFILE_DATA_SIZE);          /* datasize (512) */
-    W16(mddf, 126, 1);                          /* cluster_size */
+    W32(mddf, 120, db->total_blocks);           /* blockcount */
+    W16(mddf, 124, 536);                        /* blocksize (536 = 512 data + 24 label) */
+    W16(mddf, 126, PROFILE_DATA_SIZE);          /* datasize (512) */
+    W16(mddf, 128, 1);                          /* cluster_size */
 
-    /* MDDFaddr = 0 (filesystem page 0, i.e. disk block 24) */
-    W32(mddf, 128, 0);
+    /* MDDFaddr = 0 (filesystem page 0, i.e. disk block BOOT_TRACK_BLOCKS) */
+    W32(mddf, 130, 0);
 
     /* MDDFsize = sizeof(MDDFdb) */
-    W16(mddf, 132, MDDF_RECORD_SIZE);
+    W16(mddf, 134, MDDF_RECORD_SIZE);
 
     /* bitmap — starts at filesystem page 1 */
-    W32(mddf, 134, 1);                          /* bitmap_addr */
-    W32(mddf, 138, total_fs_pages);             /* bitmap_size (bits) */
+    W32(mddf, 136, 1);                          /* bitmap_addr */
+    W32(mddf, 140, total_fs_pages);             /* bitmap_size (bits) */
     uint32_t bitmap_bytes_val = (total_fs_pages + 7) / 8;
     uint32_t bitmap_pages_val = (bitmap_bytes_val + PROFILE_DATA_SIZE - 1) / PROFILE_DATA_SIZE;
-    W16(mddf, 142, (uint16_t)bitmap_bytes_val); /* bitmap_bytes */
-    W16(mddf, 144, (uint16_t)bitmap_pages_val); /* bitmap_pages */
+    W16(mddf, 144, (uint16_t)bitmap_bytes_val); /* bitmap_bytes */
+    W16(mddf, 146, (uint16_t)bitmap_pages_val); /* bitmap_pages */
 
     /* slist — starts after bitmap */
     uint32_t slist_start = 1 + bitmap_pages_val;
-    W32(mddf, 146, slist_start);                /* slist_addr */
-    W16(mddf, 150, 1);                          /* slist_packing (1 entry per block) */
-    W16(mddf, 152, 1);                          /* slist_block_count */
+    W32(mddf, 148, slist_start);                /* slist_addr */
+    W16(mddf, 152, 36);                         /* slist_packing (36 entries per block) */
+    W16(mddf, 154, 1);                          /* slist_block_count */
 
     /* File management fields */
-    W16(mddf, 154, 4);                          /* first_file */
-    W16(mddf, 156, (uint16_t)(4 + db->num_files)); /* empty_file */
-    W16(mddf, 158, 256);                        /* maxfiles */
-    W16(mddf, 160, 1);                          /* hintsize (pages) */
-    W16(mddf, 162, 0);                          /* leader_offset */
-    W16(mddf, 164, 1);                          /* leader_pages */
-    W16(mddf, 166, 0);                          /* flabel_offset */
-    W16(mddf, 170, 0);                          /* map_offset */
-    W16(mddf, 172, 1);                          /* map_size */
-    W16(mddf, 174, (uint16_t)db->num_files);   /* filecount */
+    W16(mddf, 156, 4);                          /* first_file */
+    W16(mddf, 158, (uint16_t)(4 + db->num_files)); /* empty_file */
+    W16(mddf, 160, 256);                        /* maxfiles */
+    W16(mddf, 162, 1);                          /* hintsize (pages) */
+    W16(mddf, 164, 0);                          /* leader_offset */
+    W16(mddf, 166, 1);                          /* leader_pages */
+    W16(mddf, 168, 0);                          /* flabel_offset */
+    W16(mddf, 170, 0);                          /* unusedi1 */
+    W16(mddf, 172, 0);                          /* map_offset */
+    W16(mddf, 174, 84);                         /* map_size */
+    W16(mddf, 176, (uint16_t)db->num_files);   /* filecount */
 
     /* Free space tracking */
     uint32_t used = db->next_free_block - BOOT_TRACK_BLOCKS;
     uint32_t free_pages = (total_fs_pages > used) ? total_fs_pages - used : 0;
-    W32(mddf, 176, used);                       /* freestart */
-    W32(mddf, 184, free_pages);                 /* freecount */
+    W32(mddf, 178, used);                       /* freestart */
+    W32(mddf, 186, free_pages);                 /* freecount */
 
     /* Root catalog */
-    W16(mddf, 188, 3);                          /* rootsnum (s-file 3) */
-    W16(mddf, 190, 64);                         /* rootmaxentries */
+    W16(mddf, 190, 3);                          /* rootsnum (s-file 3) */
+    W16(mddf, 192, 64);                         /* rootmaxentries */
+
+    /* Late fields (after booleans at 274-275) */
+    W16(mddf, 276, 0);                          /* smallmap_offset */
 
     #undef W16
     #undef W32

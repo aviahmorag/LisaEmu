@@ -74,7 +74,15 @@ uint8_t *bootrom_generate(void) {
     emit32(&b, 0x00FE0400);
 
     /* Vectors 2-63: default → RTE handler at $FE0300,
-     * with specific handlers for Line-A (10) and Line-F (11) */
+     * with specific handlers for Line-A (10) and Line-F (11).
+     *
+     * IMPORTANT: Certain PROM entry points overlap with vector positions:
+     *   $FE0084 (vector 33) = prom_monitor
+     *   $FE0090 (vector 36) = prof_entry (ProFile read)
+     *   $FE0094 (vector 37) = twig_entry (Twiggy read)
+     *   $FE00BC (vector 47) = checksum routine
+     * These positions contain JMP instructions to actual code, which
+     * also serve as valid vector addresses during setup mode. */
     for (int i = 2; i < 64; i++) {
         if (i == 10) {
             emit32(&b, 0x00FE0320);  /* Line-A → skip handler */
@@ -84,6 +92,30 @@ uint8_t *bootrom_generate(void) {
             emit32(&b, 0x00FE0300);  /* Default RTE */
         }
     }
+
+    /* ================================================================
+     * PROM entry points — placed at real PROM addresses.
+     * These overlap with vector table entries but that's OK: after
+     * startup, vectors come from RAM. The boot track (LDRLDR) calls
+     * these as subroutines via JSR/JMP.
+     * ================================================================ */
+
+    /* $FE0084: prom_monitor — reenter PROM / halt */
+    b.pc = 0x0084;
+    emit16(&b, 0x4E71);          /* NOP */
+    emit16(&b, 0x60FC);          /* BRA.S self (halt forever) */
+
+    /* $FE0090: prof_entry — ProFile block read.
+     * Just RTS — the LDRLDR will get empty/zero data but the boot
+     * process won't crash. Eventually we need a real implementation. */
+    b.pc = 0x0090;
+    emit16(&b, 0x4E75);          /* RTS (2 bytes: $90-$91) */
+    /* pad */
+    emit16(&b, 0x4E71);          /* NOP (2 bytes: $92-$93) */
+
+    /* $FE0094: twig_entry — Twiggy/Sony block read (stub) */
+    b.pc = 0x0094;
+    emit16(&b, 0x4E75);          /* RTS */
 
     /* ================================================================
      * PROM checksum routine at $FE00BC
@@ -277,11 +309,21 @@ uint8_t *bootrom_generate(void) {
     emit16(&b, 0x2039);          /* MOVE.L ($400).L,D0 */
     emit32(&b, 0x00000400);
     emit16(&b, 0x4A80);          /* TST.L D0 */
-    emit16(&b, 0x6706);          /* BEQ.S no_boot (+6 = skip JMP) */
+    emit16(&b, 0x670A);          /* BEQ.S try_boot_track (+10) */
 
-    /* 8. Jump to OS code at $400 */
+    /* 8. Jump to OS code at $400 (cross-compiled image path) */
     emit16(&b, 0x4EF9);          /* JMP ($400).L */
     emit32(&b, 0x00000400);
+
+    /* try_boot_track: $400 was zero, check if boot track is loaded at $20000 */
+    emit16(&b, 0x2039);          /* MOVE.L ($20000).L,D0 */
+    emit32(&b, 0x00020000);
+    emit16(&b, 0x4A80);          /* TST.L D0 */
+    emit16(&b, 0x6706);          /* BEQ.S no_boot (+6 = skip JMP) */
+
+    /* Jump to boot track at $20000 (real Lisa OS image path) */
+    emit16(&b, 0x4EF9);          /* JMP ($20000).L */
+    emit32(&b, 0x00020000);
 
     /* no_boot: Draw diagonal error indicator and halt */
     emit16(&b, 0x207C);          /* MOVEA.L #$7A000,A0 */

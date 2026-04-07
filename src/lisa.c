@@ -47,10 +47,12 @@ typedef struct {
 
 typedef struct {
     bool initialized;
-    int32_t fs_block0;
+    int32_t fs_block0;      /* Disk block where MDDF is physically located */
+    int32_t geo_firstblock; /* geo.firstblock from MDDF — used for page→block mapping */
     int16_t data_size;
     int32_t slist_addr;
     int16_t slist_packing;
+    int16_t slist_block_count;
     int16_t map_offset;
     int16_t smallmap_offset;
     int16_t catentries;
@@ -58,6 +60,13 @@ typedef struct {
     int32_t root_page;
     int16_t tree_depth;
     int32_t rootsnum;
+    int16_t first_file;
+    int16_t empty_file;
+    int16_t maxfiles;
+    int16_t leader_offset;
+    int16_t leader_pages;
+    int16_t flabel_offset;
+    int16_t hintsize;
 
     bool file_open;
     ldr_mapentry_t filemap[LDR_MAP_MAX];
@@ -97,41 +106,135 @@ static bool ldr_fs_init(lisa_t *lisa) {
     if (ldr_fs.initialized) return true;
     memset(&ldr_fs, 0, sizeof(ldr_fs));
 
+    /* Scan for MDDF: look for fsversion = 14, 15, or 17 (valid Lisa OS versions).
+     * The MDDF can be at various locations depending on disk format:
+     * - Block 24 for our cross-compiled images (24-block boot track)
+     * - Block 46 for real Lisa OS disk images (larger boot track)
+     * - Block 30 for some Twiggy-converted images
+     * We also verify the volname is a valid Pascal string. */
     uint8_t mddf_buf[512];
-    uint32_t try_blocks[] = { 24, 0, 32, 16 };
     bool found = false;
-    for (int i = 0; i < 4; i++) {
-        if (!ldr_read_disk_block(lisa, try_blocks[i], mddf_buf)) continue;
+    uint32_t max_scan = 100;
+    if (lisa->profile.data_size / PROFILE_BLOCK_SIZE < max_scan)
+        max_scan = (uint32_t)(lisa->profile.data_size / PROFILE_BLOCK_SIZE);
+
+    for (uint32_t blk = 0; blk < max_scan; blk++) {
+        if (!ldr_read_disk_block(lisa, blk, mddf_buf)) continue;
         int16_t fsver = ldr_get16(mddf_buf);
-        if (fsver >= 10 && fsver <= 30) {
-            ldr_fs.fs_block0 = try_blocks[i];
-            found = true;
-            fprintf(stderr, "LDR_FS: MDDF at block %u, fsversion=%d\n",
-                    try_blocks[i], fsver);
-            break;
+        if (fsver != 14 && fsver != 15 && fsver != 17) continue;
+
+        /* Verify: volname at offset 12 must be a valid Pascal string[32] */
+        uint8_t namelen = mddf_buf[12];
+        if (namelen == 0 || namelen > 32) continue;
+        bool valid_name = true;
+        for (int i = 0; i < namelen; i++) {
+            uint8_t c = mddf_buf[13 + i];
+            if (c < 0x20 || c > 0x7E) { valid_name = false; break; }
         }
+        if (!valid_name) continue;
+
+        /* Verify: datasize should be 512.
+         * At offset 126 in correct layout (real images with 34-byte strings).
+         * At offset 124 in our cross-compiled images (33-byte strings, 2 off). */
+        int16_t ds126 = ldr_get16(mddf_buf + 126);
+        int16_t ds124 = ldr_get16(mddf_buf + 124);
+        if (ds126 != 512 && ds124 != 512) continue;
+
+        ldr_fs.fs_block0 = (int32_t)blk;
+        found = true;
+        char vname[33] = {0};
+        memcpy(vname, mddf_buf + 13, namelen);
+        fprintf(stderr, "LDR_FS: MDDF at block %u, fsversion=%d, volume=\"%s\"\n",
+                blk, fsver, vname);
+        break;
     }
     if (!found) { fprintf(stderr, "LDR_FS: no MDDF found\n"); return false; }
 
-    /* Parse MDDF fields per SOURCE-VMSTUFF.TEXT MDDFdb layout */
-    ldr_fs.fs_version = ldr_get16(mddf_buf + 0);
-    ldr_fs.data_size = ldr_get16(mddf_buf + 126);
-    if (ldr_fs.data_size <= 0 || ldr_fs.data_size > 512) ldr_fs.data_size = 512;
-    ldr_fs.slist_addr = ldr_get32(mddf_buf + 148);
-    ldr_fs.slist_packing = ldr_get16(mddf_buf + 152);
-    ldr_fs.map_offset = ldr_get16(mddf_buf + 172);
-    ldr_fs.catentries = ldr_get16(mddf_buf + 192);
-    ldr_fs.rootsnum = ldr_get16(mddf_buf + 190);
-    ldr_fs.smallmap_offset = ldr_get16(mddf_buf + 278);
-    ldr_fs.root_page = ldr_get32(mddf_buf + 304);
-    ldr_fs.tree_depth = ldr_get16(mddf_buf + 308);
+    /* Parse MDDF fields per SOURCE-VMSTUFF.TEXT MDDFdb layout.
+     *
+     * IMPORTANT: Lisa Pascal string[32] = 34 bytes in records (33 + 1 pad
+     * for word alignment). Lisa Pascal boolean = 1 byte in records, with
+     * consecutive booleans packed and padded at end to word boundary.
+     *
+     * Field offsets (verified against real "AOS 3.0" disk image):
+     *   0: fsversion (2)        10: volnum (2)
+     *   2: volid.a (4)          12: volname (34 = 1 len + 32 chars + 1 pad)
+     *   6: volid.b (4)          46: password (34)
+     *  80: init_machine_id (4)  84: master_machine_id (4)
+     *  88: DT_created (4)       92: DT_copy_created (4)
+     *  96: DT_copied (4)       100: DT_scavenged (4)
+     * 104: copy_thread (4)
+     * 108: geo.firstblock (4)  112: geo.lastblock (4)  116: geo.lastfspage (4)
+     * 120: blockcount (4)      124: blocksize (2)      126: datasize (2)
+     * 128: cluster_size (2)    130: MDDFaddr (4)       134: MDDFsize (2)
+     * 136: bitmap_addr (4)     140: bitmap_size (4)
+     * 144: bitmap_bytes (2)    146: bitmap_pages (2)
+     * 148: slist_addr (4)      152: slist_packing (2)  154: slist_block_count (2)
+     * 156: first_file (2)      158: empty_file (2)     160: maxfiles (2)
+     * 162: hintsize (2)        164: leader_offset (2)  166: leader_pages (2)
+     * 168: flabel_offset (2)   170: unusedi1 (2)
+     * 172: map_offset (2)      174: map_size (2)
+     * 176: filecount (2)       178: freestart (4)
+     * 182: unusedl1 (4)        186: freecount (4)
+     * 190: rootsnum (2)        192: rootmaxentries (2)
+     * 194: mountinfo (2)       196: overmount_stamp (8)
+     * 204: pmem_id (4)         208: pmem (66)
+     * 274: vol_scavenged (1)   275: tbt_copied (1)   [+pad to 276]
+     * 276: smallmap_offset (2) 278: hentry_offset (2)
+     * 280: backup_volid (8)    288: flabel_size (2)
+     * 290: fs_overhead (2)     292: result_scavenge (2)
+     * 294: boot_code (2)       296: boot_environ (2)
+     * 298: oem_id (4)          302: root_page (4)
+     * 306: tree_depth (2)      308: node_id (2)
+     * 310: vol_seq_no (2)      312: vol_mounted (2)
+     */
+    /* Detect layout variant: real images have datasize=512 at offset 126,
+     * our cross-compiled images have it at offset 124 (2-byte shift from
+     * using 33-byte strings instead of 34-byte word-aligned strings). */
+    int adj = 0;
+    if (ldr_get16(mddf_buf + 126) == 512) {
+        adj = 0;  /* Correct layout (real Lisa OS images) */
+        fprintf(stderr, "LDR_FS: using correct MDDF layout (34-byte strings)\n");
+    } else if (ldr_get16(mddf_buf + 124) == 512) {
+        adj = -2; /* Our cross-compiled layout (33-byte strings, 2 bytes early) */
+        fprintf(stderr, "LDR_FS: using cross-compiled MDDF layout (33-byte strings, adj=-2)\n");
+    }
 
-    fprintf(stderr, "LDR_FS: datasize=%d slist=%d packing=%d map_off=%d "
-            "catentries=%d rootsnum=%d block0=%d root_page=%d depth=%d smoff=%d\n",
-            ldr_fs.data_size, (int)ldr_fs.slist_addr, ldr_fs.slist_packing,
-            ldr_fs.map_offset, ldr_fs.catentries, ldr_fs.rootsnum,
-            (int)ldr_fs.fs_block0, (int)ldr_fs.root_page, ldr_fs.tree_depth,
-            ldr_fs.smallmap_offset);
+    ldr_fs.fs_version = ldr_get16(mddf_buf + 0);
+    ldr_fs.geo_firstblock = ldr_get32(mddf_buf + 108 + adj);
+    ldr_fs.data_size = ldr_get16(mddf_buf + 126 + adj);
+    if (ldr_fs.data_size <= 0 || ldr_fs.data_size > 512) ldr_fs.data_size = 512;
+    ldr_fs.slist_addr = ldr_get32(mddf_buf + 148 + adj);
+    ldr_fs.slist_packing = ldr_get16(mddf_buf + 152 + adj);
+    ldr_fs.slist_block_count = ldr_get16(mddf_buf + 154 + adj);
+    ldr_fs.first_file = ldr_get16(mddf_buf + 156 + adj);
+    ldr_fs.empty_file = ldr_get16(mddf_buf + 158 + adj);
+    ldr_fs.maxfiles = ldr_get16(mddf_buf + 160 + adj);
+    ldr_fs.hintsize = ldr_get16(mddf_buf + 162 + adj);
+    ldr_fs.leader_offset = ldr_get16(mddf_buf + 164 + adj);
+    ldr_fs.leader_pages = ldr_get16(mddf_buf + 166 + adj);
+    ldr_fs.flabel_offset = ldr_get16(mddf_buf + 168 + adj);
+    ldr_fs.map_offset = ldr_get16(mddf_buf + 172 + adj);
+    ldr_fs.catentries = ldr_get16(mddf_buf + 192 + adj);
+    ldr_fs.rootsnum = ldr_get16(mddf_buf + 190 + adj);
+    /* Fields after booleans at 274-275 shift by 2 vs naive 2-byte-bool layout.
+     * For correct layout: smallmap_offset at 276, root_page at 302, tree_depth at 306.
+     * For cross-compiled (adj=-2): smallmap_offset at 274, root_page at 300, etc. */
+    ldr_fs.smallmap_offset = ldr_get16(mddf_buf + 276 + adj);
+    ldr_fs.root_page = ldr_get32(mddf_buf + 302 + adj);
+    ldr_fs.tree_depth = ldr_get16(mddf_buf + 306 + adj);
+
+    fprintf(stderr, "LDR_FS: geo.firstblock=%d datasize=%d slist=%d packing=%d slist_blks=%d\n"
+            "LDR_FS: map_off=%d smallmap_off=%d catentries=%d rootsnum=%d\n"
+            "LDR_FS: root_page=%d depth=%d first_file=%d empty_file=%d maxfiles=%d\n"
+            "LDR_FS: leader_off=%d leader_pages=%d hintsize=%d flabel_off=%d\n",
+            (int)ldr_fs.geo_firstblock, ldr_fs.data_size,
+            (int)ldr_fs.slist_addr, ldr_fs.slist_packing, ldr_fs.slist_block_count,
+            ldr_fs.map_offset, ldr_fs.smallmap_offset, ldr_fs.catentries, ldr_fs.rootsnum,
+            (int)ldr_fs.root_page, ldr_fs.tree_depth,
+            ldr_fs.first_file, ldr_fs.empty_file, ldr_fs.maxfiles,
+            ldr_fs.leader_offset, ldr_fs.leader_pages, ldr_fs.hintsize,
+            ldr_fs.flabel_offset);
 
     ldr_fs.initialized = true;
     ldr_fs.file_open = false;
@@ -141,19 +244,36 @@ static bool ldr_fs_init(lisa_t *lisa) {
 }
 
 static bool ldr_read_page(lisa_t *lisa, int32_t page, uint8_t *dst) {
-    return ldr_read_disk_block(lisa, ldr_fs.fs_block0 + page, dst);
+    /* For real Lisa OS images, geo.firstblock provides the page→block mapping.
+     * For our cross-compiled images, fs_block0 (the MDDF's disk block) serves
+     * the same role since we place the MDDF at page 0 = block BOOT_TRACK_BLOCKS.
+     * Real images may have the MDDF at a different disk block than geo.firstblock
+     * (e.g., MDDF at block 46 but geo.firstblock=30 for Twiggy-converted images). */
+    int32_t block0 = ldr_fs.geo_firstblock;
+    /* Fallback: if geo_firstblock is 0 or unreasonable, use MDDF block position */
+    if (block0 <= 0 || block0 > ldr_fs.fs_block0)
+        block0 = ldr_fs.fs_block0;
+    return ldr_read_disk_block(lisa, block0 + page, dst);
 }
 
 static bool ldr_find_sentry(lisa_t *lisa, int16_t sfile_num,
                              int32_t *hint_addr, int32_t *file_size) {
+    /* s_entry format (14 bytes per entry):
+     *   hintaddr:  longint (4)  — fs page of hint/leader page
+     *   fileaddr:  longint (4)  — first allocated data page
+     *   filesize:  longint (4)  — file size in bytes
+     *   version:   integer (2)  — version number
+     *
+     * slist_packing entries per 512-byte block.
+     * Entry N is at slist page N/packing, byte offset (N%packing)*14 */
     if (ldr_fs.slist_packing <= 0) return false;
     int32_t spage = (sfile_num / ldr_fs.slist_packing) + ldr_fs.slist_addr;
     int soffset = (sfile_num % ldr_fs.slist_packing) * 14;
     uint8_t sbuf[512];
     if (!ldr_read_page(lisa, spage, sbuf)) return false;
     if (soffset + 14 > 512) return false;
-    *hint_addr = ldr_get32(sbuf + soffset);
-    *file_size = ldr_get32(sbuf + soffset + 8);
+    *hint_addr = ldr_get32(sbuf + soffset);       /* hintaddr at +0 */
+    *file_size = ldr_get32(sbuf + soffset + 8);   /* filesize at +8 */
     return true;
 }
 
@@ -176,7 +296,11 @@ static bool ldr_build_filemap(lisa_t *lisa, int32_t hint_addr, int32_t file_size
         if (map_page <= 0) break;
         uint8_t map_buf[512], tag_buf[24];
         if (!ldr_read_page(lisa, map_page, map_buf)) break;
-        ldr_read_disk_tag(lisa, ldr_fs.fs_block0 + map_page, tag_buf);
+        /* Read tag for fwdlink — use same block0 as ldr_read_page */
+        int32_t block0 = ldr_fs.geo_firstblock;
+        if (block0 <= 0 || block0 > ldr_fs.fs_block0)
+            block0 = ldr_fs.fs_block0;
+        ldr_read_disk_tag(lisa, block0 + map_page, tag_buf);
 
         int16_t max_entries = ldr_get16(map_buf + fmap_offset + 4);
         uint8_t *entries = map_buf + fmap_offset + 8;
@@ -272,15 +396,49 @@ static void ldr_movemultiple(lisa_t *lisa, int32_t count, uint32_t dest) {
     }
 }
 
+/* Find a file by scanning the s-list and reading leader page names.
+ * This works for both flat-catalog and B-tree volumes without needing
+ * to navigate the directory structure. */
+static bool ldr_find_in_slist(lisa_t *lisa, const char *upper_name, int nlen,
+                               int32_t *out_hint, int32_t *out_size) {
+    int16_t start = ldr_fs.first_file;
+    int16_t end = ldr_fs.empty_file;
+    if (end <= start) end = ldr_fs.maxfiles;
+
+    for (int16_t sf = start; sf < end && sf < 6000; sf++) {
+        int32_t hint_addr, file_size;
+        if (!ldr_find_sentry(lisa, sf, &hint_addr, &file_size)) continue;
+        if (hint_addr <= 0 || file_size <= 0) continue;
+
+        /* Read the leader page to get the filename.
+         * The leader page is at hint_addr + leader_offset.
+         * The filename is a Pascal string at byte 0 of the leader page. */
+        int32_t leader_page = hint_addr + ldr_fs.leader_offset;
+        uint8_t leader[512];
+        if (!ldr_read_page(lisa, leader_page, leader)) continue;
+
+        int fname_len = leader[0];
+        if (fname_len <= 0 || fname_len > 32 || fname_len != nlen) continue;
+
+        bool match = true;
+        for (int i = 0; i < nlen; i++) {
+            char c = leader[1 + i];
+            if (c >= 'a' && c <= 'z') c -= 32;
+            if (c != upper_name[i]) { match = false; break; }
+        }
+        if (match) {
+            *out_hint = hint_addr;
+            *out_size = file_size;
+            fprintf(stderr, "LDR_FS: slist scan found '%s' sfile=%d hint=%d size=%d\n",
+                    upper_name, sf, (int)hint_addr, (int)file_size);
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool ldr_open_file(lisa_t *lisa, const char *name) {
     if (!ldr_fs.initialized && !ldr_fs_init(lisa)) return false;
-
-    int32_t cat_hint, cat_size;
-    if (!ldr_find_sentry(lisa, ldr_fs.rootsnum, &cat_hint, &cat_size))
-        return false;
-    if (!ldr_build_filemap(lisa, cat_hint, cat_size))
-        return false;
-    ldr_fs.file_open = true;
 
     char upper[64];
     int nlen = (int)strlen(name);
@@ -289,47 +447,73 @@ static bool ldr_open_file(lisa_t *lisa, const char *name) {
         upper[i] = (name[i] >= 'a' && name[i] <= 'z') ? name[i] - 32 : name[i];
     upper[nlen] = '\0';
 
-    int centry_size = 54;
     int bufsize = ldr_fs.data_size > 0 ? ldr_fs.data_size : 512;
 
-    for (int entry = 0; entry < ldr_fs.catentries; entry++) {
-        int32_t bpos = (int32_t)entry * centry_size;
-        if (!ldr_fillbuf(lisa, bpos)) break;
-
-        uint8_t eb[64];
-        int sp = ldr_fs.curr_page, sb = ldr_fs.next_byte;
-        for (int i = 0; i < centry_size && i < 64; i++)
-            eb[i] = ldr_getbyte(lisa);
-        ldr_fs.curr_page = sp;
-        ldr_fs.next_byte = sb;
-
-        int enl = eb[0];
-        if (enl <= 0 || enl > 32 || enl != nlen) continue;
-
-        bool match = true;
-        for (int i = 0; i < nlen; i++) {
-            char c = eb[1+i];
-            if (c >= 'a' && c <= 'z') c -= 32;
-            if (c != upper[i]) { match = false; break; }
-        }
-        if (!match) continue;
-
-        int16_t cetype = ldr_get16(eb + 34);
-        int16_t sfile = ldr_get16(eb + 36);
-        if (cetype != 3) continue; /* not fileentry */
-
-        fprintf(stderr, "LDR_FS: found '%s' sfile=%d\n", upper, sfile);
-
-        int32_t hint_addr, file_size;
-        if (!ldr_find_sentry(lisa, sfile, &hint_addr, &file_size)) return false;
-        fprintf(stderr, "LDR_FS: hint=%d size=%d\n", (int)hint_addr, (int)file_size);
-
-        if (!ldr_build_filemap(lisa, hint_addr, file_size)) return false;
+    /* Strategy 1: Try the catalog (works for our cross-compiled images) */
+    int32_t cat_hint, cat_size;
+    bool found_in_cat = false;
+    if (ldr_find_sentry(lisa, ldr_fs.rootsnum, &cat_hint, &cat_size) &&
+        cat_hint > 0 && cat_size > 0 &&
+        ldr_build_filemap(lisa, cat_hint, cat_size)) {
         ldr_fs.file_open = true;
-        ldr_fs.curr_page = -1;
-        ldr_fs.next_byte = bufsize;
-        return true;
+
+        int centry_size = 54;
+        for (int entry = 0; entry < ldr_fs.catentries; entry++) {
+            int32_t bpos = (int32_t)entry * centry_size;
+            if (!ldr_fillbuf(lisa, bpos)) break;
+
+            uint8_t eb[64];
+            int sp = ldr_fs.curr_page, sb = ldr_fs.next_byte;
+            for (int i = 0; i < centry_size && i < 64; i++)
+                eb[i] = ldr_getbyte(lisa);
+            ldr_fs.curr_page = sp;
+            ldr_fs.next_byte = sb;
+
+            int enl = eb[0];
+            if (enl <= 0 || enl > 32 || enl != nlen) continue;
+
+            bool match = true;
+            for (int i = 0; i < nlen; i++) {
+                char c = eb[1+i];
+                if (c >= 'a' && c <= 'z') c -= 32;
+                if (c != upper[i]) { match = false; break; }
+            }
+            if (!match) continue;
+
+            int16_t cetype = ldr_get16(eb + 34);
+            int16_t sfile = ldr_get16(eb + 36);
+            if (cetype != 3) continue; /* not fileentry */
+
+            fprintf(stderr, "LDR_FS: catalog found '%s' sfile=%d\n", upper, sfile);
+
+            int32_t hint_addr, file_size;
+            if (!ldr_find_sentry(lisa, sfile, &hint_addr, &file_size)) continue;
+            fprintf(stderr, "LDR_FS: hint=%d size=%d\n", (int)hint_addr, (int)file_size);
+
+            if (!ldr_build_filemap(lisa, hint_addr, file_size)) continue;
+            ldr_fs.file_open = true;
+            ldr_fs.curr_page = -1;
+            ldr_fs.next_byte = bufsize;
+            found_in_cat = true;
+            break;
+        }
     }
+
+    if (found_in_cat) return true;
+
+    /* Strategy 2: Scan the s-list directly (works for real Lisa OS images
+     * where the B-tree catalog may be hard to navigate) */
+    fprintf(stderr, "LDR_FS: catalog search failed, scanning s-list for '%s'...\n", upper);
+    int32_t hint_addr, file_size;
+    if (ldr_find_in_slist(lisa, upper, nlen, &hint_addr, &file_size)) {
+        if (ldr_build_filemap(lisa, hint_addr, file_size)) {
+            ldr_fs.file_open = true;
+            ldr_fs.curr_page = -1;
+            ldr_fs.next_byte = bufsize;
+            return true;
+        }
+    }
+
     fprintf(stderr, "LDR_FS: '%s' not found\n", upper);
     return false;
 }
@@ -655,7 +839,14 @@ static void io_write_cb(uint32_t offset, uint8_t val) {
                          * Original loader adds block0 to blok internally. */
                     if (lisa->profile.mounted && lisa->profile.data) {
                         if (!ldr_fs.initialized) ldr_fs_init(lisa);
-                        uint32_t block0 = ldr_fs.initialized ? (uint32_t)ldr_fs.fs_block0 : 24;
+                        uint32_t block0 = BOOT_TRACK_BLOCKS;
+                        if (ldr_fs.initialized) {
+                            /* Use geo_firstblock for page→block mapping,
+                             * falling back to MDDF block position */
+                            block0 = (uint32_t)ldr_fs.geo_firstblock;
+                            if (block0 == 0 || block0 > (uint32_t)ldr_fs.fs_block0)
+                                block0 = (uint32_t)ldr_fs.fs_block0;
+                        }
                         for (uint32_t b = 0; b < count; b++) {
                             uint32_t block_num = block0 + blok + b;
                             size_t src_offset = (size_t)block_num * PROFILE_BLOCK_SIZE + PROFILE_TAG_SIZE;
@@ -990,15 +1181,33 @@ void lisa_reset(lisa_t *lisa) {
     ldr_fs.initialized = false;
 
     /* Pre-load OS from ProFile disk image into RAM.
-     * Read the disk catalog to find system.os, then load all its blocks.
-     * Boot track (blocks 0-23) → RAM at $20000
+     * Uses the loader filesystem to find system.os by scanning the MDDF,
+     * s-list, and leader pages. Works with both our cross-compiled images
+     * (24-block boot track, MDDF at block 24) and real Lisa OS images
+     * (variable boot track, MDDF typically at block 46).
+     *
+     * Boot track → RAM at $20000
      * system.os file data → RAM at $0 (where the linker placed it) */
     uint32_t os_loaded_bytes = 0;
     if (lisa->profile.mounted && lisa->profile.data) {
-        /* First, load boot track at $20000 */
+        /* Initialize the loader filesystem to find MDDF and parse it */
+        if (!ldr_fs_init(lisa)) {
+            fprintf(stderr, "Pre-loader: cannot init filesystem\n");
+        }
+
+        /* Determine boot track size from MDDF location or geo.firstblock */
+        int boot_track_end = BOOT_TRACK_BLOCKS;
+        if (ldr_fs.initialized) {
+            /* The boot track extends up to the MDDF block */
+            boot_track_end = (int)ldr_fs.fs_block0;
+            if (boot_track_end < BOOT_TRACK_BLOCKS)
+                boot_track_end = BOOT_TRACK_BLOCKS;
+        }
+
+        /* Load boot track at $20000 */
         uint32_t dest = 0x20000;
         int boot_blocks = 0;
-        for (int blk = 0; blk < BOOT_TRACK_BLOCKS && dest + PROFILE_DATA_SIZE < LISA_RAM_SIZE; blk++) {
+        for (int blk = 0; blk < boot_track_end && dest + PROFILE_DATA_SIZE < LISA_RAM_SIZE; blk++) {
             size_t src_offset = (size_t)blk * PROFILE_BLOCK_SIZE;
             if (src_offset + PROFILE_BLOCK_SIZE <= lisa->profile.data_size) {
                 memcpy(&lisa->mem.ram[dest], lisa->profile.data + src_offset + PROFILE_TAG_SIZE, PROFILE_DATA_SIZE);
@@ -1006,58 +1215,86 @@ void lisa_reset(lisa_t *lisa) {
                 boot_blocks++;
             }
         }
+        printf("Pre-loaded %d boot blocks at RAM $20000\n", boot_blocks);
 
-        /* Read catalog to find system.os and load it at $0 */
-        uint32_t cat_block = BOOT_TRACK_BLOCKS + 1;  /* Catalog is after MDDF */
-        size_t cat_offset = (size_t)cat_block * PROFILE_BLOCK_SIZE + PROFILE_TAG_SIZE;
-        if (cat_offset + PROFILE_DATA_SIZE <= lisa->profile.data_size) {
-            uint8_t *catalog = lisa->profile.data + cat_offset;
-            /* First entry (offset 0) should be system.os */
-            uint32_t file_size = ((uint32_t)catalog[34] << 24) | ((uint32_t)catalog[35] << 16) |
-                                 ((uint32_t)catalog[36] << 8)  | (uint32_t)catalog[37];
-            uint32_t start_block = ((uint32_t)catalog[38] << 8) | (uint32_t)catalog[39];
-            uint32_t num_blocks = ((uint32_t)catalog[40] << 8) | (uint32_t)catalog[41];
-
-            if (file_size > 0 && start_block > 0) {
-                /* Load system.os into RAM at $0. */
-                uint32_t ram_dest = 0;
-                uint32_t loaded = 0;
-                for (uint32_t b = 0; b < num_blocks && ram_dest + PROFILE_DATA_SIZE < LISA_RAM_SIZE; b++) {
-                    size_t blk_offset = (size_t)(start_block + b) * PROFILE_BLOCK_SIZE + PROFILE_TAG_SIZE;
-                    if (blk_offset + PROFILE_DATA_SIZE <= lisa->profile.data_size) {
-                        memcpy(&lisa->mem.ram[ram_dest], lisa->profile.data + blk_offset, PROFILE_DATA_SIZE);
+        /* For real Lisa OS disk images (MDDF not at block 24), the boot track
+         * contains the complete Pascal-based loader that will read SYSTEM.LLD
+         * and SYSTEM.OS using LDRCALL operations (intercepted by our HLE).
+         * We do NOT pre-load system.os — the boot track loader handles it.
+         *
+         * For our cross-compiled images (MDDF at block 24), the boot track is
+         * minimal and we use the simplified catalog to pre-load system.os. */
+        bool is_real_image = (ldr_fs.initialized && ldr_fs.fs_block0 != BOOT_TRACK_BLOCKS);
+        if (is_real_image) {
+            printf("Real Lisa OS image detected (MDDF at block %d) — "
+                   "boot track loader will load OS via HLE\n",
+                   (int)ldr_fs.fs_block0);
+            /* Set os_loaded_bytes to a reasonable estimate for memory layout.
+             * The actual loading will be done by the boot track loader. */
+            os_loaded_bytes = 185344;  /* Approximate system.os size */
+        } else if (ldr_fs.initialized && ldr_open_file(lisa, "SYSTEM.OS")) {
+            /* Cross-compiled image: load system.os directly via filemap */
+            uint32_t ram_dest = 0;
+            uint32_t loaded_pages = 0;
+            for (int mi = 0; mi < LDR_MAP_MAX; mi++) {
+                if (ldr_fs.filemap[mi].cpages <= 0) break;
+                int32_t addr = ldr_fs.filemap[mi].address;
+                int16_t cpg = ldr_fs.filemap[mi].cpages;
+                for (int p = 0; p < cpg && ram_dest + PROFILE_DATA_SIZE <= LISA_RAM_SIZE; p++) {
+                    uint8_t page_buf[512];
+                    if (ldr_read_page(lisa, addr + p, page_buf)) {
+                        memcpy(&lisa->mem.ram[ram_dest], page_buf, PROFILE_DATA_SIZE);
                         ram_dest += PROFILE_DATA_SIZE;
-                        loaded++;
+                        loaded_pages++;
                     }
                 }
-                os_loaded_bytes = loaded * PROFILE_DATA_SIZE;
-                printf("Pre-loaded system.os: %u blocks (%u bytes) at RAM $0, start_block=%u\n",
-                       loaded, os_loaded_bytes, start_block);
+            }
+            os_loaded_bytes = loaded_pages * PROFILE_DATA_SIZE;
+            printf("Pre-loaded system.os: %u pages (%u bytes) at RAM $0\n",
+                   loaded_pages, os_loaded_bytes);
+        } else {
+            /* Fallback: try our simplified catalog format (cross-compiled images) */
+            uint32_t cat_block = BOOT_TRACK_BLOCKS + 1;
+            size_t cat_offset = (size_t)cat_block * PROFILE_BLOCK_SIZE + PROFILE_TAG_SIZE;
+            if (cat_offset + PROFILE_DATA_SIZE <= lisa->profile.data_size) {
+                uint8_t *catalog = lisa->profile.data + cat_offset;
+                uint32_t file_size = ((uint32_t)catalog[34] << 24) | ((uint32_t)catalog[35] << 16) |
+                                     ((uint32_t)catalog[36] << 8)  | (uint32_t)catalog[37];
+                uint32_t start_block = ((uint32_t)catalog[38] << 8) | (uint32_t)catalog[39];
+                uint32_t num_blocks = ((uint32_t)catalog[40] << 8) | (uint32_t)catalog[41];
+
+                if (file_size > 0 && start_block > 0) {
+                    uint32_t ram_dest = 0;
+                    uint32_t loaded = 0;
+                    for (uint32_t b = 0; b < num_blocks && ram_dest + PROFILE_DATA_SIZE < LISA_RAM_SIZE; b++) {
+                        size_t blk_offset = (size_t)(start_block + b) * PROFILE_BLOCK_SIZE + PROFILE_TAG_SIZE;
+                        if (blk_offset + PROFILE_DATA_SIZE <= lisa->profile.data_size) {
+                            memcpy(&lisa->mem.ram[ram_dest], lisa->profile.data + blk_offset, PROFILE_DATA_SIZE);
+                            ram_dest += PROFILE_DATA_SIZE;
+                            loaded++;
+                        }
+                    }
+                    os_loaded_bytes = loaded * PROFILE_DATA_SIZE;
+                    printf("Pre-loaded system.os (fallback): %u blocks (%u bytes) at RAM $0\n",
+                           loaded, os_loaded_bytes);
+                }
             }
         }
 
-        printf("Pre-loaded %d boot blocks at RAM $20000\n", boot_blocks);
-
-        /* Dump PASCALINIT code (first 80 bytes) */
-        fprintf(stderr, "PASCALINIT @$DFD38:\n");
-        for (int di = 0; di < 40; di += 2) {
-            uint32_t a = 0xDFD38 + di;
-            fprintf(stderr, " $%04X", (lisa->mem.ram[a]<<8)|lisa->mem.ram[a+1]);
-            if ((di % 20) == 18) fprintf(stderr, "\n");
+        if (!is_real_image) {
+            /* Vector table ($0-$3FF) is pre-installed by the linker in system.os.
+             * Only set Vector 0 (SSP) and Vector 1 (PC) for boot. */
+            /* Vector 0: Initial SSP */
+            lisa->mem.ram[0] = 0x00; lisa->mem.ram[1] = 0x07;
+            lisa->mem.ram[2] = 0x90; lisa->mem.ram[3] = 0x00;
+            /* Vector 1: Initial PC (points to first code at $400) */
+            lisa->mem.ram[4] = 0x00; lisa->mem.ram[5] = 0x00;
+            lisa->mem.ram[6] = 0x04; lisa->mem.ram[7] = 0x00;
         }
-        fprintf(stderr, "\n");
-
-        /* Vector table ($0-$3FF) is pre-installed by the linker in system.os.
-         * Only set Vector 0 (SSP) and Vector 1 (PC) for boot. */
-        /* Vector 0: Initial SSP */
-        lisa->mem.ram[0] = 0x00; lisa->mem.ram[1] = 0x07;
-        lisa->mem.ram[2] = 0x90; lisa->mem.ram[3] = 0x00;
-        /* Vector 1: Initial PC (points to first code at $400) */
-        lisa->mem.ram[4] = 0x00; lisa->mem.ram[5] = 0x00;
-        lisa->mem.ram[6] = 0x04; lisa->mem.ram[7] = 0x00;
+        /* For real images, the boot track loader will set up vectors */
 
         /* Log vector table state */
-        printf("Vector table from linker: TRAP1[$84]=$%02X%02X%02X%02X TRAP7[$9C]=$%02X%02X%02X%02X\n",
+        printf("Vector table: TRAP1[$84]=$%02X%02X%02X%02X TRAP7[$9C]=$%02X%02X%02X%02X\n",
                lisa->mem.ram[0x84], lisa->mem.ram[0x85], lisa->mem.ram[0x86], lisa->mem.ram[0x87],
                lisa->mem.ram[0x9C], lisa->mem.ram[0x9D], lisa->mem.ram[0x9E], lisa->mem.ram[0x9F]);
 
@@ -1075,6 +1312,13 @@ void lisa_reset(lisa_t *lisa) {
             lisa->mem.ram[(addr)+1] = (val) & 0xFF; \
         } while(0)
 
+        /* For real images, the boot track loader handles TRAP setup, parameter
+         * blocks, and memory layout. We only install safety vectors.
+         * For cross-compiled images, we set up everything. */
+
+        /* Boot device identifier — needed by both real and cross-compiled */
+        lisa->mem.ram[0x1B3] = 0;      /* adr_bootdev: 0 = internal disk (Widget/ProFile on Pepsi) */
+
         /* Install minimal TRAP handlers for traps used before INIT_TRAPV.
          * TRAP #5 = TRAPTOHW (hardware interface) — used by %initstdio
          * TRAP #8 = mapiospace — used for I/O space mapping
@@ -1088,11 +1332,7 @@ void lisa_reset(lisa_t *lisa) {
         WRITE32(0x28, 0x00FE0320);  /* Line-A → ROM skip handler */
         WRITE32(0x2C, 0x00FE0310);  /* Line-F → ROM skip handler */
 
-        /* Fill ALL zero TRAP vectors ($80-$BC) with the ROM RTE handler.
-         * TRAP #0-#15 map to vectors $80,$84,...$BC. The OS installs real
-         * handlers via INIT_TRAPV during boot, but if any TRAP is called
-         * before that (e.g. TRAP #6 for MMU, TRAP #7 for SR management),
-         * a zero vector would jump to address 0 and crash the CPU. */
+        /* Fill ALL zero TRAP vectors ($80-$BC) with the ROM RTE handler. */
         for (uint32_t vec = 0x80; vec <= 0xBC; vec += 4) {
             uint32_t val = (lisa->mem.ram[vec] << 24) |
                            (lisa->mem.ram[vec+1] << 16) |
@@ -1100,21 +1340,12 @@ void lisa_reset(lisa_t *lisa) {
                             lisa->mem.ram[vec+3];
             if (val == 0) {
                 WRITE32(vec, 0x00FE0300);
-                printf("  [TRAP safety] Vector $%03X (TRAP #%u) was zero → installed ROM RTE handler\n",
-                       vec, (vec - 0x80) / 4);
             }
         }
 
-        /* %initstdio: no bypass — properly fixed via MOVEM register list
-         * parsing and @-label local scoping in the assembler. */
-
-
-        /* Boot device and low-memory parameters */
-        lisa->mem.ram[0x1B3] = 0;      /* adr_bootdev: 0 = internal disk (Widget/ProFile on Pepsi) */
-
-        /* Verify chan_select at $1F0 — must be 0 for screen console.
-         * The linker output may have data at this offset from code/relocs. */
-        {
+        if (!is_real_image) {
+            /* Verify chan_select at $1F0 — must be 0 for screen console.
+             * The linker output may have data at this offset from code/relocs. */
             uint32_t cs = (lisa->mem.ram[0x1F0] << 24) | (lisa->mem.ram[0x1F1] << 16) |
                           (lisa->mem.ram[0x1F2] << 8) | lisa->mem.ram[0x1F3];
             if (cs != 0) {
@@ -1139,6 +1370,19 @@ void lisa_reset(lisa_t *lisa) {
         WRITE32(0x2A4, 0x00000000);   /* prom_byte0: physical byte 0 */
         WRITE32(0x2A8, LISA_RAM_SIZE); /* prom_realsize: amount of memory */
 
+        /* For real images, set fs_block0 at $210 and loader link.
+         * The boot track loader handles everything else. */
+        if (is_real_image) {
+            int16_t fs_b0 = (int16_t)ldr_fs.geo_firstblock;
+            if (fs_b0 <= 0) fs_b0 = (int16_t)ldr_fs.fs_block0;
+            WRITE16(0x210, fs_b0);      /* ld_fs_block0 */
+            WRITE16(0x22E, 1);          /* dev_type: profile */
+            WRITE32(0x21C, 0x00020000); /* ldbaseptr: loader base */
+            /* The boot track loader will build its own parameter block,
+             * set up MMU, allocate memory, and load SYSTEM.LLD + SYSTEM.OS */
+        }
+
+        if (!is_real_image) {
         /* Loader parameter block — OS reads this via PASCALINIT/GETLDMAP.
          * Layout from source-parms.text: version, then base/length pairs
          * for each memory region, then miscellaneous loader state.
@@ -1231,7 +1475,19 @@ void lisa_reset(lisa_t *lisa) {
         W32D(himem);         /* himem */
         W32D(lomem);         /* lomem */
         W32D(LISA_RAM_SIZE); /* l_physicalmem */
-        W16D(24);            /* fs_block0 */
+        {
+            /* fs_block0: the disk block of the MDDF (filesystem page 0).
+             * For real images this may differ from BOOT_TRACK_BLOCKS (e.g. 46 vs 24).
+             * The loader passes this to the OS via the parameter block at $210. */
+            int16_t fs_b0 = BOOT_TRACK_BLOCKS;
+            if (ldr_fs.initialized) {
+                /* Use geo.firstblock from MDDF — this is what the OS expects for
+                 * page→block translation in its filesystem operations. */
+                fs_b0 = (int16_t)ldr_fs.geo_firstblock;
+                if (fs_b0 <= 0) fs_b0 = (int16_t)ldr_fs.fs_block0;
+            }
+            W16D(fs_b0);  /* fs_block0 */
+        }
         W16D(0);             /* debugmode = false */
         W32D(smt_base);      /* smt_base — above OS code, not in vector table */
         W16D(1);             /* os_segs = 1 */
@@ -1355,6 +1611,8 @@ void lisa_reset(lisa_t *lisa) {
             fprintf(stderr, "Param block: version=$%X, b_intrin_ptrs @$%X=$%08X\n",
                     version_addr, off28, val28);
         }
+
+        } /* end if (!is_real_image) */
 
         #undef WRITE32
         #undef WRITE16
