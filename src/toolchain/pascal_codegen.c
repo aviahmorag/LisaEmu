@@ -525,8 +525,31 @@ static int expr_size(codegen_t *cg, ast_node_t *node) {
             }
             return 2;
         }
-        case AST_FUNC_CALL:
-            return 2; /* Default to word; full return type tracking is future work */
+        case AST_FUNC_CALL: {
+            /* Check known intrinsics for correct return size */
+            if (node->name[0]) {
+                if (str_eq_nocase(node->name, "ORD4")) return 4;
+                if (str_eq_nocase(node->name, "POINTER")) return 4;
+                if (str_eq_nocase(node->name, "ORD")) {
+                    /* ORD on a pointer/longint argument returns longint (4 bytes) */
+                    if (node->num_children > 0) {
+                        int arg_sz = expr_size(cg, node->children[0]);
+                        if (arg_sz >= 4) return 4;
+                    }
+                    return 2; /* ORD on integer/boolean returns integer */
+                }
+                if (str_eq_nocase(node->name, "SIZEOF")) return 2;
+                if (str_eq_nocase(node->name, "CHR")) return 2;
+                if (str_eq_nocase(node->name, "ABS")) {
+                    if (node->num_children > 0) return expr_size(cg, node->children[0]);
+                    return 2;
+                }
+                /* Look up function return type */
+                cg_symbol_t *fsym = find_symbol_any(cg, node->name);
+                if (fsym && fsym->type && fsym->type->size > 0) return fsym->type->size;
+            }
+            return 2; /* Default to word */
+        }
         case AST_BINARY_OP:
         case AST_UNARY_OP: {
             /* Propagate from operands */

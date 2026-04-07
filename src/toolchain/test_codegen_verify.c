@@ -418,6 +418,17 @@ int main(void) {
         "procedure Access; begin out := r.sub.b; end;\n"
         "end.\n");
 
+    /* 9. Pointer arithmetic with ord() must use 32-bit operations
+     *    pointer(ord(p) - 2) must preserve the high 16 bits of the pointer.
+     *    Previously, ord() on a pointer returned integer (16-bit), causing
+     *    SUB.W which truncated addresses above $FFFF. */
+    total += verify("pointer_ord_arithmetic",
+        "unit tc10; interface\n"
+        "procedure DecPtr(VAR p: ptr);\n"
+        "implementation\n"
+        "procedure DecPtr; begin p := pointer(ord(p) - 2); end;\n"
+        "end.\n");
+
     printf("\n=== TOTAL ERRORS: %d ===\n", total);
     return total;
 }

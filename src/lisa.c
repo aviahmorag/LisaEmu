@@ -858,6 +858,15 @@ void lisa_reset(lisa_t *lisa) {
                lisa->mem.ram[0x4EC], lisa->mem.ram[0x4ED], lisa->mem.ram[0x4EE], lisa->mem.ram[0x4EF],
                lisa->mem.ram[0x4F0], lisa->mem.ram[0x4F1], lisa->mem.ram[0x4F2], lisa->mem.ram[0x4F3]);
 
+        /* Param block diagnostics */
+        {
+            uint32_t off28 = version_addr - 28;
+            uint32_t val28 = (lisa->mem.ram[off28]<<24)|(lisa->mem.ram[off28+1]<<16)|
+                             (lisa->mem.ram[off28+2]<<8)|lisa->mem.ram[off28+3];
+            fprintf(stderr, "Param block: version=$%X, b_intrin_ptrs @$%X=$%08X\n",
+                    version_addr, off28, val28);
+        }
+
         #undef WRITE32
         #undef WRITE16
     }
