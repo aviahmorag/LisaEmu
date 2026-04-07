@@ -1627,6 +1627,43 @@ void lisa_reset(lisa_t *lisa) {
            lisa->mem.rom[0], lisa->mem.rom[1], lisa->mem.rom[2], lisa->mem.rom[3],
            lisa->mem.rom[4], lisa->mem.rom[5], lisa->mem.rom[6], lisa->mem.rom[7]);
 
+    /* Patch ROM BEFORE reset: set initial SSP and A6 to user stack area.
+     * INITSYS's frame must be within the user stack MMU segment so that
+     * REG_TO_MAPPED's physical→mapped address translation works. */
+    {
+        #define RAM32(a) ((uint32_t)lisa->mem.ram[(a)]<<24 | (uint32_t)lisa->mem.ram[(a)+1]<<16 | \
+                          (uint32_t)lisa->mem.ram[(a)+2]<<8 | (uint32_t)lisa->mem.ram[(a)+3])
+        uint32_t va = RAM32(0x218);  /* version_addr from parameter block */
+        if (va > 0 && va < LISA_RAM_SIZE) {
+            uint32_t b_op = RAM32(va - 68);  /* b_opustack (17th field) */
+            uint32_t l_op = RAM32(va - 72);  /* l_opustack (18th field) */
+            uint32_t e_us = b_op + l_op;     /* top of user stack */
+            if (e_us > 0x1000 && e_us < LISA_RAM_SIZE) {
+                /* Patch ROM initial SSP (vector 0) */
+                lisa->mem.rom[0] = (e_us >> 24) & 0xFF;
+                lisa->mem.rom[1] = (e_us >> 16) & 0xFF;
+                lisa->mem.rom[2] = (e_us >> 8) & 0xFF;
+                lisa->mem.rom[3] = e_us & 0xFF;
+                /* Patch ALL MOVEA.L #$00079000,Ax in ROM (A7 at $FE0400, A6 later).
+                 * Pattern: xx7C 00079000 where xx = 2E (A7) or 2C (A6). */
+                for (int ri = 0; ri < 0x3F00; ri += 2) {
+                    if ((lisa->mem.rom[ri] == 0x2E || lisa->mem.rom[ri] == 0x2C) &&
+                        lisa->mem.rom[ri+1] == 0x7C &&
+                        lisa->mem.rom[ri+2] == 0x00 && lisa->mem.rom[ri+3] == 0x07 &&
+                        lisa->mem.rom[ri+4] == 0x90 && lisa->mem.rom[ri+5] == 0x00) {
+                        lisa->mem.rom[ri+2] = (e_us >> 24) & 0xFF;
+                        lisa->mem.rom[ri+3] = (e_us >> 16) & 0xFF;
+                        lisa->mem.rom[ri+4] = (e_us >> 8) & 0xFF;
+                        lisa->mem.rom[ri+5] = e_us & 0xFF;
+                    }
+                }
+                fprintf(stderr, "Boot stack patched: SSP=A6=$%06X (b_opustack=$%X+$%X)\n",
+                        e_us, b_op, l_op);
+            }
+        }
+        #undef RAM32
+    }
+
     m68k_reset(&lisa->cpu);
 
     /* Set A5 to initial global data pointer (loader normally does this).

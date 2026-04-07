@@ -3157,23 +3157,63 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             odd_pc_logged = 1;
         }
 
-        /* Trace GETLDMAP — check case selector value */
+        /* Trace entry to STARTUP at $400 */
+        {
+            static int startup_entry_logged = 0;
+            if (!startup_entry_logged && cpu->pc == 0x400) {
+                fprintf(stderr, ">>> STARTUP entry: A5=$%08X A6=$%08X A7=$%08X SSP=$%08X USP=$%08X SR=$%04X\n",
+                        cpu->a[5], cpu->a[6], cpu->a[7], cpu->ssp, cpu->usp, cpu->sr);
+                startup_entry_logged = 1;
+            }
+        }
+        /* Trace GETLDMAP and parameter block */
         static int getldmap_logged = 0;
         if (!getldmap_logged && cpu->pc == 0x45A) {
-            fprintf(stderr, ">>> GETLDMAP entry: PC=$%06X A5=$%08X A6=$%08X SP=$%08X\n",
-                    cpu->pc, cpu->a[5], cpu->a[6], cpu->a[7]);
-            /* After LINK A6, the param is at A6+8 (return addr at A6+4) */
-            /* But at entry (before LINK), param is on stack */
-            fprintf(stderr, "  Stack:");
-            for (int si = 0; si < 12; si++)
-                fprintf(stderr, " %08X", cpu_read32(cpu, (cpu->a[7] + si * 4)));
-            fprintf(stderr, "\n");
-            /* Dump code at GETLDMAP (40 words = 80 bytes) */
-            fprintf(stderr, "  Code:");
-            for (int ci = 0; ci < 40; ci++)
-                fprintf(stderr, " %04X", cpu_read16(cpu, 0x45A + ci * 2));
-            fprintf(stderr, "\n");
+            /* At entry (before LINK): SP → return addr, SP+4 → ldmapbase */
+            uint32_t ldm = cpu_read32(cpu, cpu->a[7] + 4);
+            fprintf(stderr, ">>> GETLDMAP: ldmapbase=$%08X version=%d A6=$%08X\n",
+                    ldm, cpu_read16(cpu, ldm), cpu->a[6]);
+            /* Dump parameter block: 20 longs downward from ldmapbase */
+            fprintf(stderr, "  Param block (version then 20 fields):\n");
+            fprintf(stderr, "    version=$%04X\n", cpu_read16(cpu, ldm));
+            for (int i = 0; i < 20; i++) {
+                uint32_t addr = ldm - 4 - i * 4;
+                fprintf(stderr, "    [%d] @$%X = $%08X\n", i, addr, cpu_read32(cpu, addr));
+            }
+            /* INITSYS parent frame: A6 at entry = INITSYS frame */
+            uint32_t initsys_a6 = cpu->a[6];
+            fprintf(stderr, "  INITSYS locals (A6=$%08X): @-102=$%04X @-104=$%08X @-108=$%08X\n",
+                    initsys_a6,
+                    cpu_read16(cpu, initsys_a6 - 102),
+                    cpu_read32(cpu, initsys_a6 - 104),
+                    cpu_read32(cpu, initsys_a6 - 108));
             getldmap_logged = 1;
+        }
+        /* Trace REG_TO_MAPPED entry — locals should be filled by GETLDMAP */
+        static int r2m_logged = 0;
+        if (!r2m_logged && cpu->pc == 0xD1B64) {
+            r2m_logged = 1;
+            /* At REG_TO_MAPPED entry: SP → return addr, SP+4 → e_us, SP+8 → b_sg */
+            /* But more importantly, check INITSYS locals via A6 */
+            uint32_t a6 = cpu->a[6]; /* INITSYS frame pointer */
+            fprintf(stderr, ">>> REG_TO_MAPPED entry: A6=$%08X A5=$%08X SP=$%08X\n",
+                    a6, cpu->a[5], cpu->a[7]);
+            fprintf(stderr, "  Params: b_sg=$%08X e_us=$%08X\n",
+                    cpu_read32(cpu, cpu->a[7] + 4),
+                    cpu_read32(cpu, cpu->a[7] + 8));
+            /* Check INITSYS locals after GETLDMAP should have filled them */
+            /* version at A6-102, b_sysjt at A6-106, l_sysjt at A6-110 */
+            /* b_sys_global at A6-114, l_sys_global at A6-118 */
+            fprintf(stderr, "  INITSYS locals: version=%d b_sysjt=$%08X l_sysjt=$%08X\n",
+                    cpu_read16(cpu, a6 - 102),
+                    cpu_read32(cpu, a6 - 106),
+                    cpu_read32(cpu, a6 - 110));
+            fprintf(stderr, "  b_sys_global=$%08X l_sys_global=$%08X\n",
+                    cpu_read32(cpu, a6 - 114),
+                    cpu_read32(cpu, a6 - 118));
+            fprintf(stderr, "  b_sgheap=$%08X l_sgheap=$%08X\n",
+                    cpu_read32(cpu, a6 - 138),
+                    cpu_read32(cpu, a6 - 142));
         }
 
         /* Trace SYSTEM_ERROR call */
