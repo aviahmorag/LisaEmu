@@ -2948,20 +2948,24 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 fprintf(stderr, "\n");
             }
         }
-        /* Trace the call FROM SYSGLOBAL to GENIO CALLDRIVER */
-        if (cpu->pc == 0xBAABC) {
-            static int sysg_trace = 0;
-            if (sysg_trace++ < 1) {
-                fprintf(stderr, "=== SYSGLOBAL $BAABC: op=$%04X next=$%04X A6=$%08X SP=$%08X\n",
-                        cpu_read16(cpu, cpu->pc), cpu_read16(cpu, cpu->pc+2),
-                        cpu->a[6], cpu->a[7]);
-                /* Dump code around $BAABC */
-                fprintf(stderr, "  Code $BAA90-$BAAE0:");
-                for (int i = 0; i < 80; i += 2)
-                    fprintf(stderr, " %04X", cpu_read16(cpu, 0xBAA90 + i));
+        /* Dump FP code at NEWFPSUB when loop is first entered */
+        if (cpu->pc == 0xC11CE) {
+            static int fp_trace = 0;
+            if (fp_trace++ < 1) {
+                fprintf(stderr, "=== NEWFPSUB entry at $C11CE ===\n");
+                fprintf(stderr, "  D0=$%08X D1=$%08X D2=$%08X D3=$%08X\n",
+                        cpu->d[0], cpu->d[1], cpu->d[2], cpu->d[3]);
+                fprintf(stderr, "  D4=$%08X D5=$%08X D6=$%08X D7=$%08X\n",
+                        cpu->d[4], cpu->d[5], cpu->d[6], cpu->d[7]);
+                fprintf(stderr, "  A0=$%08X A1=$%08X A2=$%08X A3=$%08X A5=$%08X A6=$%08X SP=$%08X\n",
+                        cpu->a[0], cpu->a[1], cpu->a[2], cpu->a[3], cpu->a[5], cpu->a[6], cpu->a[7]);
+                /* Dump code from $C11CE to $C1240 */
+                fprintf(stderr, "  Code $C11C0-$C1240:");
+                for (int i = 0; i < 128; i += 2) {
+                    if (i % 32 == 0) fprintf(stderr, "\n    $%06X:", 0xC11C0 + i);
+                    fprintf(stderr, " %04X", cpu_read16(cpu, 0xC11C0 + i));
+                }
                 fprintf(stderr, "\n");
-                /* Show return address on stack */
-                fprintf(stderr, "  Stack: ret=$%08X\n", cpu_read32(cpu, cpu->a[7]));
             }
         }
         /* Trace CALLDRIVER loop — find who called it */
