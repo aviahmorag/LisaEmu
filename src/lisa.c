@@ -196,9 +196,6 @@ static void io_write_cb(uint32_t offset, uint8_t val) {
     }
 }
 
-/* Forward declarations */
-static void profile_read_block(lisa_t *lisa, uint32_t block);
-static void profile_write_block(lisa_t *lisa, uint32_t block);
 
 /* ========================================================================
  * VIA callbacks
@@ -394,33 +391,7 @@ static void render_framebuffer(lisa_t *lisa) {
     lisa->display_dirty = true;
 }
 
-/* ========================================================================
- * ProFile disk operations
- * ======================================================================== */
-
-static void profile_read_block(lisa_t *lisa, uint32_t block) {
-    if (!lisa->profile.mounted || !lisa->profile.data) {
-        memset(lisa->profile.sector_buf, 0xFF, PROFILE_BLOCK_SIZE);
-        return;
-    }
-
-    size_t offset = (size_t)block * PROFILE_BLOCK_SIZE;
-    if (offset + PROFILE_BLOCK_SIZE <= lisa->profile.data_size) {
-        memcpy(lisa->profile.sector_buf, lisa->profile.data + offset, PROFILE_BLOCK_SIZE);
-    } else {
-        memset(lisa->profile.sector_buf, 0, PROFILE_BLOCK_SIZE);
-    }
-    lisa->profile.buf_index = 0;
-}
-
-static void profile_write_block(lisa_t *lisa, uint32_t block) {
-    if (!lisa->profile.mounted || !lisa->profile.data) return;
-
-    size_t offset = (size_t)block * PROFILE_BLOCK_SIZE;
-    if (offset + PROFILE_BLOCK_SIZE <= lisa->profile.data_size) {
-        memcpy(lisa->profile.data + offset, lisa->profile.sector_buf, PROFILE_BLOCK_SIZE);
-    }
-}
+/* ProFile disk operations now in profile.c */
 
 /* ========================================================================
  * Public API
@@ -1175,9 +1146,8 @@ int lisa_run_frame(lisa_t *lisa) {
         }
         if (frame_count == 120) {
             uint32_t test_addr = 0xCC0000;
-            uint32_t phys = 0;
-            int seg = (test_addr >> 17) & 0x7F;
             int ctx = lisa->mem.current_context;
+            (void)test_addr;
             fprintf(stderr, "  MMU state: enabled=%d ctx=%d seg102: sor=$%03X slr=$%03X changed=%d\n",
                     lisa->mem.mmu_enabled, ctx,
                     lisa->mem.segments[ctx][102].sor,

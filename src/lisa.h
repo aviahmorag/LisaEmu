@@ -28,10 +28,10 @@ typedef struct {
     int     head, tail, count;
 } cops_queue_t;
 
-/* ProFile hard disk */
-#define PROFILE_BLOCK_SIZE   532  /* 512 data + 20 tag bytes */
-#define PROFILE_DATA_SIZE    512
-#define PROFILE_TAG_SIZE     20
+/* Old ProFile constants (now in profile.h, kept for profile_disk_t) */
+#ifndef PROFILE_BLOCK_SIZE
+#define PROFILE_BLOCK_SIZE   532
+#endif
 #define PROFILE_MAX_BLOCKS   19456  /* ~10MB ProFile */
 #define BOOT_TRACK_BLOCKS    24
 
