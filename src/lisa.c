@@ -2253,11 +2253,18 @@ static bool hle_handle_system_error(lisa_t *lisa __attribute__((unused)), m68k_t
     uint32_t ret_addr = cpu_read32(cpu, cpu->a[7]);
     int16_t err_code = (int16_t)cpu_read16(cpu, cpu->a[7] + 4);
 
-    /* Log all SYSTEM_ERROR calls */
+    /* Log all SYSTEM_ERROR calls with stack context */
     static int se_trace = 0;
-    if (se_trace < 30) {
+    if (se_trace < 10) {
         se_trace++;
-        fprintf(stderr, "HLE SYSTEM_ERROR(%d) at ret=$%06X\n", err_code, ret_addr);
+        fprintf(stderr, "HLE SYSTEM_ERROR(%d) at ret=$%06X SP=$%08X A6=$%08X\n",
+                err_code, ret_addr, cpu->a[7], cpu->a[6]);
+        fprintf(stderr, "  Stack: %08X %08X %08X %08X\n",
+                cpu_read32(cpu, cpu->a[7]),
+                cpu_read32(cpu, cpu->a[7]+4),
+                cpu_read32(cpu, cpu->a[7]+8),
+                cpu_read32(cpu, cpu->a[7]+12));
+        fprintf(stderr, "  PC=$%06X D0=$%08X\n", cpu->pc, cpu->d[0]);
     }
 
     /* Error 10738 = stup_find_boot: can't find boot CD in pram.
@@ -2275,8 +2282,11 @@ static bool hle_handle_system_error(lisa_t *lisa __attribute__((unused)), m68k_t
         return true;
     }
 
-    /* All other errors: let the stub at $3F0 handle them */
-    return false;
+    /* SYSTEM_ERROR should halt — it never returns on a real Lisa.
+     * Stop the CPU to prevent infinite recursion. */
+    fprintf(stderr, "SYSTEM_ERROR(%d): HALTING CPU\n", err_code);
+    cpu->stopped = true;
+    return true;
 }
 
 /* 5:1 deinterleave for ProFile sector numbers (from LisaEm) */
