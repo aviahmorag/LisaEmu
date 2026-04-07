@@ -79,6 +79,66 @@ static void mangle_local_label(const char *name, int scope, char *out, int out_s
     }
 }
 
+/* Multi-definition table: tracks all PCs for labels defined multiple times.
+ * Used to resolve references to the nearest definition (handles duplicate
+ * labels across .include files in the FP library). */
+#define MAX_MULTIDEF 512
+static struct {
+    char name[ASM_MAX_LABEL];
+    int32_t pcs[8];   /* Up to 8 definitions */
+    int count;
+} multidef[MAX_MULTIDEF];
+static int num_multidef = 0;
+
+static void multidef_add(const char *name, int32_t pc) {
+    /* Find existing entry */
+    for (int i = 0; i < num_multidef; i++) {
+        if (strncasecmp(multidef[i].name, name, ASM_SYM_SIGCHARS) == 0) {
+            if (multidef[i].count < 8)
+                multidef[i].pcs[multidef[i].count++] = pc;
+            return;
+        }
+    }
+    /* Create new entry */
+    if (num_multidef < MAX_MULTIDEF) {
+        strncpy(multidef[num_multidef].name, name, ASM_MAX_LABEL - 1);
+        multidef[num_multidef].pcs[0] = pc;
+        multidef[num_multidef].count = 1;
+        num_multidef++;
+    }
+}
+
+/* Find the nearest definition of a multiply-defined label to ref_pc.
+ * Prefers the nearest FORWARD definition, then nearest backward. */
+static int32_t multidef_resolve(const char *name, int32_t ref_pc) {
+    for (int i = 0; i < num_multidef; i++) {
+        if (strncasecmp(multidef[i].name, name, ASM_SYM_SIGCHARS) == 0 &&
+            multidef[i].count > 1) {
+            /* Find nearest forward definition */
+            int32_t best = -1;
+            int32_t best_dist = 0x7FFFFFFF;
+            for (int j = 0; j < multidef[i].count; j++) {
+                int32_t dist = multidef[i].pcs[j] - ref_pc;
+                if (dist >= 0 && dist < best_dist) {
+                    best = multidef[i].pcs[j];
+                    best_dist = dist;
+                }
+            }
+            if (best >= 0) return best;
+            /* No forward def — use nearest backward */
+            for (int j = 0; j < multidef[i].count; j++) {
+                int32_t dist = ref_pc - multidef[i].pcs[j];
+                if (dist >= 0 && dist < best_dist) {
+                    best = multidef[i].pcs[j];
+                    best_dist = dist;
+                }
+            }
+            return best;
+        }
+    }
+    return -1;  /* Not a multi-defined label */
+}
+
 static int find_symbol(asm68k_t *as, const char *name) {
     /* Mangle @-labels with scope */
     char mangled[ASM_MAX_LABEL + 16];
@@ -106,10 +166,12 @@ static int add_symbol(asm68k_t *as, const char *name, sym_type_t type, int32_t v
     if (idx >= 0) {
         /* Update existing symbol */
         if (as->pass == 1 && as->symbols[idx].defined && type == SYM_LABEL) {
-            /* @-labels with same name in same scope on same pass is a real duplicate */
-            if (name[0] != '@')
-                asm_error(as, "symbol '%s' already defined", name);
-            /* For @-labels, just update (they're now scope-mangled so real dupes are rare) */
+            /* Track multiply-defined labels for proximity resolution.
+             * Record BOTH the previous definition and the new one. */
+            if (name[0] != '@') {
+                multidef_add(effective_name, as->symbols[idx].value); /* previous */
+                multidef_add(effective_name, value);                  /* new */
+            }
         }
         as->symbols[idx].value = value;
         as->symbols[idx].defined = true;
@@ -148,6 +210,14 @@ static int32_t get_symbol_value(asm68k_t *as, const char *name) {
     if (idx < 0) {
         if (as->pass == 2) asm_error(as, "undefined symbol '%s'", name);
         return 0;
+    }
+    /* For multiply-defined labels (e.g., UNPNRM in multiple .include files),
+     * resolve to the nearest definition to the current PC. This handles
+     * duplicate label names across included files in the FP library. */
+    if (as->pass == 2 && name[0] != '@') {
+        int32_t resolved = multidef_resolve(name, as->pc);
+        if (resolved >= 0)
+            return resolved;
     }
     return as->symbols[idx].value;
 }
@@ -2216,6 +2286,9 @@ void asm68k_add_include_path(asm68k_t *as, const char *path) {
 bool asm68k_assemble_string(asm68k_t *as, const char *source, const char *filename) {
     strncpy(as->current_file, filename, sizeof(as->current_file) - 1);
     as->num_errors = 0;
+
+    /* Reset multi-definition tracker */
+    num_multidef = 0;
 
     /* Pass 1: collect symbols and sizes */
     as->pass = 1;
