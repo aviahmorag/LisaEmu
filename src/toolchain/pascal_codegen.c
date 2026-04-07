@@ -398,6 +398,16 @@ static cg_symbol_t *add_local(codegen_t *cg, const char *name, type_desc_t *type
 }
 
 static cg_symbol_t *add_global_sym(codegen_t *cg, const char *name, type_desc_t *type) {
+    /* Check for existing symbol with same name — avoid duplicates that
+     * confuse the linker. Interface + external declarations for the same
+     * proc would otherwise create two entries, the first (ENTRY, val=0)
+     * blocking the real implementation via "first ENTRY wins". */
+    for (int i = 0; i < cg->num_globals; i++) {
+        if (str_eq_nocase(cg->globals[i].name, name)) {
+            if (type) cg->globals[i].type = type;
+            return &cg->globals[i];
+        }
+    }
     if (cg->num_globals >= CODEGEN_MAX_SYMBOLS) return NULL;
     cg_symbol_t *s = &cg->globals[cg->num_globals++];
     memset(s, 0, sizeof(cg_symbol_t));
@@ -792,10 +802,25 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
             break;
 
         case AST_IDENT_EXPR: {
-            /* Check if this identifier is a zero-argument function call.
-             * In Pascal, `PASCALINIT` without parens calls the function. */
+            /* Check if this identifier is a callable proc/func */
             cg_proc_sig_t *ident_sig = find_proc_sig(cg, node->name);
             if (ident_sig && ident_sig->num_params == 0) {
+                if (!ident_sig->is_function) {
+                    /* Procedure name in expression context → push its ADDRESS.
+                     * In Lisa Pascal, INITSYS(PASCALINIT) passes PASCALINIT's
+                     * address as a ptr, not calling it. Procedures don't return
+                     * values, so using one in an expression means "its address". */
+                    emit16(cg, 0x203C);  /* MOVE.L #imm,D0 */
+                    emit32(cg, 0);       /* Placeholder — will be relocated */
+                    if (cg->num_relocs < CODEGEN_MAX_RELOCS) {
+                        cg_reloc_t *r = &cg->relocs[cg->num_relocs++];
+                        r->offset = cg->code_size - 4;
+                        strncpy(r->symbol, node->name, sizeof(r->symbol) - 1);
+                        r->size = 4;
+                        r->pc_relative = false;
+                    }
+                    break;
+                }
                 /* Zero-arg function call.
                  * For external (assembly) functions: push space for return value
                  * on stack before JSR. Assembly function puts result there.
@@ -1979,6 +2004,7 @@ static void process_declarations(codegen_t *cg, ast_node_t *node, bool is_global
             case AST_PROC_DECL:
             case AST_FUNC_DECL: {
                 bool is_ext = str_eq_nocase(child->str_val, "EXTERNAL");
+                bool is_func = (child->type == AST_FUNC_DECL);
                 /* Register signature for VAR parameter tracking */
                 bool has_params = false;
                 for (int j = 0; j < child->num_children; j++) {
@@ -1990,10 +2016,15 @@ static void process_declarations(codegen_t *cg, ast_node_t *node, bool is_global
                         break;
                     }
                 }
+                /* Set is_function flag on the registered signature */
+                {
+                    cg_proc_sig_t *sig = find_proc_sig(cg, child->name);
+                    if (sig) sig->is_function = is_func;
+                }
                 /* If external declaration without params, mark existing signature */
                 if (is_ext) {
                     cg_proc_sig_t *existing = find_proc_sig(cg, child->name);
-                    if (existing) existing->is_external = true;
+                    if (existing) { existing->is_external = true; existing->is_function = is_func; }
                     /* Also register empty sig if no params and no existing sig */
                     if (!has_params && !existing && cg->proc_sigs &&
                         cg->num_proc_sigs < CODEGEN_MAX_PROC_SIGS) {
@@ -2001,6 +2032,7 @@ static void process_declarations(codegen_t *cg, ast_node_t *node, bool is_global
                         memset(sig, 0, sizeof(*sig));
                         strncpy(sig->name, child->name, 63);
                         sig->is_external = true;
+                        sig->is_function = is_func;
                     }
                 }
                 /* Register as external symbol */

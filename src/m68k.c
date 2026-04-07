@@ -2661,27 +2661,9 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         pc_ring[pc_ring_idx++ & 255] = cpu->pc;
         g_last_cpu_pc = cpu->pc;
 
-        /* Trace INITSYS call sequence */
-        {
-            static const struct { uint32_t addr; const char *name; } trace_funcs[] = {
-                {0x4D88, "AFTER_PASCALINIT"}, {0x4BFE, "INITSYS"},
-                {0xDB4A8, "INTSOFF"}, {0xCB3BC, "POOL_INIT"},
-                {0xE0008, "REG_TO_MAPPED"},
-                {0xD9736, "INIT_TRAPV"},
-                {0xDB892, "INIT_NMI_TRAPV"},
-                {0x2794, "INIT_SCTAB"},
-                {0, NULL}
-            };
-            for (int ti = 0; trace_funcs[ti].name; ti++) {
-                if (cpu->pc == trace_funcs[ti].addr) {
-                    static int init_trace_count = 0;
-                    if (init_trace_count++ < 50)
-                        fprintf(stderr, ">>> INIT: %s at PC=$%06X A5=$%08X SP=$%08X\n",
-                                trace_funcs[ti].name, cpu->pc, cpu->a[5], cpu->a[7]);
-                }
-            }
-        }
-        if (cpu->pc == 0xCB478) {
+        /* Trace HLE SYSTEM_ERROR with full context */
+        /* (AFTER_PASCALINIT trace removed - address is stale) */
+        if (cpu->pc == 0xBB4B2) {
             static int pool_logged = 0;
             if (pool_logged++ < 2) {
                 fprintf(stderr, "=== POOL_INIT at PC=$%06X A5=$%08X A6=$%08X SP=$%08X\n",
@@ -3180,12 +3162,17 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         if (!getldmap_logged && cpu->pc == 0x45A) {
             fprintf(stderr, ">>> GETLDMAP entry: PC=$%06X A5=$%08X A6=$%08X SP=$%08X\n",
                     cpu->pc, cpu->a[5], cpu->a[6], cpu->a[7]);
-            /* The parameter (ldmapbase) is on the stack */
-            fprintf(stderr, "  ldmapbase (param) = $%08X\n", cpu_read32(cpu, cpu->a[7] + 4));
-            uint32_t lm = cpu_read32(cpu, cpu->a[7] + 4);
-            if (lm > 0 && lm < 0x100000)
-                fprintf(stderr, "  ldmapbase^ (version) = $%04X (%d)\n",
-                        cpu_read16(cpu, lm), cpu_read16(cpu, lm));
+            /* After LINK A6, the param is at A6+8 (return addr at A6+4) */
+            /* But at entry (before LINK), param is on stack */
+            fprintf(stderr, "  Stack:");
+            for (int si = 0; si < 12; si++)
+                fprintf(stderr, " %08X", cpu_read32(cpu, (cpu->a[7] + si * 4)));
+            fprintf(stderr, "\n");
+            /* Dump code at GETLDMAP (40 words = 80 bytes) */
+            fprintf(stderr, "  Code:");
+            for (int ci = 0; ci < 40; ci++)
+                fprintf(stderr, " %04X", cpu_read16(cpu, 0x45A + ci * 2));
+            fprintf(stderr, "\n");
             getldmap_logged = 1;
         }
 
@@ -3282,10 +3269,109 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             continue;
         }
 
+        /* Trace crash function: dump opcodes and track A6 */
+        {
+            static int crash_fn_dumped = 0;
+            /* Trace FPMODES function at $022892 */
+            if (cpu->pc == 0x022892 && !crash_fn_dumped) {
+                fprintf(stderr, "\n>>> ENTERING FPMODES fn at $022892, A6=$%08X SP=$%08X\n",
+                        cpu->a[6], cpu->a[7]);
+                fprintf(stderr, "    Code at $022892:");
+                for (int di = 0; di < 24; di++)
+                    fprintf(stderr, " %04X", cpu_read16(cpu, 0x022892 + di * 2));
+                fprintf(stderr, "\n");
+                fprintf(stderr, "    Stack:");
+                for (int si = 0; si < 8; si++)
+                    fprintf(stderr, " %08X", cpu_read32(cpu, (cpu->a[7] + si * 4) & 0xFFFFFF));
+                fprintf(stderr, "\n");
+            }
+            if (cpu->pc == 0x03D53E && !crash_fn_dumped) {
+                crash_fn_dumped = 1;
+                fprintf(stderr, "\n>>> ENTERING CRASH FN at $03D53E, A6=$%08X SP=$%08X\n", cpu->a[6], cpu->a[7]);
+                fprintf(stderr, "    Code BEFORE $03D53E:");
+                for (int di = -16; di < 0; di++)
+                    fprintf(stderr, " %04X", cpu_read16(cpu, 0x03D53E + di * 2));
+                fprintf(stderr, "\n");
+                fprintf(stderr, "    Code FROM  $03D53E:");
+                for (int di = 0; di < 24; di++)
+                    fprintf(stderr, " %04X", cpu_read16(cpu, 0x03D53E + di * 2));
+                fprintf(stderr, "\n");
+                /* Stack dump */
+                fprintf(stderr, "    Return addr on stack: $%08X\n", cpu_read32(cpu, cpu->a[7]));
+                fprintf(stderr, "    Stack:");
+                for (int si = 0; si < 12; si++)
+                    fprintf(stderr, " %08X", cpu_read32(cpu, (cpu->a[7] + si * 4) & 0xFFFFFF));
+                fprintf(stderr, "\n");
+                fprintf(stderr, "    Regs: D0=%08X D1=%08X D2=%08X A0=%08X A1=%08X A2=%08X\n",
+                        cpu->d[0], cpu->d[1], cpu->d[2], cpu->a[0], cpu->a[1], cpu->a[2]);
+            }
+            /* Trace when A6 becomes $FFFFFFDE (garbage) */
+            {
+                static uint32_t prev_a6 = 0;
+                static int a6_corrupt_log = 0;
+                if (cpu->a[6] == 0xFFFFFFDE && prev_a6 != 0xFFFFFFDE && a6_corrupt_log < 5) {
+                    a6_corrupt_log++;
+                    fprintf(stderr, "\n!!! A6 CORRUPTED: $%08X → $FFFFFFDE at PC=$%06X op=$%04X\n",
+                            prev_a6, cpu->pc, cpu_read16(cpu, cpu->pc));
+                    fprintf(stderr, "    SP=$%08X A5=$%08X D0=$%08X\n",
+                            cpu->a[7], cpu->a[5], cpu->d[0]);
+                    fprintf(stderr, "    Last 30 PCs:");
+                    for (int ri = 30; ri > 0; ri--)
+                        fprintf(stderr, " $%06X", pc_ring[(pc_ring_idx - ri) & 255]);
+                    fprintf(stderr, "\n");
+                    fprintf(stderr, "    Stack:");
+                    for (int si = 0; si < 8; si++)
+                        fprintf(stderr, " %08X", cpu_read32(cpu, (cpu->a[7] + si * 4) & 0xFFFFFF));
+                    fprintf(stderr, "\n");
+                }
+                prev_a6 = cpu->a[6];
+            }
+        }
+
         cpu->cycles = 0;
+        uint32_t sp_before = cpu->a[7];
+        uint32_t pc_before = cpu->pc;
         execute_one(cpu);
         if (cpu->cycles == 0) cpu->cycles = 4; /* minimum */
         cpu->total_cycles += cpu->cycles;
+
+        /* SP delta trace: catch single-instruction stack corruption */
+        {
+            uint32_t sp_after = cpu->a[7];
+            int32_t delta = (int32_t)sp_after - (int32_t)sp_before;
+            if (delta > 0x1000 || delta < -0x1000) {
+                static int sp_delta_log = 0;
+                if (sp_delta_log++ < 10) {
+                    fprintf(stderr, "\n!!! SP DELTA: $%08X → $%08X (delta=%+d) at PC=$%06X op=$%04X\n",
+                            sp_before, sp_after, delta, pc_before, cpu_read16(cpu, pc_before));
+                    fprintf(stderr, "    A6=$%08X A5=$%08X A0=$%08X D0=$%08X SR=$%04X\n",
+                            cpu->a[6], cpu->a[5], cpu->a[0], cpu->d[0], cpu->sr);
+                    /* Decode what the instruction did */
+                    uint16_t op_at = cpu_read16(cpu, pc_before);
+                    if ((op_at & 0xFFF8) == 0x4E58) {
+                        /* UNLK An */
+                        int reg = op_at & 7;
+                        fprintf(stderr, "    UNLK A%d — A%d was $%08X, loaded from [A%d]=$%08X\n",
+                                reg, 7, sp_before, reg, cpu->a[reg]);
+                        fprintf(stderr, "    Frame pointer (A%d) was pointing to: $%08X\n",
+                                reg, sp_before);
+                    } else {
+                        fprintf(stderr, "    Instruction at PC=$%06X: $%04X\n",
+                                pc_before, op_at);
+                    }
+                    /* Dump stack around the corruption */
+                    fprintf(stderr, "    Stack at SP_before=$%08X:", sp_before);
+                    for (int si = 0; si < 8; si++)
+                        fprintf(stderr, " %08X", cpu_read32(cpu, (sp_before + si * 4) & 0xFFFFFF));
+                    fprintf(stderr, "\n");
+                    /* Last 20 PCs */
+                    fprintf(stderr, "    Last 20 PCs:");
+                    for (int ri = 20; ri > 0; ri--)
+                        fprintf(stderr, " $%06X", pc_ring[(pc_ring_idx - ri) & 255]);
+                    fprintf(stderr, "\n");
+                }
+            }
+        }
 
         /* Trace exception */
         if (cpu->sr & SR_TRACE) {

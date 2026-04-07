@@ -196,15 +196,39 @@ static int add_global_symbol(linker_t *lk, const char *name, link_sym_type_t typ
                               int32_t value, int module_idx) {
     int existing = find_global_symbol_exact(lk, name);
     if (existing >= 0) {
-        /* Update existing symbol — allow redefinition (last one wins).
-         * In Lisa OS, the same method names (CREATE, Draw, etc.) appear in
-         * different compilation units for different classes.
-         * Don't pre-resolve — Phase 2 resolves symbols from kernel modules only. */
+        /* Duplicate symbol handling: first ENTRY wins.
+         * DRIVERASM exports thunks (GETSPACE, SYSTEM_ERROR, etc.) that
+         * read the driver jump table at $210 and indirect through it.
+         * The real implementations are in Pascal units compiled earlier.
+         * If we let DRIVERASM's thunks overwrite the real implementations,
+         * any call before INIT_JTDRIVER populates $210 will crash. */
         if (type == LSYM_ENTRY) {
-            lk->symbols[existing].type = LSYM_ENTRY;
-            lk->symbols[existing].value = value;
-            lk->symbols[existing].module_idx = module_idx;
-            /* resolved will be set in Phase 2 based on is_kernel */
+            if (lk->symbols[existing].type != LSYM_ENTRY) {
+                /* Promote EXTERN to ENTRY */
+                lk->symbols[existing].type = LSYM_ENTRY;
+                lk->symbols[existing].value = value;
+                lk->symbols[existing].module_idx = module_idx;
+            } else {
+                /* Both ENTRY — DRIVERASM thunks have lowest priority.
+                 * DRIVERASM exports thunks (GETSPACE, INTSOFF, etc.) that
+                 * indirect through the driver jump table at $210. These must
+                 * not shadow the real implementations. If the existing symbol
+                 * is from DRIVERASM, let ANY non-DRIVERASM entry replace it. */
+                bool existing_is_driverasm = false;
+                bool new_is_driverasm = false;
+                int ex_mod = lk->symbols[existing].module_idx;
+                if (ex_mod >= 0 && ex_mod < lk->num_modules)
+                    existing_is_driverasm = (strcasestr(lk->modules[ex_mod]->filename, "DRIVERASM") != NULL);
+                if (module_idx >= 0 && module_idx < lk->num_modules)
+                    new_is_driverasm = (strcasestr(lk->modules[module_idx]->filename, "DRIVERASM") != NULL);
+
+                if (existing_is_driverasm && !new_is_driverasm) {
+                    /* Replace DRIVERASM thunk with real implementation */
+                    lk->symbols[existing].value = value;
+                    lk->symbols[existing].module_idx = module_idx;
+                }
+                /* else: keep existing (first non-DRIVERASM wins, or both DRIVERASM) */
+            }
         }
         return existing;
     }

@@ -9,80 +9,120 @@ build/lisaemu Lisa_Source   # Cross-compiled OS (the main path)
 
 ## Where We Are
 
-**The OS draws on screen for the first time.** Asymmetric patterns visible —
-real OS code executing through the display system. The duplicate label fix
-unblocked the floating-point library and the OS now reaches driver init,
-filesystem code, and display output.
+**Past the stack corruption and driver jump table crashes.** The OS now
+reaches INITSYS, calls GETLDMAP, REG_TO_MAPPED, and POOL_INIT. 
+POOL_INIT receives wrong parameters → GETSPACE fails → SYSTEM_ERROR(10701).
 
-**Stops at:** SYSTEM_ERROR(0) triggered by sudden stack corruption.
-SP jumps from valid mapped address to $FFFFFFE6 (wraps through $0).
+**Stops at:** SYSTEM_ERROR(10701) — "no sysglobal space during startup"
+POOL_INIT gets garbage parameters because the GETLDMAP copy from the
+loader parameter block to INITSYS local variables has a layout mismatch.
 
-## What Was Fixed (this session total: 40+ commits)
+## What Was Fixed (this session)
 
-### The breakthrough fix: duplicate labels across .include files
-NEWFPSUB includes mathsub, fpunpack, and size — all define UNPNRM,
-UNPZUN, UNP0, etc. with DIFFERENT code. Our assembler resolved
-fpunpack's `BMI.S UNPNRM` to mathsub's version (wrong code),
-causing the FP unpack loop to never terminate.
+### 1. Variant record sizing (parser)
+Variant records (`CASE ... OF ...`) had zero size because the parser
+skipped all variant fields. Functions like `getexcepset` in FPMODES had
+`LINK A6,#0` (no locals), so local variable writes overwrote the saved
+frame pointer → UNLK A6 corrupted SP → SYSTEM_ERROR(0).
 
-Fix: proximity-based label resolution. Multi-definition tracker
-records all PCs for labels defined more than once. On pass 2,
-get_symbol_value finds the nearest forward definition.
+Fix: Parse variant fields and add the largest arm's fields to the record.
 
-### Other fixes this session
-- ORD() on pointers returned 2 not 4 (root cause of code overwrite)
-- WITH statement implemented (206 OS instances)
-- 30+ codegen type-size fixes
-- Cross-unit type resolution (dangling pointers, aliases, forward params)
-- smt_base and driver JT moved out of code space
-- Standalone programs removed from kernel
-- Negative global offsets from A5
-- prof_entry PROM routine for pre-compiled image boot
-- SYSTEM_ERROR HLE halts CPU instead of returning
+### 2. DRIVERASM symbol priority (linker)
+DRIVERASM exports thunks (GETSPACE, INTSOFF, SYSTEM_ERROR, etc.) that
+indirect through a jump table at $210. Before INIT_JTDRIVER runs, $210=0,
+so any call through these thunks crashes into the vector table.
 
-## Current Blocker: Sudden Stack Corruption
+Fix: DRIVERASM symbols have lowest linker priority. Non-DRIVERASM ENTRY
+symbols always replace DRIVERASM ones.
 
-SP jumps from valid mapped value (~$CBFFxx) to $FFFFFFE6 in ONE
-instruction. Not a gradual stack leak — a single UNLK or MOVEA
-sets SP to garbage, then exception frames push it down through
-$000000 and wrap to $FFFFFF.
+### 3. Duplicate global symbols (codegen)
+Pascal interface + external declarations for the same procedure created
+two global symbols. The first (ENTRY, val=0) blocked the real assembly
+implementation via "first ENTRY wins" in the linker.
+
+Fix: `add_global_sym` returns existing symbols by name instead of always
+creating new entries.
+
+### 4. Procedure vs function distinction (codegen)
+`INITSYS(PASCALINIT)` was wrongly treated: PASCALINIT (a function
+returning ptr) was being called as a procedure. Added `is_function` flag
+to `cg_proc_sig_t`. Procedures used in expressions push their ADDRESS;
+functions are called and return values.
+
+### 5. SP delta trace (emulator)
+Added per-instruction SP delta check: catches when SP changes by >$1000
+in one instruction. Identified the UNLK A6 crash, the GETSPACE/DRIVERASM
+jump table crashes, and verified the fixes.
+
+## Current Blocker: GETLDMAP → POOL_INIT Parameter Mismatch
+
+GETLDMAP copies the loader parameter block (at $D3100, version=22) into
+INITSYS local variables word-by-word. The copy works (version check
+passes), but POOL_INIT still receives wrong values.
+
+### Key observations
+- PASCALINIT correctly returns $D3100 (from $218/adrparamptr)
+- GETLDMAP entry: ldmapbase=$D3100, version=22 ✓
+- GETLDMAP code at $45A: LINK A6,#-8, reads ldmapbase at 8(A6), checks version
+- @parmend = parent_A6 - 684 ($FD54 offset)
+- @version = parent_A6 - 102 ($FF9A offset)
+- POOL_INIT params: mb_sysglob=$F0A7F4 (A6!), l_sysglob=$4B7A (code addr)
+
+### Likely cause
+The parameter block in lisa.c has correct data at $D3100 (version=22,
+fields below). GETLDMAP copies to INITSYS locals. But after REG_TO_MAPPED
+transitions to mapped memory, the A6-relative local variables may be in
+unmapped physical memory while the new mapped SP/A6 addresses refer to
+different locations.
+
+The physical-to-mapped transition in REG_TO_MAPPED changes the stack:
+- Before: A6=$078FF4 (physical)
+- After: A6=$CBFFE0 (mapped via MMU)
+
+The GETLDMAP locals are written to the PHYSICAL stack frame ($078Fxx).
+But after REG_TO_MAPPED, code accesses the MAPPED frame ($CBFFxx).
+If the MMU doesn't map $078Fxx → $CBFFxx, the data is unreachable.
 
 ### Next step
-Add trace that fires when SP changes by >$1000 in one instruction.
-This catches the exact instruction that corrupts SP. Look for:
-- UNLK with corrupted A6
-- MOVEA.L loading garbage into A7
-- RTE popping corrupt stack frame
+Trace what REG_TO_MAPPED does. Verify that the MMU mapping preserves
+access to the INITSYS locals after the transition. The issue may be:
+1. The MMU segment for the stack doesn't cover the right physical range
+2. The base addresses in the parameter block are wrong
+3. The stack transition changes A6 but doesn't remap the old locals
 
-### Pre-compiled image (side path, for validation)
-- "AOS 3.0" image at _inspiration/LisaSourceCompilation-main/
-- Decompress: gunzip .cpgz → cpio extract → 48MB raw ProFile
-- prof_entry at $FE0090 reads blocks (24 reads successful)
-- Needs more work (LDRLDR halts after spare table read)
+### Parameter block layout (lisa.c)
+```
+version_addr ($D3100):  version = 22 (2 bytes)
+version_addr - 4:       b_sysjt (4 bytes)
+version_addr - 8:       l_sysjt
+version_addr - 12:      b_sysglobal
+version_addr - 16:      l_sysglobal
+...
+```
+
+The layout matches parms.text variable order. The copy loop in GETLDMAP
+reads 2-byte words from ldmapbase downward and writes to INITSYS locals.
 
 ## Boot Sequence
 ```
-✅ ROM → PASCALINIT → %initstdio → GETLDMAP (clean, zero exceptions)
-✅ INITSYS: POOL_INIT, INTSOFF, INIT_NMI_TRAPV, REG_TO_MAPPED
+✅ ROM → PASCALINIT → %initstdio → GETLDMAP (version=22)
+✅ INITSYS: GETLDMAP copies params, REG_TO_MAPPED transitions stack
 ✅ FP library (NEWFPSUB) — fixed via duplicate label resolution
-✅ DRIVERASM reached (driver framework)
-✅ Filesystem code reached ($06227C)
-✅ Display output — OS draws to screen (asymmetric patterns)
-💥 SYSTEM_ERROR(0) — stack corruption, CPU halted
+✅ DRIVERASM reached (driver framework)  
+✅ INTSOFF/INTSON resolve to mover.text (real implementations)
+✅ SYSTEM_ERROR resolves to SYSGLOBAL (real implementation)
+💥 POOL_INIT — wrong parameters from INITSYS locals
 ❌ BOOT_IO_INIT → ProFile handshake
 ❌ FS_INIT → mount boot volume  
-❌ INTRINSIC.LIB loading
 ❌ ENTER_SCHEDULER → Desktop
 ```
 
 ## Key Files
 ```
-src/toolchain/asm68k.c            — duplicate label resolution (multidef)
-src/toolchain/pascal_codegen.c    — WITH, expr_size, ORD(), 30+ fixes
-src/toolchain/toolchain_bridge.c  — type remapping, HLE export, program skip
-src/toolchain/linker.c            — module map, vectors
-src/toolchain/bootrom.c           — prof_entry, loader stub, PROM checksum
-src/profile.c/h                   — ProFile protocol (ready, untested)
-src/lisa.c                        — boot params, HLE handlers, loader fs
-src/m68k.c                        — HLE callback, traces, SP watermark
+src/toolchain/pascal_parser.c   — variant record field parsing
+src/toolchain/pascal_codegen.c  — dedup globals, proc/func distinction
+src/toolchain/pascal_codegen.h  — is_function flag in proc_sig
+src/toolchain/linker.c          — DRIVERASM priority, first-entry-wins
+src/m68k.c                      — SP delta trace, crash function traces
+src/lisa.c                      — parameter block layout
 ```

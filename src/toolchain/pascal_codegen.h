@@ -113,6 +113,7 @@ typedef struct {
     char param_name[CODEGEN_MAX_PARAMS][64]; /* Parameter names for forward-decl matching */
     struct type_desc *param_type[CODEGEN_MAX_PARAMS]; /* Parameter types (for IMPL body reconstruction) */
     bool is_external;                       /* true = assembly/external (callee-clean) */
+    bool is_function;                       /* true = function (returns value), false = procedure */
 } cg_proc_sig_t;
 
 /* Relocation */

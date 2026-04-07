@@ -1443,7 +1443,10 @@ void lisa_reset(lisa_t *lisa) {
         if (version_addr & 1) version_addr++;  /* word-align */
         WRITE16(version_addr, 22);  /* version = 22 */
 
-        /* Write fields downward: p starts just below version, decreases */
+        /* Write fields downward: p starts at version_addr, decreases.
+         * Each W32D does p -= 4 first, then writes. The GETLDMAP copy loop
+         * reads 2-byte words starting at ldmapbase (=version_addr) and going down.
+         * 4-byte fields occupy two consecutive words in the param block. */
         uint32_t p = version_addr;
         #define W32D(val) do { p -= 4; WRITE32(p, (val)); } while(0)
         #define W16D(val) do { p -= 2; WRITE16(p, (val)); } while(0)

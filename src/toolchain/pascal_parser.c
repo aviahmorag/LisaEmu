@@ -701,23 +701,74 @@ static ast_node_t *parse_type(parser_t *p) {
         }
         /* Variant part (CASE tag OF ...) */
         if (match(p, TOK_CASE)) {
-            /* CASE [tag :] type OF variant_list */
-            /* Skip the variant part — track depth with RECORD/END pairs.
-             * Nested CASE inside variants does NOT add depth — only RECORD does.
-             * This handles nested variant records like TAbk in UNITHZ. */
-            int depth = 0;
-            while (!check(p, TOK_EOF) && !BAILED(p)) {
-                if (CURTYPE(p) == TOK_RECORD) {
-                    depth++;
+            /* CASE [tag :] type OF variant_list
+             * Parse variant fields so the record gets correct sizing.
+             * We collect all fields from all variants — this may overcount
+             * (variants overlap in memory) but never undercounts, which is
+             * critical: undercounting causes LINK A6,#0 → stack corruption. */
+
+            /* Skip tag and discriminant type up to OF */
+            while (!check(p, TOK_OF) && !check(p, TOK_END) && !check(p, TOK_EOF) && !BAILED(p))
+                advance(p);
+            match(p, TOK_OF);
+
+            /* Track the largest variant arm to use for sizing.
+             * We'll collect fields from the first variant arm that has fields. */
+            int best_arm_field_count = 0;
+            ast_node_t *best_arm_fields[64];
+
+            while (!check(p, TOK_END) && !check(p, TOK_EOF) && !BAILED(p)) {
+                /* Skip variant labels: const [, const]... : */
+                while (!check(p, TOK_COLON) && !check(p, TOK_END) && !check(p, TOK_EOF) && !BAILED(p))
                     advance(p);
-                } else if (CURTYPE(p) == TOK_END) {
-                    if (depth <= 0) break;  /* This END closes the outer RECORD */
-                    depth--;
-                    advance(p);
+                if (!match(p, TOK_COLON)) break;
+
+                /* Variant arm fields in parentheses: (field1: type1; ...) */
+                if (match(p, TOK_LPAREN)) {
+                    int arm_field_count = 0;
+                    ast_node_t *arm_fields[64];
+
+                    while (!check(p, TOK_RPAREN) && !check(p, TOK_CASE) &&
+                           !check(p, TOK_END) && !check(p, TOK_EOF) && !BAILED(p)) {
+                        /* Parse field: name[, name] : type */
+                        if (CURTYPE(p) == TOK_IDENT) {
+                            ast_node_t *field = ast_new(AST_FIELD, p->lex.line);
+                            strncpy(field->name, CUR(p).str_val, sizeof(field->name) - 1);
+                            advance(p);
+                            while (match(p, TOK_COMMA)) {
+                                strncat(field->name, ",", sizeof(field->name) - strlen(field->name) - 1);
+                                if (CURTYPE(p) == TOK_IDENT) {
+                                    strncat(field->name, CUR(p).str_val, sizeof(field->name) - strlen(field->name) - 1);
+                                    advance(p);
+                                }
+                            }
+                            if (match(p, TOK_COLON)) {
+                                ast_add_child(field, parse_type(p));
+                            }
+                            if (arm_field_count < 64)
+                                arm_fields[arm_field_count++] = field;
+                            match(p, TOK_SEMICOLON);
+                        } else {
+                            advance(p); /* skip unexpected tokens */
+                        }
+                    }
+                    match(p, TOK_RPAREN);
+
+                    /* Keep the arm with the most fields (heuristic for largest) */
+                    if (arm_field_count > best_arm_field_count) {
+                        best_arm_field_count = arm_field_count;
+                        for (int fi = 0; fi < arm_field_count; fi++)
+                            best_arm_fields[fi] = arm_fields[fi];
+                    }
                 } else {
-                    advance(p);
+                    /* No parentheses — skip to next variant or END */
                 }
+                match(p, TOK_SEMICOLON);
             }
+
+            /* Add the largest variant arm's fields to the record */
+            for (int fi = 0; fi < best_arm_field_count; fi++)
+                ast_add_child(n, best_arm_fields[fi]);
         }
         expect(p, TOK_END);
         return n;
