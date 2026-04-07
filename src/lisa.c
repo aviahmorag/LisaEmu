@@ -2279,9 +2279,93 @@ static bool hle_handle_system_error(lisa_t *lisa __attribute__((unused)), m68k_t
     return false;
 }
 
+/* 5:1 deinterleave for ProFile sector numbers (from LisaEm) */
+static uint32_t deinterleave5(uint32_t sector) {
+    uint32_t offset = sector % 20;
+    uint32_t track = sector - offset;
+    static const int interleave[20] = {0,4,8,12,16,1,5,9,13,17,2,6,10,14,18,3,7,11,15,19};
+    return track + interleave[offset % 20];
+}
+
+/* prof_entry intercept — read a ProFile block directly from disk image.
+ * Interface: D1=sector(interleaved), A1=tag dest(20b), A2=data dest(512b) */
+static bool hle_prof_entry(lisa_t *lisa, m68k_t *cpu) {
+    uint32_t sector = cpu->d[1];
+    uint32_t tag_dest = cpu->a[1] & 0xFFFFFF;
+    uint32_t data_dest = cpu->a[2] & 0xFFFFFF;
+
+    /* Deinterleave unless it's a special block number */
+    if (sector < 0x00F00000)
+        sector = deinterleave5(sector);
+
+    static int prof_reads = 0;
+    if (prof_reads < 30)
+        fprintf(stderr, "PROF_ENTRY: read sector %u → tag@$%06X data@$%06X\n",
+                sector, tag_dest, data_dest);
+    prof_reads++;
+
+    /* Read from mounted ProFile image */
+    if (!lisa->prof.mounted || !lisa->prof.data) {
+        cpu->sr |= 1;  /* Set carry = error */
+        cpu->pc += 2;   /* Skip NOP, hit RTS */
+        return true;
+    }
+
+    uint32_t total_blocks = (uint32_t)(lisa->prof.data_size / 532);
+
+    /* Special block $FFFFFF: spare table / drive identity */
+    uint8_t spare_block[532];
+    uint8_t *block;
+    if (sector >= 0xFFFFF0) {
+        memset(spare_block, 0, sizeof(spare_block));
+        /* Tag: all zeros */
+        /* Data at offset 20: device info */
+        spare_block[20] = 0x00;  /* Device type: ProFile */
+        spare_block[21] = 0x00;
+        spare_block[22] = 0x00;
+        spare_block[23] = 0x00;
+        /* Number of blocks (3 bytes, big-endian) */
+        spare_block[24] = (total_blocks >> 16) & 0xFF;
+        spare_block[25] = (total_blocks >> 8) & 0xFF;
+        spare_block[26] = total_blocks & 0xFF;
+        /* Bytes per block: 532 */
+        spare_block[27] = 0x02;
+        spare_block[28] = 0x14;
+        /* Spares: 0 */
+        spare_block[29] = 0x00;
+        spare_block[30] = 0x00;
+        spare_block[31] = 0x00;
+        spare_block[32] = 0x00;
+        block = spare_block;
+    } else if (sector >= total_blocks) {
+        cpu->sr |= 1;  /* Error: beyond disk */
+        cpu->pc += 2;
+        return true;
+    } else {
+        block = lisa->prof.data + (size_t)sector * 532;
+    }
+
+    /* Write 20 tag bytes to A1 */
+    for (int i = 0; i < 20; i++)
+        cpu->write8((tag_dest + i) & 0xFFFFFF, block[i]);
+
+    /* Write 512 data bytes to A2 */
+    for (int i = 0; i < 512; i++)
+        cpu->write8((data_dest + i) & 0xFFFFFF, block[20 + i]);
+
+    cpu->sr &= ~1;  /* Clear carry = success */
+    cpu->pc += 2;    /* Skip NOP, hit RTS */
+    return true;
+}
+
 bool lisa_hle_intercept(lisa_t *lisa, m68k_t *cpu) {
-    if (!lisa->hle.active) return false;
     uint32_t pc = cpu->pc & 0x00FFFFFF;
+
+    /* ALWAYS intercept prof_entry at $FE0090 (ROM PROM routine) */
+    if (pc == 0xFE0090)
+        return hle_prof_entry(lisa, cpu);
+
+    if (!lisa->hle.active) return false;
 
     /* Intercept CALLDRIVER */
     if (pc == lisa->hle.calldriver) return hle_handle_calldriver(lisa, cpu);

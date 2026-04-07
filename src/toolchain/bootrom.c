@@ -342,6 +342,31 @@ uint8_t *bootrom_generate(void) {
     emit16(&b, 0x60FC);          /* BRA.S self (halt) */
 
     /* ================================================================
+     * prof_entry at $FE0090 — ProFile block read for boot loader.
+     * The LDRLDR boot track calls this to read sectors.
+     * Interface (from LisaEm romless_proread):
+     *   D1 = sector number (with 5:1 interleave encoding)
+     *   A1 = tag destination (20 bytes)
+     *   A2 = data destination (512 bytes)
+     * Returns: carry clear = success
+     *
+     * We emit a NOP + RTS here. The emulator intercepts PC=$FE0090
+     * and performs the read directly from the mounted disk image.
+     * ================================================================ */
+    b.pc = 0x0090;
+    emit16(&b, 0x4E71);          /* NOP — intercepted by emulator */
+    emit16(&b, 0x4E75);          /* RTS */
+
+    /* twig_entry at $FE0094 — floppy read (stub) */
+    b.pc = 0x0094;
+    emit16(&b, 0x4E71);
+    emit16(&b, 0x4E75);
+
+    /* prom_monitor at $FE0084 — halt loop */
+    b.pc = 0x0084;
+    emit16(&b, 0x60FE);          /* BRA.S self (infinite loop) */
+
+    /* ================================================================
      * Loader stub at $FE0600 — replacement for the boot loader's
      * LDRTRAP/DRIVER_CALL interface.
      *
