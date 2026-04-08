@@ -1891,7 +1891,7 @@ int lisa_run_frame(lisa_t *lisa) {
                 lisa->via2.ddra, lisa->via2.ddrb);
         fprintf(stderr, "=== END FRAME 5 DUMP ===\n");
     }
-    if (frame_count == 10 || frame_count == 60 || frame_count == 300 || frame_count == 800) {
+    if (frame_count == 10 || frame_count == 60 || frame_count == 300 || frame_count == 800 || frame_count == 2000) {
         fprintf(stderr, "DIAG frame %d: PC=$%06X SR=$%04X stopped=%d pending_irq=%d setup=%d\n",
                 frame_count, lisa->cpu.pc, lisa->cpu.sr, lisa->cpu.stopped,
                 lisa->cpu.pending_irq, lisa->mem.setup_mode);
