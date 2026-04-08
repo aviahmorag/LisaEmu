@@ -461,8 +461,8 @@ static void take_exception(m68k_t *cpu, int vector) {
     /* Count all exceptions by type */
     if (vector < 256) exception_histogram[vector]++;
 
-    /* Detect stack overflow */
-    if (cpu->a[7] < 0x1000 || cpu->a[7] > 0x1FF000) {
+    /* Detect stack overflow — allow mapped stack addresses ($CA0000+ and $F60000+) */
+    if (cpu->a[7] < 0x1000 || (cpu->a[7] > 0x1FF000 && cpu->a[7] < 0xCA0000)) {
         static int overflow_reported = 0;
         if (!overflow_reported) {
             overflow_reported = 1;
@@ -489,6 +489,19 @@ static void take_exception(m68k_t *cpu, int vector) {
                            (vector >= 32 && vector < 48) ? "TRAP" : "IRQ";
         printf("Exception: vector %d (%s) at PC=$%06X, new PC=$%08X\n",
                vector, name, cpu->pc, cpu_read32(cpu, vector * 4));
+        /* Extra detail for Zero Divide */
+        if (vector == 5) {
+            fprintf(stderr, "  ZERO DIVIDE at PC=$%06X: opcode=$%04X D0=$%08X D1=$%08X D2=$%08X\n",
+                    cpu->pc, cpu_read16(cpu, cpu->pc),
+                    cpu->d[0], cpu->d[1], cpu->d[2]);
+            fprintf(stderr, "    A6=$%08X SP=$%08X A5=$%08X\n",
+                    cpu->a[6], cpu->a[7], cpu->a[5]);
+            /* Dump code around PC */
+            fprintf(stderr, "    Code at PC-16..+8: ");
+            for (uint32_t a = (cpu->pc > 16 ? cpu->pc - 16 : 0); a < cpu->pc + 8; a += 2)
+                fprintf(stderr, "%04X ", cpu_read16(cpu, a));
+            fprintf(stderr, "\n");
+        }
 
         exception_count++;
     }
@@ -2663,21 +2676,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
 
         /* Trace HLE SYSTEM_ERROR with full context */
         /* (AFTER_PASCALINIT trace removed - address is stale) */
-        if (cpu->pc == 0xBB4B2) {
-            static int pool_logged = 0;
-            if (pool_logged++ < 2) {
-                fprintf(stderr, "=== POOL_INIT at PC=$%06X A5=$%08X A6=$%08X SP=$%08X\n",
-                        cpu->pc, cpu->a[5], cpu->a[6], cpu->a[7]);
-                /* Parameters are on stack (after return address) */
-                fprintf(stderr, "  params: mb_sysglob=$%08X l_sysglob=$%08X mb_sgheap=$%08X l_sgheap=$%08X mb_sysloc=$%08X l_sysloc=$%08X\n",
-                        cpu_read32(cpu, cpu->a[7]+4),
-                        cpu_read32(cpu, cpu->a[7]+8),
-                        cpu_read32(cpu, cpu->a[7]+12),
-                        cpu_read32(cpu, cpu->a[7]+16),
-                        cpu_read32(cpu, cpu->a[7]+20),
-                        cpu_read32(cpu, cpu->a[7]+24));
-            }
-        }
+        /* (Address-specific traces removed — addresses change with code layout) */
         /* SP watermark: catch stack leak in both physical and mapped space */
         {
             static uint32_t lowest_sp = 0xFFFFFF;

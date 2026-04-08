@@ -802,7 +802,7 @@ bool linker_link(linker_t *lk) {
                     target, nearest, target - nearest_dist, nearest_dist);
     }
     /* Search for specific symbols to debug */
-    const char *debug_syms[] = {"INIT_TRAPV", "INTSOFF", "INITSYS", "TRAP1", "TRAP7", "BUS_ERR", "SCHDTRAP", "INIT_NMI_TRAPV", "INTSON", "PASCALINIT", "GETLDMAP", "REG_TO_MAPPED", "SYSTEM_ERROR", "POOL_INIT", "INIT_SCTAB", "SCTAB1", "BAD_SCALL", NULL};
+    const char *debug_syms[] = {"INIT_TRAPV", "INTSOFF", "INITSYS", "TRAP1", "TRAP7", "BUS_ERR", "SCHDTRAP", "INIT_NMI_TRAPV", "INTSON", "PASCALINIT", "GETLDMAP", "REG_TO_MAPPED", "SYSTEM_ERROR", "POOL_INIT", "INIT_SCTAB", "SCTAB1", "BAD_SCALL", "MMU_BASE", "INIT_PE", "INIT_FREEPOOL", "GETSPACE", "GETFREE", NULL};
     for (int d = 0; debug_syms[d]; d++) {
         int idx = find_global_symbol(lk, debug_syms[d]);
         if (idx >= 0) {

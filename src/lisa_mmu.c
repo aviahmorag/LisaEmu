@@ -83,7 +83,7 @@ static void mmu_reg_write(lisa_mem_t *mem, uint32_t addr, uint16_t data) {
     }
 
     static int mmu_write_count = 0;
-    if (mmu_write_count < 30) {
+    if (mmu_write_count < 200) {
         fprintf(stderr, "MMU REG: ctx=%d seg=%d %s=$%03X (addr=$%06X)\n",
                 context, seg, (addr & 8) ? "SOR" : "SLR", data, addr);
         mmu_write_count++;
@@ -192,12 +192,15 @@ void lisa_mem_write8(lisa_mem_t *mem, uint32_t addr, uint8_t val) {
                 break;
             }
             if (phys < LISA_RAM_SIZE) {
-                /* Watchpoint: first write to sysglobal area ($E2000) */
-                if (phys >= 0xE2000 && phys < 0xE8000) {
+                /* Watchpoint: write to sysglobal area (mapped $CC0000+).
+                 * With os_end ~$D5000: b_sysglobal ~$D6800. Detect any writes to
+                 * the range $D0000-$F0000 which covers sysglobal, heap, syslocal. */
+                if (phys >= 0xD0000 && phys < 0xF0000 && mem->ram[phys] != val) {
                     static int wp_count = 0;
-                    if (wp_count++ < 3)
-                        fprintf(stderr, ">>> SYSGLOBAL WRITE: phys=$%06X val=$%02X (addr=$%06X)\n",
-                                phys, val, addr);
+                    wp_count++;
+                    if (wp_count <= 30 || (phys >= 0xE0800 && phys < 0xE8800))
+                        fprintf(stderr, ">>> SGWRITE[%d]: phys=$%06X val=$%02X old=$%02X (addr=$%06X)\n",
+                                wp_count, phys, val, mem->ram[phys], addr);
                 }
                 /* Watch for CHANGING writes to STARTUP code area.
                  * Skip initial load (old=0) — only catch overwrites. */

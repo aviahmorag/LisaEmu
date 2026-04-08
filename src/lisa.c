@@ -1559,16 +1559,27 @@ void lisa_reset(lisa_t *lisa) {
             uint32_t l_syslocal = 0x4000;
             SET_MMU_SEG(ctx, 103, 0x0700, (uint16_t)(b_syslocal >> 9));
 
+            /* Stack segments: Lisa MMU DO_AN_MMU computes SOR differently
+             * for stack type ($600): SOR = origin + length - hw_adjust,
+             * where hw_adjust = $100 pages (128KB = one full segment).
+             * This places the stack's physical TOP at the TOP of the MMU
+             * segment, so downward growth works correctly.
+             * Formula: SOR = (base >> 9) + (length >> 9) - 0x100 */
+            #define STACK_SOR(base, len) \
+                (uint16_t)(((base) >> 9) + ((len) >> 9) - 0x100)
+
             /* superstkmmu (101): maps $CA0000 → physical supervisor stack */
-            SET_MMU_SEG(ctx, 101, 0x0600, (uint16_t)(b_superstack >> 9));
+            SET_MMU_SEG(ctx, 101, 0x0600, STACK_SOR(b_superstack, l_superstack));
 
             /* stackmmu (123): maps $F60000 → physical user stack + jump table */
             uint32_t b_stack = b_syslocal + l_syslocal;
             uint32_t b_opustack = b_stack;
-            SET_MMU_SEG(ctx, 123, 0x0600, (uint16_t)(b_opustack >> 9));
+            SET_MMU_SEG(ctx, 123, 0x0600, STACK_SOR(b_opustack, l_opustack));
 
             /* Also map segment 104 for legacy compatibility */
-            SET_MMU_SEG(ctx, 104, 0x0600, (uint16_t)(b_stack >> 9));
+            SET_MMU_SEG(ctx, 104, 0x0600, STACK_SOR(b_stack, l_opustack));
+
+            #undef STACK_SOR
 
             /* screenmmu (105): maps $D20000 → physical screen */
             SET_MMU_SEG(ctx, 105, 0x0700, (uint16_t)(b_screen >> 9));
@@ -1861,11 +1872,14 @@ int lisa_run_frame(lisa_t *lisa) {
                 lisa->via2.ier, lisa->via2.ifr);
         /* Test MMU write at runtime */
         if (frame_count == 10) {
-            /* Write $AB to logical $CC0000, check physical $E2000 */
+            /* Write $AB to logical $CC0000, check translated physical address.
+             * sysglobmmu(102) SOR maps $CC0000 to physical b_sysglobal. */
+            uint16_t sor102 = lisa->mem.segments[1][102].sor;
+            uint32_t expected_phys = (uint32_t)sor102 << 9;
             lisa_mem_write8(&lisa->mem, 0xCC0000, 0xAB);
-            uint8_t got = lisa->mem.ram[0xE2000];
-            fprintf(stderr, "  MMU WRITE TEST: wrote $AB to $CC0000, phys $E2000 = $%02X (%s)\n",
-                    got, got == 0xAB ? "PASS" : "FAIL");
+            uint8_t got = (expected_phys < LISA_RAM_SIZE) ? lisa->mem.ram[expected_phys] : 0;
+            fprintf(stderr, "  MMU WRITE TEST: wrote $AB to $CC0000, phys $%06X = $%02X (%s)\n",
+                    expected_phys, got, got == 0xAB ? "PASS" : "FAIL");
             lisa_mem_write8(&lisa->mem, 0xCC0000, 0);  /* clean up */
         }
         if (frame_count == 60) {
@@ -1945,33 +1959,48 @@ int lisa_run_frame(lisa_t *lisa) {
                     lisa->via2.ier, lisa->via2.ifr, lisa->via2.ora, lisa->via2.orb);
             fprintf(stderr, "=== END FRAME 60 DECODE ===\n");
         }
-        if (frame_count == 120) {
-            fprintf(stderr, "  A5=$%08X A6=$%08X SP=$%08X\n",
-                    lisa->cpu.a[5], lisa->cpu.a[6], lisa->cpu.a[7]);
-            /* Check b_sysglobal_ptr at $200 */
-            uint32_t bsg = lisa_mem_read32(&lisa->mem, 0x200);
-            fprintf(stderr, "  b_sysglobal_ptr(@$200)=$%08X\n", bsg);
-            /* Check if sysglobal has been written (first 16 bytes) */
-            fprintf(stderr, "  sysglobal@$CC0000:");
-            for (int i = 0; i < 16; i++)
-                fprintf(stderr, " %02X", lisa_mem_read8(&lisa->mem, 0xCC0000 + i));
-            fprintf(stderr, "\n  physical@$E2000:");
-            for (int i = 0; i < 16; i++)
-                fprintf(stderr, " %02X", lisa->mem.ram[0xE2000 + i]);
-            fprintf(stderr, "\n");
-        }
-        if (frame_count == 120) {
-            uint32_t test_addr = 0xCC0000;
+        if (frame_count == 10) {
+            /* Dump pool state after POOL_INIT.
+             * sysglobal at $CC0000, expected pool header written by POOL_INIT. */
             int ctx = lisa->mem.current_context;
-            (void)test_addr;
-            fprintf(stderr, "  MMU state: enabled=%d ctx=%d seg102: sor=$%03X slr=$%03X changed=%d\n",
+            fprintf(stderr, "  MMU state: enabled=%d ctx=%d seg102: sor=$%03X seg101: sor=$%03X seg123: sor=$%03X\n",
                     lisa->mem.mmu_enabled, ctx,
                     lisa->mem.segments[ctx][102].sor,
-                    lisa->mem.segments[ctx][102].slr,
-                    lisa->mem.segments[ctx][102].changed);
-            uint8_t val = lisa_mem_read8(&lisa->mem, test_addr);
-            fprintf(stderr, "  MMU read $CC0000 = $%02X (phys $E2000 = $%02X)\n",
-                    val, lisa->mem.ram[0xE2000]);
+                    lisa->mem.segments[ctx][101].sor,
+                    lisa->mem.segments[ctx][123].sor);
+            /* Dump first 64 bytes of sysglobal pool (pool header) */
+            fprintf(stderr, "  sysglobal pool @$CC0000 (first 64 bytes):\n");
+            for (int row = 0; row < 4; row++) {
+                uint32_t base = 0xCC0000 + row * 16;
+                fprintf(stderr, "    $%06X:", base);
+                for (int i = 0; i < 16; i += 2) {
+                    fprintf(stderr, " %04X",
+                            lisa_mem_read16(&lisa->mem, base + i));
+                }
+                fprintf(stderr, "\n");
+            }
+            /* Also check physical RAM directly */
+            uint16_t sor102 = lisa->mem.segments[ctx][102].sor;
+            uint32_t phys_sg = (uint32_t)sor102 << 9;
+            fprintf(stderr, "  physical sysglobal @$%06X (first 32 bytes):\n    ", phys_sg);
+            for (int i = 0; i < 32; i++) {
+                fprintf(stderr, "%02X ", lisa->mem.ram[phys_sg + i]);
+                if (i == 15) fprintf(stderr, "\n    ");
+            }
+            fprintf(stderr, "\n");
+            /* Check pool header area at sgheap (offset $A000 into sysglobal) */
+            fprintf(stderr, "  physical sgheap @$%06X (first 32 bytes):\n    ", phys_sg + 0xA000);
+            for (int i = 0; i < 32; i++) {
+                fprintf(stderr, "%02X ", lisa->mem.ram[phys_sg + 0xA000 + i]);
+                if (i == 15) fprintf(stderr, "\n    ");
+            }
+            fprintf(stderr, "\n");
+            /* Check A5 region (globals, negative offsets from A5) */
+            fprintf(stderr, "  A5-relative globals (A5=$CC5FFC, physical @$%06X):\n", phys_sg + 0x5FFC);
+            fprintf(stderr, "    A5-8: %08X  A5-4: %08X  A5+0: %08X\n",
+                    lisa_mem_read32(&lisa->mem, 0xCC5FFC - 8),
+                    lisa_mem_read32(&lisa->mem, 0xCC5FFC - 4),
+                    lisa_mem_read32(&lisa->mem, 0xCC5FFC));
         }
         /* Check screen content */
         {
@@ -2344,9 +2373,10 @@ static bool hle_prof_entry(lisa_t *lisa, m68k_t *cpu) {
     uint32_t tag_dest = cpu->a[1] & 0xFFFFFF;
     uint32_t data_dest = cpu->a[2] & 0xFFFFFF;
 
-    /* Deinterleave unless it's a special block number */
-    if (sector < 0x00F00000)
-        sector = deinterleave5(sector);
+    /* NOTE: deinterleaving disabled — the raw ProFile image stores blocks
+     * in sequential order, and the boot loader sends sequential sector
+     * numbers. Deinterleaving would read wrong blocks. */
+    /* if (sector < 0x00F00000) sector = deinterleave5(sector); */
 
     static int prof_reads = 0;
     if (prof_reads < 30)

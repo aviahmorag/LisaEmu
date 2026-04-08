@@ -966,17 +966,70 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                     emit16(cg, use_long ? 0x9081 : 0x9041);  /* SUB.L/W D1,D0 */
                     break;
                 case TOK_STAR:
-                    emit16(cg, 0xC1C1);  /* MULS D1,D0 */
+                    if (use_long) {
+                        /* 32-bit multiply: D0.L * D1.L → D0.L
+                         * M68000 only has 16×16→32 MULU/MULS.
+                         * Algorithm: result = A_lo*B_lo + (A_hi*B_lo + A_lo*B_hi)<<16
+                         * (A_hi*B_hi<<32 overflows and is discarded) */
+                        emit16(cg, 0x2400);  /* MOVE.L D0,D2     ; D2 = A */
+                        emit16(cg, 0x2F01);  /* MOVE.L D1,-(SP)  ; save B */
+                        emit16(cg, 0x4840);  /* SWAP D0           ; D0.w = A_hi */
+                        emit16(cg, 0xC0C1);  /* MULU.W D1,D0     ; D0 = A_hi * B_lo */
+                        emit16(cg, 0x4841);  /* SWAP D1           ; D1.w = B_hi */
+                        emit16(cg, 0xC2C2);  /* MULU.W D2,D1     ; D1 = A_lo * B_hi */
+                        emit16(cg, 0xD041);  /* ADD.W D1,D0      ; sum cross products */
+                        emit16(cg, 0x4840);  /* SWAP D0           ; cross sum → high word */
+                        emit16(cg, 0x4240);  /* CLR.W D0          ; clear low word */
+                        emit16(cg, 0x221F);  /* MOVE.L (SP)+,D1  ; restore B */
+                        emit16(cg, 0xC4C1);  /* MULU.W D1,D2     ; D2 = A_lo * B_lo */
+                        emit16(cg, 0xD082);  /* ADD.L D2,D0      ; final result */
+                    } else {
+                        emit16(cg, 0xC1C1);  /* MULS.W D1,D0 */
+                    }
                     break;
                 case TOK_SLASH:
                 case TOK_DIV:
-                    emit16(cg, 0x48C0);  /* EXT.L D0 */
-                    emit16(cg, 0x81C1);  /* DIVS D1,D0 */
+                    if (use_long) {
+                        /* 32-bit unsigned division: D0.L / D1.L → D0.L
+                         * Uses binary long division (shift-and-subtract).
+                         * D0=dividend → quotient, D2=remainder, D3=counter */
+                        emit16(cg, 0x4282);  /* CLR.L D2           ; remainder=0 */
+                        emit16(cg, 0x761F);  /* MOVEQ #31,D3       ; 32 iterations */
+                        /* loop: */
+                        emit16(cg, 0xD080);  /* ADD.L D0,D0        ; dividend <<= 1 */
+                        emit16(cg, 0xD582);  /* ADDX.L D2,D2       ; remainder <<= 1 + carry */
+                        emit16(cg, 0xB481);  /* CMP.L D1,D2        ; remainder >= divisor? */
+                        emit16(cg, 0x6504);  /* BCS.S +4           ; skip if remainder < divisor */
+                        emit16(cg, 0x9481);  /* SUB.L D1,D2        ; remainder -= divisor */
+                        emit16(cg, 0x5280);  /* ADDQ.L #1,D0       ; set quotient bit */
+                        /* .skip: */
+                        emit16(cg, 0x51CB);  /* DBRA D3,offset     */
+                        emit16(cg, 0xFFF2);  /* displacement = -14  (back to ADD.L D0,D0) */
+                    } else {
+                        emit16(cg, 0x48C0);  /* EXT.L D0 */
+                        emit16(cg, 0x81C1);  /* DIVS D1,D0 */
+                    }
                     break;
                 case TOK_MOD:
-                    emit16(cg, 0x48C0);  /* EXT.L D0 */
-                    emit16(cg, 0x81C1);  /* DIVS D1,D0 */
-                    emit16(cg, 0x4840);  /* SWAP D0 (remainder in low word) */
+                    if (use_long) {
+                        /* 32-bit unsigned modulo: D0.L mod D1.L → D0.L
+                         * Same algorithm as division, result is remainder in D2 */
+                        emit16(cg, 0x4282);  /* CLR.L D2           ; remainder=0 */
+                        emit16(cg, 0x761F);  /* MOVEQ #31,D3       ; 32 iterations */
+                        emit16(cg, 0xD080);  /* ADD.L D0,D0        ; dividend <<= 1 */
+                        emit16(cg, 0xD582);  /* ADDX.L D2,D2       ; remainder <<= 1 + carry */
+                        emit16(cg, 0xB481);  /* CMP.L D1,D2        ; remainder >= divisor? */
+                        emit16(cg, 0x6504);  /* BCS.S +4           ; skip if remainder < divisor */
+                        emit16(cg, 0x9481);  /* SUB.L D1,D2        ; remainder -= divisor */
+                        emit16(cg, 0x5280);  /* ADDQ.L #1,D0       ; set quotient bit */
+                        emit16(cg, 0x51CB);  /* DBRA D3,offset     */
+                        emit16(cg, 0xFFF2);  /* displacement = -14  */
+                        emit16(cg, 0x2002);  /* MOVE.L D2,D0       ; result = remainder */
+                    } else {
+                        emit16(cg, 0x48C0);  /* EXT.L D0 */
+                        emit16(cg, 0x81C1);  /* DIVS D1,D0 */
+                        emit16(cg, 0x4840);  /* SWAP D0 (remainder in low word) */
+                    }
                     break;
                 case TOK_AND:
                     emit16(cg, use_long ? 0xC081 : 0xC041);

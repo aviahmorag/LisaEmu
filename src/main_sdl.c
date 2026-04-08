@@ -86,12 +86,35 @@ int main(int argc, char *argv[]) {
 
     if (argc < 2) {
         printf("Usage: %s <Lisa_Source_dir>    (build from source)\n", argv[0]);
+        printf("       %s --image <profile_image>  (boot pre-built disk image)\n", argv[0]);
         printf("       %s <rom_file> [profile_image] [floppy_image]\n", argv[0]);
         return 1;
     }
 
-    /* Detect: is argv[1] a source directory or a ROM file? */
-    if (toolchain_validate_source(argv[1])) {
+    /* Check for --image flag: boot directly from a pre-built ProFile image */
+    if (argc >= 3 && strcmp(argv[1], "--image") == 0) {
+        printf("Booting from pre-built disk image: %s\n", argv[2]);
+
+        /* Generate boot ROM in memory and load it directly */
+        {
+            uint8_t *rom = bootrom_generate();
+            if (rom) {
+                lisa_mem_load_rom(&lisa.mem, rom, ROM_SIZE);
+                free(rom);
+                printf("Boot ROM generated (%d bytes)\n", ROM_SIZE);
+            } else {
+                fprintf(stderr, "Failed to generate boot ROM\n");
+                return 1;
+            }
+        }
+
+        /* Mount the pre-built disk image */
+        lisa_mount_profile(&lisa, argv[2]);
+
+        /* No HLE addresses — the pre-built OS has unknown symbol locations.
+         * We'll detect SYSTEM_ERROR by exception vector pattern later. */
+        fprintf(stderr, "HLE: disabled for pre-built image (no symbol table)\n");
+    } else if (toolchain_validate_source(argv[1])) {
         /* Build from source */
         printf("Building from source: %s\n", argv[1]);
         build_result_t br = toolchain_build(argv[1], "build", NULL);
