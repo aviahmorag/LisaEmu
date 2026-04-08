@@ -4,64 +4,87 @@
 
 ```bash
 make
-build/lisaemu --image prebuilt/los_compilation_base.image   # pre-built
-build/lisaemu Lisa_Source                                    # cross-compiled
+build/lisaemu --image prebuilt/los_compilation_base.image   # pre-built: reaches SYSTEM.LLD
+build/lisaemu Lisa_Source                                    # cross-compiled: needs codegen fix
 ```
 
 ## Where We Are
 
-### Pre-built image: past BOOTINIT, loading SYSTEM.LLD
-The Pascal boot loader completes BOOTINIT (200+ MMU segment writes via
-DO_AN_MMU/TRAP #6). LOADSYS begins reading SYSTEM.LLD blocks from disk.
-Crashes at PC=$2A (bad jump to vector table) after ~30 disk reads.
+### Pre-built image: SYSTEM.LLD executing
+The pre-built OS loads through the complete boot sequence:
+Boot ROM → LDPROF → Pascal loader → BOOTINIT (212 TRAP6 calls) →
+LOADSYS → SYSTEM.LLD loaded from disk → INSTALL_LLD → segment 16 mapped →
+**SYSTEM.LLD code running at $207F4A** (INIT_LLD hardware initialization).
 
-### Cross-compiled: POOL_INIT codegen
-POOL_INIT receives correct parameters. INIT_FREEPOOL has codegen bugs
-(parameter loaded as constant, undersized LINK frame).
+Stuck in a wait loop — LLD code is polling VIA2 or COPS for a hardware
+response that our emulator doesn't generate yet.
 
-## Fixes This Session (8 fixes, 7 commits)
+### Cross-compiled: INIT_FREEPOOL codegen bug
+POOL_INIT gets correct params, but INIT_FREEPOOL has a codegen bug:
+parameters loaded as constants instead of from stack frame. Error 10701.
 
-1. **MMU stack SOR** — hw_adjust for stack segments
-2. **32-bit multiply** — inline 32×32→32 partial products
-3. **32-bit divide** — inline shift-and-subtract loop
-4. **Pre-built image boot** — `--image` flag, prof_entry HLE
-5. **ProFile block reads** — no deinterleave needed (physical block order)
-6. **RAM address wrapping** — wrap at physical memory boundary
-7. **MMU context mirroring** — context 1→0 for setup mode access
-8. **RAM 2.25MB** — eliminate mmucodemmu physical address aliasing
+### Both paths converge at hardware emulation
+Once the cross-compiled codegen is fixed, it will hit the same hardware
+wait as the pre-built image. Both need COPS/VIA hardware responses.
 
-## Current Blockers
+## Session Fixes (14 fixes, 15 commits)
 
-### Pre-built image: crash after SYSTEM.LLD read starts
-After 30 PROF_ENTRY reads, crashes at PC=$2A. The 2nd round of disk reads
-loads sectors to $7BFE+ (safe place area). Need to investigate:
-- Whether asm_read_block double-interleaves (also applies interleave like ldr_read_block)
-- Whether the loaded data lands at the correct addresses
-- What triggers the jump to $2A
+| # | Fix | Both paths? |
+|---|-----|:-----------:|
+| 1 | MMU stack SOR (hw_adjust) | ✅ |
+| 2 | 32-bit multiply | ✅ codegen |
+| 3 | 32-bit divide | ✅ codegen |
+| 4 | Pre-built image boot (--image) | Pre-built |
+| 5 | ProFile no-deinterleave | ✅ |
+| 6 | RAM address wrapping | ✅ |
+| 7 | Context 0/1 mirroring | ✅ |
+| 8 | RAM 2.25MB (mmucodemmu alias fix) | ✅ |
+| 9 | **MMU enabled during setup mode** | ✅ |
+| 10 | Segment 84/126/127 → all contexts | ✅ |
+| 11 | Report 2MB to loader (SOR 12-bit) | ✅ |
 
-### Cross-compiled: INIT_FREEPOOL codegen
-Unchanged from earlier — parameter access generates constant load.
+## Next Steps (Priority Order)
+
+### 1. COPS/VIA2 hardware (unblocks both paths)
+SYSTEM.LLD's INIT_LLD polls VIA2 for COPS responses. The COPS
+microcontroller handles keyboard, mouse, clock, and power. We need:
+- VIA2 CA1 handshake (COPS data ready signal)
+- COPS command/response protocol (at minimum: keyboard ID, clock data)
+- VIA2 port A/B read/write for COPS communication
+
+### 2. INIT_FREEPOOL codegen fix (unblocks cross-compiled path)
+The codegen for `(* inherited params *)` doesn't register parameters
+properly. `fp_ptr` loaded as constant instead of A6+offset read.
+Also: LINK allocates 4 bytes for 2 pointer locals (should be 8).
+
+### 3. Continue OS loading (after SYSTEM.LLD init completes)
+After INIT_LLD succeeds, the loader reads SYSTEM.OS segments from disk.
+Each segment gets mapped via TRAP #6. Then ENTEROP jumps to the OS
+entry point (STARTUP.TEXT). This is where our cross-compiled path
+and pre-built path fully converge.
 
 ## Boot Sequence (pre-built image)
 ```
-✅ ROM → LDPROF → load boot track → Pascal loader entry
-✅ BOOTINIT → SETVARS → BGETSPACE → INITMMUTIL
-✅ INITMMUTIL → program mmucodemmu, install TRAP #6, copy DO_AN_MMU
-✅ BOOTINIT loop → 200+ PROG_MMU calls via TRAP #6 (all 512 SMT entries)
-✅ LOADSYS begins → spare table query → starts reading blocks
-💥 Crash at PC=$2A after ~30 disk reads
-❌ LOAD_LLD → complete SYSTEM.LLD loading
-❌ LOAD_OS → read SYSTEM.OS
-❌ ENTEROP → jump to OS entry point
+✅ Boot ROM → LDPROF → Pascal loader entry
+✅ BOOTINIT → INITMMUTIL → DO_AN_MMU (212 TRAP6 calls)
+✅ LOADSYS → SYSTEM.LLD read from disk (sectors 258+)
+✅ INSTALL_LLD → segment 16 mapped (SOR=$EF9)
+✅ INIT_LLD → SYSTEM.LLD code executing at $207F4A
+⏳ INIT_LLD waiting for COPS/VIA2 hardware response
+❌ LOAD_OS → read SYSTEM.OS segments
+❌ ENTEROP → jump to OS entry point (STARTUP.TEXT)
+❌ OS initialization → Desktop
 ```
 
-## Key Insight: All Fixes Help Both Paths
+## Key Hardware Needed
 
-| Fix | Cross-compiled | Pre-built | Why |
-|-----|:---:|:---:|-----|
-| MMU stack SOR | ✅ | ✅ | Same hardware MMU |
-| 32-bit mul/div | ✅ | — | Codegen fix |
-| ProFile reads | ✅ | ✅ | Same disk I/O |
-| RAM wrapping | ✅ | ✅ | Same memory controller |
-| Context mirroring | ✅ | ✅ | Same setup mode behavior |
-| RAM 2.25MB | ✅ | ✅ | Same address space |
+| Component | Status | What it does |
+|-----------|--------|-------------|
+| CPU (68000) | ✅ Working | All instructions |
+| MMU | ✅ Working | 5 contexts, 128 segments |
+| ProFile disk | ✅ Working | Block reads via HLE |
+| VIA1 | Partial | ProFile handshake (needs improvement) |
+| VIA2 | Partial | COPS communication (needs implementation) |
+| COPS | ❌ Missing | Keyboard, mouse, clock, power |
+| Display | Partial | 720×364 mono bitmap, no screen updates yet |
+| Floppy | ❌ Missing | Not needed for ProFile boot |
