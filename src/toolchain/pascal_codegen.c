@@ -1984,20 +1984,14 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
 
 static void process_var_decl(codegen_t *cg, ast_node_t *node, bool is_global) {
     type_desc_t *type = (node->num_children > 0) ? resolve_type(cg, node->children[0]) : find_type(cg, "integer");
-    /* If type wasn't found, check if the type name suggests a pointer type.
-     * In Lisa Pascal, all pointer types (^something, xxx_ptr) are 4 bytes.
-     * Unresolved types that are pointer-like should default to 4 bytes. */
+    /* If type wasn't found, default to 4 bytes (longint/pointer).
+     * In Lisa Pascal, most non-trivial types are at least 4 bytes: pointers,
+     * longints, absptr, records. Defaulting to 2 (integer) causes pointer
+     * truncation and stack frame underallocation throughout the OS code.
+     * The 4-byte default is safer: worst case wastes 2 bytes per variable;
+     * the 2-byte default silently corrupts pointers and addresses. */
     if (!type && node->num_children > 0) {
-        const char *tname = node->children[0]->name;
-        if (tname[0])
-            fprintf(stderr, "  UNRESOLVED TYPE '%s' for var '%s'\n", tname, node->name);
-        /* Check for pointer indicators: name contains "ptr", starts with "^", or is a ^type ref */
-        if (strcasestr(tname, "ptr") || tname[0] == '^' ||
-            (node->children[0]->type == AST_DEREF)) {
-            type = find_type(cg, "ptr");  /* Generic 4-byte pointer */
-            if (type && (strcasecmp(node->name, "hdr_ptr") == 0 || strcasecmp(node->name, "ent_ptr") == 0))
-                fprintf(stderr, "  → FIXED '%s' to ptr (size=%d)\n", node->name, type->size);
-        }
+        type = find_type(cg, "longint");  /* Default unresolved types to 4 bytes */
     }
 
     /* Handle multiple names: "a,b,c" */
