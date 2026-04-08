@@ -1829,6 +1829,20 @@ int lisa_run_frame(lisa_t *lisa) {
      * The OS must complete INITSYS before interrupt handlers are ready.
      * INTSON(0) at the end of BOOT_IO_INIT enables interrupts naturally. */
     if (frame_count == 5) {
+        /* Dump the DO_AN_MMU code at mmucodemmu physical address */
+        uint16_t sor84 = lisa->mem.segments[1][84].sor;
+        if (sor84 != 0) {
+            uint32_t phys84 = ((uint32_t)sor84 << 9) + 0x4000;
+            phys84 %= LISA_RAM_SIZE;
+            fprintf(stderr, "=== MMUCODEMMU CODE at phys $%06X (SOR=$%03X) ===\n", phys84, sor84);
+            for (int row = 0; row < 16; row++) {
+                uint32_t a = (phys84 + row * 16) % LISA_RAM_SIZE;
+                fprintf(stderr, "  +$%03X:", row * 16);
+                for (int i = 0; i < 16; i++)
+                    fprintf(stderr, " %02X", lisa->mem.ram[(a + i) % LISA_RAM_SIZE]);
+                fprintf(stderr, "\n");
+            }
+        }
         /* Dump memory around PC=$3015C to decode the wait loop */
         uint32_t pc = lisa->cpu.pc;
         fprintf(stderr, "=== FRAME 5 DIAGNOSTIC DUMP ===\n");

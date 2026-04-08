@@ -189,8 +189,12 @@ static void update_mmu_context(lisa_mem_t *mem) {
     int new_ctx = compute_context(mem);
     mem->current_context = new_ctx;
 
-    /* Enable MMU translation when in normal mode (not start mode) */
-    mem->mmu_enabled = !mem->setup_mode;
+    /* MMU translation is ALWAYS active — even during setup mode.
+     * Setup mode only affects: (1) ROM overlay at $0-$7FFF, and
+     * (2) which context is used (context 0 during setup mode).
+     * The MMU must remain enabled because DO_AN_MMU code runs from
+     * MMU-mapped segments while toggling setup mode. */
+    mem->mmu_enabled = true;
 }
 
 void lisa_mem_write8(lisa_mem_t *mem, uint32_t addr, uint8_t val) {
