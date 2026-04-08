@@ -98,7 +98,7 @@ static void mmu_reg_write(lisa_mem_t *mem, uint32_t addr, uint16_t data) {
     mmu_write_count++;
     extern int mmu_write_count_global;
     mmu_write_count_global = mmu_write_count;
-    if (mmu_write_count <= 5 || (mmu_write_count >= 90 && mmu_write_count <= 120)) {
+    if (mmu_write_count <= 5 || (mmu_write_count >= 39 && mmu_write_count <= 70) || mmu_write_count == 500 || mmu_write_count == 1000) {
         fprintf(stderr, "MMU REG[%d]: ctx=%d seg=%d %s=$%03X (addr=$%06X)\n",
                 mmu_write_count, context, seg, (addr & 8) ? "SOR" : "SLR", data, addr);
     }
