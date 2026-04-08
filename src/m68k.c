@@ -2189,11 +2189,17 @@ static void op_trap(m68k_t *cpu) {
         static int trap_count[16] = {0};
         trap_count[vector]++;
         if (vector == 6) { extern int g_trap6_total; g_trap6_total++; }
-        if (vector == 6 && (trap_count[6] <= 3 || trap_count[6] >= 208)) {
-            fprintf(stderr, "TRAP6_RAW[%d]: PC=$%06X d0=$%04X d1=$%04X d2=$%04X d3=$%04X\n",
-                    trap_count[6], cpu->pc - 2,
-                    cpu->d[0]&0xFFFF, cpu->d[1]&0xFFFF,
-                    cpu->d[2]&0xFFFF, cpu->d[3]&0xFFFF);
+        if (vector == 6 && trap_count[6] >= 211) {
+            /* Dump the SMT entry for the INSTALL_LLD call */
+            uint32_t smt_ptr = cpu_read32(cpu, (cpu->a[5] - 4) & 0xFFFFFF);
+            uint32_t d2v = cpu->d[2] & 0xFFFF;
+            uint32_t d3v = cpu->d[3] & 0xFFFF;
+            uint32_t smt_entry = smt_ptr + d2v * 512 + d3v * 4;
+            uint16_t origin = cpu_read16(cpu, smt_entry);
+            uint8_t access = cpu_read8(cpu, smt_entry + 2);
+            uint8_t limit = cpu_read8(cpu, smt_entry + 3);
+            fprintf(stderr, "TRAP6[%d]: d2=%d d3=%d SMT@$%06X: origin=$%04X access=$%02X limit=$%02X\n",
+                    trap_count[6], d2v, d3v, smt_entry, origin, access, limit);
         }
     }
     take_exception(cpu, VEC_TRAP_BASE + vector);
