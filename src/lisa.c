@@ -579,6 +579,12 @@ static void mem_write32_cb(uint32_t addr, uint32_t val) {
  * ======================================================================== */
 
 static uint8_t io_read_cb(uint32_t offset) {
+    static int io_trace = 0;
+    if (io_trace < 20) {
+        extern uint32_t g_last_cpu_pc;
+        io_trace++;
+        fprintf(stderr, "IO_READ[%d]: offset=$%04X PC=$%06X\n", io_trace, offset, g_last_cpu_pc & 0xFFFFFF);
+    }
     lisa_t *lisa = g_lisa;
 
     /* VIA1 - parallel/ProFile - registers at odd bytes */
@@ -590,7 +596,15 @@ static uint8_t io_read_cb(uint32_t offset) {
     /* VIA2 - keyboard/COPS */
     if (offset >= 0xDD81 && offset < 0xDD9F) {
         uint8_t reg = (offset - 0xDD81) / 2;
-        return via_read(&lisa->via2, reg);
+        uint8_t val = via_read(&lisa->via2, reg);
+        static int via2_reads = 0;
+        if (via2_reads < 10) {
+            via2_reads++;
+            extern uint32_t g_last_cpu_pc;
+            fprintf(stderr, "VIA2_READ[%d]: offset=$%04X reg=%d val=$%02X PC=$%06X\n",
+                    via2_reads, offset, reg, val, g_last_cpu_pc & 0xFFFFFF);
+        }
+        return val;
     }
 
     /* Vertical retrace acknowledge — reading clears the IRQ */
@@ -1021,25 +1035,47 @@ static uint8_t via2_portb_read(void *ctx) {
 static void via2_porta_write(uint8_t val, uint8_t ddr, void *ctx) {
     lisa_t *lisa = (lisa_t *)ctx;
 
-    /* OS is sending a command to COPS */
-    /* Commands: $7C = enable mouse, $01 = read clock, etc. */
-    /* We just acknowledge and don't do anything special for most */
+    /* COPS command protocol (from LisaEm reference):
+     * $00 = Turn I/O port ON (reset COPS)
+     * $01 = Turn I/O port OFF
+     * $02 = Read clock data
+     * $10-$1F = Write nibble to clock buffer
+     * $20-$2F = Clock mode control (set/power/timer)
+     * $30-$4F = Keyboard LED control
+     * $50-$6F = NMI key configuration
+     * $70-$77 = Mouse OFF
+     * $78-$7F = Mouse ON with interval
+     * $80-$FF = NOP */
+    static int cops_cmd_count = 0;
+    if (cops_cmd_count < 20)
+        fprintf(stderr, "COPS CMD[%d]: $%02X\n", ++cops_cmd_count, val);
 
-    switch (val) {
-        case 0x7C: /* Enable mouse with 16ms interval */
-            /* Acknowledged — mouse will be sent via cops_rx queue when moved */
-            break;
-        case 0x01: /* Read clock */
-            /* Queue clock response: 5 bytes (year, month/day, hour, min, sec) */
-            cops_enqueue(&lisa->cops_rx, 0xE0 | 0x06);  /* Clock data, year nibble (1986) */
-            cops_enqueue(&lisa->cops_rx, 0x01);  /* Month */
-            cops_enqueue(&lisa->cops_rx, 0x01);  /* Day */
-            cops_enqueue(&lisa->cops_rx, 0x00);  /* Hour */
-            cops_enqueue(&lisa->cops_rx, 0x00);  /* Minute */
-            break;
-        default:
-            /* Unknown command — just ignore */
-            break;
+    if (val >= 0x80) {
+        /* NOP — high bit set commands are ignored */
+    } else if (val == 0x00 || val == 0x01) {
+        /* Reset/power — queue keyboard ID */
+        cops_enqueue(&lisa->cops_rx, 0x80);  /* Reset marker */
+        cops_enqueue(&lisa->cops_rx, 0x2F);  /* Keyboard ID: US layout */
+    } else if (val == 0x02) {
+        /* Read clock — queue clock data (LisaEm format) */
+        cops_enqueue(&lisa->cops_rx, 0x80);  /* Reset/clock marker */
+        cops_enqueue(&lisa->cops_rx, 0xE6);  /* Year nibble (1986 = 0xE6) */
+        cops_enqueue(&lisa->cops_rx, 0x61);  /* Days high (061 = Feb) */
+        cops_enqueue(&lisa->cops_rx, 0x10);  /* Days low + hours high */
+        cops_enqueue(&lisa->cops_rx, 0x20);  /* Hours low + mins high */
+        cops_enqueue(&lisa->cops_rx, 0x00);  /* Mins low + secs high */
+        cops_enqueue(&lisa->cops_rx, 0x00);  /* Secs low + tenths */
+    } else if (val >= 0x10 && val <= 0x1F) {
+        /* Write clock nibble — acknowledge silently */
+    } else if (val >= 0x20 && val <= 0x2F) {
+        /* Clock mode control — acknowledge silently */
+    } else if (val >= 0x70 && val <= 0x7F) {
+        /* Mouse control */
+        if (val >= 0x78) {
+            /* Mouse ON — acknowledge */
+        }
+    } else {
+        /* Other commands — acknowledge */
     }
 }
 
@@ -1048,7 +1084,12 @@ static uint8_t via2_porta_read(void *ctx) {
 
     /* Read byte from COPS */
     if (lisa->cops_rx.count > 0) {
-        return cops_dequeue(&lisa->cops_rx);
+        uint8_t val = cops_dequeue(&lisa->cops_rx);
+        static int read_count = 0;
+        if (read_count++ < 10)
+            fprintf(stderr, "COPS READ[%d]: $%02X (remain=%d) PC=$%06X\n",
+                    read_count, val, lisa->cops_rx.count, lisa->cpu.pc & 0xFFFFFF);
+        return val;
     }
     return 0xFF;  /* No data */
 }
