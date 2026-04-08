@@ -17,7 +17,7 @@
 #include <stddef.h>
 
 /* Lisa hardware constants */
-#define LISA_RAM_SIZE       (2 * 1024 * 1024)  /* 2 MB RAM — Lisa 2/10 with expansion board */
+#define LISA_RAM_SIZE       (2 * 1024 * 1024 + 256 * 1024)  /* 2.25 MB RAM — extra headroom for MMU segment wrapping */
 #define LISA_ROM_SIZE       (16 * 1024)       /* 16 KB Boot ROM */
 #define LISA_IO_BASE        0xFC0000
 #define LISA_IO_SIZE        0x010000

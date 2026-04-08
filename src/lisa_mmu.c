@@ -203,6 +203,16 @@ void lisa_mem_write8(lisa_mem_t *mem, uint32_t addr, uint8_t val) {
             }
             /* Lisa hardware wraps RAM addresses at the physical memory boundary */
             phys %= LISA_RAM_SIZE;
+            /* Watchpoint: trace what happens at BOOTINIT time.
+             * Look for writes to SMT physical area ($900-$D00 expected) from any source. */
+            if (phys >= 0x900 && phys < 0xD00 && mem->ram[phys] != val) {
+                static int smt_wp = 0;
+                if (smt_wp++ < 15) {
+                    extern uint32_t g_last_cpu_pc;
+                    fprintf(stderr, "SMT_AREA: phys=$%06X val=$%02X addr=$%06X PC=$%06X\n",
+                            phys, val, addr, g_last_cpu_pc);
+                }
+            }
             mem->ram[phys] = val;
             break;
         }
