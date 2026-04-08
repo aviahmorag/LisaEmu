@@ -495,15 +495,18 @@ static void take_exception(m68k_t *cpu, int vector) {
         }
     }
 
-    /* Count ALL TRAP #6 calls */
+    /* Trace TRAP #6 with full register state */
     if (vector == 38) {
         static int trap6_count = 0;
         trap6_count++;
-        if (trap6_count <= 5 || trap6_count % 50 == 0) {
-            fprintf(stderr, "TRAP6[%d]: PC=$%06X d0=$%04X d1=$%04X d2=$%04X d3=$%04X\n",
-                    trap6_count, cpu->pc,
-                    cpu->d[0] & 0xFFFF, cpu->d[1] & 0xFFFF,
-                    cpu->d[2] & 0xFFFF, cpu->d[3] & 0xFFFF);
+        if (trap6_count <= 3) {
+            fprintf(stderr, "TRAP6[%d] BEFORE: D0-7=$%08X $%08X $%08X $%08X $%08X $%08X $%08X $%08X\n",
+                    trap6_count,
+                    cpu->d[0], cpu->d[1], cpu->d[2], cpu->d[3],
+                    cpu->d[4], cpu->d[5], cpu->d[6], cpu->d[7]);
+            fprintf(stderr, "  A0-6=$%08X $%08X $%08X $%08X $%08X $%08X $%08X SP=$%08X\n",
+                    cpu->a[0], cpu->a[1], cpu->a[2], cpu->a[3],
+                    cpu->a[4], cpu->a[5], cpu->a[6], cpu->a[7]);
         }
     }
 
@@ -1671,7 +1674,18 @@ static void op_rts(m68k_t *cpu) {
 static void op_rte(m68k_t *cpu) {
     if (!is_supervisor(cpu)) { privilege_violation(cpu); return; }
     uint16_t new_sr = pop16(cpu);
-    cpu->pc = pop32(cpu);
+    uint32_t new_pc = pop32(cpu);
+    /* Trace RTE from DO_AN_MMU */
+    {
+        static int rte_trace = 0;
+        uint32_t old_pc = cpu->pc & 0xFFFFFF;
+        if (old_pc >= 0xA84000 && old_pc < 0xA84200 && rte_trace < 3) {
+            rte_trace++;
+            fprintf(stderr, "RTE[%d] from $%06X: SR=$%04X→$%04X PC→$%08X SP=$%08X\n",
+                    rte_trace, old_pc, cpu->sr, new_sr, new_pc, cpu->a[7]);
+        }
+    }
+    cpu->pc = new_pc;
     bool was_super = is_supervisor(cpu);
     cpu->sr = new_sr;
     if (was_super && !(new_sr & SR_SUPERVISOR)) {
@@ -2704,31 +2718,52 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         pc_ring[pc_ring_idx++ & 255] = cpu->pc;
         g_last_cpu_pc = cpu->pc;
 
-        /* Trace boot loader — log JMP/JSR at key addresses + region changes */
+        /* Trace PROG_MMU entry to check SMT state before TRAP #6.
+         * PROG_MMU is at $120462 (from TRAP6 trace). At entry, the stack
+         * has parameters pushed by the BOOTINIT Pascal code. */
         {
-            static int loader_trace = 0;
+            static int prog_trace = 0;
             uint32_t pc = cpu->pc & 0xFFFFFF;
-            /* Trace the start_pascal transition in the RELOCATED boot track.
-             * After the main_loop reads all blocks, start_pascal runs from $100xxx.
-             * start_pascal is ~200 bytes into LDPROF → relocated to ~$100100-$100200.
-             * Also trace any JMP (Ax) instruction in $100xxx range. */
-            /* Only trace AFTER the main_loop exits (when start_pascal runs).
-             * The main_loop at $1000B0-$1000C4 loops while D6 >= 0.
-             * start_pascal is reached when D6 < 0 and PC passes $1000C4. */
-            if (pc >= 0x1001C0 && pc < 0x100400 && loader_trace < 80) {
-                loader_trace++;
-                fprintf(stderr, "PASCAL_ENTRY: PC=$%06X op=$%04X A0=$%08X A1=$%08X A5=$%08X A6=$%08X SP=$%08X\n",
-                        pc, cpu_read16(cpu, pc),
-                        cpu->a[0], cpu->a[1], cpu->a[5], cpu->a[6], cpu->a[7]);
+            /* Trace at PROG_MMU (the 'trap #6' instruction) */
+            uint16_t opc = cpu_read16(cpu, pc);
+            /* Trace DO_AN_MMU execution ($A84000-$A840E0) */
+            if (pc >= 0xA84000 && pc < 0xA840E0) {
+                static int dam_trace = 0;
+                if (dam_trace++ < 40) {
+                    fprintf(stderr, "DAM: PC=$%06X op=$%04X D1=$%08X D2=$%08X D3=$%08X A1=$%08X A2=$%08X SR=$%04X\n",
+                            pc, opc, cpu->d[1], cpu->d[2], cpu->d[3],
+                            cpu->a[1], cpu->a[2], cpu->sr);
+                }
             }
-            /* Track region transitions */
-            static uint32_t last_region = 0;
-            uint32_t region = pc >> 16;
-            if (region != last_region && region != 0x00FE && loader_trace < 80) {
-                last_region = region;
-                loader_trace++;
-                fprintf(stderr, "LDR REGION: PC=$%06X op=$%04X A0=$%08X A1=$%08X SP=$%08X SR=$%04X\n",
-                        pc, cpu_read16(cpu, pc), cpu->a[0], cpu->a[1], cpu->a[7], cpu->sr);
+            if (opc == 0x4E46 && pc >= 0x120000 && pc < 0x130000 && prog_trace < 3) {
+                prog_trace++;
+                fprintf(stderr, "=== PROG_MMU[%d] at PC=$%06X ===\n", prog_trace, pc);
+                fprintf(stderr, "  D0=$%08X D1=$%08X D2=$%08X D3=$%08X\n",
+                        cpu->d[0], cpu->d[1], cpu->d[2], cpu->d[3]);
+                fprintf(stderr, "  A0=$%08X A1=$%08X A5=$%08X A6=$%08X SP=$%08X\n",
+                        cpu->a[0], cpu->a[1], cpu->a[5], cpu->a[6], cpu->a[7]);
+                /* Dump stack (PROG_MMU pops params from here) */
+                fprintf(stderr, "  Stack: ");
+                for (int i = 0; i < 24; i += 2)
+                    fprintf(stderr, "$%04X ", cpu_read16(cpu, (cpu->a[7] + i) & 0xFFFFFF));
+                fprintf(stderr, "\n");
+                /* Dump registers AFTER PROG_MMU (from the TRAP #6 return) */
+                fprintf(stderr, "  AT TRAP6: D0-7=$%08X $%08X $%08X $%08X $%08X $%08X $%08X $%08X\n",
+                        cpu->d[0], cpu->d[1], cpu->d[2], cpu->d[3],
+                        cpu->d[4], cpu->d[5], cpu->d[6], cpu->d[7]);
+                /* smt_adr found at A5-4 = $A840DC */
+                uint32_t smt_ptr = cpu_read32(cpu, (cpu->a[5] - 4) & 0xFFFFFF);
+                fprintf(stderr, "  smt_adr (A5-4) = $%08X\n", smt_ptr);
+                /* Dump first 8 SMT entries (32 bytes) from smt_adr */
+                fprintf(stderr, "  SMT[0..7] at $%08X:\n", smt_ptr);
+                for (int e = 0; e < 8; e++) {
+                    uint32_t ea = smt_ptr + e * 4;
+                    uint16_t origin = cpu_read16(cpu, ea);
+                    uint8_t access = cpu_read8(cpu, ea + 2);
+                    uint8_t limit = cpu_read8(cpu, ea + 3);
+                    fprintf(stderr, "    SMT[%d]: origin=$%04X access=$%02X limit=$%02X\n",
+                            e, origin, access, limit);
+                }
             }
         }
         /* SP watermark: catch stack leak in both physical and mapped space */

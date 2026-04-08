@@ -207,27 +207,7 @@ void lisa_mem_write8(lisa_mem_t *mem, uint32_t addr, uint8_t val) {
             }
             /* Lisa hardware wraps RAM addresses at the physical memory boundary */
             phys %= LISA_RAM_SIZE;
-            /* Phase-based tracing: log all writes between INITMMUTIL return and TRAP #6.
-             * Phase 0: before INITMMUTIL (ignore)
-             * Phase 1: between INITMMUTIL and TRAP #6 (log writes that could be SMT)
-             * Phase 2: after TRAP #6 (ignore) */
-            {
-                static int smt_phase = 0;
-                static int smt_writes = 0;
-                /* Detect phase transitions by mmu_write_count (from mmu_reg_write) */
-                extern int mmu_write_count_global;
-                if (smt_phase == 0 && mmu_write_count_global >= 38) smt_phase = 1; /* after INITMMUTIL */
-                if (smt_phase == 1 && mmu_write_count_global >= 42) smt_phase = 2; /* after first PROG_MMU */
-
-                if (smt_phase == 1 && mem->ram[phys] != val) {
-                    extern uint32_t g_last_cpu_pc;
-                    smt_writes++;
-                    if (smt_writes <= 20) {
-                        fprintf(stderr, "SMT_PHASE: phys=$%06X val=$%02X addr=$%06X PC=$%06X (%d writes)\n",
-                                phys, val, addr, g_last_cpu_pc & 0xFFFFFF, smt_writes);
-                    }
-                }
-            }
+            /* removed — replaced by PROG_MMU entry trace */
             mem->ram[phys] = val;
             break;
         }
