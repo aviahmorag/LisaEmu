@@ -2358,12 +2358,14 @@ static bool hle_handle_system_error(lisa_t *lisa __attribute__((unused)), m68k_t
     return true;
 }
 
-/* 5:1 deinterleave for ProFile sector numbers (from LisaEm) */
-static uint32_t deinterleave5(uint32_t sector) {
-    uint32_t offset = sector % 20;
-    uint32_t track = sector - offset;
-    static const int interleave[20] = {0,4,8,12,16,1,5,9,13,17,2,6,10,14,18,3,7,11,15,19};
-    return track + interleave[offset % 20];
+/* Reverse the 9:1 ProFile interleave used by LDPROF.TEXT.
+ * LDPROF interleave table (low nibble): {0,5,10,15,4,9,14,3,8,13,2,7,12,1,6,11}
+ * This function reverses it: given an interleaved sector, returns the logical sector. */
+static uint32_t profile_deinterleave(uint32_t sector) {
+    /* Reverse table: for forward[i]=v, reverse[v]=i */
+    static const int reverse[16] = {0,13,10,7,4,1,14,11,8,5,2,15,12,9,6,3};
+    uint32_t low4 = sector & 0x0F;
+    return (sector & ~0x0FU) | reverse[low4];
 }
 
 /* prof_entry intercept — read a ProFile block directly from disk image.
@@ -2373,10 +2375,10 @@ static bool hle_prof_entry(lisa_t *lisa, m68k_t *cpu) {
     uint32_t tag_dest = cpu->a[1] & 0xFFFFFF;
     uint32_t data_dest = cpu->a[2] & 0xFFFFFF;
 
-    /* NOTE: deinterleaving disabled — the raw ProFile image stores blocks
-     * in sequential order, and the boot loader sends sequential sector
-     * numbers. Deinterleaving would read wrong blocks. */
-    /* if (sector < 0x00F00000) sector = deinterleave5(sector); */
+    /* Reverse the 9:1 interleave applied by LDPROF before calling prof_entry.
+     * Skip for special block numbers (spare table query, etc.) */
+    if (sector < 0x00F00000)
+        sector = profile_deinterleave(sector);
 
     static int prof_reads = 0;
     if (prof_reads < 30)
