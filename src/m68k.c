@@ -481,7 +481,10 @@ static void take_exception(m68k_t *cpu, int vector) {
     if (vector == 4 && (cpu->pc & 0xFFFFFF) < 0x100) {
         static int crash_traced = 0;
         if (crash_traced++ < 1) {
-            fprintf(stderr, "=== CRASH at PC=$%06X (vector %d) ===\n", cpu->pc, vector);
+            /* Print total trap counts */
+            extern int g_trap6_total;
+            fprintf(stderr, "=== CRASH at PC=$%06X (vector %d) TRAP6_TOTAL=%d ===\n",
+                    cpu->pc, vector, g_trap6_total);
             fprintf(stderr, "  D0=$%08X D1=$%08X D2=$%08X D3=$%08X\n",
                     cpu->d[0], cpu->d[1], cpu->d[2], cpu->d[3]);
             fprintf(stderr, "  A0=$%08X A1=$%08X A5=$%08X A6=$%08X SP=$%08X SR=$%04X\n",
@@ -495,11 +498,11 @@ static void take_exception(m68k_t *cpu, int vector) {
         }
     }
 
-    /* Trace TRAP #6 with full register state */
+    /* Count TRAP #6 calls */
     if (vector == 38) {
         static int trap6_count = 0;
         trap6_count++;
-        if (trap6_count <= 3) {
+        if (trap6_count <= 5) {
             fprintf(stderr, "TRAP6[%d] BEFORE: D0-7=$%08X $%08X $%08X $%08X $%08X $%08X $%08X $%08X\n",
                     trap6_count,
                     cpu->d[0], cpu->d[1], cpu->d[2], cpu->d[3],
@@ -1679,10 +1682,10 @@ static void op_rte(m68k_t *cpu) {
     {
         static int rte_trace = 0;
         uint32_t old_pc = cpu->pc & 0xFFFFFF;
-        if (old_pc >= 0xA84000 && old_pc < 0xA84200 && rte_trace < 3) {
+        if (old_pc >= 0xA84000 && old_pc < 0xA84200 && rte_trace < 5) {
             rte_trace++;
-            fprintf(stderr, "RTE[%d] from $%06X: SR=$%04X→$%04X PC→$%08X SP=$%08X\n",
-                    rte_trace, old_pc, cpu->sr, new_sr, new_pc, cpu->a[7]);
+            fprintf(stderr, "RTE[%d] from $%06X: SR=$%04X→$%04X PC→$%08X D1=$%08X D3=$%08X\n",
+                    rte_trace, old_pc, cpu->sr, new_sr, new_pc, cpu->d[1], cpu->d[3]);
         }
     }
     cpu->pc = new_pc;
@@ -2181,15 +2184,16 @@ static void op_bit_static(m68k_t *cpu) {
 static void op_trap(m68k_t *cpu) {
     int vector = cpu->ir & 0xF;
 
-    /* Log TRAP calls during early boot */
+    /* Count ALL traps */
     {
-        static int trap_log = 0;
-        if (trap_log < 10) {
-            fprintf(stderr, "TRAP #%d at PC=$%06X handler=$%08X SR=$%04X A0=$%08X D0=$%08X\n",
-                    vector, cpu->pc - 2,
-                    cpu_read32(cpu, (VEC_TRAP_BASE + vector) * 4),
-                    cpu->sr, cpu->a[0], cpu->d[0]);
-            trap_log++;
+        static int trap_count[16] = {0};
+        trap_count[vector]++;
+        if (vector == 6) { extern int g_trap6_total; g_trap6_total++; }
+        if (vector == 6 && (trap_count[6] <= 3 || trap_count[6] >= 208)) {
+            fprintf(stderr, "TRAP6_RAW[%d]: PC=$%06X d0=$%04X d1=$%04X d2=$%04X d3=$%04X\n",
+                    trap_count[6], cpu->pc - 2,
+                    cpu->d[0]&0xFFFF, cpu->d[1]&0xFFFF,
+                    cpu->d[2]&0xFFFF, cpu->d[3]&0xFFFF);
         }
     }
     take_exception(cpu, VEC_TRAP_BASE + vector);
@@ -3526,3 +3530,4 @@ uint32_t m68k_get_reg(m68k_t *cpu, int reg) {
     return 0;
 }
 uint16_t m68k_get_sr(m68k_t *cpu) { return cpu->sr; }
+int g_trap6_total = 0;
