@@ -84,14 +84,23 @@ static void mmu_reg_write(lisa_mem_t *mem, uint32_t addr, uint16_t data) {
         mem->segments[context][seg].changed |= 1;
     }
 
-    /* Mirror context 1 writes to context 0 (setup/start mode context).
-     * During setup mode, the CPU uses context 0 for address translation.
-     * Code that toggles setup ON (like DO_AN_MMU) needs to access the
-     * same segments that were programmed in context 1. On the real Lisa,
-     * the OS explicitly programs both contexts, but we mirror to ensure
-     * setup mode always has access to the running context's segments. */
+    /* Mirror critical segments to ALL contexts.
+     * DO_AN_MMU switches context bits to program different domains.
+     * Between setupoff/setupon, the CPU briefly runs in the target domain's
+     * context. The mmucodemmu segment (84) and I/O segment (126) must be
+     * accessible in ALL contexts, or DO_AN_MMU crashes when it switches
+     * to an empty context.
+     * Also mirror context 1 to context 0 for setup mode access. */
     if (context == 1) {
         mem->segments[0][seg] = mem->segments[1][seg];
+    }
+    /* Mirror mmucodemmu (84) and I/O segments (126,127) to all contexts */
+    if (seg == 84 || seg == 126 || seg == 127) {
+        for (int c = 0; c < MMU_NUM_CONTEXTS; c++) {
+            if (c != context) {
+                mem->segments[c][seg] = mem->segments[context][seg];
+            }
+        }
     }
 
     static int mmu_write_count = 0;
