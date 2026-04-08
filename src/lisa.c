@@ -591,24 +591,18 @@ static uint8_t io_read_cb(uint32_t offset) {
     }
     lisa_t *lisa = g_lisa;
 
-    /* VIA1 - parallel/ProFile - registers at odd bytes */
-    if (offset >= 0xD801 && offset < 0xD81F) {
-        uint8_t reg = (offset - 0xD801) / 2;
+    /* VIA1 - parallel/ProFile ($FCD800-$FCDCFF with aliases due to partial
+     * address decoding). The VIA uses RS0-RS3 from CPU A1-A4, so the register
+     * is (offset >> 1) & 0xF regardless of higher address bits. */
+    if (offset >= 0xD800 && offset < 0xDC00) {
+        uint8_t reg = (offset >> 1) & 0xF;
         return via_read(&lisa->via1, reg);
     }
 
-    /* VIA2 - keyboard/COPS */
-    if (offset >= 0xDD81 && offset < 0xDD9F) {
-        uint8_t reg = (offset - 0xDD81) / 2;
-        uint8_t val = via_read(&lisa->via2, reg);
-        static int via2_reads = 0;
-        if (via2_reads < 10) {
-            via2_reads++;
-            extern uint32_t g_last_cpu_pc;
-            fprintf(stderr, "VIA2_READ[%d]: offset=$%04X reg=%d val=$%02X PC=$%06X\n",
-                    via2_reads, offset, reg, val, g_last_cpu_pc & 0xFFFFFF);
-        }
-        return val;
+    /* VIA2 - keyboard/COPS ($FCDD00-$FCDEFF with aliases) */
+    if (offset >= 0xDC00 && offset < 0xE000) {
+        uint8_t reg = (offset >> 1) & 0xF;
+        return via_read(&lisa->via2, reg);
     }
 
     /* Vertical retrace acknowledge — reading clears the IRQ */
@@ -623,9 +617,27 @@ static uint8_t io_read_cb(uint32_t offset) {
         return lisa->mem.vretrace_irq ? 0x80 : 0x00;
     }
 
-    /* Status register */
-    if (offset == 0xF800 || (offset >= 0xF800 && offset < 0xF900)) {
-        return lisa->mem.status_reg;
+    /* Hardware status register ($FCF800-$FCF8FF)
+     * Bit 7: Unused (always 1)
+     * Bit 6: Inverse video (1 = normal, 0 = inverse)
+     * Bit 5: CSYNC (horizontal sync, toggles with video timing)
+     * Bit 4: Video bit (current display pixel)
+     * Bit 3: Bus timeout error (0 = no error)
+     * Bit 2: Vertical retrace (1 = in retrace)
+     * Bit 1: Hard memory error (1 = no error, active low)
+     * Bit 0: Soft memory error (1 = no error, active low) */
+    if (offset >= 0xF800 && offset < 0xF900) {
+        uint8_t status = 0x00;
+        status |= 0x80;  /* Bit 7: unused, always 1 */
+        status |= 0x40;  /* Bit 6: normal video (not inverse) */
+        /* Bit 5: CSYNC — toggle based on frame count for realism */
+        if (lisa->total_frames & 1) status |= 0x20;
+        /* Bit 4: video bit — always 0 (black pixel) */
+        /* Bit 3: no bus timeout */
+        if (lisa->mem.vretrace_irq) status |= 0x04;  /* Bit 2: vertical retrace */
+        status |= 0x02;  /* Bit 1: no hard memory error */
+        status |= 0x01;  /* Bit 0: no soft memory error */
+        return status;
     }
 
     /* Contrast */
@@ -696,16 +708,16 @@ static uint8_t io_read_cb(uint32_t offset) {
 static void io_write_cb(uint32_t offset, uint8_t val) {
     lisa_t *lisa = g_lisa;
 
-    /* VIA1 */
-    if (offset >= 0xD801 && offset < 0xD81F) {
-        uint8_t reg = (offset - 0xD801) / 2;
+    /* VIA1 ($FCD800-$FCDCFF with aliases) */
+    if (offset >= 0xD800 && offset < 0xDC00) {
+        uint8_t reg = (offset >> 1) & 0xF;
         via_write(&lisa->via1, reg, val);
         return;
     }
 
-    /* VIA2 */
-    if (offset >= 0xDD81 && offset < 0xDD9F) {
-        uint8_t reg = (offset - 0xDD81) / 2;
+    /* VIA2 ($FCDC00-$FCDEFF with aliases) */
+    if (offset >= 0xDC00 && offset < 0xE000) {
+        uint8_t reg = (offset >> 1) & 0xF;
         via_write(&lisa->via2, reg, val);
         return;
     }
