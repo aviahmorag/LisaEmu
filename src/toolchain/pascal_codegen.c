@@ -379,7 +379,14 @@ static cg_symbol_t *find_imported(codegen_t *cg, const char *name) {
 
 static cg_symbol_t *find_symbol_any(codegen_t *cg, const char *name) {
     cg_symbol_t *s = find_local(cg, name);
-    if (s) return s;
+    if (s) {
+        if (strcasecmp(name, "fp_ptr") == 0)
+            fprintf(stderr, "  LOOKUP fp_ptr: FOUND LOCAL at offset=%d is_param=%d scope=%d\n",
+                    s->offset, s->is_param, cg->scope_depth);
+        return s;
+    }
+    if (strcasecmp(name, "fp_ptr") == 0)
+        fprintf(stderr, "  LOOKUP fp_ptr: NOT LOCAL (scope=%d), checking global/imported\n", cg->scope_depth);
     s = find_global(cg, name);
     if (s) return s;
     return find_imported(cg, name);
@@ -1975,6 +1982,21 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
 
 static void process_var_decl(codegen_t *cg, ast_node_t *node, bool is_global) {
     type_desc_t *type = (node->num_children > 0) ? resolve_type(cg, node->children[0]) : find_type(cg, "integer");
+    /* If type wasn't found, check if the type name suggests a pointer type.
+     * In Lisa Pascal, all pointer types (^something, xxx_ptr) are 4 bytes.
+     * Unresolved types that are pointer-like should default to 4 bytes. */
+    if (!type && node->num_children > 0) {
+        const char *tname = node->children[0]->name;
+        if (tname[0])
+            fprintf(stderr, "  UNRESOLVED TYPE '%s' for var '%s'\n", tname, node->name);
+        /* Check for pointer indicators: name contains "ptr", starts with "^", or is a ^type ref */
+        if (strcasestr(tname, "ptr") || tname[0] == '^' ||
+            (node->children[0]->type == AST_DEREF)) {
+            type = find_type(cg, "ptr");  /* Generic 4-byte pointer */
+            if (type && (strcasecmp(node->name, "hdr_ptr") == 0 || strcasecmp(node->name, "ent_ptr") == 0))
+                fprintf(stderr, "  → FIXED '%s' to ptr (size=%d)\n", node->name, type->size);
+        }
+    }
 
     /* Handle multiple names: "a,b,c" */
     char names[256];
@@ -2150,12 +2172,22 @@ static void gen_proc_or_func(codegen_t *cg, ast_node_t *node) {
     if (!has_param_list) {
         cg_proc_sig_t *sig = find_proc_sig(cg, node->name);
         if (sig && sig->num_params > 0) {
+            fprintf(stderr, "  INHERITED PARAMS for %s: %d params from signature\n", node->name, sig->num_params);
+            for (int j = 0; j < sig->num_params; j++) {
+                fprintf(stderr, "    param[%d]: '%s' size=%d var=%d type=%s\n",
+                        j, sig->param_name[j],
+                        sig->param_type[j] ? sig->param_type[j]->size : -1,
+                        sig->param_is_var[j],
+                        sig->param_type[j] ? sig->param_type[j]->name : "NULL");
+            }
             for (int j = 0; j < sig->num_params; j++) {
                 type_desc_t *ptype = sig->param_type[j];
                 if (!ptype) ptype = find_type(cg, "integer");
                 cg_symbol_t *s = add_local(cg, sig->param_name[j], ptype, true, sig->param_is_var[j]);
                 if (s) {
                     s->offset = param_offset;
+                    fprintf(stderr, "      → registered '%s' at A6+%d (size=%d)\n",
+                            sig->param_name[j], param_offset, ptype ? ptype->size : 2);
                     param_offset += sig->param_is_var[j] ? 4 : (ptype ? ptype->size : 2);
                     if (param_offset % 2) param_offset++;
                 }
