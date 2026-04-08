@@ -602,7 +602,15 @@ static uint8_t io_read_cb(uint32_t offset) {
     /* VIA2 - keyboard/COPS ($FCDD00-$FCDEFF with aliases) */
     if (offset >= 0xDC00 && offset < 0xE000) {
         uint8_t reg = (offset >> 1) & 0xF;
-        return via_read(&lisa->via2, reg);
+        uint8_t val = via_read(&lisa->via2, reg);
+        static int v2trace = 0;
+        if (v2trace < 30) {
+            extern uint32_t g_last_cpu_pc;
+            v2trace++;
+            fprintf(stderr, "VIA2_RD[%d]: reg=%d val=$%02X ddra=$%02X PC=$%06X\n",
+                    v2trace, reg, val, lisa->via2.ddra, g_last_cpu_pc & 0xFFFFFF);
+        }
+        return val;
     }
 
     /* Vertical retrace acknowledge — reading clears the IRQ */
@@ -1977,13 +1985,17 @@ int lisa_run_frame(lisa_t *lisa) {
                 lisa->via2.ddra, lisa->via2.ddrb);
         fprintf(stderr, "=== END FRAME 5 DUMP ===\n");
     }
-    if (frame_count == 800) {
+    if (frame_count == 500 || frame_count == 600 || frame_count == 700 || frame_count == 800) {
         /* Dump code at stuck PC */
         uint32_t pc = lisa->cpu.pc;
-        pc = lisa->cpu.pc;  /* update to current PC (might have changed) */
+        pc = lisa->cpu.pc;
         fprintf(stderr, "  CODE @$%06X: ", pc);
         for (int i = -16; i < 24; i += 2)
             fprintf(stderr, "%04X ", lisa_mem_read16(&lisa->mem, pc + i));
+        /* Dump the COPS polling subroutine at $208904 */
+        fprintf(stderr, "\n  COPSPOLL @$208904: ");
+        for (int i = 0; i < 48; i += 2)
+            fprintf(stderr, "%04X ", lisa_mem_read16(&lisa->mem, 0x208904 + i));
         fprintf(stderr, "\n  D0=$%08X D1=$%08X A0=$%08X A6=$%08X SP=$%08X\n",
                 lisa->cpu.d[0], lisa->cpu.d[1], lisa->cpu.a[0], lisa->cpu.a[6], lisa->cpu.a[7]);
     }

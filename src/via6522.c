@@ -46,7 +46,8 @@ uint8_t via_read(via6522_t *via, uint8_t reg) {
             via->ifr &= ~(VIA_IRQ_CB1 | VIA_IRQ_CB2);
             update_irq(via);
             uint8_t ext = via->port_b_read ? via->port_b_read(via->callback_ctx) : via->irb;
-            return (via->orb & via->ddrb) | (ext & ~via->ddrb);
+            uint8_t result = (via->orb & via->ddrb) | (ext & ~via->ddrb);
+            return result;
         }
         case VIA_ORA: {
             via->ifr &= ~(VIA_IRQ_CA1 | VIA_IRQ_CA2);
