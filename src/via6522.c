@@ -51,7 +51,12 @@ uint8_t via_read(via6522_t *via, uint8_t reg) {
         case VIA_ORA: {
             via->ifr &= ~(VIA_IRQ_CA1 | VIA_IRQ_CA2);
             update_irq(via);
-            uint8_t ext = via->port_a_read ? via->port_a_read(via->callback_ctx) : via->ira;
+            /* Only call port_a_read when there are INPUT bits (~ddra != 0).
+             * When ddra=$FF (all outputs), reading returns ORA — calling the
+             * read callback would consume data without delivering it to the CPU. */
+            uint8_t ext = via->ira;
+            if (via->port_a_read && (~via->ddra) != 0)
+                ext = via->port_a_read(via->callback_ctx);
             return (via->ora & via->ddra) | (ext & ~via->ddra);
         }
         case VIA_DDRB: return via->ddrb;
@@ -85,7 +90,9 @@ uint8_t via_read(via6522_t *via, uint8_t reg) {
         case VIA_IER: return via->ier | 0x80;
 
         case VIA_ORA_NH: {
-            uint8_t ext = via->port_a_read ? via->port_a_read(via->callback_ctx) : via->ira;
+            uint8_t ext = via->ira;
+            if (via->port_a_read && (~via->ddra) != 0)
+                ext = via->port_a_read(via->callback_ctx);
             return (via->ora & via->ddra) | (ext & ~via->ddra);
         }
     }
@@ -106,7 +113,10 @@ void via_write(via6522_t *via, uint8_t reg, uint8_t val) {
 
         case VIA_ORA:
             via->ora = val;
-            via->ifr &= ~(VIA_IRQ_CA1 | VIA_IRQ_CA2);
+            /* Don't clear CA1 on write — COPS data availability must persist.
+             * On the real VIA, writing ORA clears CA2 flags (handshake output)
+             * but CA1 (peripheral input) is only cleared on ORA READ. */
+            via->ifr &= ~VIA_IRQ_CA2;
             update_irq(via);
             if (via->port_a_write)
                 via->port_a_write(val, via->ddra, via->callback_ctx);
