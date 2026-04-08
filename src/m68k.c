@@ -477,6 +477,19 @@ static void take_exception(m68k_t *cpu, int vector) {
         }
     }
 
+    /* Trace TRAP #6 calls with register dumps */
+    if (vector == 38) {
+        static int trap6_count = 0;
+        trap6_count++;
+        if (trap6_count <= 15) {
+            fprintf(stderr, "TRAP6[%d]: PC=$%06X d0=$%04X d1=$%04X d2=$%04X d3=$%04X SP=$%06X\n",
+                    trap6_count, cpu->pc,
+                    cpu->d[0] & 0xFFFF, cpu->d[1] & 0xFFFF,
+                    cpu->d[2] & 0xFFFF, cpu->d[3] & 0xFFFF,
+                    cpu->a[7] & 0xFFFFFF);
+        }
+    }
+
     /* Trace exceptions for debugging */
     if (exception_count < 50) {
         static const char *vec_names[] = {

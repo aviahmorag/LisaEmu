@@ -1675,6 +1675,18 @@ void lisa_reset(lisa_t *lisa) {
         #undef RAM32
     }
 
+    /* Copy MMU context 1 to context 0 (setup/start mode context).
+     * The boot ROM programs segments via CXASEL which targets context 1.
+     * But during setup mode, the CPU uses context 0 for all address
+     * translation (except I/O and ROM). Without this copy, code that
+     * toggles setup mode ON (like DO_AN_MMU in the boot loader) would
+     * lose access to MMU-mapped segments since context 0 is empty. */
+    for (int s = 0; s < MMU_NUM_SEGMENTS; s++) {
+        if (lisa->mem.segments[1][s].changed) {
+            lisa->mem.segments[0][s] = lisa->mem.segments[1][s];
+        }
+    }
+
     m68k_reset(&lisa->cpu);
 
     /* Set A5 to initial global data pointer (loader normally does this).

@@ -82,6 +82,16 @@ static void mmu_reg_write(lisa_mem_t *mem, uint32_t addr, uint16_t data) {
         mem->segments[context][seg].changed |= 1;
     }
 
+    /* Mirror context 1 writes to context 0 (setup/start mode context).
+     * During setup mode, the CPU uses context 0 for address translation.
+     * Code that toggles setup ON (like DO_AN_MMU) needs to access the
+     * same segments that were programmed in context 1. On the real Lisa,
+     * the OS explicitly programs both contexts, but we mirror to ensure
+     * setup mode always has access to the running context's segments. */
+    if (context == 1) {
+        mem->segments[0][seg] = mem->segments[1][seg];
+    }
+
     static int mmu_write_count = 0;
     if (mmu_write_count < 200) {
         fprintf(stderr, "MMU REG: ctx=%d seg=%d %s=$%03X (addr=$%06X)\n",
