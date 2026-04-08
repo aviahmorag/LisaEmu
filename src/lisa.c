@@ -634,7 +634,10 @@ static uint8_t io_read_cb(uint32_t offset) {
         if (lisa->total_frames & 1) status |= 0x20;
         /* Bit 4: video bit — always 0 (black pixel) */
         /* Bit 3: no bus timeout */
-        if (lisa->mem.vretrace_irq) status |= 0x04;  /* Bit 2: vertical retrace */
+        /* Bit 2: Vertical retrace — toggles at ~60Hz based on frame count.
+         * SYSTEM.LLD polls this for timing delays even before the IRQ
+         * system is initialized, so it must toggle independently. */
+        if (lisa->total_frames % 2 == 0) status |= 0x04;
         status |= 0x02;  /* Bit 1: no hard memory error */
         status |= 0x01;  /* Bit 0: no soft memory error */
         return status;
@@ -976,12 +979,20 @@ static void via1_portb_write(uint8_t val, uint8_t ddr, void *ctx) {
 
 static uint8_t via1_portb_read(void *ctx) {
     lisa_t *lisa = (lisa_t *)ctx;
+    /* ProFile VIA1 Port B bits:
+     * Bit 0 (OCD): Open Cable Detect — 1 = cable connected
+     * Bit 1 (BSY): Busy — 1 = ProFile busy, 0 = ready
+     * Bit 2 (DEN): Data Enable
+     * Bit 3 (RRW): Read/Write direction
+     * Bit 4 (CMD): Command line
+     * Bit 5 (PARITY): Parity */
     uint8_t val = 0;
 
     if (lisa->prof.mounted) {
-        val |= 0x01; /* OCD - connected */
-        if (!profile_bsy(&lisa->prof))
-            val |= 0x02; /* BSY - not busy (active low) */
+        val |= 0x01; /* OCD = 1: cable connected */
+        /* BSY: 0 = ready, 1 = busy. Don't set bit 1 when idle. */
+        if (profile_bsy(&lisa->prof))
+            val |= 0x02; /* BSY = 1: ProFile is busy */
     }
 
     return val;
