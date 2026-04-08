@@ -1851,6 +1851,15 @@ int lisa_run_frame(lisa_t *lisa) {
         /* Dump memory around PC=$3015C to decode the wait loop */
         uint32_t pc = lisa->cpu.pc;
         fprintf(stderr, "=== FRAME 5 DIAGNOSTIC DUMP ===\n");
+        /* Dump INIT_FREEPOOL generated code */
+        fprintf(stderr, "INIT_FREEPOOL @$BD034 (64 bytes):\n");
+        for (int row = 0; row < 4; row++) {
+            uint32_t a = 0xBD034 + row * 16;
+            fprintf(stderr, "  $%06X:", a);
+            for (int i = 0; i < 16; i += 2)
+                fprintf(stderr, " %02X%02X", lisa->mem.ram[a+i], lisa->mem.ram[a+i+1]);
+            fprintf(stderr, "\n");
+        }
         fprintf(stderr, "Code $0490-$04F8:");
         for (int i = 0; i < 104; i += 2)
             fprintf(stderr, " %02X%02X", lisa->mem.ram[0x490+i], lisa->mem.ram[0x490+i+1]);

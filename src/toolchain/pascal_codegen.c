@@ -381,12 +381,14 @@ static cg_symbol_t *find_symbol_any(codegen_t *cg, const char *name) {
     cg_symbol_t *s = find_local(cg, name);
     if (s) {
         if (strcasecmp(name, "fp_ptr") == 0)
-            fprintf(stderr, "  LOOKUP fp_ptr: FOUND LOCAL at offset=%d is_param=%d scope=%d\n",
-                    s->offset, s->is_param, cg->scope_depth);
+            fprintf(stderr, "  LOOKUP fp_ptr: FOUND LOCAL at offset=%d is_param=%d scope=%d in '%s'\n",
+                    s->offset, s->is_param, cg->scope_depth, cg->current_file ? cg->current_file : "?");
         return s;
     }
-    if (strcasecmp(name, "fp_ptr") == 0)
-        fprintf(stderr, "  LOOKUP fp_ptr: NOT LOCAL (scope=%d), checking global/imported\n", cg->scope_depth);
+    if (strcasecmp(name, "fp_ptr") == 0) {
+        fprintf(stderr, "  LOOKUP fp_ptr: NOT LOCAL (scope=%d), checking global/imported in '%s'\n",
+                cg->scope_depth, cg->current_file ? cg->current_file : "?");
+    }
     s = find_global(cg, name);
     if (s) return s;
     return find_imported(cg, name);
