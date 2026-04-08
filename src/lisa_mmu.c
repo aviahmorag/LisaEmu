@@ -146,9 +146,9 @@ uint8_t lisa_mem_read8(lisa_mem_t *mem, uint32_t addr) {
                     return mem->io_read(phys - LISA_IO_BASE);
                 return 0xFF;
             }
-            if (phys < LISA_RAM_SIZE)
-                return mem->ram[phys];
-            return 0xFF;
+            /* Lisa hardware wraps RAM addresses at the physical memory boundary */
+            phys %= LISA_RAM_SIZE;
+            return mem->ram[phys];
         }
         case 1: /* I/O */
             if (mem->io_read)
@@ -191,32 +191,9 @@ void lisa_mem_write8(lisa_mem_t *mem, uint32_t addr, uint8_t val) {
                     mem->io_write(phys - LISA_IO_BASE, val);
                 break;
             }
-            if (phys < LISA_RAM_SIZE) {
-                /* Watchpoint: write to sysglobal area (mapped $CC0000+).
-                 * With os_end ~$D5000: b_sysglobal ~$D6800. Detect any writes to
-                 * the range $D0000-$F0000 which covers sysglobal, heap, syslocal. */
-                if (phys >= 0xD0000 && phys < 0xF0000 && mem->ram[phys] != val) {
-                    static int wp_count = 0;
-                    wp_count++;
-                    if (wp_count <= 30 || (phys >= 0xE0800 && phys < 0xE8800))
-                        fprintf(stderr, ">>> SGWRITE[%d]: phys=$%06X val=$%02X old=$%02X (addr=$%06X)\n",
-                                wp_count, phys, val, mem->ram[phys], addr);
-                }
-                /* Watch for CHANGING writes to STARTUP code area.
-                 * Skip initial load (old=0) — only catch overwrites. */
-                if (phys >= 0x4F0 && phys <= 0x4F3 && mem->ram[phys] != val && mem->ram[phys] != 0) {
-                    static int code_write = 0;
-                    if (code_write++ < 3) {
-                        /* Access CPU PC via the lisa_t struct — mem is at a known offset from lisa_t */
-                        /* lisa_t has: m68k_t cpu (first member after mem at known offset) */
-                        /* Simpler: use a global variable set by the CPU loop */
-                        extern uint32_t g_last_cpu_pc;
-                        fprintf(stderr, "!!! CODE OVERWRITE: phys=$%06X val=$%02X addr=$%06X old=$%02X CPU_PC=$%06X\n",
-                                phys, val, addr, mem->ram[phys], g_last_cpu_pc);
-                    }
-                }
-                mem->ram[phys] = val;
-            }
+            /* Lisa hardware wraps RAM addresses at the physical memory boundary */
+            phys %= LISA_RAM_SIZE;
+            mem->ram[phys] = val;
             break;
         }
         case 1: { /* I/O */
