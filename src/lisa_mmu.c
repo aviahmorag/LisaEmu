@@ -35,7 +35,7 @@ void lisa_mem_init(lisa_mem_t *mem) {
     mem->segment2 = 0;
 
     /* Default video address (primary screen) */
-    mem->video_addr = LISA_RAM_SIZE - 0x8000;  /* Top of 2MB RAM */
+    mem->video_addr = 2 * 1024 * 1024 - 0x8000;  /* Top of reported 2MB ($1F8000) */
     mem->contrast = 0xFF;
     mem->vretrace_enabled = true;
 }
@@ -238,7 +238,7 @@ void lisa_mem_write8(lisa_mem_t *mem, uint32_t addr, uint8_t val) {
                     if (mem->video_alt)
                         mem->video_addr = LISA_RAM_SIZE - 0x8000 + LISA_SCREEN_BYTES;
                     else
-                        mem->video_addr = LISA_RAM_SIZE - 0x8000;  /* Top of 2MB RAM */
+                        mem->video_addr = 2 * 1024 * 1024 - 0x8000;  /* Top of reported 2MB ($1F8000) */
                     break;
 
                 case IO_SETUP_SET:   /* $FCE010 — enter start/setup mode */
