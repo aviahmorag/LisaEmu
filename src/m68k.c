@@ -2674,9 +2674,33 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         pc_ring[pc_ring_idx++ & 255] = cpu->pc;
         g_last_cpu_pc = cpu->pc;
 
-        /* Trace HLE SYSTEM_ERROR with full context */
-        /* (AFTER_PASCALINIT trace removed - address is stale) */
-        /* (Address-specific traces removed — addresses change with code layout) */
+        /* Trace boot loader — log JMP/JSR at key addresses + region changes */
+        {
+            static int loader_trace = 0;
+            uint32_t pc = cpu->pc & 0xFFFFFF;
+            /* Trace the start_pascal transition in the RELOCATED boot track.
+             * After the main_loop reads all blocks, start_pascal runs from $100xxx.
+             * start_pascal is ~200 bytes into LDPROF → relocated to ~$100100-$100200.
+             * Also trace any JMP (Ax) instruction in $100xxx range. */
+            /* Only trace AFTER the main_loop exits (when start_pascal runs).
+             * The main_loop at $1000B0-$1000C4 loops while D6 >= 0.
+             * start_pascal is reached when D6 < 0 and PC passes $1000C4. */
+            if (pc >= 0x1001C0 && pc < 0x100400 && loader_trace < 80) {
+                loader_trace++;
+                fprintf(stderr, "PASCAL_ENTRY: PC=$%06X op=$%04X A0=$%08X A1=$%08X A5=$%08X A6=$%08X SP=$%08X\n",
+                        pc, cpu_read16(cpu, pc),
+                        cpu->a[0], cpu->a[1], cpu->a[5], cpu->a[6], cpu->a[7]);
+            }
+            /* Track region transitions */
+            static uint32_t last_region = 0;
+            uint32_t region = pc >> 16;
+            if (region != last_region && region != 0x00FE && loader_trace < 80) {
+                last_region = region;
+                loader_trace++;
+                fprintf(stderr, "LDR REGION: PC=$%06X op=$%04X A0=$%08X A1=$%08X SP=$%08X SR=$%04X\n",
+                        pc, cpu_read16(cpu, pc), cpu->a[0], cpu->a[1], cpu->a[7], cpu->sr);
+            }
+        }
         /* SP watermark: catch stack leak in both physical and mapped space */
         {
             static uint32_t lowest_sp = 0xFFFFFF;

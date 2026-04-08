@@ -2375,10 +2375,10 @@ static bool hle_prof_entry(lisa_t *lisa, m68k_t *cpu) {
     uint32_t tag_dest = cpu->a[1] & 0xFFFFFF;
     uint32_t data_dest = cpu->a[2] & 0xFFFFFF;
 
-    /* Reverse the 9:1 interleave applied by LDPROF before calling prof_entry.
-     * Skip for special block numbers (spare table query, etc.) */
-    if (sector < 0x00F00000)
-        sector = profile_deinterleave(sector);
+    /* The LDPROF interleave routine converts logical→physical sector numbers
+     * before calling prof_entry. The disk image stores blocks in physical
+     * order. So the sector number we receive IS the physical block number —
+     * no deinterleaving needed. */
 
     static int prof_reads = 0;
     if (prof_reads < 30)
