@@ -579,11 +579,15 @@ static void mem_write32_cb(uint32_t addr, uint32_t val) {
  * ======================================================================== */
 
 static uint8_t io_read_cb(uint32_t offset) {
-    static int io_trace = 0;
-    if (io_trace < 20) {
+    {
+        static int io_trace = 0;
         extern uint32_t g_last_cpu_pc;
+        uint32_t pc = g_last_cpu_pc & 0xFFFFFF;
         io_trace++;
-        fprintf(stderr, "IO_READ[%d]: offset=$%04X PC=$%06X\n", io_trace, offset, g_last_cpu_pc & 0xFFFFFF);
+        /* Log I/O reads from SYSTEM.LLD area or late in boot */
+        if (io_trace <= 5 || (pc >= 0x200000 && io_trace <= 50) || (io_trace > 100000 && io_trace <= 100005)) {
+            fprintf(stderr, "IO_READ[%d]: offset=$%04X PC=$%06X\n", io_trace, offset, pc);
+        }
     }
     lisa_t *lisa = g_lisa;
 
