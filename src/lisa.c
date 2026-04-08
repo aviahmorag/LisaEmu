@@ -612,7 +612,7 @@ static uint8_t io_read_cb(uint32_t offset) {
         /* Recalculate IRQ level */
         int level = 0;
         if (lisa->irq_via1) level = 1;
-        if (lisa->irq_via2) level = 2;
+        if (lisa->irq_via2) level = 1;  /* VIA2 is IRQ level 1 on Lisa */
         m68k_set_irq(&lisa->cpu, level);
         return lisa->mem.vretrace_irq ? 0x80 : 0x00;
     }
@@ -731,7 +731,7 @@ static void io_write_cb(uint32_t offset, uint8_t val) {
         lisa->irq_vretrace = 0;
         int level = 0;
         if (lisa->irq_via1) level = 1;
-        if (lisa->irq_via2) level = 2;
+        if (lisa->irq_via2) level = 1;  /* VIA2 is IRQ level 1 on Lisa */
         m68k_set_irq(&lisa->cpu, level);
         return;
     }
@@ -1047,14 +1047,21 @@ static void via2_portb_write(uint8_t val, uint8_t ddr, void *ctx) {
 
 static uint8_t via2_portb_read(void *ctx) {
     lisa_t *lisa = (lisa_t *)ctx;
+    /* VIA2 Port B: COPS interface
+     * Bit 0: Data available from COPS
+     * Bit 1-3: Volume control (output)
+     * Bit 4: CRDY — COPS ready for command
+     * Bit 5: Parity reset (output)
+     * Bit 6: COPS handshake (input) — toggles during data transfer
+     * Bit 7: Controller reset (output) */
     uint8_t val = 0;
 
-    /* Bit 4: CRDY — COPS always ready for commands */
-    val |= 0x10;
+    val |= 0x10;  /* CRDY: always ready */
 
-    /* Bit 0: data available from COPS */
-    if (lisa->cops_rx.count > 0)
-        val |= 0x01;
+    if (lisa->cops_rx.count > 0) {
+        val |= 0x01;  /* Data available */
+        val |= 0x40;  /* Handshake: data ready (PB6) */
+    }
 
     return val;
 }
@@ -1074,8 +1081,9 @@ static void via2_porta_write(uint8_t val, uint8_t ddr, void *ctx) {
      * $78-$7F = Mouse ON with interval
      * $80-$FF = NOP */
     static int cops_cmd_count = 0;
-    if (cops_cmd_count < 20)
-        fprintf(stderr, "COPS CMD[%d]: $%02X\n", ++cops_cmd_count, val);
+    cops_cmd_count++;
+    if (cops_cmd_count <= 50)
+        fprintf(stderr, "COPS CMD[%d]: $%02X\n", cops_cmd_count, val);
 
     if (val >= 0x80) {
         /* NOP — high bit set commands are ignored */
@@ -1121,14 +1129,15 @@ static uint8_t via2_porta_read(void *ctx) {
     return 0xFF;  /* No data */
 }
 
-/* VIA2 IRQ -> CPU IRQ level 2 */
+/* VIA2 IRQ → CPU IRQ level 1 (same as VIA1).
+ * On the Lisa, both VIAs share IRQ level 1 via a priority encoder.
+ * Vertical retrace is a separate source (directly wired, not VIA). */
 static void via2_irq(bool state, void *ctx) {
     lisa_t *lisa = (lisa_t *)ctx;
     lisa->irq_via2 = state ? 1 : 0;
     int level = 0;
-    if (lisa->irq_vretrace) level = 1;
-    if (lisa->irq_via1) level = 1;
-    if (lisa->irq_via2) level = 2;
+    if (lisa->irq_via1 || lisa->irq_via2) level = 1;
+    if (lisa->irq_vretrace) level = 1;  /* vretrace also level 1 on Lisa */
     m68k_set_irq(&lisa->cpu, level);
 }
 
@@ -1971,6 +1980,7 @@ int lisa_run_frame(lisa_t *lisa) {
     if (frame_count == 800) {
         /* Dump code at stuck PC */
         uint32_t pc = lisa->cpu.pc;
+        pc = lisa->cpu.pc;  /* update to current PC (might have changed) */
         fprintf(stderr, "  CODE @$%06X: ", pc);
         for (int i = -16; i < 24; i += 2)
             fprintf(stderr, "%04X ", lisa_mem_read16(&lisa->mem, pc + i));
@@ -2154,7 +2164,8 @@ int lisa_run_frame(lisa_t *lisa) {
      * can fire. This handles the case where BOOT_IO_INIT didn't properly
      * call INTSON before ENTER_SCHEDULER. */
     if (frame_count > 100 && lisa->cpu.pending_irq > 0 &&
-        (lisa->cpu.sr & 0x0700) == 0x0700) {
+        lisa->cpu.pending_irq <= ((lisa->cpu.sr >> 8) & 7)) {
+        /* Pending IRQ is at or below the mask level — can't be delivered */
         static int force_count = 0;
         if (force_count < 3) {
             force_count++;
@@ -2170,8 +2181,8 @@ int lisa_run_frame(lisa_t *lisa) {
     if (lisa->mem.vretrace_enabled && frame_count > 200) {
         lisa->mem.vretrace_irq = true;
         lisa->irq_vretrace = 1;
-        int level = 3;  /* vretrace at level 3 to break through mask level 2 */
-        if (lisa->irq_via2) level = 2;
+        int level = 1;  /* vretrace is IRQ level 1 on Lisa */
+        if (lisa->irq_via2) level = 1;  /* VIA2 is IRQ level 1 on Lisa */
         m68k_set_irq(&lisa->cpu, level);
 
         /* Execute one instruction — enough for the CPU to take the IRQ */
@@ -2182,7 +2193,7 @@ int lisa_run_frame(lisa_t *lisa) {
         lisa->irq_vretrace = 0;
         level = 0;
         if (lisa->irq_via1) level = 1;
-        if (lisa->irq_via2) level = 2;
+        if (lisa->irq_via2) level = 1;  /* VIA2 is IRQ level 1 on Lisa */
         m68k_set_irq(&lisa->cpu, level);
     }
 
