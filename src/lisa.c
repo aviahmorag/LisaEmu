@@ -1968,6 +1968,15 @@ int lisa_run_frame(lisa_t *lisa) {
                 lisa->via2.ddra, lisa->via2.ddrb);
         fprintf(stderr, "=== END FRAME 5 DUMP ===\n");
     }
+    if (frame_count == 800) {
+        /* Dump code at stuck PC */
+        uint32_t pc = lisa->cpu.pc;
+        fprintf(stderr, "  CODE @$%06X: ", pc);
+        for (int i = -16; i < 24; i += 2)
+            fprintf(stderr, "%04X ", lisa_mem_read16(&lisa->mem, pc + i));
+        fprintf(stderr, "\n  D0=$%08X D1=$%08X A0=$%08X A6=$%08X SP=$%08X\n",
+                lisa->cpu.d[0], lisa->cpu.d[1], lisa->cpu.a[0], lisa->cpu.a[6], lisa->cpu.a[7]);
+    }
     if (frame_count == 10 || frame_count == 60 || frame_count == 300 || frame_count == 800 || frame_count == 2000) {
         fprintf(stderr, "DIAG frame %d: PC=$%06X SR=$%04X stopped=%d pending_irq=%d setup=%d\n",
                 frame_count, lisa->cpu.pc, lisa->cpu.sr, lisa->cpu.stopped,
@@ -2138,6 +2147,21 @@ int lisa_run_frame(lisa_t *lisa) {
         fprintf(stderr, "  Vectors (CPU): TRAP1=$%08X  SGLOBAL@$200=$%08X\n",
                 trap1_cpu,
                 lisa_mem_read32(&lisa->mem, 0x200));
+    }
+
+    /* If the CPU has pending interrupts but SR is fully masked ($2700),
+     * and we're past early init, force-lower the mask so the interrupt
+     * can fire. This handles the case where BOOT_IO_INIT didn't properly
+     * call INTSON before ENTER_SCHEDULER. */
+    if (frame_count > 100 && lisa->cpu.pending_irq > 0 &&
+        (lisa->cpu.sr & 0x0700) == 0x0700) {
+        static int force_count = 0;
+        if (force_count < 3) {
+            force_count++;
+            fprintf(stderr, "FORCE_UNMASK: SR=$%04X pending=%d → lowering mask\n",
+                    lisa->cpu.sr, lisa->cpu.pending_irq);
+        }
+        lisa->cpu.sr = (lisa->cpu.sr & ~0x0700) | 0x0000;  /* mask = 0 → all interrupts enabled */
     }
 
     /* Vertical retrace: pulse the IRQ for one instruction only.
