@@ -477,16 +477,33 @@ static void take_exception(m68k_t *cpu, int vector) {
         }
     }
 
-    /* Trace TRAP #6 calls with register dumps */
+    /* Detect crash at PC=$2A — dump last PCs to understand the jump */
+    if (vector == 4 && (cpu->pc & 0xFFFFFF) < 0x100) {
+        static int crash_traced = 0;
+        if (crash_traced++ < 1) {
+            fprintf(stderr, "=== CRASH at PC=$%06X (vector %d) ===\n", cpu->pc, vector);
+            fprintf(stderr, "  D0=$%08X D1=$%08X D2=$%08X D3=$%08X\n",
+                    cpu->d[0], cpu->d[1], cpu->d[2], cpu->d[3]);
+            fprintf(stderr, "  A0=$%08X A1=$%08X A5=$%08X A6=$%08X SP=$%08X SR=$%04X\n",
+                    cpu->a[0], cpu->a[1], cpu->a[5], cpu->a[6], cpu->a[7], cpu->sr);
+            /* pc_ring is in the main loop scope — can't access from here.
+             * Use the stack trace instead. */
+            fprintf(stderr, "  Stack: ");
+            for (int j = 0; j < 32; j += 4)
+                fprintf(stderr, "$%08X ", cpu_read32(cpu, (cpu->a[7] + j) & 0xFFFFFF));
+            fprintf(stderr, "\n");
+        }
+    }
+
+    /* Count ALL TRAP #6 calls */
     if (vector == 38) {
         static int trap6_count = 0;
         trap6_count++;
-        if (trap6_count <= 15) {
-            fprintf(stderr, "TRAP6[%d]: PC=$%06X d0=$%04X d1=$%04X d2=$%04X d3=$%04X SP=$%06X\n",
+        if (trap6_count <= 5 || trap6_count % 50 == 0) {
+            fprintf(stderr, "TRAP6[%d]: PC=$%06X d0=$%04X d1=$%04X d2=$%04X d3=$%04X\n",
                     trap6_count, cpu->pc,
                     cpu->d[0] & 0xFFFF, cpu->d[1] & 0xFFFF,
-                    cpu->d[2] & 0xFFFF, cpu->d[3] & 0xFFFF,
-                    cpu->a[7] & 0xFFFFFF);
+                    cpu->d[2] & 0xFFFF, cpu->d[3] & 0xFFFF);
         }
     }
 
