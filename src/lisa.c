@@ -1366,9 +1366,14 @@ void lisa_reset(lisa_t *lisa) {
         }
 
         /* Memory info */
-        WRITE32(0x294, LISA_RAM_SIZE); /* prom_memsize: last byte + 1 */
+        /* Report 2MB to the loader even though we have 2.25MB physical RAM.
+         * The extra 256KB is for the mmucodemmu segment (SOR near $FE4) which
+         * wraps past 2MB. The loader must not allocate above 2MB because the
+         * SOR register is only 12 bits (max page $FFF = physical $1FFE00). */
+        uint32_t reported_ram = 2 * 1024 * 1024;  /* 2MB */
+        WRITE32(0x294, reported_ram);  /* prom_memsize: last byte + 1 */
         WRITE32(0x2A4, 0x00000000);   /* prom_byte0: physical byte 0 */
-        WRITE32(0x2A8, LISA_RAM_SIZE); /* prom_realsize: amount of memory */
+        WRITE32(0x2A8, reported_ram);  /* prom_realsize: amount of memory */
 
         /* For real images, set fs_block0 at $210 and loader link.
          * The boot track loader handles everything else. */
