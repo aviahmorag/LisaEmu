@@ -1986,6 +1986,8 @@ int lisa_run_frame(lisa_t *lisa) {
                 lisa->via2.ddra, lisa->via2.ddrb);
         fprintf(stderr, "=== END FRAME 5 DUMP ===\n");
     }
+    /* NOTE: Pre-built Lisa OS 3.1 uses hardcoded initialization, not
+     * the parameter-block/GETLDMAP mechanism. No $218 fix needed. */
     if (frame_count == 500 || frame_count == 600 || frame_count == 700 || frame_count == 800) {
         /* Dump code at stuck PC */
         uint32_t pc = lisa->cpu.pc;
@@ -2602,6 +2604,23 @@ bool lisa_hle_intercept(lisa_t *lisa, m68k_t *cpu) {
     /* ALWAYS intercept prof_entry at $FE0090 (ROM PROM routine) */
     if (pc == 0xFE0090)
         return hle_prof_entry(lisa, cpu);
+
+    /* The pre-built Lisa OS 3.1 uses hardcoded initialization at $52051C.
+     * It sets up VIA1/VIA2 and enters the COPS loop but leaves interrupts
+     * masked at IPL 7. We lower the IPL when the scheduler starts, matching
+     * what INTSON(0) would do at the end of BOOT_IO_INIT. */
+    {
+        static bool intson_done = false;
+        if (!intson_done && pc >= 0x520840 && pc <= 0x520844) {
+            uint16_t sr = cpu->sr;
+            if ((sr & 0x0700) >= 0x0400) {  /* IPL >= 4 */
+                cpu->sr = (sr & ~0x0700) | 0x0000;  /* Set IPL to 0 */
+                intson_done = true;
+                fprintf(stderr, "HLE: INTSON — lowered IPL from %d to 0 at PC=$%06X\n",
+                        (sr >> 8) & 7, pc);
+            }
+        }
+    }
 
     if (!lisa->hle.active) return false;
 
