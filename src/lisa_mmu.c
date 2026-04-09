@@ -223,7 +223,6 @@ void lisa_mem_write8(lisa_mem_t *mem, uint32_t addr, uint8_t val) {
             }
             /* Lisa hardware wraps RAM addresses at the physical memory boundary */
             phys %= LISA_RAM_SIZE;
-            /* removed — replaced by PROG_MMU entry trace */
             mem->ram[phys] = val;
             break;
         }

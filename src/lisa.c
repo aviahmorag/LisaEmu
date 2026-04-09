@@ -2608,7 +2608,11 @@ bool lisa_hle_intercept(lisa_t *lisa, m68k_t *cpu) {
     /* The pre-built Lisa OS 3.1 uses hardcoded initialization at $52051C.
      * It sets up VIA1/VIA2 and enters the COPS loop but leaves interrupts
      * masked at IPL 7. We lower the IPL when the scheduler starts, matching
-     * what INTSON(0) would do at the end of BOOT_IO_INIT. */
+     * what INTSON(0) would do at the end of BOOT_IO_INIT.
+     *
+     * We also enable VIA1 CA1 interrupt (ProFile BSY transition) and set
+     * the ProFile driver polling pointer at $494. The hardcoded OS init
+     * skips the CALLDRIVER(dinit) that would normally do this. */
     {
         static bool intson_done = false;
         if (!intson_done && pc >= 0x520840 && pc <= 0x520844) {
@@ -2618,6 +2622,23 @@ bool lisa_hle_intercept(lisa_t *lisa, m68k_t *cpu) {
                 intson_done = true;
                 fprintf(stderr, "HLE: INTSON — lowered IPL from %d to 0 at PC=$%06X\n",
                         (sr >> 8) & 7, pc);
+
+                /* Set up VIA1 for ProFile operation.
+                 * On the real Lisa, CALLDRIVER(dinit) does this. */
+                via_write(&lisa->via1, VIA_DDRB, 0x1C);  /* Bits 2-4 output: DEN, RRW, CMD */
+                via_write(&lisa->via1, VIA_DDRA, 0xFF);   /* Port A all outputs (data bus) */
+                via_write(&lisa->via1, VIA_IER, 0x82);    /* Enable CA1 (BSY) interrupt */
+                fprintf(stderr, "HLE: ProFile init — DDRB=$%02X DDRA=$%02X IER=$%02X\n",
+                        lisa->via1.ddrb, lisa->via1.ddra, lisa->via1.ier);
+
+                /* Copy ProFile driver entry from $49C to $494 so the
+                 * polling dispatcher at $208904 can find it. The dispatcher
+                 * checks $498 (COPS) then $494 (ProFile). */
+                uint32_t prof_drv = lisa_mem_read32(&lisa->mem, 0x49C);
+                if (prof_drv > 0 && prof_drv < 0x300000) {
+                    lisa_mem_write32(&lisa->mem, 0x494, prof_drv);
+                    fprintf(stderr, "HLE: Set ProFile driver $494=$%06X (from $49C)\n", prof_drv);
+                }
             }
         }
     }
