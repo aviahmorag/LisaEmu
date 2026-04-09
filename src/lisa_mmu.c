@@ -135,11 +135,14 @@ static uint32_t mmu_translate(lisa_mem_t *mem, uint32_t addr) {
     uint32_t offset = addr & 0x1FFFF;  /* 17-bit offset (128KB segments) */
     uint32_t phys = ((uint32_t)s->sor << 9) + offset;
 
-    /* Check SLR for I/O space mapping */
+    /* Check SLR for I/O space mapping.
+     * On real Lisa hardware, I/O segments ignore SOR — the 17-bit offset
+     * within the segment maps directly to the I/O address bus at $FC0000+.
+     * The OS sets SOR to arbitrary values for I/O segments (e.g. $0E00)
+     * which must NOT be used for address calculation. */
     uint16_t slr_type = s->slr & SLR_MASK;
     if (slr_type == SLR_IO_SPACE || slr_type == SLR_SIO_SPACE) {
-        /* Map to I/O space — return address as-is for I/O dispatch */
-        return phys | 0xFC0000;  /* Force into I/O region */
+        return 0xFC0000 | offset;  /* Direct offset into I/O space */
     }
 
     return phys & 0xFFFFFF;  /* 24-bit physical address */

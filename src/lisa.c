@@ -1402,7 +1402,7 @@ void lisa_reset(lisa_t *lisa) {
          * For cross-compiled images, we set up everything. */
 
         /* Boot device identifier — needed by both real and cross-compiled */
-        lisa->mem.ram[0x1B3] = 0;      /* adr_bootdev: 0 = internal disk (Widget/ProFile on Pepsi) */
+        lisa->mem.ram[0x1B3] = 2;      /* adr_bootdev: 2 = parallel port (ProFile on iob_lisa) */
 
         /* Install minimal TRAP handlers for traps used before INIT_TRAPV.
          * TRAP #5 = TRAPTOHW (hardware interface) — used by %initstdio
@@ -1915,6 +1915,7 @@ int lisa_run_frame(lisa_t *lisa) {
     /* Debug: log CPU/VIA/vector state once after significant execution */
     static int frame_count = 0;
     frame_count++;
+
     /* Don't force-unmask interrupts or generate vretrace during init.
      * The OS must complete INITSYS before interrupt handlers are ready.
      * INTSON(0) at the end of BOOT_IO_INIT enables interrupts naturally. */
@@ -2537,8 +2538,8 @@ static bool hle_prof_entry(lisa_t *lisa, m68k_t *cpu) {
 
     static int prof_reads = 0;
     if (prof_reads < 30)
-        fprintf(stderr, "PROF_ENTRY: read sector %u → tag@$%06X data@$%06X\n",
-                sector, tag_dest, data_dest);
+        fprintf(stderr, "PROF_ENTRY[%d]: sector %u → tag@$%06X data@$%06X\n",
+                prof_reads, sector, tag_dest, data_dest);
     prof_reads++;
 
     /* Read from mounted ProFile image */
