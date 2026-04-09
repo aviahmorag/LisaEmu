@@ -620,7 +620,7 @@ static uint8_t io_read_cb(uint32_t offset) {
         /* Recalculate IRQ level */
         int level = 0;
         if (lisa->irq_via1) level = 1;
-        if (lisa->irq_via2) level = 1;  /* VIA2 is IRQ level 1 on Lisa */
+        if (lisa->irq_via2) level = 2;  /* VIA2/COPS is IRQ level 2 on Lisa */
         m68k_set_irq(&lisa->cpu, level);
         return lisa->mem.vretrace_irq ? 0x80 : 0x00;
     }
@@ -745,7 +745,7 @@ static void io_write_cb(uint32_t offset, uint8_t val) {
         lisa->irq_vretrace = 0;
         int level = 0;
         if (lisa->irq_via1) level = 1;
-        if (lisa->irq_via2) level = 1;  /* VIA2 is IRQ level 1 on Lisa */
+        if (lisa->irq_via2) level = 2;  /* VIA2/COPS is IRQ level 2 on Lisa */
         m68k_set_irq(&lisa->cpu, level);
         return;
     }
@@ -1149,10 +1149,20 @@ static void via2_porta_write(uint8_t val, uint8_t ddr, void *ctx) {
     } else if (val >= 0x70 && val <= 0x7F) {
         /* Mouse control */
         if (val >= 0x78) {
-            /* Mouse ON — acknowledge */
+            /* Mouse ON — no response needed. COPS starts sending
+             * mouse delta data ($00, Dx, Dy) on movement. */
         }
     } else {
         /* Other commands — acknowledge */
+    }
+
+    /* After processing a COPS command, if there's queued data waiting
+     * (e.g., keyboard ID from boot), trigger CA1 to notify the OS.
+     * The Level 2 interrupt handler will read VIA2 port A to consume
+     * the data and clear the CA1 flag. We only do this after the first
+     * command, when the interrupt infrastructure is fully initialized. */
+    if (lisa->cops_rx.count > 0 && cops_cmd_count >= 1) {
+        via_trigger_ca1(&lisa->via2);
     }
 }
 
@@ -1166,20 +1176,32 @@ static uint8_t via2_porta_read(void *ctx) {
         if (read_count++ < 10)
             fprintf(stderr, "COPS READ[%d]: $%02X (remain=%d) PC=$%06X\n",
                     read_count, val, lisa->cops_rx.count, lisa->cpu.pc & 0xFFFFFF);
+
+        /* If more COPS data is queued, re-trigger CA1 so the Level 2
+         * handler fires again. On real hardware, COPS holds CA1 asserted
+         * as long as it has data to send. The VIA ORA read clears CA1,
+         * then we re-assert it here if more data is available. */
+        if (lisa->cops_rx.count > 0) {
+            via_trigger_ca1(&lisa->via2);
+        }
+
         return val;
     }
     return 0xFF;  /* No data */
 }
 
-/* VIA2 IRQ → CPU IRQ level 1 (same as VIA1).
- * On the Lisa, both VIAs share IRQ level 1 via a priority encoder.
- * Vertical retrace is a separate source (directly wired, not VIA). */
+/* VIA2 IRQ → CPU IRQ level 2 (COPS).
+ * On the Lisa, VIA1 is level 1 (shared with vretrace) and VIA2/COPS
+ * is level 2. The OS installs separate Level 1 and Level 2 handlers.
+ * Level 1: vretrace + VIA1 (ProFile, Timer1)
+ * Level 2: VIA2 CA1 (COPS keyboard/mouse/clock) */
 static void via2_irq(bool state, void *ctx) {
     lisa_t *lisa = (lisa_t *)ctx;
     lisa->irq_via2 = state ? 1 : 0;
+    /* Set CPU IRQ to highest active level */
     int level = 0;
-    if (lisa->irq_via1 || lisa->irq_via2) level = 1;
-    if (lisa->irq_vretrace) level = 1;  /* vretrace also level 1 on Lisa */
+    if (lisa->irq_vretrace || lisa->irq_via1) level = 1;
+    if (lisa->irq_via2) level = 2;  /* VIA2/COPS is IRQ level 2 on Lisa */
     m68k_set_irq(&lisa->cpu, level);
 }
 
@@ -2210,8 +2232,12 @@ int lisa_run_frame(lisa_t *lisa) {
                             ((uint32_t)lisa->mem.ram[0x65] << 16) |
                             ((uint32_t)lisa->mem.ram[0x66] << 8) |
                             lisa->mem.ram[0x67];
-        fprintf(stderr, "  Vectors (RAM): TRAP1=$%08X TRAP2=$%08X INT1=$%08X\n",
-                trap1_vec, trap2_vec, int1_vec);
+        uint32_t int2_vec = ((uint32_t)lisa->mem.ram[0x68] << 24) |
+                            ((uint32_t)lisa->mem.ram[0x69] << 16) |
+                            ((uint32_t)lisa->mem.ram[0x6A] << 8) |
+                            lisa->mem.ram[0x6B];
+        fprintf(stderr, "  Vectors (RAM): TRAP1=$%08X INT1=$%08X INT2=$%08X\n",
+                trap1_vec, int1_vec, int2_vec);
         /* Also read via CPU path to compare */
         uint32_t trap1_cpu = lisa_mem_read32(&lisa->mem, 0x84);
         fprintf(stderr, "  Vectors (CPU): TRAP1=$%08X  SGLOBAL@$200=$%08X\n",
@@ -2219,21 +2245,10 @@ int lisa_run_frame(lisa_t *lisa) {
                 lisa_mem_read32(&lisa->mem, 0x200));
     }
 
-    /* If the CPU has pending interrupts but SR is fully masked ($2700),
-     * and we're past early init, force-lower the mask so the interrupt
-     * can fire. This handles the case where BOOT_IO_INIT didn't properly
-     * call INTSON before ENTER_SCHEDULER. */
-    if (frame_count > 100 && lisa->cpu.pending_irq > 0 &&
-        lisa->cpu.pending_irq <= ((lisa->cpu.sr >> 8) & 7)) {
-        /* Pending IRQ is at or below the mask level — can't be delivered */
-        static int force_count = 0;
-        if (force_count < 3) {
-            force_count++;
-            fprintf(stderr, "FORCE_UNMASK: SR=$%04X pending=%d → lowering mask\n",
-                    lisa->cpu.sr, lisa->cpu.pending_irq);
-        }
-        lisa->cpu.sr = (lisa->cpu.sr & ~0x0700) | 0x0000;  /* mask = 0 → all interrupts enabled */
-    }
+    /* FORCE_UNMASK removed: with proper interrupt levels (VIA1=level 1,
+     * VIA2=level 2, vretrace=level 1), interrupts should be delivered
+     * naturally. Force-lowering IPL inside an existing handler caused
+     * nested interrupt cascades. */
 
     /* Vertical retrace: pulse the IRQ for one instruction only.
      * Only enable after the OS has initialized interrupt handlers
@@ -2242,7 +2257,7 @@ int lisa_run_frame(lisa_t *lisa) {
         lisa->mem.vretrace_irq = true;
         lisa->irq_vretrace = 1;
         int level = 1;  /* vretrace is IRQ level 1 on Lisa */
-        if (lisa->irq_via2) level = 1;  /* VIA2 is IRQ level 1 on Lisa */
+        if (lisa->irq_via2) level = 2;  /* VIA2/COPS is IRQ level 2 on Lisa */
         m68k_set_irq(&lisa->cpu, level);
 
         /* Execute one instruction — enough for the CPU to take the IRQ */
@@ -2253,7 +2268,7 @@ int lisa_run_frame(lisa_t *lisa) {
         lisa->irq_vretrace = 0;
         level = 0;
         if (lisa->irq_via1) level = 1;
-        if (lisa->irq_via2) level = 1;  /* VIA2 is IRQ level 1 on Lisa */
+        if (lisa->irq_via2) level = 2;  /* VIA2/COPS is IRQ level 2 on Lisa */
         m68k_set_irq(&lisa->cpu, level);
     }
 
@@ -2649,6 +2664,42 @@ bool lisa_hle_intercept(lisa_t *lisa, m68k_t *cpu) {
     /* ALWAYS intercept prof_entry at $FE0090 (ROM PROM routine) */
     if (pc == 0xFE0090)
         return hle_prof_entry(lisa, cpu);
+
+    /* HLE: Level 2 interrupt handler (COPS) at $2082D2.
+     * The binary's Level 2 handler enters a long initialization phase
+     * that never completes (copies data through $FAxxxx-$FBxxxx for
+     * thousands of frames). Instead, we handle COPS data directly:
+     * read VIA2 port A to consume queued data, process it, clear CA1,
+     * and RTE back to the interrupted code.
+     *
+     * On the real Lisa, the Level 2 handler (from libhw-DRIVERS.TEXT):
+     *   1. Save D0, raise IPL to 5
+     *   2. Check VIA2 IFR bit 1 (CA1 = COPS data ready)
+     *   3. Read VIA2 port A → gets COPS byte
+     *   4. Dispatch through state machine (keycodes, mouse, clock)
+     *   5. ENABLE, RTE */
+    if (pc == 0x2082D2) {
+        /* Check if VIA2 CA1 is pending */
+        if (lisa->via2.ifr & VIA_IRQ_CA1) {
+            /* Read all available COPS data (like the real handler would) */
+            while (lisa->cops_rx.count > 0) {
+                uint8_t byte = via_read(&lisa->via2, VIA_ORA);
+                static int hle_cops = 0;
+                if (hle_cops++ < 20)
+                    fprintf(stderr, "HLE COPS: read $%02X (remain=%d)\n",
+                            byte, lisa->cops_rx.count);
+            }
+        }
+
+        /* RTE: pop SR and PC from stack (the interrupt acceptance pushed them) */
+        cpu->sr = (uint16_t)((cpu->read8(cpu->a[7]) << 8) | cpu->read8(cpu->a[7] + 1));
+        cpu->a[7] += 2;
+        cpu->pc = (cpu->read8(cpu->a[7]) << 24) | (cpu->read8(cpu->a[7]+1) << 16) |
+                  (cpu->read8(cpu->a[7]+2) << 8) | cpu->read8(cpu->a[7]+3);
+        cpu->a[7] += 4;
+        cpu->cycles = 20;
+        return true;
+    }
 
     /* The pre-built Lisa OS 3.1 uses hardcoded initialization at $52051C.
      * It sets up VIA1/VIA2 and enters the COPS loop but leaves interrupts
