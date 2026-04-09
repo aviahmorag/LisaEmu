@@ -642,10 +642,16 @@ static uint8_t io_read_cb(uint32_t offset) {
         if (lisa->total_frames & 1) status |= 0x20;
         /* Bit 4: video bit — always 0 (black pixel) */
         /* Bit 3: no bus timeout */
-        /* Bit 2: Vertical retrace — toggles at ~60Hz based on frame count.
-         * SYSTEM.LLD polls this for timing delays even before the IRQ
-         * system is initialized, so it must toggle independently. */
-        if (lisa->total_frames % 2 == 0) status |= 0x04;
+        /* Bit 2: Vertical retrace — must toggle within a frame.
+         * SYSTEM.LLD and COPSCMD poll this for timing delays even before
+         * the IRQ system is initialized. On real hardware, vretrace is
+         * active for ~1.5ms of each ~16.7ms frame. We simulate this
+         * by using the CPU's cycle counter to determine the phase. */
+        {
+            uint64_t pos = lisa->cpu.total_cycles % (uint64_t)LISA_CYCLES_PER_FRAME;
+            if (pos >= (uint64_t)(LISA_CYCLES_PER_FRAME * 9 / 10))
+                status |= 0x04;  /* In vretrace (last 10% of frame) */
+        }
         status |= 0x02;  /* Bit 1: no hard memory error */
         status |= 0x01;  /* Bit 0: no soft memory error */
         return status;
@@ -1055,20 +1061,44 @@ static void via2_portb_write(uint8_t val, uint8_t ddr, void *ctx) {
 
 static uint8_t via2_portb_read(void *ctx) {
     lisa_t *lisa = (lisa_t *)ctx;
-    /* VIA2 Port B: COPS interface
+    /* VIA2 Port B: COPS interface (from Lisa OS source COPSCMD)
      * Bit 0: Data available from COPS
      * Bit 1-3: Volume control (output)
-     * Bit 4: CRDY — COPS ready for command
+     * Bit 4: (unused input, reads as 0)
      * Bit 5: Parity reset (output)
-     * Bit 6: COPS handshake (input) — toggles during data transfer
-     * Bit 7: Controller reset (output) */
+     * Bit 6: CRDY — COPS ready for command (1=ready, 0=busy processing)
+     * Bit 7: Controller reset (output)
+     *
+     * COPSCMD protocol:
+     *   1. Check CRDY=1 (ready for command)
+     *   2. Write command to port A
+     *   3. Check CRDY=1 (sanity check, should still be 1)
+     *   4. Poll 16 times for CRDY=0 (COPS accepted command)
+     *   5. When CRDY=0, set DDRA to output, spin, set back to input
+     */
     uint8_t val = 0;
 
-    val |= 0x10;  /* CRDY: always ready */
+    /* Bit 0: data available from COPS */
+    if (lisa->cops_rx.count > 0)
+        val |= 0x01;
 
-    if (lisa->cops_rx.count > 0) {
-        val |= 0x01;  /* Data available */
-        val |= 0x40;  /* Handshake: data ready (PB6) */
+    /* Bit 6: CRDY — COPS ready for command.
+     * After a command is written (via porta_write), CRDY goes low
+     * for a few port B reads, then returns high. The COPSCMD routine
+     * writes the command, does 1 sanity check (expects CRDY=1), then
+     * polls up to 16 times for CRDY=0. So we keep CRDY=1 for the
+     * first read after a command, then go to 0. */
+    if (lisa->cops_crdy_count == 0) {
+        val |= 0x40;  /* CRDY=1: ready for command (no command pending) */
+    } else {
+        /* Command was written. First read: CRDY still 1 (sanity check).
+         * Subsequent reads: CRDY=0 (COPS processing). */
+        if (lisa->cops_crdy_count == 1)
+            val |= 0x40;  /* First read after command: still 1 */
+        /* else: CRDY=0 (COPS busy — command accepted) */
+        lisa->cops_crdy_count++;
+        if (lisa->cops_crdy_count > 4)
+            lisa->cops_crdy_count = 0;  /* Reset: CRDY returns to 1 */
     }
 
     return val;
@@ -1092,6 +1122,10 @@ static void via2_porta_write(uint8_t val, uint8_t ddr, void *ctx) {
     cops_cmd_count++;
     if (cops_cmd_count <= 50)
         fprintf(stderr, "COPS CMD[%d]: $%02X\n", cops_cmd_count, val);
+
+    /* Start CRDY handshake: next port B read will see CRDY=1 (sanity),
+     * then subsequent reads see CRDY=0 (COPS accepted command). */
+    lisa->cops_crdy_count = 1;
 
     if (val >= 0x80) {
         /* NOP — high bit set commands are ignored */
@@ -1787,10 +1821,21 @@ void lisa_reset(lisa_t *lisa) {
     printf("After reset: PC=$%08X SSP=$%08X A5=$%08X\n",
            lisa->cpu.pc, lisa->cpu.ssp, lisa->cpu.a[5]);
 
-    /* Queue initial COPS data: keyboard ID so OS init can proceed */
+    /* Queue initial COPS data (keyboard ID) so the OS boot spin loop
+     * at $520842 can proceed. The spin loop polls VIA2 port B bit 0
+     * for data availability, then reads port A to get the data.
+     *
+     * We write directly to the queue WITHOUT triggering VIA2 CA1.
+     * If we used cops_enqueue, it would set CA1 in IFR, causing an
+     * immediate interrupt after INTSON. The interrupt handler can't
+     * handle COPS data yet (driver not initialized), leading to an
+     * infinite loop. By writing the queue directly, the data is
+     * available via port B polling but no interrupt fires. */
     cops_queue_init(&lisa->cops_rx);
-    cops_enqueue(&lisa->cops_rx, 0x80);  /* Reset/status indicator */
-    cops_enqueue(&lisa->cops_rx, 0x2F);  /* Keyboard ID: US layout */
+    lisa->cops_rx.queue[0] = 0x80;  /* Reset/status indicator */
+    lisa->cops_rx.queue[1] = 0x2F;  /* Keyboard ID: US layout */
+    lisa->cops_rx.count = 2;
+    lisa->cops_rx.tail = 2;
 
     lisa->running = true;
     lisa->power_on = true;

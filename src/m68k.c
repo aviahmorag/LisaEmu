@@ -503,13 +503,10 @@ static void take_exception(m68k_t *cpu, int vector) {
         static int trap6_count = 0;
         trap6_count++;
         if (trap6_count <= 5) {
-            fprintf(stderr, "TRAP6[%d] BEFORE: D0-7=$%08X $%08X $%08X $%08X $%08X $%08X $%08X $%08X\n",
-                    trap6_count,
+            fprintf(stderr, "TRAP6[%d] at PC=$%06X: D0-7=$%08X $%08X $%08X $%08X $%08X $%08X $%08X $%08X\n",
+                    trap6_count, cpu->pc,
                     cpu->d[0], cpu->d[1], cpu->d[2], cpu->d[3],
                     cpu->d[4], cpu->d[5], cpu->d[6], cpu->d[7]);
-            fprintf(stderr, "  A0-6=$%08X $%08X $%08X $%08X $%08X $%08X $%08X SP=$%08X\n",
-                    cpu->a[0], cpu->a[1], cpu->a[2], cpu->a[3],
-                    cpu->a[4], cpu->a[5], cpu->a[6], cpu->a[7]);
         }
     }
 
@@ -3406,6 +3403,8 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             cpu->total_cycles += cpu->cycles;
             continue;
         }
+
+        /* (Post-INTSON trace removed — enable for debugging) */
 
         /* Trace crash function: dump opcodes and track A6 */
         {

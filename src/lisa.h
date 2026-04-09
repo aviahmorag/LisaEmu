@@ -71,6 +71,7 @@ typedef struct {
 
     /* COPS (keyboard/mouse controller) */
     cops_queue_t cops_rx;  /* Data from COPS to CPU */
+    int          cops_crdy_count; /* Port B reads since last command (for CRDY toggle) */
     int          mouse_x, mouse_y;
     bool         mouse_button;
 
