@@ -8,112 +8,107 @@ build/lisaemu Lisa_Source                                    # cross-compiled
 build/lisaemu --image prebuilt/los_compilation_base.image   # pre-built
 ```
 
-## Where We Are: OS Init, COPS Handshake Working
+## Where We Are: OS Init Polling, Interrupt Architecture Fixed
 
-Three fixes applied this session. The OS now gets past INTSON, sends COPS
-commands, and enters the interrupt-driven scheduler phase.
+Six fixes applied this session. The interrupt architecture now matches
+the real Lisa hardware. COPS keyboard data is consumed via HLE Level 2
+handler. OS enters main init polling loop.
 
 ### Fixes Applied This Session
 
-1. **COPS data queue without CA1 trigger**: Queue keyboard ID ($80, $2F)
-   directly in cops_rx without calling cops_enqueue, which would trigger
-   VIA2 CA1 interrupt. The OS polls VIA2 port B for data availability
-   (polling), not via interrupt. This prevents an unresolvable IRQ loop
-   where the handler couldn't clear CA1 because the COPS driver wasn't
-   initialized yet.
+1. **COPS data queue without CA1 trigger**: Queue keyboard ID directly
+   in cops_rx without via_trigger_ca1. Prevents unresolvable IRQ loop.
 
-2. **COPS CRDY handshake (port B bit 6)**: Implemented proper COPSCMD
-   protocol from Lisa OS source (libhw-DRIVERS.TEXT). CRDY (bit 6) starts
-   high (ready), stays high for the first read after a command write
-   (sanity check), then goes low (COPS busy/accepted) for a few reads,
-   then returns high. Previously CRDY was tied to cops_rx.count, which
-   was always wrong.
+2. **COPS CRDY handshake (port B bit 6)**: Proper COPSCMD protocol from
+   Lisa OS source. CRDY toggles: 1→1(sanity)→0(accepted)→1(ready).
 
-3. **Vertical retrace status bit timing**: Changed status register
-   ($FCF801) bit 2 from frame-based toggle to cycle-based position within
-   the frame. Uses `total_cycles % CYCLES_PER_FRAME` to determine
-   vretrace window (last 10% of frame). Previously only toggled between
-   frames, causing the OS vretrace polling loop to hang within a frame.
+3. **Vertical retrace cycle timing**: Status register bit 2 uses
+   `total_cycles % CYCLES_PER_FRAME` for intra-frame vretrace.
+
+4. **VIA2 IRQ level = 2**: Both VIA IRQs were level 1. Now VIA1=level 1
+   (shared with vretrace) and VIA2=level 2 (COPS), matching real Lisa
+   interrupt architecture from libhw-DRIVERS.TEXT.
+
+5. **HLE Level 2 handler**: Binary's Level 2 handler at $2082D2 enters
+   an infinite init loop. HLE intercepts it, reads VIA2 port A to
+   consume COPS data, and RTEs directly.
+
+6. **Removed FORCE_UNMASK**: Was causing nested interrupts inside handlers.
+   With proper interrupt levels, it's unnecessary.
 
 ### Pre-built image status
-- Boot loader reads 199 ProFile sectors ✅
-- OS initializes with hardcoded values at $52051C ✅
-- VIA1 configured for ProFile, VIA2 for COPS ✅
-- INTSON HLE fires, lowers IPL, sets up ProFile driver ✅
-- COPS command $7C (mouse enable) sent with proper handshake ✅
-- Vretrace polling loop at $520952 works (exits/re-enters) ✅
-- **Still stuck**: OS oscillates between vretrace wait ($520952) and
-  COPS handler init code ($208Axx). The interrupt handler runs COPS
-  init code (copies ROM data, sets up driver tables) and includes
-  vretrace waits. Exits via RTE at $520464 to COPS dispatch at $208Axx.
-  System cycles through this but doesn't complete COPS init.
+- Boot → OS → MMU → VIAs → INTSON → COPS $7C → Level 2 HLE ✅
+- Keyboard ID ($80, $2F) consumed by HLE COPS handler ✅
+- **Still stuck**: OS enters vretrace polling loop at $520952. The loop
+  exits periodically (every ~13K instructions when vretrace bit toggles)
+  but an outer loop keeps re-entering it. The OS is in main init
+  polling, waiting for something.
 
-### Key discovery: COPSCMD protocol
-From Lisa OS source `LISA_OS/LIBS/LIBHW/libhw-DRIVERS.TEXT`:
-- D2 = 6 (CRDY bit number — bit 6 of port B, NOT bit 4)
-- Write command to IORA2 (register $0F = ORA no-handshake)
-- Check CRDY=1 (sanity), then poll 16× for CRDY=0 (accepted)
-- Set DDRA to output, spin 10 cycles, set back to input
-- The OS uses vretrace-timed polling loops for COPS status
+### Lisa interrupt architecture (from source)
+```
+Level 1 ($0064 = $5208A6):
+  1. Check StatusRegister+1 bit 2 → VertRetrace handler
+  2. Check VIA1 IFR bit 6 → Timer1 (20ms tick, alarms)
+  3. Check VIA1 IFR & IER & $22 → ProFile I/O (CA1/Timer2)
+  4. Check VIA2 PORTB bit 4 → Twiggy floppy
+  5. Check VIA1 IER bit 2 → Shift register alarm
+  6. RTE
 
-## Immediate Next Step: COPS Driver Init Completion
+Level 2 ($0068 = $2082D2):
+  1. Save D0, raise IPL to 5
+  2. Check VIA2 IFR bit 1 (CA1) → COPS handler
+  3. Read VIA2 port A → COPS byte
+  4. Dispatch: $00=mouse, $80=reset, else=keycode
+  5. ENABLE, RTE
+```
 
-The system is in the COPS interrupt handler initialization phase. It
-copies ROM code to RAM, sets up driver dispatch tables, and processes
-COPS data from an internal buffer. To advance:
+## Immediate Next Step: Main Init Polling Loop
+
+The OS polls in a loop at $5207FE-$520822 with vretrace waits:
+```
+$5207FE: MOVE.B $xxxx.L,D0    ; read status byte
+$520804: BTST #n,D0            ; test a bit
+$520808: BEQ.S +4              ; skip if clear
+$52080A: JSR $520964            ; call handler if set
+...
+$52081C: MOVE.W (SP)+,SR       ; restore SR
+$52081E: MOVEM.L (SP)+,regs    ; restore regs
+$520822: RTS                    ; return (to scheduler?)
+```
 
 ### Investigation needed
-1. **Why does COPS init take so many frames?** The handler copies data
-   with DBRA loops ($208AF6: MOVE.L (A0)+,(A1)+ / DBRA D1,...). These
-   run for many iterations. Check if the copy length is correct or if
-   it's reading invalid data/addresses.
+1. **What status byte at $5207FE?** Decode the MOVE.B absolute long
+   address to find which I/O register or memory location is checked.
+   This tells us what event the OS is waiting for.
 
-2. **VIA2 port A reads**: The handler NEVER reads VIA2 port A to get
-   COPS data. It processes data from internal buffers at $208Axx. The
-   queued keyboard ID ($80, $2F) is never consumed. This may be correct
-   (the interrupt handler would read port A in the Level 2 interrupt
-   handler, but Level 2 doesn't fire because VIA2 CA1 was never set).
+2. **VIA1 Timer1**: The Level 1 handler checks Timer1, but VIA1 Timer1
+   is NOT running (t1_run=0). The OS might need Timer1 for 20ms ticks.
+   Check if the OS init code starts Timer1, or if the INTSON HLE needs
+   to start it.
 
-3. **COPS response to $7C**: The mouse enable command ($7C) gets no
-   response queued. On the real Lisa, COPS just starts sending mouse
-   delta data. The handler may be waiting for the first COPS interrupt
-   (VIA2 CA1) to confirm the mouse is active. We may need to trigger
-   CA1 with a mouse-ready response after the $7C command.
+3. **Level 1 interrupt delivery**: With vretrace IRQ pulsing after
+   frame 200, Level 1 should fire. Check if the Level 1 handler at
+   $5208A6 runs correctly (checks vretrace, Timer1, ProFile).
 
-4. **Check if the COPS init ever completes**: The handler code at
-   $208Axx processes bytes from a buffer (CMP.B #$0D at $208A78).
-   It may be walking through a driver table. Check if it terminates
-   or loops due to bad data.
+4. **ProFile driver response**: The OS might poll for ProFile I/O
+   completion via VIA1 CA1. If ProFile never responds (no BSY
+   transitions), the OS waits forever.
 
 ### Key addresses
 ```
-$520952  Vretrace polling loop (MOVE.L D0,$FCE018; BTST #2,$FCF801)
-$520464  RTE from exception handler
-$208A06  Entry to COPS dispatch (MOVEM.L regs,-(SP))
-$208AF6  COPS data copy loop (MOVE.L (A0)+,(A1)+ / DBRA D1,...)
-$2089C4  Handler registration check (CMPA.L $0094,A0)
-$204016  COPS driver entry ($498)
-$208390  ProFile driver entry ($494)
+$520952  Vretrace polling loop (main init)
+$5207FE  Status byte check (what is it reading?)
+$520464  RTE from init polling handler
+$2082D2  Level 2 handler (HLE'd — consumes COPS data)
+$5208A6  Level 1 handler (vretrace + VIA1)
 ```
 
-### VIA2 port B bit assignments (from Lisa OS source)
+## Boot Sequence Achieved
 ```
-Bit 0: Data available from COPS (1=data ready)
-Bit 6: CRDY — COPS ready for command (1=ready, 0=busy)
-       (NOT bit 4 as previously assumed)
-```
-
-## Session Summary
-
-### Critical fixes:
-- COPS data queue without CA1 → prevents unresolvable IRQ loop
-- COPS CRDY handshake on bit 6 → COPSCMD protocol works
-- Vretrace cycle-based timing → polling loop exits within frames
-
-### Boot sequence achieved:
-```
-Pre-built: ROM → LDPROF → SYSTEM.LLD → SYSTEM.OS → MMU setup →
-           INTSON → COPS $7C → Vretrace wait → Handler init ✅
-           But: COPS handler init loops, doesn't complete
-Cross-compiled: ROM → PASCALINIT → INITSYS → POOL_INIT → Deep init ✅
+Pre-built: ROM → boot loader → SYSTEM.LLD + SYSTEM.OS →
+           MMU setup (TRAP #6) → VIA1/VIA2 config →
+           INTSON (IPL→0) → COPS $7C (mouse enable) →
+           Level 2 IRQ → HLE reads keyboard ID ($80,$2F) →
+           Main init polling (vretrace wait loop) ✅
+           Stuck at: vretrace polling, waiting for next event
 ```
