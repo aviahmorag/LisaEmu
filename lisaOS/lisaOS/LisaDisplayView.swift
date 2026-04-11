@@ -24,6 +24,10 @@ final class LisaDisplayNSView: NSView {
     }
 
     override func keyDown(with event: NSEvent) {
+        // Drop OS-level auto-repeats. Lisa OS generates its own key-repeats
+        // from RepeatTable in libhw-KEYBD, so forwarding macOS repeats would
+        // compound them and fill the screen on a single keypress.
+        if event.isARepeat { return }
         viewModel?.keyDown(event.keyCode)
     }
 

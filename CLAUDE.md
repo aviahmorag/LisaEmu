@@ -72,31 +72,44 @@ cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' bui
 
 ## Current Status
 
-**Toolchain (source → image pipeline)** — green:
+**Prebuilt-image boot — WORKING (interactive Lisabug shell).** Running
+the Xcode macOS app with `prebuilt/los_compilation_base.image` boots
+the real Lisa OS far enough to drop into the Lisabug debugger prompt,
+paints to the framebuffer, and accepts live keyboard input via native
+`NSView.keyDown`. The CPU decoder bug that caused earlier Level 7
+crashes on `BSET Dn,<ea>` has been fixed in `src/m68k.c:~2507` (the
+group-0 dynamic-bit dispatch now accepts bits 7:6 == 11 for BSET).
+Keyboard mapping uses authoritative Lisa keycodes from
+`Lisa_Source/LISA_OS/LIBS/LIBHW/LIBHW-LEGENDS.TEXT` (Final US layout).
+Key auto-repeat is filtered via `event.isARepeat` in
+`LisaDisplayView.swift` — Lisa OS runs its own repeat timer from
+`libhw-KEYBD` `RepeatTable`, so forwarding macOS repeats would
+compound them.
+
+**Toolchain (source → image pipeline)** — green but does NOT yet boot
+end-to-end:
 
 - Parser: **100%** (317/317 Pascal files)
 - Assembler: **100%** (103/103)
 - Linker: **Link OK: YES**, 8527/8527 symbols resolved, 2.2 MB output,
-  97.2% of JSR abs.L targets point at real code (up from 89.4%)
+  97.2% of JSR abs.L targets point at real code
 - `build/lisaemu Lisa_Source` runs the full pipeline: compiles from
   `Lisa_Source/`, writes `build/lisa_profile.image` (5.1 MB, 58 files,
   9728 blocks) + `build/lisa_boot.rom`, plus a raw
   `build/lisa_linked.bin` (870 KB) for offline disassembly, then starts
-  executing the compiled 68000 code. Early-boot TRAPs 37/39 (OS syscall
-  + HW driver dispatcher) take the real handlers; TRAP #6 (MMU
-  accessor) takes an RTE stub at `$3F8` because `do_an_mmu` is
-  runtime-installed by `ENTEROP` and that sequence hasn't been brought
-  up from our compiled build yet. The CPU runs past the TRAPs without
-  crashing and ends up looping inside `libfp-FPMODES` around
-  `PC=$097A**` — next blocker is either re-enabling HLE TRAP #6 for
-  the compile-from-source path or proving ENTEROP runs and installs
-  the real vector.
+  executing the compiled 68000 code. Early-boot TRAPs 37/39 take the
+  real handlers; TRAP #6 (MMU accessor) currently hits an RTE stub at
+  `$3F8`. CPU then spins in `libfp-FPMODES` around `PC=$097A**` with
+  a pattern that strongly suggests Pascal codegen is loading a VAR
+  pointer as 16-bit (`MOVE.W 8(A6),D0 / MOVEA.L D0,A0 / MOVE.W
+  (A0),D0`) and truncating it. Separate track from the prebuilt-boot
+  work — many codegen bugs likely remain.
 
-**Emulator core** — verified end-to-end against the prebuilt test
-fixture (`prebuilt/los_compilation_base.image`): CPU, MMU,
-VIA1/VIA2, COPS, keyboard, video, interrupts, exception dispatch and
-TRAP #5 HW-interface dispatcher all work; a pressed key reaches the
-Lisa OS event queue and drives visible framebuffer updates.
+**Emulator core** — verified end-to-end against the prebuilt fixture:
+CPU, MMU, VIA1/VIA2, COPS, keyboard, video, interrupts, exception
+dispatch, TRAP #5 HW-interface dispatcher, Lisabug debugger shell all
+work. First macOS-native interactive boot with live keyboard as of
+this session.
 
 See `NEXT_SESSION.md` (gitignored) for the live handoff and
 `.claude-handoffs/` for per-session archives.

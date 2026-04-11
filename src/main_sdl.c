@@ -18,61 +18,77 @@
 static lisa_t lisa;
 
 /* Map SDL scancodes to Lisa keycodes */
+/* Lisa physical keycodes from Lisa_Source/LISA_OS/LIBS/LIBHW/LIBHW-LEGENDS.TEXT
+ * (Final US layout, Primary section, keycodes $20-$7F). */
 static int sdl_to_lisa_key(SDL_Scancode sc) {
     switch (sc) {
-        case SDL_SCANCODE_A: return 0x42;
-        case SDL_SCANCODE_B: return 0x5A;
-        case SDL_SCANCODE_C: return 0x6A;
-        case SDL_SCANCODE_D: return 0x57;
-        case SDL_SCANCODE_E: return 0x32;
-        case SDL_SCANCODE_F: return 0x58;
-        case SDL_SCANCODE_G: return 0x59;
-        case SDL_SCANCODE_H: return 0x44;
-        case SDL_SCANCODE_I: return 0x45;
-        case SDL_SCANCODE_J: return 0x5C;
-        case SDL_SCANCODE_K: return 0x5D;
-        case SDL_SCANCODE_L: return 0x5B;
-        case SDL_SCANCODE_M: return 0x5F;
-        case SDL_SCANCODE_N: return 0x5E;
-        case SDL_SCANCODE_O: return 0x36;
-        case SDL_SCANCODE_P: return 0x46;
-        case SDL_SCANCODE_Q: return 0x30;
-        case SDL_SCANCODE_R: return 0x33;
-        case SDL_SCANCODE_S: return 0x56;
-        case SDL_SCANCODE_T: return 0x34;
-        case SDL_SCANCODE_U: return 0x43;
-        case SDL_SCANCODE_V: return 0x6B;
-        case SDL_SCANCODE_W: return 0x31;
-        case SDL_SCANCODE_X: return 0x69;
-        case SDL_SCANCODE_Y: return 0x35;
-        case SDL_SCANCODE_Z: return 0x68;
+        case SDL_SCANCODE_A: return 0x70;
+        case SDL_SCANCODE_B: return 0x6E;
+        case SDL_SCANCODE_C: return 0x6D;
+        case SDL_SCANCODE_D: return 0x7B;
+        case SDL_SCANCODE_E: return 0x60;
+        case SDL_SCANCODE_F: return 0x69;
+        case SDL_SCANCODE_G: return 0x6A;
+        case SDL_SCANCODE_H: return 0x6B;
+        case SDL_SCANCODE_I: return 0x53;
+        case SDL_SCANCODE_J: return 0x54;
+        case SDL_SCANCODE_K: return 0x55;
+        case SDL_SCANCODE_L: return 0x59;
+        case SDL_SCANCODE_M: return 0x58;
+        case SDL_SCANCODE_N: return 0x6F;
+        case SDL_SCANCODE_O: return 0x5F;
+        case SDL_SCANCODE_P: return 0x44;
+        case SDL_SCANCODE_Q: return 0x75;
+        case SDL_SCANCODE_R: return 0x65;
+        case SDL_SCANCODE_S: return 0x76;
+        case SDL_SCANCODE_T: return 0x66;
+        case SDL_SCANCODE_U: return 0x52;
+        case SDL_SCANCODE_V: return 0x6C;
+        case SDL_SCANCODE_W: return 0x77;
+        case SDL_SCANCODE_X: return 0x7A;
+        case SDL_SCANCODE_Y: return 0x67;
+        case SDL_SCANCODE_Z: return 0x79;
 
-        case SDL_SCANCODE_1: return 0x20;
-        case SDL_SCANCODE_2: return 0x21;
-        case SDL_SCANCODE_3: return 0x22;
-        case SDL_SCANCODE_4: return 0x23;
-        case SDL_SCANCODE_5: return 0x24;
-        case SDL_SCANCODE_6: return 0x25;
-        case SDL_SCANCODE_7: return 0x27;
-        case SDL_SCANCODE_8: return 0x2A;
-        case SDL_SCANCODE_9: return 0x28;
-        case SDL_SCANCODE_0: return 0x2B;
+        case SDL_SCANCODE_1: return 0x74;
+        case SDL_SCANCODE_2: return 0x71;
+        case SDL_SCANCODE_3: return 0x72;
+        case SDL_SCANCODE_4: return 0x73;
+        case SDL_SCANCODE_5: return 0x64;
+        case SDL_SCANCODE_6: return 0x61;
+        case SDL_SCANCODE_7: return 0x62;
+        case SDL_SCANCODE_8: return 0x63;
+        case SDL_SCANCODE_9: return 0x50;
+        case SDL_SCANCODE_0: return 0x51;
+
+        case SDL_SCANCODE_MINUS:        return 0x40;
+        case SDL_SCANCODE_EQUALS:       return 0x41;
+        case SDL_SCANCODE_BACKSLASH:    return 0x42;
+        case SDL_SCANCODE_LEFTBRACKET:  return 0x56;
+        case SDL_SCANCODE_RIGHTBRACKET: return 0x57;
+        case SDL_SCANCODE_SEMICOLON:    return 0x5A;
+        case SDL_SCANCODE_APOSTROPHE:   return 0x5B;
+        case SDL_SCANCODE_COMMA:        return 0x5D;
+        case SDL_SCANCODE_PERIOD:       return 0x5E;
+        case SDL_SCANCODE_GRAVE:        return 0x68;
 
         case SDL_SCANCODE_RETURN:    return 0x48;
-        case SDL_SCANCODE_ESCAPE:    return 0x00;
-        case SDL_SCANCODE_BACKSPACE: return 0x2D;
-        case SDL_SCANCODE_TAB:       return 0x30;
-        case SDL_SCANCODE_SPACE:     return 0x6E;
+        case SDL_SCANCODE_ESCAPE:    return 0x20;  /* Clear */
+        case SDL_SCANCODE_BACKSPACE: return 0x45;
+        case SDL_SCANCODE_TAB:       return 0x78;
+        case SDL_SCANCODE_SPACE:     return 0x5C;
 
-        case SDL_SCANCODE_LSHIFT: return 0x70;
-        case SDL_SCANCODE_RSHIFT: return 0x71;
-        case SDL_SCANCODE_LALT:   return 0x72;
-        case SDL_SCANCODE_LGUI:   return 0x74;
+        case SDL_SCANCODE_LSHIFT: return 0x7E;
+        case SDL_SCANCODE_RSHIFT: return 0x7E;
+        case SDL_SCANCODE_CAPSLOCK: return 0x7D;
+        case SDL_SCANCODE_LALT:   return 0x7C;  /* L-Option */
+        case SDL_SCANCODE_RALT:   return 0x7C;
+        case SDL_SCANCODE_LGUI:   return 0x7F;  /* Command */
+        case SDL_SCANCODE_RGUI:   return 0x7F;
 
-        case SDL_SCANCODE_LEFT:  return 0x01;
-        case SDL_SCANCODE_RIGHT: return 0x02;
-        case SDL_SCANCODE_DOWN:  return 0x03;
-        case SDL_SCANCODE_UP:    return 0x04;
+        case SDL_SCANCODE_LEFT:  return 0x22;
+        case SDL_SCANCODE_RIGHT: return 0x23;
+        case SDL_SCANCODE_DOWN:  return 0x2B;
+        case SDL_SCANCODE_UP:    return 0x27;
 
         default: return -1;
     }

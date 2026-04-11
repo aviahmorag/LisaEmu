@@ -2505,8 +2505,9 @@ static void execute_one(m68k_t *cpu) {
     switch ((op >> 12) & 0xF) {
         case 0x0:
             /* Bit manipulation, MOVEP, immediate */
-            if ((op & 0x0100) && ((op & 0x00C0) != 0x00C0)) {
-                /* Dynamic bit ops or MOVEP */
+            if (op & 0x0100) {
+                /* Dynamic bit ops (BTST/BCHG/BCLR/BSET Dn,<ea>) or MOVEP.
+                 * MOVEP has mode field = 001 (An indirect with disp). */
                 if ((op & 0x0038) == 0x0008) {
                     op_movep(cpu);
                 } else {

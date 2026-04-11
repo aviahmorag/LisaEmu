@@ -1994,10 +1994,14 @@ int lisa_run_frame(lisa_t *lisa) {
             }
         }
 
+        /* VIA 6522 is clocked at Φ2 = CPU/10 (≈500 kHz on a 5 MHz Lisa).
+         * Accumulate CPU cycles, then pass VIA cycles (/10) to via_tick,
+         * keeping the remainder so we don't lose fractional ticks. */
         if (via_tick_accum >= 10) {
-            via_tick(&lisa->via1, via_tick_accum);
-            via_tick(&lisa->via2, via_tick_accum);
-            via_tick_accum = 0;
+            int via_cycles = via_tick_accum / 10;
+            via_tick(&lisa->via1, via_cycles);
+            via_tick(&lisa->via2, via_cycles);
+            via_tick_accum -= via_cycles * 10;
         }
     }
 
@@ -2362,10 +2366,6 @@ int lisa_run_frame(lisa_t *lisa) {
                              ((uint32_t)lisa->mem.ram[0x85] << 16) |
                              ((uint32_t)lisa->mem.ram[0x86] << 8) |
                              lisa->mem.ram[0x87];
-        uint32_t trap2_vec = ((uint32_t)lisa->mem.ram[0x88] << 24) |
-                             ((uint32_t)lisa->mem.ram[0x89] << 16) |
-                             ((uint32_t)lisa->mem.ram[0x8A] << 8) |
-                             lisa->mem.ram[0x8B];
         uint32_t int1_vec = ((uint32_t)lisa->mem.ram[0x64] << 24) |
                             ((uint32_t)lisa->mem.ram[0x65] << 16) |
                             ((uint32_t)lisa->mem.ram[0x66] << 8) |
@@ -2712,16 +2712,6 @@ static bool hle_handle_system_error(lisa_t *lisa __attribute__((unused)), m68k_t
     fprintf(stderr, "SYSTEM_ERROR(%d): HALTING CPU\n", err_code);
     cpu->stopped = true;
     return true;
-}
-
-/* Reverse the 9:1 ProFile interleave used by LDPROF.TEXT.
- * LDPROF interleave table (low nibble): {0,5,10,15,4,9,14,3,8,13,2,7,12,1,6,11}
- * This function reverses it: given an interleaved sector, returns the logical sector. */
-static uint32_t profile_deinterleave(uint32_t sector) {
-    /* Reverse table: for forward[i]=v, reverse[v]=i */
-    static const int reverse[16] = {0,13,10,7,4,1,14,11,8,5,2,15,12,9,6,3};
-    uint32_t low4 = sector & 0x0F;
-    return (sector & ~0x0FU) | reverse[low4];
 }
 
 /* prof_entry intercept — read a ProFile block directly from disk image.
