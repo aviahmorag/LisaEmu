@@ -319,24 +319,51 @@ void lisa_mem_write16(lisa_mem_t *mem, uint32_t addr, uint16_t val) {
 
     /* HLE: Bypass Lisabug auto-entry on dev-disk boots.
      *
+     * SCAFFOLDING FOR PREBUILT-IMAGE SMOKE TESTS ONLY. Does not belong
+     * in the source-compile path — that flow will not link SYSTEM.DEBUG
+     * at all. Narrowly gated on dev-disk boots of los_compilation_base.
+     *
      * Lisa OS installs `JMP macsbug` at low-memory address $234 via
      * INIT_NMI_TRAPV (see source-NMIHANDLER.TEXT line 239:
      *     move.w  #$4ef9,enter_macsbug  ; where enter_macsbug .equ $234
-     * ). Every Pascal `MACSBUG;` call in the kernel (DB_INIT,
-     * SYSTEM_ERROR paths, debug assertions) does JSR $234 which then
-     * jumps to Lisabug.
+     * ).
      *
-     * On the los_compilation_base.image dev disk, Lisabug is enabled
-     * and fires immediately on boot, making the OS unreachable. We
-     * replace the installed JMP opcode with RTS ($4E75) so every
-     * JSR $234 returns immediately to its caller. The address bytes
-     * at $236..$239 become dead data (RTS doesn't reach them).
+     * The real Lisabug entry path is NOT Pascal `MACSBUG;` → `JSR $234`
+     * (there is no such direct JSR). Pascal `MACSBUG;` compiles to
+     * `JSR macsbug` where macsbug is the assembly routine in
+     * source-NMIHANDLER.TEXT:262. That routine sets up a synthetic
+     * level-7 exception frame on the supervisor stack (via `trap #7`
+     * from the userstate path, or explicit `move.w sr,-(sp)` from the
+     * supstate path) and ends with `jmp enter_macsbug` — i.e., `jmp $234`
+     * — from the `its_enabled` path in `lisabugentry`. The comment
+     * above `lisabugentry` in the OS source is literal:
+     *     ";IF Lisabug exists, emulate a level 7 interrupt to get there"
      *
-     * The NMI-button path (`jmp enter_macsbug` from nmi_handler)
-     * would be broken by this (RTS with no pushed return PC), but
-     * we never emulate the NMI button, so it's unreachable. */
+     * So by the time CPU executes whatever is at $234, the supervisor
+     * stack has (top) SR word, (next) PC longword — a real exception
+     * frame. The correct bypass is RTE ($4E73), which pops SR+PC (6
+     * bytes) and returns to the Pascal caller cleanly.
+     *
+     * A previous iteration of this bypass used RTS ($4E75), which only
+     * pops 4 bytes as PC — that popped SR + first-half-of-PC as garbage
+     * and broke the return. That bug led to the mistaken conclusion
+     * that Lisabug was being entered via some other path (like
+     * `hard_excep`/`pmacsbug` directly); in reality no exception ever
+     * fires on the dev-disk boot — per-vector first-fire instrumentation
+     * in src/m68k.c:take_exception confirms only v37/v38 hit.
+     *
+     * Root cause of the on-screen "Level 7 Interrupt" banner: it is
+     * Lisabug's own header text, drawn after being entered through this
+     * synthetic-exception path — not from any real CPU interrupt.
+     * The actual entry trigger is SOURCE-STARTUP.TEXT:302 (DB_INIT),
+     * the deliberate Workshop developer breakpoint. */
     if (addr == 0x234 && val == 0x4EF9) {
-        val = 0x4E75;  /* RTS */
+        static int bp_logged = 0;
+        if (!bp_logged++) {
+            fprintf(stderr, "[HLE] $234 JMP→RTE intercept installed "
+                    "(Lisabug auto-entry bypass)\n");
+        }
+        val = 0x4E73;  /* RTE — matches synthetic level-7 frame */
     }
 
     /* Check for MMU register writes during start mode.

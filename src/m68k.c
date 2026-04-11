@@ -3526,6 +3526,34 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         cpu->cycles = 0;
         uint32_t sp_before = cpu->a[7];
         uint32_t pc_before = cpu->pc;
+
+        /* HLE: Lisabug auto-entry bypass — execution-time.
+         *
+         * See src/lisa_mmu.c $234 write-intercept comment for context.
+         * The write-time intercept doesn't always catch INIT_NMI_TRAPV
+         * (depends on whether it runs through lisa_mem_write16), so we
+         * belt-and-braces it here: any time PC reaches $234 (target of
+         * `jmp enter_macsbug` from source-NMIHANDLER.TEXT lisabugentry),
+         * synthesize an RTE directly. The supervisor stack has SR+PC
+         * pushed as a fake level-7 exception frame by lisabugentry
+         * ("emulate a level 7 interrupt to get there" — NMIHANDLER:311)
+         * so RTE cleanly returns to the Pascal caller of MACSBUG.
+         *
+         * Scoped to prebuilt Workshop images; source-compiled boots
+         * won't link SYSTEM.DEBUG and won't hit this path. */
+        if ((cpu->pc & 0xFFFFFF) == 0x234) {
+            static int hle_count = 0;
+            if (hle_count++ < 3) {
+                fprintf(stderr, "[HLE] Lisabug auto-entry bypass #%d: "
+                        "PC=$234 → synthesize RTE (SSP=$%08X)\n",
+                        hle_count, cpu->a[7]);
+            }
+            op_rte(cpu);
+            cpu->cycles = 20;
+            cpu->total_cycles += cpu->cycles;
+            continue;
+        }
+
         execute_one(cpu);
         if (cpu->cycles == 0) cpu->cycles = 4; /* minimum */
         cpu->total_cycles += cpu->cycles;
