@@ -108,22 +108,62 @@ prompt eventually lands on a `*** SYSTEM ERROR 10738 ***`
 (`stup_find_boot`, `SOURCE-CD.TEXT:70`) but that is a downstream
 consequence of Lisabug's Go-path, not the initial "crash".
 
-**Remaining mystery**: *which* Lisa OS / Workshop Lisabug code path
-draws the register dump to the framebuffer during process #4
-creation. It is not an exception handler (none fire). Most likely
-Workshop Lisabug installs a developer-entry breakpoint and Pascal
-code calls into `showregs`/`pmacsbug` directly. Finding that call
-site is the next root-cause step. An obvious technique: instrument
-framebuffer writes landing in the Lisabug text region with a PC
-breakpoint, capture the call chain the first time "Level 7
-Interrupt" bytes get written.
+**Source of the banner**: Correlating the CPU register state at
+`SP DELTA: $000FD914 → $00000450 at PC=$20820C op=$4FF8` with the
+on-screen register dump proves Lisabug is drawn by the code at
+`$208xxx`. Every register in the displayed dump
+(`D0=00522014 A0=001027F2 A5=000FFEE0 A6=000FD9FC`) matches the
+CPU state at that moment exactly. The code at `$208xxx` is reached
+via `$520464 → $208752 → $2081F4..$20820C` — i.e., from the
+TRAP #5 HW-interface dispatcher with a specific selector, NOT via
+`jmp enter_macsbug` ($234). Lisabug has been loaded into an MMU
+segment (LOADSEG from SYSTEM.DEBUG in `source-LOADER.TEXT:869`)
+and its code mapped into virtual `$208xxx`, entered via a TRAP #5
+selector, not via the low-memory `$234` trampoline.
 
-Attempted bypass from a prior session: `src/lisa_mmu.c:lisa_mem_write16`
-intercepts writes of `$4EF9` (JMP abs.L opcode) to `$234` and
-replaces with `$4E75` (RTS). That blocks the Pascal-level
-`MACSBUG;` path via `enter_macsbug .equ $234` but did not stop the
-on-screen banner — consistent with the banner coming from a
-different Lisabug entry point.
+The entry trigger is `SOURCE-STARTUP.TEXT:302` — `DB_INIT` procedure
+has `MACSBUG;` gated by `if debugmode then`, the intentional
+Workshop developer-entry breakpoint ("Mend your (debugging) fences
+now."). After the banner draws, Lisa OS is idle in Lisabug's
+keyboard-and-mouse-poll loop (`TRAP5-SEL: d7=148×N d7=158×N`
+alternating) waiting for the user to type `G`.
+
+**Existing bypass infrastructure (both gated, both harmless, both
+currently ineffective on this image)**:
+
+- `src/lisa_mmu.c:lisa_mem_write16` intercepts writes of `$4EF9`
+  (JMP abs.L opcode) to `$234` and replaces with `$4E73` (RTE —
+  correct per `NMIHANDLER:311 lisabugentry` comment "emulate a
+  level 7 interrupt to get there", which pushes SR+PC as a
+  synthetic exception frame; RTE pops both, RTS was wrong).
+  Commit `cae21c9`. Does NOT fire in practice on this image —
+  Lisa OS never writes `$4EF9` to `$234` on this boot path.
+- `src/m68k.c:m68k_execute` belt-and-braces fetch-time intercept:
+  when `PC == $234`, call `op_rte(cpu)` directly and skip decode.
+  Also does NOT fire — CPU never reaches `$234` at all in either
+  sandbox or native, confirming the MACSBUG call path does not go
+  through the low-memory trampoline on this image.
+
+**What actually blocks desktop reachability on this track:**
+1. Lisa OS enters Lisabug at DB_INIT. Lisabug's G-resume loop is
+   broken in our emu — per prior session, three G's land on
+   SYSTEM ERROR 10738 (`stup_find_boot`). Lisabug therefore holds
+   execution forever, blocking STARTUP completion and any
+   user-process launch (APEW/APDM).
+2. Cleanest fix: runtime-zero `lb_enabled` in sysglobal so
+   `NMIHANDLER:lisabugentry` takes its own RTE path (line 319) on
+   every MACSBUG call. Needs the physical address of `lb_enabled`,
+   findable either from `Lisa_Source/LISA_OS/Linkmaps 3.0/` or by
+   hooking the write store `lb_enabled := lb_loaded;` in
+   `STARTUP:2159` and snapshotting the target address.
+3. Even after that, this is still the **Workshop** dev disk —
+   Lisa OS will boot to APEW (Environments Window) first, not
+   straight to APDM Desktop. Getting to the Office Desktop from
+   APEW is a separate interaction (or requires a non-Workshop
+   image).
+4. Unknown unknowns past APEW — no prior run has exercised user
+   process launch / APDM load / desktop UI draw paths in our
+   emulator.
 
 Fixes landed this session (all in one commit + one pending):
 
@@ -166,7 +206,8 @@ Fixes landed this session (all in one commit + one pending):
   frames. Used for fast sandbox baseline runs vs native Xcode.
 
 **Toolchain (source → image pipeline)** — green but does NOT yet boot
-end-to-end:
+end-to-end. **This is the real product track** — the prebuilt-image
+work above is a validation fixture for the emulator core.
 
 - Parser: **100%** (317/317 Pascal files)
 - Assembler: **100%** (103/103)
@@ -178,11 +219,22 @@ end-to-end:
   `build/lisa_linked.bin` (870 KB) for offline disassembly, then starts
   executing the compiled 68000 code. Early-boot TRAPs 37/39 take the
   real handlers; TRAP #6 (MMU accessor) currently hits an RTE stub at
-  `$3F8`. CPU then spins in `libfp-FPMODES` around `PC=$097A**` with
-  a pattern that strongly suggests Pascal codegen is loading a VAR
-  pointer as 16-bit (`MOVE.W 8(A6),D0 / MOVEA.L D0,A0 / MOVE.W
-  (A0),D0`) and truncating it. Separate track from the prebuilt-boot
-  work — many codegen bugs likely remain.
+  `$3F8`. CPU then spins in `libfp-FPMODES` around `PC=$097A**`.
+
+**Blocker**: Pascal codegen bug. The spin pattern
+`MOVE.W 8(A6),D0 / MOVEA.L D0,A0 / MOVE.W (A0),D0` strongly suggests
+VAR parameters are being loaded as 16-bit pointers (truncating the
+high half of the address) instead of the correct 32-bit load. Fix
+site is in `src/toolchain/pascal_codegen.c` — VAR param dereference
+emission. Likely more codegen bugs follow this one.
+
+**Why this track matters more**: our toolchain does not link
+SYSTEM.DEBUG, so source-compiled boots have **no Lisabug in the way
+at all**. Boot goes straight through kernel init → STARTUP → APEW →
+Desktop (APDM) without the Workshop developer breakpoint that
+dominates the prebuilt-image path. Every codegen bug fixed here
+moves the shipping product forward; Lisabug bypass work on the
+prebuilt image gets thrown away.
 
 **Emulator core** — verified end-to-end against the prebuilt fixture:
 CPU, MMU, VIA1/VIA2, COPS, keyboard, video, interrupts, exception
