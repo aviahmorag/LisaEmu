@@ -182,13 +182,37 @@ sheet.
 
 **So the real blockers now are two emulator-side divergences, not
 Lisabug anymore:**
-1. **`PC=$302790 op=$4FBC`** — find who JSR/JMPs to `$302790`
-   expecting code and what they thought was there. Likely one of:
-   (a) a procedure call with a miscomputed target (Pascal JSR
-   long constant), (b) an RTS popping a bad return address, or
-   (c) an MMU segment mapping that's wrong so we read one
-   segment's data while the code expects another. PC ring buffer
-   at the moment of the illegal will reveal the caller instantly.
+1. **`PC=$302790 op=$4FBC`** — **forensic dump captured this session**
+   via new `[V4-TARGET]` one-shot instrumentation in `src/m68k.c`
+   main dispatch loop (fires pre-dispatch when `PC==$302790`).
+   PC ring proves this is a **sequential fall-through**, not a
+   miscomputed jump or corrupted RTS target:
+   ```
+   [55] $302720  UNLK A6            ─┐ caller function
+   [56] $302722  MOVE.L (A7)+, SP   │ epilogue (pop params
+   [57] $302724  RTS                ─┘  then RTS)
+   [58] $30278A  CLR.B D7              ← clean return here
+   [59] $30278C  BRA $3027A0           skip to test
+   [60] $3027A0  CMPI.B #imm, D7       test
+   [61] $3027A4  BLE.S $30278E         loop back
+   [62] $30278E  EXT.W D7              loop body start
+   [63] $302790  $4FBC  ← ILLEGAL
+   ```
+   Textbook Pascal `for D7 := 0 to N do` codegen with a valid
+   structure. SSP=$00F7EB24, USP=$00F7EADA — plenty of headroom,
+   no stack corruption. Ruled out: (a) miscomputed JSR target,
+   (b) RTS to garbage. Remaining hypothesis: **MMU returns wrong
+   bytes for virtual `$302790`**, or physical RAM at the mapped
+   address was corrupted by an earlier errant write. `$4FBC` is
+   genuinely illegal on 68000 (not LEA, CHK, MOVEM, or any 68020
+   extension — verified against all group-4 decodings). Loop body
+   from `$302790` onward contains `$4FBC $000C $2007 $E340 $39BC
+   $0001 $0070 $5207` — likely corrupt, not just one bad word.
+   **Next instrumentation** (in place): `lisa_dump_mmu_for_vaddr()`
+   in `src/lisa.c` walks all 5 MMU contexts for segment 24, prints
+   SLR/SOR/changed, physical base, and raw physical bytes
+   alongside virtual-read bytes. Called from the `[V4-TARGET]`
+   block in `src/m68k.c`. Rerun needed to collect the mapping.
 2. **`PC=$2E007C ir=$2C56`** — the A7 nuke is in Lisa OS's
    exception-handler reentry path. Probably a secondary issue
    caused by (1), but could be its own bug.
@@ -235,6 +259,23 @@ Fixes landed this session (all in one commit + one pending):
 - `src/main_sdl.c` has `--headless [frames]` mode that skips SDL
   init and runs the emulator loop printing CPU state every 50
   frames. Used for fast sandbox baseline runs vs native Xcode.
+  **Known limitation**: headless boot of `los_compilation_base.image`
+  reaches Lisabug's transient register-dump routine at `$20820C`
+  once via TRAP5 very early, then settles into the COPS polling
+  loop (`$520xxx`) indefinitely without triggering DB_INIT's
+  MACSBUG. v=39 TRAP #7 and the `$234` JMP→RTE intercept never
+  fire in headless, so the `$302790` divergence is only reachable
+  via the native Xcode app (user-driven G+Return at the Lisabug
+  prompt). Sandbox-vs-native timing divergence is a separate
+  bug, not pursued here.
+- `src/m68k.c` main dispatch loop has a one-shot `[V4-TARGET]`
+  forensic dump that fires pre-dispatch when `PC==$302790`.
+  Prints all D/A registers, SR, SSP, USP, illegal-vector handler,
+  full 64-entry PC ring with opcodes, 17 code words around the
+  target, 32-long stack dump, and (via `lisa_dump_mmu_for_vaddr`
+  in `src/lisa.c`) the MMU segment mapping across all 5 contexts
+  plus raw physical RAM bytes vs virtual-read bytes for segment
+  24. One-shot, gated behind `static int v4_target_dumped`.
 
 **Toolchain (source → image pipeline)** — green but does NOT yet boot
 end-to-end. **This is the real product track** — the prebuilt-image

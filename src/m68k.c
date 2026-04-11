@@ -610,6 +610,13 @@ static void illegal_instruction(m68k_t *cpu) {
         fprintf(stderr, "ILLEGAL: opcode=$%04X group=%X at PC=$%06X\n",
                 cpu->ir, group, cpu->pc - 2);
     }
+    /* Per M68000 PRM: illegal-instruction exceptions push the PC of the
+     * faulting instruction itself, not PC+2. Rewind so the handler sees
+     * the opcode address on its stack frame. Lisa OS uses $4FBC as a
+     * custom exception-driven opcode — its handler reads the instruction
+     * at the stacked PC to decode the operation, so stacking PC+2 would
+     * make it read the operand word instead of the opcode. */
+    cpu->pc -= 2;
     take_exception(cpu, VEC_ILLEGAL_INST);
 }
 
@@ -2751,6 +2758,65 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         static bool line_f_logged = false;
         pc_ring[pc_ring_idx++ & 255] = cpu->pc;
         g_last_cpu_pc = cpu->pc;
+
+        /* One-shot forensic dump at PC=$302790 — the first real emulator
+         * divergence on the prebuilt-image boot path. Fires BEFORE dispatch
+         * so pc_ring is intact and we can see the caller who jumped here
+         * expecting code. op=$4FBC is not a valid 68000 instruction. */
+        {
+            static int v4_target_dumped = 0;
+            if (!v4_target_dumped && (cpu->pc & 0xFFFFFF) == 0x302790) {
+                v4_target_dumped = 1;
+                fprintf(stderr, "\n=== [V4-TARGET] PC=$302790 about to execute op=$%04X ===\n",
+                        cpu_read16(cpu, cpu->pc));
+                fprintf(stderr, "  SR=$%04X  SSP=$%08X  USP=$%08X\n",
+                        cpu->sr, cpu->a[7], cpu->usp);
+                fprintf(stderr, "  D0=$%08X D1=$%08X D2=$%08X D3=$%08X\n",
+                        cpu->d[0], cpu->d[1], cpu->d[2], cpu->d[3]);
+                fprintf(stderr, "  D4=$%08X D5=$%08X D6=$%08X D7=$%08X\n",
+                        cpu->d[4], cpu->d[5], cpu->d[6], cpu->d[7]);
+                fprintf(stderr, "  A0=$%08X A1=$%08X A2=$%08X A3=$%08X\n",
+                        cpu->a[0], cpu->a[1], cpu->a[2], cpu->a[3]);
+                fprintf(stderr, "  A4=$%08X A5=$%08X A6=$%08X A7=$%08X\n",
+                        cpu->a[4], cpu->a[5], cpu->a[6], cpu->a[7]);
+                /* Illegal-instruction vector — what handler did Lisa OS install? */
+                fprintf(stderr, "  vec[4] (illegal) handler = $%08X\n",
+                        cpu_read32(cpu, 4 * 4));
+                /* Full 256-entry PC ring leading up to this moment — wide
+                 * enough to see who called function B (entry around $3026Fx)
+                 * several stack frames up from the trap site. */
+                fprintf(stderr, "  PC ring (oldest -> newest, 256 entries):\n");
+                for (int ri = 256; ri > 0; ri--) {
+                    uint32_t rpc = pc_ring[(pc_ring_idx - ri) & 255];
+                    uint16_t ropc = cpu_read16(cpu, rpc);
+                    fprintf(stderr, "    [%3d] PC=$%06X op=$%04X\n",
+                            256 - ri, rpc, ropc);
+                }
+                /* Wider code window $302500..$302800 — covers function C
+                 * ($302570+), the for-loop function ($30278x), and whatever
+                 * is at B's entry (~$3026F4 from image layout). All via
+                 * cpu_read16 so we see the emulator's authoritative view. */
+                fprintf(stderr, "  Code at $302500..$302800 (via MMU):\n");
+                for (uint32_t a = 0x302500; a < 0x302800; a += 16) {
+                    fprintf(stderr, "    $%06X: ", a);
+                    for (uint32_t o = 0; o < 16; o += 2)
+                        fprintf(stderr, " %04X", cpu_read16(cpu, a + o));
+                    fprintf(stderr, "\n");
+                }
+                /* MMU mapping + physical bytes for this virtual address */
+                extern void lisa_dump_mmu_for_vaddr(uint32_t vaddr);
+                lisa_dump_mmu_for_vaddr(0x302790);
+                /* Stack dump — 32 longs from SSP */
+                fprintf(stderr, "  Stack at SSP=$%08X (32 longs):\n", cpu->a[7]);
+                for (int i = 0; i < 32; i++) {
+                    if ((i & 3) == 0) fprintf(stderr, "    +%02X:", i * 4);
+                    fprintf(stderr, " $%08X",
+                            cpu_read32(cpu, (cpu->a[7] + i * 4) & 0xFFFFFF));
+                    if ((i & 3) == 3) fprintf(stderr, "\n");
+                }
+                fprintf(stderr, "=== [V4-TARGET] end ===\n\n");
+            }
+        }
 
         /* Trace PROG_MMU entry to check SMT state before TRAP #6.
          * PROG_MMU is at $120462 (from TRAP6 trace). At entry, the stack

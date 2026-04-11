@@ -8,6 +8,18 @@ final class LisaDisplayNSView: NSView {
 
     override var acceptsFirstResponder: Bool { true }
 
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        // Grab keyboard focus as soon as the emulator view is mounted (e.g.
+        // after Power On) so the user can type into Lisa OS without having
+        // to click the view first.
+        if window != nil {
+            DispatchQueue.main.async { [weak self] in
+                self?.window?.makeFirstResponder(self)
+            }
+        }
+    }
+
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         if let existing = activeTrackingArea {
