@@ -2423,20 +2423,24 @@ int lisa_run_frame(lisa_t *lisa) {
 
 /*
  * Lisa keyboard keycodes are sent via COPS as:
- *   Key down: keycode with bit 7 clear
- *   Key up:   keycode with bit 7 set
+ *   Key down: keycode with bit 7 SET   ($80 | keycode)
+ *   Key up:   keycode with bit 7 CLEAR (keycode & $7F)
+ *
+ * See Lisa_Source/LISA_OS/LIBS/LIBHW/libhw-DRIVERS.TEXT (COPS0 handler):
+ *     AND.W  #$7F,D0      ; keycode
+ *     AND.W  #$80,D1      ; $00=up, $80=down
  */
 void lisa_key_down(lisa_t *lisa, int keycode) {
     if (keycode < 0 || keycode > 127) return;
     lisa->keys_down[keycode] = true;
-    cops_enqueue(&lisa->cops_rx, keycode & 0x7F);
+    cops_enqueue(&lisa->cops_rx, (uint8_t)(keycode | 0x80));
     via_trigger_ca1(&lisa->via2);
 }
 
 void lisa_key_up(lisa_t *lisa, int keycode) {
     if (keycode < 0 || keycode > 127) return;
     lisa->keys_down[keycode] = false;
-    cops_enqueue(&lisa->cops_rx, keycode | 0x80);
+    cops_enqueue(&lisa->cops_rx, (uint8_t)(keycode & 0x7F));
     via_trigger_ca1(&lisa->via2);
 }
 
