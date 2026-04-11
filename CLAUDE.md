@@ -72,27 +72,36 @@ cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' bui
 
 ## Current Status
 
-**Prebuilt-image boot — partial.** Running the Xcode macOS app with
-`prebuilt/los_compilation_base.image` runs real Lisa OS code far
-enough to paint the framebuffer and reach the post-init phase, but
-natively lands in **Lisabug** showing a "Level 7 Interrupt" banner
-with a register dump. This is NOT a spurious CPU IPL7; it's Lisa
-OS's exception path jumping into Lisabug via `ldmacsbug` (see
-`Lisa_Source/LISA_OS/OS/source-NMIHANDLER.TEXT`). From the `>`
-prompt, `G` (Go) resumes briefly and hits another Level 7; a third
-`G` lands in a zeroed page (`ORI.B #$0000,D0` at `$002E2E5C`) and
-Lisa OS panics with `*** SYSTEM ERROR 10738 ***` (`stup_find_boot`,
-`Lisa_Source/LISA_OS/OS/SOURCE-CD.TEXT:70`).
+**Prebuilt-image boot — real Lisa OS runs, but lands in Lisabug.**
+Running the Xcode macOS app with `prebuilt/los_compilation_base.image`
+executes real Lisa OS through MMU init (215 DO_AN_MMU calls), COPS
+handshake, ProFile driver init, framebuffer paints, and into the
+driver polling loop. On the native Xcode build it then lands in
+Lisabug with a "Level 7 Interrupt" banner at PC=$1027FC — this is
+NOT a spurious CPU IPL7 but Lisa OS's `hard_excep` catching *some*
+exception and calling `pmacsbug` for a register-dump display
+(`SOURCE-EXCEPRES.TEXT:showregs` → `pmacsbug`). Typing `G` at the
+`>` prompt resumes briefly and hits another Level 7; a third `G`
+lands in a zeroed page and Lisa OS panics with `*** SYSTEM ERROR
+10738 ***` (`stup_find_boot`, `SOURCE-CD.TEXT:70`).
 
-The **headless SDL run** of the exact same binary does NOT hit
-Level 7 or 10738 — it reaches steady-state TRAP #5 / COPS polling
-cleanly (`v37×46589` over 300 diag frames). The divergence between
-native and sandbox is under investigation; the leading theory is
-that macOS `mouseMoved` events during early boot were corrupting
-OS state because `lisa_mouse_move` was sending Dx,Dy without the
-required leading `$00` COPS header (per `libhw-DRIVERS.TEXT`
-`COPS0:@4`). Mouse packet fixed in `src/lisa.c:lisa_mouse_move` —
-awaiting native retest with the cursor kept stationary during boot.
+The **headless SDL sandbox run** of the exact same binary does NOT
+hit Level 7 — it reaches steady-state TRAP #5 / COPS polling
+cleanly (`v37×46589` over 300 diag frames, advancing past frame
+800 without incident). So there is a real native-vs-sandbox
+divergence that has not been root-caused yet. The leading suspect
+is a transient `SP=$414` window in process creation at PC=$20820C
+(`op=$4FF8` LEA abs.W,A7) visible in the log as `!!! SP LOW: $000414`
+— while SP sits in the exception-vector region any push would
+corrupt vector $414 (line-1010 emulator), which could later fire
+and land in `hard_excep`. Unconfirmed.
+
+Attempted bypass: `src/lisa_mmu.c:lisa_mem_write16` intercepts writes
+of `$4EF9` (JMP abs.L opcode) to `$234` and replaces with `$4E75`
+(RTS). That blocks the Pascal-level `MACSBUG;` path via
+`enter_macsbug .equ $234`, but did NOT stop the native Level 7 —
+proving the entry path is via `hard_excep`/`pmacsbug`, not the
+direct Pascal call.
 
 Fixes landed this session (all in one commit + one pending):
 
