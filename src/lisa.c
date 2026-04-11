@@ -2445,8 +2445,14 @@ void lisa_key_up(lisa_t *lisa, int keycode) {
 }
 
 /*
- * Mouse movement: COPS sends delta packets
- * Format: 2 bytes - dx, dy (signed)
+ * Mouse movement: COPS sends a 3-byte packet —
+ *   byte 0: $00  (header: "mouse data follows", per libhw-DRIVERS COPS0/@4)
+ *   byte 1: Dx   (signed 8-bit delta)
+ *   byte 2: Dy   (signed 8-bit delta)
+ *
+ * WITHOUT the $00 header, the COPS0 handler takes the "keycode" branch
+ * on the first byte (bit 7 = up/down, bits 0..6 = keycode), pumping
+ * phantom keystrokes into Lisa OS on every mouse motion.
  */
 void lisa_mouse_move(lisa_t *lisa, int dx, int dy) {
     if (dx == 0 && dy == 0) return;
@@ -2466,7 +2472,8 @@ void lisa_mouse_move(lisa_t *lisa, int dx, int dy) {
     if (lisa->mouse_y < 0) lisa->mouse_y = 0;
     if (lisa->mouse_y >= LISA_SCREEN_HEIGHT) lisa->mouse_y = LISA_SCREEN_HEIGHT - 1;
 
-    /* Queue mouse delta packet */
+    /* 3-byte packet: header $00, then Dx, Dy */
+    cops_enqueue(&lisa->cops_rx, 0x00);
     cops_enqueue(&lisa->cops_rx, (uint8_t)(int8_t)dx);
     cops_enqueue(&lisa->cops_rx, (uint8_t)(int8_t)dy);
     via_trigger_ca1(&lisa->via2);

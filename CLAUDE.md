@@ -72,19 +72,55 @@ cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' bui
 
 ## Current Status
 
-**Prebuilt-image boot — WORKING (interactive Lisabug shell).** Running
-the Xcode macOS app with `prebuilt/los_compilation_base.image` boots
-the real Lisa OS far enough to drop into the Lisabug debugger prompt,
-paints to the framebuffer, and accepts live keyboard input via native
-`NSView.keyDown`. The CPU decoder bug that caused earlier Level 7
-crashes on `BSET Dn,<ea>` has been fixed in `src/m68k.c:~2507` (the
-group-0 dynamic-bit dispatch now accepts bits 7:6 == 11 for BSET).
-Keyboard mapping uses authoritative Lisa keycodes from
-`Lisa_Source/LISA_OS/LIBS/LIBHW/LIBHW-LEGENDS.TEXT` (Final US layout).
-Key auto-repeat is filtered via `event.isARepeat` in
-`LisaDisplayView.swift` — Lisa OS runs its own repeat timer from
-`libhw-KEYBD` `RepeatTable`, so forwarding macOS repeats would
-compound them.
+**Prebuilt-image boot — partial.** Running the Xcode macOS app with
+`prebuilt/los_compilation_base.image` runs real Lisa OS code far
+enough to paint the framebuffer and reach the post-init phase, but
+natively lands in **Lisabug** showing a "Level 7 Interrupt" banner
+with a register dump. This is NOT a spurious CPU IPL7; it's Lisa
+OS's exception path jumping into Lisabug via `ldmacsbug` (see
+`Lisa_Source/LISA_OS/OS/source-NMIHANDLER.TEXT`). From the `>`
+prompt, `G` (Go) resumes briefly and hits another Level 7; a third
+`G` lands in a zeroed page (`ORI.B #$0000,D0` at `$002E2E5C`) and
+Lisa OS panics with `*** SYSTEM ERROR 10738 ***` (`stup_find_boot`,
+`Lisa_Source/LISA_OS/OS/SOURCE-CD.TEXT:70`).
+
+The **headless SDL run** of the exact same binary does NOT hit
+Level 7 or 10738 — it reaches steady-state TRAP #5 / COPS polling
+cleanly (`v37×46589` over 300 diag frames). The divergence between
+native and sandbox is under investigation; the leading theory is
+that macOS `mouseMoved` events during early boot were corrupting
+OS state because `lisa_mouse_move` was sending Dx,Dy without the
+required leading `$00` COPS header (per `libhw-DRIVERS.TEXT`
+`COPS0:@4`). Mouse packet fixed in `src/lisa.c:lisa_mouse_move` —
+awaiting native retest with the cursor kept stationary during boot.
+
+Fixes landed this session (all in one commit + one pending):
+
+- `src/m68k.c` group-0 dynamic bit-op dispatch accepts `type=3`
+  (BSET Dn,<ea>). The old guard `(op & 0x00C0) != 0x00C0` was
+  rejecting every `BSET` with bits 7:6 == 11 and falling through
+  to `illegal_instruction`. Classic Level-7 trigger on the COPS
+  polling path.
+- `src/lisa.c:lisa_run_frame` now divides accumulated CPU cycles by
+  10 before passing to `via_tick`. VIA 6522 is clocked at Φ2 =
+  CPU/10 (~500 kHz on 5 MHz Lisa 2); previously everything VIA-timed
+  (jiffy counter, key repeat, vretrace) was running 10× too fast.
+- `src/lisa.c:lisa_key_down/up` COPS bit sense was inverted. Per
+  `libhw-DRIVERS.TEXT` COPS0, `$80|keycode` is DOWN, `keycode&$7F`
+  is UP. We had it backwards, which made tapping any key produce
+  a phantom auto-repeat that never released.
+- `src/lisa.c:lisa_mouse_move` now prepends a `$00` header before
+  Dx,Dy so the COPS0 handler takes the "mouse data follows" branch
+  instead of interpreting Dx as a random keycode.
+- `lisaOS/lisaOS/EmulatorViewModel.swift:mapKeyCode` and
+  `src/main_sdl.c:sdl_to_lisa_key` now use authoritative Lisa
+  keycodes from `Lisa_Source/LISA_OS/LIBS/LIBHW/LIBHW-LEGENDS.TEXT`
+  (`_FinalUS` Primary section). Previous values were a hand-rolled
+  guess that bore no relation to Lisa's physical keycode table.
+- `lisaOS/lisaOS/LisaDisplayView.swift:keyDown` drops macOS
+  auto-repeats via `event.isARepeat`. Lisa OS runs its own repeat
+  timer from `libhw-KEYBD RepeatTable`; forwarding OS-level repeats
+  was compounding them.
 
 **Toolchain (source → image pipeline)** — green but does NOT yet boot
 end-to-end:
