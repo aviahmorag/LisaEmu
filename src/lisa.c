@@ -643,15 +643,15 @@ static uint8_t io_read_cb(uint32_t offset) {
         if (lisa->total_frames & 1) status |= 0x20;
         /* Bit 4: video bit — always 0 (black pixel) */
         /* Bit 3: no bus timeout */
-        /* Bit 2: Vertical retrace — must toggle within a frame.
-         * SYSTEM.LLD and COPSCMD poll this for timing delays even before
-         * the IRQ system is initialized. On real hardware, vretrace is
-         * active for ~1.5ms of each ~16.7ms frame. We simulate this
-         * by using the CPU's cycle counter to determine the phase. */
+        /* Bit 2: Vertical retrace.
+         * Per Lisa_Source/LISA_OS/OS/source-SERNUM (line 87-94): bit 2 is
+         * ACTIVE LOW. BTST #2/BEQ waits with "BEQ vretrace-occurred", so
+         * bit=0 means in retrace. Default high (not retrace), clear for
+         * the last 10% of the frame. */
         {
             uint64_t pos = lisa->cpu.total_cycles % (uint64_t)LISA_CYCLES_PER_FRAME;
-            if (pos >= (uint64_t)(LISA_CYCLES_PER_FRAME * 9 / 10))
-                status |= 0x04;  /* In vretrace (last 10% of frame) */
+            if (pos < (uint64_t)(LISA_CYCLES_PER_FRAME * 9 / 10))
+                status |= 0x04;  /* NOT in vretrace (first 90% of frame) */
         }
         status |= 0x02;  /* Bit 1: no hard memory error */
         status |= 0x01;  /* Bit 0: no soft memory error */
@@ -2666,35 +2666,6 @@ bool lisa_hle_intercept(lisa_t *lisa, m68k_t *cpu) {
     if (pc == 0xFE0090)
         return hle_prof_entry(lisa, cpu);
 
-    /* DEBUG: one-shot dump of main init polling loop at first hit. */
-    {
-        static bool dumped_poll = false;
-        if (!dumped_poll && pc == 0x520952) {
-            dumped_poll = true;
-            fprintf(stderr, "\n=== POLL LOOP DUMP at PC=$520952 ===\n");
-            uint32_t base = 0x5207FE;
-            fprintf(stderr, "bytes at $%06X:", base);
-            for (int i = 0; i < 48; i++)
-                fprintf(stderr, " %02X", cpu->read8((base + i) & 0xFFFFFF));
-            fprintf(stderr, "\n");
-            fprintf(stderr, "bytes at $520952:");
-            for (int i = 0; i < 32; i++)
-                fprintf(stderr, " %02X", cpu->read8((0x520952 + i) & 0xFFFFFF));
-            fprintf(stderr, "\n");
-            /* Decode MOVE.B abs.L at $5207FE if opcode matches $1039 */
-            uint16_t op = (cpu->read8(0x5207FE) << 8) | cpu->read8(0x5207FF);
-            if (op == 0x1039) {
-                uint32_t ea = (cpu->read8(0x520800) << 24) |
-                              (cpu->read8(0x520801) << 16) |
-                              (cpu->read8(0x520802) << 8)  |
-                              cpu->read8(0x520803);
-                fprintf(stderr, "MOVE.B abs.L -> reads from $%08X\n", ea);
-            } else {
-                fprintf(stderr, "opcode at $5207FE = $%04X (not MOVE.B abs.L $1039)\n", op);
-            }
-            fprintf(stderr, "=== END DUMP ===\n\n");
-        }
-    }
 
     /* HLE: Level 2 interrupt handler (COPS) at $2082D2.
      * The binary's Level 2 handler enters a long initialization phase
@@ -2750,6 +2721,22 @@ bool lisa_hle_intercept(lisa_t *lisa, m68k_t *cpu) {
                 fprintf(stderr, "HLE: INTSON — lowered IPL from %d to 0 at PC=$%06X\n",
                         (sr >> 8) & 7, pc);
 
+                /* The function at $520824 already pushed SR ($2708) onto
+                 * the stack at $52083A and raised IPL to 7 via ORI. We
+                 * caught it at $520840 after the ORI. Lowering the live
+                 * SR is not enough — when the function exits at $52089E
+                 * via MOVE (A7)+, SR, it will restore IPL to 7 from the
+                 * stacked copy. Patch the stacked SR to have IPL=0 so the
+                 * pop restores to 0 instead. */
+                uint32_t stacked_sr_addr = cpu->a[7];
+                uint16_t stacked_sr = ((uint16_t)cpu->read8(stacked_sr_addr) << 8) |
+                                       cpu->read8(stacked_sr_addr + 1);
+                uint16_t new_stacked_sr = stacked_sr & ~0x0700;
+                cpu->write8(stacked_sr_addr,     (new_stacked_sr >> 8) & 0xFF);
+                cpu->write8(stacked_sr_addr + 1,  new_stacked_sr       & 0xFF);
+                fprintf(stderr, "HLE: Patched stacked SR at A7=$%06X from $%04X to $%04X\n",
+                        stacked_sr_addr, stacked_sr, new_stacked_sr);
+
                 /* Set up VIA1 for ProFile operation.
                  * On the real Lisa, CALLDRIVER(dinit) does this. */
                 via_write(&lisa->via1, VIA_DDRB, 0x1C);  /* Bits 2-4 output: DEN, RRW, CMD */
@@ -2781,6 +2768,7 @@ bool lisa_hle_intercept(lisa_t *lisa, m68k_t *cpu) {
                     lisa_mem_write32(&lisa->mem, 0x494, prof_drv);
                     fprintf(stderr, "HLE: Set ProFile driver $494=$%06X (from $49C)\n", prof_drv);
                 }
+
             }
         }
     }
