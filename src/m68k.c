@@ -3605,19 +3605,36 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
          * ("emulate a level 7 interrupt to get there" — NMIHANDLER:311)
          * so RTE cleanly returns to the Pascal caller of MACSBUG.
          *
+         * GATE: only fire if the stacked SR has IPL==7 — that's the
+         * signature of the DB_INIT synthetic level-7 frame. The
+         * `hard_excep` path also routes through $234 when dropping
+         * into Lisabug on a real system-code exception, but its
+         * stacked SR carries the faulting code's IPL (typically 0),
+         * and its frame is a real exception frame that Lisabug is
+         * supposed to parse. Popping it via RTE corrupts the
+         * supervisor stack → A7=0 cascade. Let Lisa OS's real
+         * Lisabug run for those.
+         *
          * Scoped to prebuilt Workshop images; source-compiled boots
          * won't link SYSTEM.DEBUG and won't hit this path. */
         if ((cpu->pc & 0xFFFFFF) == 0x234) {
-            static int hle_count = 0;
-            if (hle_count++ < 3) {
-                fprintf(stderr, "[HLE] Lisabug auto-entry bypass #%d: "
-                        "PC=$234 → synthesize RTE (SSP=$%08X)\n",
-                        hle_count, cpu->a[7]);
+            uint16_t stacked_sr = cpu_read16(cpu, cpu->a[7] & 0xFFFFFF);
+            uint32_t stacked_pc = cpu_read32(cpu, (cpu->a[7] + 2) & 0xFFFFFF);
+            int ipl = (stacked_sr >> 8) & 7;
+            static int hle_seen = 0;
+            if (hle_seen++ < 8) {
+                fprintf(stderr, "[HLE] $234 entry #%d: stacked SR=$%04X "
+                        "(IPL=%d) PC=$%06X SSP=$%08X → %s\n",
+                        hle_seen, stacked_sr, ipl, stacked_pc, cpu->a[7],
+                        ipl == 7 ? "RTE (DB_INIT)" : "EXECUTE (hard_excep)");
             }
-            op_rte(cpu);
-            cpu->cycles = 20;
-            cpu->total_cycles += cpu->cycles;
-            continue;
+            if (ipl == 7) {
+                op_rte(cpu);
+                cpu->cycles = 20;
+                cpu->total_cycles += cpu->cycles;
+                continue;
+            }
+            /* else: fall through and let real Lisabug code at $234 run */
         }
 
         execute_one(cpu);

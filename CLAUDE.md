@@ -180,8 +180,9 @@ the fix applied advances dramatically further than prior runs:
 See `.claude-tmp/post_g_summary.md` for the event-order cheat
 sheet.
 
-**Updated understanding (2026-04-11 late evening): `$302790` is NOT
-a bug — the real blocker is the `$234` bypass being too aggressive.**
+**Resolved (2026-04-11 night): `$302790` is legit Apple code AND
+the `$234` bypass is now correctly gated on stacked SR IPL. Boot
+cleanly reaches the Lisabug `>` prompt waiting for user input.**
 
 The on-screen banner on the latest Xcode run is the smoking gun:
 ```
@@ -216,16 +217,33 @@ Lisabug was supposed to parse, display registers, and wait for
 `OSQUIT`). The RTE pops junk, A7 ends up at 0, CPU falls into the
 vector table, cascades to illegal at PC=0.
 
-**So the remaining blocker is: gate the `$234` bypass so it only
-fires on the DB_INIT boot path, not on exception-driven Lisabug
-entries.** Options:
-- Match on the level-7 synthetic-frame SR the DB_INIT path uses
-  (DB_INIT pushes SR with specific IPL=7), vs `hard_excep`'s SR
-  (which is the user process's SR at trap time)
-- Check PC-before-234 to see if we came from NMIHANDLER (DB_INIT)
-  vs EXCEPASM's `go_to_macsbug` path
-- Or drop the bypass and instead pre-queue an auto-`OSQUIT`
-  response via COPS when the $234 entry is detected
+**RESOLVED (2026-04-11 night)**: gated the `$234` bypass on stacked
+SR IPL at fetch time in `src/m68k.c:~3610`. DB_INIT's synthetic
+level-7 frame carries IPL=7 and still gets the RTE bypass; the
+`hard_excep` path's real exception frame carries user IPL (0) and
+falls through to real Lisabug code. Also removed the write-time
+memory patch in `src/lisa_mmu.c:~360` that had been permanently
+rewriting `$4EF9` to `$4E73` — with the IPL gate as the single
+decision point, memory is left holding the original JMP and both
+code paths resolve correctly at runtime.
+
+Verified on the Xcode native build: stderr shows
+```
+[HLE] $234 entry #1: stacked SR=$0700 (IPL=7) ... → RTE (DB_INIT)
+[HLE] $234 entry #2: stacked SR=$0700 (IPL=7) ... → RTE (DB_INIT)
+[HLE] $234 entry #3: stacked SR=$2000 (IPL=0) ... → EXECUTE (hard_excep)
+```
+Entry #3 happens after the `$302790` illegal fires and Lisa OS's
+`hard_excep` Pascal path drops into Lisabug. The real
+Lisabug banner-draw code at `$208xxx` runs cleanly, the SYSTEM
+ERROR 10738 banner is painted, CPU settles in the COPS polling
+loop at `$520xxx` waiting for keyboard input. No A7=0 cascade,
+no vector-table fall-through, `VEC-HIST` at frame 1500 =
+`v37×135933` only (matches the pristine baseline). The on-screen
+output now shows BOTH the original Level 7 Interrupt / DB_INIT
+register dump AND the subsequent ILLEGAL INSTRUCTION SYSTEM ERROR
+banner, with a `>` prompt ready for the user to type `OSQUIT` or
+`G`.
 
 **The `$302790` illegal itself is legitimate — the bytes are on
 disk ($4FBC $000C confirmed in `prebuilt/los_compilation_base.image`

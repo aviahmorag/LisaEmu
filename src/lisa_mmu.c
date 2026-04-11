@@ -357,13 +357,19 @@ void lisa_mem_write16(lisa_mem_t *mem, uint32_t addr, uint16_t val) {
      * synthetic-exception path — not from any real CPU interrupt.
      * The actual entry trigger is SOURCE-STARTUP.TEXT:302 (DB_INIT),
      * the deliberate Workshop developer breakpoint. */
+    /* NOTE: previously rewrote $4EF9 at $234 → $4E73 (RTE) here to
+     * bypass Lisabug entry. That was too aggressive: both DB_INIT
+     * (synthetic level-7 frame — safe to RTE) AND hard_excep (real
+     * exception frame — must NOT RTE) route through $234. Patching
+     * memory defeats the runtime IPL-gated bypass in m68k.c. Leave
+     * memory alone; the fetch-time gate at src/m68k.c decides per
+     * entry based on stacked SR IPL. */
     if (addr == 0x234 && val == 0x4EF9) {
-        static int bp_logged = 0;
-        if (!bp_logged++) {
-            fprintf(stderr, "[HLE] $234 JMP→RTE intercept installed "
-                    "(Lisabug auto-entry bypass)\n");
+        static int noted = 0;
+        if (!noted++) {
+            fprintf(stderr, "[HLE] $234 JMP install observed "
+                    "(handled by runtime IPL gate, not patched)\n");
         }
-        val = 0x4E73;  /* RTE — matches synthetic level-7 frame */
     }
 
     /* Check for MMU register writes during start mode.
