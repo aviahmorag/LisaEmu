@@ -144,26 +144,57 @@ currently ineffective on this image)**:
   sandbox or native, confirming the MACSBUG call path does not go
   through the low-memory trampoline on this image.
 
-**What actually blocks desktop reachability on this track:**
-1. Lisa OS enters Lisabug at DB_INIT. Lisabug's G-resume loop is
-   broken in our emu — per prior session, three G's land on
-   SYSTEM ERROR 10738 (`stup_find_boot`). Lisabug therefore holds
-   execution forever, blocking STARTUP completion and any
-   user-process launch (APEW/APDM).
-2. Cleanest fix: runtime-zero `lb_enabled` in sysglobal so
-   `NMIHANDLER:lisabugentry` takes its own RTE path (line 319) on
-   every MACSBUG call. Needs the physical address of `lb_enabled`,
-   findable either from `Lisa_Source/LISA_OS/Linkmaps 3.0/` or by
-   hooking the write store `lb_enabled := lb_loaded;` in
-   `STARTUP:2159` and snapshotting the target address.
-3. Even after that, this is still the **Workshop** dev disk —
-   Lisa OS will boot to APEW (Environments Window) first, not
-   straight to APDM Desktop. Getting to the Office Desktop from
-   APEW is a separate interaction (or requires a non-Workshop
-   image).
-4. Unknown unknowns past APEW — no prior run has exercised user
-   process launch / APDM load / desktop UI draw paths in our
-   emulator.
+**Latest state (2026-04-11 evening, cae21c9 bypass active):**
+The `$234` RTE fetch intercept is now firing for real. A run with
+the fix applied advances dramatically further than prior runs:
+
+- `v=39` TRAP #7 fires at `PC=$221004` (first ever) — this is
+  the `macsbug` userstate path (`trap #7` to get onto supervisor
+  stack). Normal behavior, previously we never reached this.
+- `INIT_NMI_TRAPV` now runs — the `$234` write intercept fires
+  exactly once (`[HLE] $234 JMP→RTE intercept installed`), which
+  previously never happened in any run.
+- Fetch-time bypass at `PC=$234` fires **three times** during
+  boot, each time popping a clean synthetic-level-7 exception
+  frame via `op_rte` and resuming. Bypass works structurally.
+- MMU segment programming extends to 262+ TRAP #6 calls
+  (previous max ~215), proving Lisa OS is running init code we
+  never reached before.
+- **First real emulator divergence**: `ILLEGAL op=$4FBC` at
+  `PC=$302790`. `$4FBC` is `LEA #imm, A7` which is not a valid
+  68000 opcode. Something set PC to there expecting code.
+  Handled by Lisa OS's `hard_excep` Pascal path — on-screen banner
+  reads "ILLEGAL INSTRUCTION in system code ! sr = 4 pc = 3155858"
+  which is decimal for `$302452` (saved-pc offset from the
+  `$302792` in our trace).
+- **Cascade after the illegal**: exception manager at `PC=$2E007C`
+  triggers A7-nuke to `$0`, PC falls through the vector table,
+  `v=10` (Line-A) fires at `PC=$17`, then `v=5` (ZERO DIVIDE) at
+  `PC=$A2002E72 SR=$2014` — which matches the second on-screen
+  dump "ZERO DIVIDE in system code ! sr = 8212 pc = -1577046414"
+  exactly (8212 = `$2014`; -1577046414 signed = `$A2002E72`).
+- CPU settles into a tight loop in `$460100-$460166` for
+  thousands of frames, firing only v=37 occasionally. That's
+  Lisa OS in exception-recovery idle after the cascade.
+
+See `.claude-tmp/post_g_summary.md` for the event-order cheat
+sheet.
+
+**So the real blockers now are two emulator-side divergences, not
+Lisabug anymore:**
+1. **`PC=$302790 op=$4FBC`** — find who JSR/JMPs to `$302790`
+   expecting code and what they thought was there. Likely one of:
+   (a) a procedure call with a miscomputed target (Pascal JSR
+   long constant), (b) an RTS popping a bad return address, or
+   (c) an MMU segment mapping that's wrong so we read one
+   segment's data while the code expects another. PC ring buffer
+   at the moment of the illegal will reveal the caller instantly.
+2. **`PC=$2E007C ir=$2C56`** — the A7 nuke is in Lisa OS's
+   exception-handler reentry path. Probably a secondary issue
+   caused by (1), but could be its own bug.
+
+These are **emulator-core bugs**, the same kind the source-compile
+track will surface. Fixing them helps both tracks equally.
 
 Fixes landed this session (all in one commit + one pending):
 
