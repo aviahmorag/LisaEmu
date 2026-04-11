@@ -317,6 +317,28 @@ void lisa_mem_write8(lisa_mem_t *mem, uint32_t addr, uint8_t val) {
 void lisa_mem_write16(lisa_mem_t *mem, uint32_t addr, uint16_t val) {
     addr &= 0xFFFFFF;
 
+    /* HLE: Bypass Lisabug auto-entry on dev-disk boots.
+     *
+     * Lisa OS installs `JMP macsbug` at low-memory address $234 via
+     * INIT_NMI_TRAPV (see source-NMIHANDLER.TEXT line 239:
+     *     move.w  #$4ef9,enter_macsbug  ; where enter_macsbug .equ $234
+     * ). Every Pascal `MACSBUG;` call in the kernel (DB_INIT,
+     * SYSTEM_ERROR paths, debug assertions) does JSR $234 which then
+     * jumps to Lisabug.
+     *
+     * On the los_compilation_base.image dev disk, Lisabug is enabled
+     * and fires immediately on boot, making the OS unreachable. We
+     * replace the installed JMP opcode with RTS ($4E75) so every
+     * JSR $234 returns immediately to its caller. The address bytes
+     * at $236..$239 become dead data (RTS doesn't reach them).
+     *
+     * The NMI-button path (`jmp enter_macsbug` from nmi_handler)
+     * would be broken by this (RTS with no pushed return PC), but
+     * we never emulate the NMI button, so it's unreachable. */
+    if (addr == 0x234 && val == 0x4EF9) {
+        val = 0x4E75;  /* RTS */
+    }
+
     /* Check for MMU register writes during start mode.
      * The OS programs MMU via TRAP #6 handler (DO_AN_MMU) which:
      *   1. Turns setup on ($FCE010)
