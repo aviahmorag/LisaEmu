@@ -412,12 +412,12 @@ static cg_symbol_t *find_symbol_any(codegen_t *cg, const char *name) {
     if (s) {
         if (strcasecmp(name, "fp_ptr") == 0)
             fprintf(stderr, "  LOOKUP fp_ptr: FOUND LOCAL at offset=%d is_param=%d scope=%d in '%s'\n",
-                    s->offset, s->is_param, cg->scope_depth, cg->current_file ? cg->current_file : "?");
+                    s->offset, s->is_param, cg->scope_depth, cg->current_file);
         return s;
     }
     if (strcasecmp(name, "fp_ptr") == 0) {
         fprintf(stderr, "  LOOKUP fp_ptr: NOT LOCAL (scope=%d), checking global/imported in '%s'\n",
-                cg->scope_depth, cg->current_file ? cg->current_file : "?");
+                cg->scope_depth, cg->current_file);
     }
     s = find_global(cg, name);
     if (s) return s;
@@ -1650,8 +1650,11 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
              * every `writeln(x)` call became an unresolved relocation to
              * the (non-existent) symbol "WRITELN". */
             if (is_pascal_runtime_stub_proc(node->name)) {
-                for (int i = 0; i < node->num_children; i++)
-                    gen_expression(cg, node->children[i]);
+                /* Emit nothing for arg evaluation — these procs are no-ops
+                 * and args are almost always pure literals or simple reads
+                 * with no real side effects. Emitting arg-eval bytes leaves
+                 * dead code in the output that corrupts execution if PC
+                 * ever lands there (e.g. via a mangled exception return). */
                 if (str_eq_nocase(node->name, "HALT")) {
                     emit16(cg, 0x4E71);  /* NOP */
                     emit16(cg, 0x60FC);  /* BRA.S self */

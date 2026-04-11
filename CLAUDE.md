@@ -80,10 +80,17 @@ cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' bui
   97.2% of JSR abs.L targets point at real code (up from 89.4%)
 - `build/lisaemu Lisa_Source` runs the full pipeline: compiles from
   `Lisa_Source/`, writes `build/lisa_profile.image` (5.1 MB, 58 files,
-  9728 blocks) + `build/lisa_boot.rom`, then starts executing the
-  compiled 68000 code. It currently hits an Illegal Instruction at
-  PC=$B14 after a few TRAPs — the generated code is the next blocker,
-  not the toolchain.
+  9728 blocks) + `build/lisa_boot.rom`, plus a raw
+  `build/lisa_linked.bin` (870 KB) for offline disassembly, then starts
+  executing the compiled 68000 code. Early-boot TRAPs 37/39 (OS syscall
+  + HW driver dispatcher) take the real handlers; TRAP #6 (MMU
+  accessor) takes an RTE stub at `$3F8` because `do_an_mmu` is
+  runtime-installed by `ENTEROP` and that sequence hasn't been brought
+  up from our compiled build yet. The CPU runs past the TRAPs without
+  crashing and ends up looping inside `libfp-FPMODES` around
+  `PC=$097A**` — next blocker is either re-enabling HLE TRAP #6 for
+  the compile-from-source path or proving ENTEROP runs and installs
+  the real vector.
 
 **Emulator core** — verified end-to-end against the prebuilt test
 fixture (`prebuilt/los_compilation_base.image`): CPU, MMU,

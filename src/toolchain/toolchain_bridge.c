@@ -708,23 +708,34 @@ build_result_t toolchain_build(const char *source_dir,
         disk_write_boot_track(db, link_data, link_size);
         disk_add_file(db, "system.os", FTYPE_CODE, link_data, link_size);
 
-        /* Dump bytes around $3015C to decode what the CPU gets stuck on */
-        if (link_size > 0x30170) {
-            fprintf(stderr, "=== LINK OUTPUT BYTES AT $30150-$30170 ===\n");
+        /* Save raw linked output for offline disassembly */
+        {
+            char raw_path[512];
+            snprintf(raw_path, sizeof(raw_path), "%s/lisa_linked.bin", output_dir);
+            FILE *rf = fopen(raw_path, "wb");
+            if (rf) {
+                fwrite(link_data, 1, link_size, rf);
+                fclose(rf);
+                fprintf(stderr, "Linked raw: %s (%u bytes)\n", raw_path, link_size);
+            }
+        }
+
+        /* Dump bytes around $B14 (where compiled code crashes with Illegal) */
+        if (link_size > 0xB40) {
+            fprintf(stderr, "=== LINK OUTPUT BYTES AT $B00-$B40 ===\n");
             fprintf(stderr, "  ");
-            for (uint32_t a = 0x30150; a <= 0x30170; a += 2)
+            for (uint32_t a = 0xB00; a <= 0xB40; a += 2)
                 fprintf(stderr, "%04X:%02X%02X ", a, link_data[a], link_data[a+1]);
             fprintf(stderr, "\n");
 
-            /* Also identify which module contains $3015C */
             for (int m = 0; m < lk->num_modules; m++) {
                 link_module_t *mod = lk->modules[m];
                 if (!mod->is_kernel) continue;
-                if (0x3015C >= mod->base_addr &&
-                    0x3015C < mod->base_addr + mod->code_size) {
-                    fprintf(stderr, "  $3015C is in module '%s' (base=$%X, size=%u, offset=%u)\n",
+                if (0xB14 >= mod->base_addr &&
+                    0xB14 < mod->base_addr + mod->code_size) {
+                    fprintf(stderr, "  $B14 is in module '%s' (base=$%X, size=%u, offset=%u)\n",
                             mod->name, mod->base_addr, mod->code_size,
-                            0x3015C - mod->base_addr);
+                            0xB14 - mod->base_addr);
                 }
             }
             fprintf(stderr, "=== END ===\n");

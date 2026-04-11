@@ -547,8 +547,15 @@ bool linker_link(linker_t *lk) {
      * Output buffer must be large enough for base_addr + code. */
     /* Place stub at $3F0 (unused vector table area) instead of after code.
      * The end-of-code area gets overwritten by OS init (sysglobal, etc.),
-     * but the vector table area at $0-$3FF is preserved. */
+     * but the vector table area at $0-$3FF is preserved.
+     *
+     * Two stubs:
+     *   $3F0: CLR.L D0; RTS  — for JSR relocations (4-byte return frame)
+     *   $3F8: RTE             — for exception vector fills (6-byte frame)
+     * Using RTS for an exception vector corrupts PC because RTS pops 4 bytes
+     * but the exception pushed 6 (SR+PC), so PC is read as SR:PC_hi. */
     uint32_t stub_addr = 0x3F0;
+    uint32_t rte_stub_addr = 0x3F8;
     uint32_t total_size = current_addr;
     if (total_size & 1) total_size++;
 
@@ -562,12 +569,15 @@ bool linker_link(linker_t *lk) {
 
     memset(lk->output, 0, total_size);
 
-    /* Write stub at $3F0: CLR.L D0; RTS — returns 0 for any unresolved function.
-     * This is in the vector table area (vectors 252-253, unused by Lisa). */
+    /* Function stub at $3F0: CLR.L D0; RTS */
     lk->output[stub_addr]     = 0x42; /* CLR.L D0 = $4280 */
     lk->output[stub_addr + 1] = 0x80;
     lk->output[stub_addr + 2] = 0x4E; /* RTS = $4E75 */
     lk->output[stub_addr + 3] = 0x75;
+
+    /* Exception stub at $3F8: RTE */
+    lk->output[rte_stub_addr]     = 0x4E; /* RTE = $4E73 */
+    lk->output[rte_stub_addr + 1] = 0x73;
 
     /* Resolve all unresolved externals to point to the stub */
     for (int i = 0; i < lk->num_symbols; i++) {
@@ -579,7 +589,6 @@ bool linker_link(linker_t *lk) {
 
     /* Re-apply ALL relocations — resolved symbols get their address,
      * unresolved ones get the stub address (never leave JSR $000000) */
-    int total_relocs_applied = 0;
     int relocs_to_stub = 0;
     /* Track which symbols go to stub */
     typedef struct { char name[64]; int count; } stub_sym_t;
@@ -589,7 +598,6 @@ bool linker_link(linker_t *lk) {
     for (int m = 0; m < lk->num_modules; m++) {
         link_module_t *mod = lk->modules[m];
         for (int r = 0; r < mod->num_relocs; r++) {
-            total_relocs_applied++;
             /* $SELF relocation: add module base_addr to existing value */
             if (strcmp(mod->relocs[r].symbol, "$SELF") == 0) {
                 uint32_t offset = mod->relocs[r].offset;
@@ -712,7 +720,12 @@ bool linker_link(linker_t *lk) {
         /* TRAP vectors */
         INSTALL_VEC(0x84, "TRAP1");              /* TRAP #1 (OS syscall) */
         INSTALL_VEC(0x88, "SCHDTRAP");           /* TRAP #2 (scheduler) */
-        INSTALL_VEC(0x98, "do_an_mmu");          /* TRAP #6 (MMU programming) */
+        /* TRAP #6 (do_an_mmu, MMU programming) is NOT pre-installed.
+         * ENTEROP (in source-LDASM.TEXT) copies do_an_mmu to a specific
+         * physical PAGE at runtime and writes that page's address into
+         * vector $98 itself. Pre-installing a bogus address would be
+         * overwritten anyway — or, worse, fire before the real handler
+         * is ready. Leave it at the RTE stub until the OS installs it. */
         INSTALL_VEC(0x9C, "TRAP7");              /* TRAP #7 (SR change) */
         INSTALL_VEC(0xB8, "trapEhandler");       /* TRAP #14 */
 
@@ -722,7 +735,9 @@ bool linker_link(linker_t *lk) {
          * allocates driver JT space in sysglobal and writes it to $210.
          * Pre-installing DRIVERASM's address causes a jump loop. */
 
-        /* Fill unset vectors ($0-$FC) with stub to prevent crashes */
+        /* Fill unset vectors ($0-$FC) with the RTE stub. Exception frames
+         * are 6 bytes (SR+PC), so the handler MUST use RTE — using the
+         * $3F0 RTS stub here would corrupt PC on return. */
         for (int v = 2; v < 64; v++) {
             int off = v * 4;
             uint32_t cur = ((uint32_t)lk->output[off] << 24) |
@@ -730,11 +745,10 @@ bool linker_link(linker_t *lk) {
                            ((uint32_t)lk->output[off+2] << 8) |
                            (uint32_t)lk->output[off+3];
             if (cur == 0) {
-                /* Point to stub (RTE-like behavior) */
-                lk->output[off]     = (stub_addr >> 24) & 0xFF;
-                lk->output[off + 1] = (stub_addr >> 16) & 0xFF;
-                lk->output[off + 2] = (stub_addr >> 8)  & 0xFF;
-                lk->output[off + 3] = stub_addr & 0xFF;
+                lk->output[off]     = (rte_stub_addr >> 24) & 0xFF;
+                lk->output[off + 1] = (rte_stub_addr >> 16) & 0xFF;
+                lk->output[off + 2] = (rte_stub_addr >> 8)  & 0xFF;
+                lk->output[off + 3] = rte_stub_addr & 0xFF;
             }
         }
 
