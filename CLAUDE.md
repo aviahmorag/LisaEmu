@@ -72,11 +72,17 @@ cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' bui
 
 ## Current Status
 
-Pre-built Lisa OS 3.1 image boots through early init. Level 1 and Level 2
-interrupts are delivered. Main init advances past the `$520952` vretrace
-wait loop and spends most cycles in the exception dispatcher region
-`$520400-$522xxx`. Screen still blank — OS not yet reaching a point where
-it writes to the video framebuffer.
+Pre-built Lisa OS 3.1 image boots end-to-end into a live, interactive
+Lisabug developer shell. CPU, MMU, VIA1/VIA2, COPS, keyboard, video,
+interrupts, exception dispatch and TRAP #5 HW-interface dispatcher all
+verified end-to-end. Injected RETURN keypress reaches the Lisabug
+command parser and gets echoed as "Illegal Instruction" in the visible
+framebuffer (`./.claude-tmp/screen-frame1500-ALT.png`). The alt
+framebuffer at phys `$1F0000` now renders correctly alongside main at
+`$1F8000`; the Lisa OS console (SCREAD/SCWRITE) draws to alt during
+boot. See `NEXT_SESSION.md` for open questions (most notably: is the
+`los_compilation_base.image` supposed to boot into Lisabug as a
+developer shell, or are we entering it via a fault path?).
 
 See `.claude-handoffs/` for per-session handoffs. Run `make audit` for
 toolchain metrics.

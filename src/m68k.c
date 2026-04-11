@@ -455,11 +455,21 @@ static int exception_count = 0;
 static uint32_t pascalinit_addr = 0;
 uint32_t g_last_cpu_pc = 0;  /* Visible to lisa_mmu.c for write watchpoints */
 
-static int exception_histogram[256] = {0};
+int m68k_exception_histogram[256] = {0};
+#define exception_histogram m68k_exception_histogram
+
+/* TRAP #5 selector histogram: D7 value at trap entry == routine number.
+ * Lisa driver Trap5 reads TrapTable(D7.W) so only the low word matters; we
+ * bucket by (D7 & 0xFF) since routines are indexed 0..~128 in word stride. */
+int m68k_trap5_selector_histogram[256] = {0};
 
 static void take_exception(m68k_t *cpu, int vector) {
     /* Count all exceptions by type */
     if (vector < 256) exception_histogram[vector]++;
+    if (vector == 37) {
+        uint32_t sel = cpu->d[7] & 0xFF;
+        m68k_trap5_selector_histogram[sel]++;
+    }
 
     /* Detect stack overflow — allow mapped stack addresses ($CA0000+ and $F60000+) */
     if (cpu->a[7] < 0x1000 || (cpu->a[7] > 0x1FF000 && cpu->a[7] < 0xCA0000)) {
@@ -2697,15 +2707,16 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         if (cpu->pending_irq > 0) {
             int mask = (cpu->sr & SR_INT_MASK) >> 8;
             if (cpu->pending_irq > mask || cpu->pending_irq == 7) {
+                int lvl = cpu->pending_irq;
                 /* Accept interrupt */
                 cpu->stopped = false;
                 uint16_t old_sr = cpu->sr;
                 set_supervisor(cpu, true);
-                cpu->sr = (cpu->sr & ~SR_INT_MASK) | (cpu->pending_irq << 8);
+                cpu->sr = (cpu->sr & ~SR_INT_MASK) | (lvl << 8);
                 cpu->sr &= ~SR_TRACE;
                 push32(cpu, cpu->pc);
                 push16(cpu, old_sr);
-                cpu->pc = cpu_read32(cpu, (VEC_AUTOVECTOR_BASE + cpu->pending_irq - 1) * 4);
+                cpu->pc = cpu_read32(cpu, (VEC_AUTOVECTOR_BASE + lvl - 1) * 4);
                 cpu->cycles = 44;
                 cpu->total_cycles += cpu->cycles;
                 cpu->pending_irq = 0;

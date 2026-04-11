@@ -99,4 +99,9 @@ uint32_t m68k_get_pc(m68k_t *cpu);
 uint32_t m68k_get_reg(m68k_t *cpu, int reg);
 uint16_t m68k_get_sr(m68k_t *cpu);
 
+/* Exception vector histogram — visible for diag dumps. Reset by consumer. */
+extern int m68k_exception_histogram[256];
+/* TRAP #5 selector histogram (D7 & 0xFF at entry). Reset by consumer. */
+extern int m68k_trap5_selector_histogram[256];
+
 #endif /* M68K_H */

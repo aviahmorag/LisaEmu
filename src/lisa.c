@@ -757,12 +757,12 @@ static void io_write_cb(uint32_t offset, uint8_t val) {
         return;
     }
 
-    /* Video page latch */
+    /* Video page latch — main FB at $1F8000, alt FB at $1F0000. */
     if (offset >= 0xE800 && offset < 0xE900) {
         lisa->mem.video_alt = (val & 1) != 0;
         lisa->mem.video_addr = lisa->mem.video_alt
-            ? (LISA_RAM_SIZE - 0x8000 + LISA_SCREEN_BYTES)
-            : (LISA_RAM_SIZE - 0x8000);
+            ? (2 * 1024 * 1024 - 0x10000)
+            : (2 * 1024 * 1024 - 0x8000);
         return;
     }
 
@@ -2122,6 +2122,67 @@ int lisa_run_frame(lisa_t *lisa) {
                 pc_hist_page[s] = 0;
             }
         }
+        /* VEC-HIST: top exception vectors since last DIAG frame, then reset. */
+        {
+            int top_v[6] = {-1,-1,-1,-1,-1,-1};
+            int top_c[6] = {0};
+            for (int v = 0; v < 256; v++) {
+                int c = m68k_exception_histogram[v];
+                if (c == 0) continue;
+                for (int k = 0; k < 6; k++) {
+                    if (c > top_c[k]) {
+                        for (int j = 5; j > k; j--) { top_v[j]=top_v[j-1]; top_c[j]=top_c[j-1]; }
+                        top_v[k] = v; top_c[k] = c;
+                        break;
+                    }
+                }
+            }
+            fprintf(stderr, "  VEC-HIST:");
+            for (int k = 0; k < 6 && top_c[k] > 0; k++)
+                fprintf(stderr, " v%d×%d", top_v[k], top_c[k]);
+            fprintf(stderr, "\n");
+            for (int v = 0; v < 256; v++) m68k_exception_histogram[v] = 0;
+        }
+        /* TRAP #5 selector histogram: which HW interface routine is hot? */
+        {
+            int top_s[6] = {-1,-1,-1,-1,-1,-1};
+            int top_c[6] = {0};
+            for (int s = 0; s < 256; s++) {
+                int c = m68k_trap5_selector_histogram[s];
+                if (c == 0) continue;
+                for (int k = 0; k < 6; k++) {
+                    if (c > top_c[k]) {
+                        for (int j = 5; j > k; j--) { top_s[j]=top_s[j-1]; top_c[j]=top_c[j-1]; }
+                        top_s[k] = s; top_c[k] = c;
+                        break;
+                    }
+                }
+            }
+            fprintf(stderr, "  TRAP5-SEL:");
+            for (int k = 0; k < 6 && top_c[k] > 0; k++)
+                fprintf(stderr, " d7=%d×%d", top_s[k], top_c[k]);
+            fprintf(stderr, "\n");
+            for (int s = 0; s < 256; s++) m68k_trap5_selector_histogram[s] = 0;
+        }
+        /* Sysglobal pool header at logical $CC0000+$A000 — look for forward progress. */
+        {
+            uint32_t base = 0xCC0000 + 0xA000;
+            fprintf(stderr, "  SGHEAP @$%06X:", base);
+            for (int i = 0; i < 32; i += 4) {
+                uint32_t w = lisa_mem_read32(&lisa->mem, base + i);
+                fprintf(stderr, " %08X", w);
+            }
+            fprintf(stderr, "\n");
+        }
+        /* Screen-address globals (libhw-DRIVERS equs: $110 alt, $160 main, $170/$174 phys). */
+        {
+            uint32_t scrn_log = lisa_mem_read32(&lisa->mem, 0x160);
+            uint32_t altscrn_log = lisa_mem_read32(&lisa->mem, 0x110);
+            uint32_t scrn_phy = lisa_mem_read32(&lisa->mem, 0x174);
+            uint32_t altscrn_phy = lisa_mem_read32(&lisa->mem, 0x170);
+            fprintf(stderr, "  SCRN log=$%08X alt=$%08X phys=$%08X altphys=$%08X\n",
+                    scrn_log, altscrn_log, scrn_phy, altscrn_phy);
+        }
         fprintf(stderr, "  VIA1: t1_run=%d t1_cnt=%d t1_latch=%d ier=$%02X ifr=$%02X\n",
                 lisa->via1.t1_running, lisa->via1.t1_counter, lisa->via1.t1_latch,
                 lisa->via1.ier, lisa->via1.ifr);
@@ -2260,13 +2321,41 @@ int lisa_run_frame(lisa_t *lisa) {
                     lisa_mem_read32(&lisa->mem, 0xCC5FFC - 4),
                     lisa_mem_read32(&lisa->mem, 0xCC5FFC));
         }
-        /* Check screen content */
+        /* Check both framebuffers (main $1F8000, alt $1F0000). */
         {
-            uint32_t saddr = lisa->mem.video_addr;
-            int nz = 0;
-            for (int i = 0; i < LISA_SCREEN_BYTES && saddr + i < LISA_RAM_SIZE; i++)
-                if (lisa->mem.ram[saddr + i] != 0x00) nz++;
-            fprintf(stderr, "  Screen @$%06X: %d/%d non-zero\n", saddr, nz, LISA_SCREEN_BYTES);
+            uint32_t main_addr = 2 * 1024 * 1024 - 0x8000;
+            uint32_t alt_addr  = 2 * 1024 * 1024 - 0x10000;
+            int nz_main = 0, nz_alt = 0;
+            for (int i = 0; i < LISA_SCREEN_BYTES; i++) {
+                if (main_addr + i < LISA_RAM_SIZE && lisa->mem.ram[main_addr + i] != 0x00) nz_main++;
+                if (alt_addr  + i < LISA_RAM_SIZE && lisa->mem.ram[alt_addr  + i] != 0x00) nz_alt++;
+            }
+            fprintf(stderr, "  Screen main=%d/%d alt=%d/%d (active=%s)\n",
+                    nz_main, LISA_SCREEN_BYTES, nz_alt, LISA_SCREEN_BYTES,
+                    lisa->mem.video_alt ? "alt" : "main");
+            /* At frame 800, render a simple ASCII thumbnail of whichever FB
+             * has content so we can *see* what the OS is drawing. */
+            if (frame_count == 800 || frame_count == 1500 || frame_count == 3000) {
+                uint32_t dump_addr = nz_alt > nz_main ? alt_addr : main_addr;
+                const char *which  = nz_alt > nz_main ? "ALT" : "MAIN";
+                char path[128];
+                snprintf(path, sizeof(path),
+                         "./.claude-tmp/screen-frame%04d-%s.pbm",
+                         frame_count, which);
+                FILE *f = fopen(path, "wb");
+                if (f) {
+                    /* PBM P4 binary: width height, then packed bits.
+                     * Lisa FB is 720×364 already bit-packed with MSB-first
+                     * per-row and byte stride 90. A Lisa "1" bit means
+                     * "black pixel"; PBM "1" also means "black" — match. */
+                    fprintf(f, "P4\n%d %d\n", LISA_SCREEN_WIDTH, LISA_SCREEN_HEIGHT);
+                    fwrite(&lisa->mem.ram[dump_addr],
+                           1, LISA_SCREEN_BYTES, f);
+                    fclose(f);
+                    fprintf(stderr, "  SCREEN saved %s (%d non-zero bytes)\n",
+                            path, which[0] == 'A' ? nz_alt : nz_main);
+                }
+            }
         }
         /* Check key exception vectors in RAM */
         uint32_t trap1_vec = ((uint32_t)lisa->mem.ram[0x84] << 24) |

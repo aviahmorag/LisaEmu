@@ -223,6 +223,22 @@ void lisa_mem_write8(lisa_mem_t *mem, uint32_t addr, uint8_t val) {
             }
             /* Lisa hardware wraps RAM addresses at the physical memory boundary */
             phys %= LISA_RAM_SIZE;
+            /* FB-WRITE watchpoint: log writes into both framebuffer pages
+             * (alt at $1F0000, main at $1F8000). Separate counters so we
+             * don't drown alt-only logging in ROM's main fill. */
+            if (phys >= 0x1F0000 && phys < 0x200000) {
+                extern uint32_t g_last_cpu_pc;
+                int is_alt = phys < 0x1F8000;
+                static int fb_logged_main = 0;
+                static int fb_logged_alt = 0;
+                int *cnt = is_alt ? &fb_logged_alt : &fb_logged_main;
+                if (*cnt < 16) {
+                    fprintf(stderr, "FB-WRITE[%s %d] PC=$%06X log=$%06X phys=$%06X val=$%02X\n",
+                            is_alt ? "ALT" : "MAIN", *cnt,
+                            g_last_cpu_pc, addr, phys, val);
+                    (*cnt)++;
+                }
+            }
             mem->ram[phys] = val;
             break;
         }
@@ -237,10 +253,11 @@ void lisa_mem_write8(lisa_mem_t *mem, uint32_t addr, uint8_t val) {
 
                 case IO_VIDEO_LATCH:
                     mem->video_alt = (val & 1) != 0;
-                    if (mem->video_alt)
-                        mem->video_addr = LISA_RAM_SIZE - 0x8000 + LISA_SCREEN_BYTES;
-                    else
-                        mem->video_addr = 2 * 1024 * 1024 - 0x8000;  /* Top of reported 2MB ($1F8000) */
+                    /* Per OS globals ScrnPhys=$1F8000 / AltScrnPhys=$1F0000:
+                     * main at top of 2MB - $8000, alt one page below (top - $10000). */
+                    mem->video_addr = mem->video_alt
+                        ? (2 * 1024 * 1024 - 0x10000)   /* $1F0000 */
+                        : (2 * 1024 * 1024 - 0x8000);   /* $1F8000 */
                     break;
 
                 case IO_SETUP_SET:   /* $FCE010 — enter start/setup mode */
@@ -329,7 +346,23 @@ void lisa_mem_write32(lisa_mem_t *mem, uint32_t addr, uint32_t val) {
 }
 
 const uint8_t *lisa_mem_get_video(lisa_mem_t *mem) {
-    if (mem->video_addr + LISA_SCREEN_BYTES <= LISA_RAM_SIZE)
+    /* Early boot: the Lisa OS draws its startup/service console to the
+     * alternate framebuffer at phys $1F0000 and only flips VideoLatch
+     * much later. To actually show something during the first ~second
+     * of boot, pick whichever of the two Lisa framebuffers has more
+     * non-zero content. Once VideoLatch has been explicitly set to an
+     * unambiguous page, trust it. */
+    uint32_t main_addr = 2 * 1024 * 1024 - 0x8000;
+    uint32_t alt_addr  = 2 * 1024 * 1024 - 0x10000;
+    if (main_addr + LISA_SCREEN_BYTES > LISA_RAM_SIZE ||
+        alt_addr  + LISA_SCREEN_BYTES > LISA_RAM_SIZE)
         return &mem->ram[mem->video_addr];
-    return mem->ram; /* fallback */
+
+    int nz_main = 0, nz_alt = 0;
+    for (int i = 0; i < LISA_SCREEN_BYTES; i += 64) {
+        if (mem->ram[main_addr + i]) nz_main++;
+        if (mem->ram[alt_addr  + i]) nz_alt++;
+    }
+    if (nz_alt > nz_main * 2) return &mem->ram[alt_addr];
+    return &mem->ram[main_addr];
 }
