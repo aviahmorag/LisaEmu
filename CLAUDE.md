@@ -72,7 +72,14 @@ cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' bui
 
 ## Current Status
 
-See `NEXT_SESSION.md` for the full prioritized fix list. Run `make audit` for live metrics.
+Pre-built Lisa OS 3.1 image boots through early init. Level 1 and Level 2
+interrupts are delivered. Main init advances past the `$520952` vretrace
+wait loop and spends most cycles in the exception dispatcher region
+`$520400-$522xxx`. Screen still blank — OS not yet reaching a point where
+it writes to the video framebuffer.
+
+See `.claude-handoffs/` for per-session handoffs. Run `make audit` for
+toolchain metrics.
 
 ## Lisa_Source Reference
 

@@ -1965,14 +1965,35 @@ int lisa_run_frame(lisa_t *lisa) {
     lisa->mem.vretrace_irq = false;
     lisa->irq_vretrace = 0;
 
+    /* Simple sparse PC histogram (page-level) for diag frames.
+     * Uses a small closed hash table — good enough for rough location. */
+    #define PC_HIST_SLOTS 64
+    static uint32_t pc_hist_page[PC_HIST_SLOTS];
+    static uint32_t pc_hist_cnt[PC_HIST_SLOTS];
+
     while (cycles_this_frame < LISA_CYCLES_PER_FRAME) {
-        /* Execute a batch of CPU instructions */
         int batch = 64;
         int executed = m68k_execute(&lisa->cpu, batch);
         cycles_this_frame += executed;
         via_tick_accum += executed;
 
-        /* Tick VIAs periodically */
+        {
+            uint32_t page = (lisa->cpu.pc & 0xFFFFFF) >> 8;  /* 256-byte pages */
+            uint32_t h = (page * 2654435761u) & (PC_HIST_SLOTS - 1);
+            for (int probe = 0; probe < PC_HIST_SLOTS; probe++) {
+                uint32_t slot = (h + probe) & (PC_HIST_SLOTS - 1);
+                if (pc_hist_cnt[slot] == 0) {
+                    pc_hist_page[slot] = page;
+                    pc_hist_cnt[slot] = 1;
+                    break;
+                }
+                if (pc_hist_page[slot] == page) {
+                    pc_hist_cnt[slot]++;
+                    break;
+                }
+            }
+        }
+
         if (via_tick_accum >= 10) {
             via_tick(&lisa->via1, via_tick_accum);
             via_tick(&lisa->via2, via_tick_accum);
@@ -2070,10 +2091,37 @@ int lisa_run_frame(lisa_t *lisa) {
         fprintf(stderr, "\n  D0=$%08X D1=$%08X A0=$%08X A6=$%08X SP=$%08X\n",
                 lisa->cpu.d[0], lisa->cpu.d[1], lisa->cpu.a[0], lisa->cpu.a[6], lisa->cpu.a[7]);
     }
-    if (frame_count == 10 || frame_count == 60 || frame_count == 300 || frame_count == 800 || frame_count == 2000) {
+    if (frame_count == 10 || frame_count == 60 || frame_count == 300 || frame_count == 800 || frame_count == 1500 || frame_count == 3000 || frame_count == 6000) {
         fprintf(stderr, "DIAG frame %d: PC=$%06X SR=$%04X stopped=%d pending_irq=%d setup=%d\n",
                 frame_count, lisa->cpu.pc, lisa->cpu.sr, lisa->cpu.stopped,
                 lisa->cpu.pending_irq, lisa->mem.setup_mode);
+        /* Dump top PC histogram buckets and reset */
+        {
+            uint32_t top_page[6] = {0};
+            uint32_t top_cnt[6] = {0};
+            for (int s = 0; s < PC_HIST_SLOTS; s++) {
+                if (pc_hist_cnt[s] == 0) continue;
+                for (int k = 0; k < 6; k++) {
+                    if (pc_hist_cnt[s] > top_cnt[k]) {
+                        for (int j = 5; j > k; j--) {
+                            top_page[j] = top_page[j-1];
+                            top_cnt[j]  = top_cnt[j-1];
+                        }
+                        top_page[k] = pc_hist_page[s];
+                        top_cnt[k]  = pc_hist_cnt[s];
+                        break;
+                    }
+                }
+            }
+            fprintf(stderr, "  PC hot pages:");
+            for (int k = 0; k < 6 && top_cnt[k] > 0; k++)
+                fprintf(stderr, " $%06X×%u", top_page[k] << 8, top_cnt[k]);
+            fprintf(stderr, "\n");
+            for (int s = 0; s < PC_HIST_SLOTS; s++) {
+                pc_hist_cnt[s] = 0;
+                pc_hist_page[s] = 0;
+            }
+        }
         fprintf(stderr, "  VIA1: t1_run=%d t1_cnt=%d t1_latch=%d ier=$%02X ifr=$%02X\n",
                 lisa->via1.t1_running, lisa->via1.t1_counter, lisa->via1.t1_latch,
                 lisa->via1.ier, lisa->via1.ifr);
