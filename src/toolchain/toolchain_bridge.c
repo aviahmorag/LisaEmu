@@ -17,6 +17,7 @@
 #include "linker.h"
 #include "diskimage.h"
 #include "bootrom.h"
+#include "toolchain_fileset.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,114 +40,9 @@ typedef struct {
     bool is_assembly;  /* true = assembly, false = Pascal */
 } source_file_t;
 
-/* Check if a directory name should be skipped (non-source directories) */
-static bool should_skip_dir(const char *name) {
-    if (strcasecmp(name, "BUILD") == 0) return true;
-    if (strcasestr(name, "Linkmaps") != NULL) return true;
-    if (strcasestr(name, "exec") != NULL) return true;
-    if (strcasecmp(name, "DICT") == 0) return true;
-    if (strcasecmp(name, "FONTS") == 0) return true;
-    if (strcasecmp(name, "APIN") == 0) return true;  /* install scripts */
-    if (strcasecmp(name, "GUIDE_APIM") == 0) return true; /* guide/tutorial app */
-    if (strcasecmp(name, "TKIN") == 0) return true;  /* toolkit install */
-    /* LIBHW directory is in LIBS/ — don't skip it. Only skip if it's a duplicate at the top level. */
-    /* (Previously this was broken: name is just "LIBHW" which never contains "LIBS") */
-    /* Skip TK3/TK4/TK5 sample app directories (contain build scripts, not compilable units) */
-    if (strcasecmp(name, "TK3") == 0 || strcasecmp(name, "TK4") == 0 || strcasecmp(name, "TK5") == 0) return true;
-
-    return false;
-}
-
-/* Check if a file is likely a non-Pascal/non-assembly file that should be skipped */
-static bool should_skip_file(const char *name) {
-    /* Skip build scripts, link lists, alert tables, 68k assembly stubs, docs */
-    if (strncasecmp(name, "BUILD-", 6) == 0) return true;
-    if (strncasecmp(name, "build-", 6) == 0) return true;
-    if (strcasestr(name, "ALERT") != NULL) return true;  /* alert resource files */
-    if (strcasestr(name, "LINK.TEXT") != NULL) return true; /* link command files */
-    if (strcasestr(name, "linkmap") != NULL) return true;
-    /* 68K.TEXT files are valid assembly — no longer skipped */
-    if (strcasestr(name, "COMP.TEXT") != NULL) return true; /* compile scripts */
-    if (strcasestr(name, "INSTALL.TEXT") != NULL) return true;
-    if (strcasestr(name, "DOC.TEXT") != NULL) return true;
-    if (strcasestr(name, "REL.TEXT") != NULL && strncasecmp(name, "libhw-REL", 9) == 0) return true;
-    if (strcasestr(name, "APPENDIX") != NULL) return true;
-    /* LIBHW include fragments — assembled via DRIVERS.TEXT master */
-    if (strcasestr(name, "libhw-CURSOR") != NULL) return true;
-    if (strcasestr(name, "libhw-KEYBD") != NULL) return true;
-    if (strcasestr(name, "libhw-LEGENDS") != NULL) return true;
-    if (strcasestr(name, "libhw-MACHINE") != NULL) return true;
-    if (strcasestr(name, "libhw-MOUSE") != NULL) return true;
-    if (strcasestr(name, "libhw-SPRKEYBD") != NULL) return true;
-    if (strcasestr(name, "libhw-TIMERS") != NULL) return true;
-    if (strcasestr(name, "INSTRUCT") != NULL) return true;
-    if (strcasestr(name, "RELEASE") != NULL) return true;
-    /* LIBFP: assembly include fragments are assembled via NEWFPSUB master.
-     * Pascal files in LIBFP should be compiled normally.
-     * Content detection handles asm vs Pascal classification. */
-    /* QSORT is assembly but starts with EQU constants — force assembly detection below */
-    /* Documentation / release notes */
-    if (strcasestr(name, "relmemo") != NULL) return true;
-    /* Standalone programs — user utilities, not OS kernel components */
-    if (strcasestr(name, "KEYBOARD.TEXT") != NULL) return true;
-    if (strcasestr(name, "STUNTS") != NULL) return true;
-    if (strcasestr(name, "DRVRMAIN") != NULL) return true;
-    if (strcasestr(name, "PEPSITESTS") != NULL) return true;
-    if (strcasestr(name, "SUMMARY") != NULL) return true;
-    if (strcasestr(name, "MAINBAUD") != NULL) return true;
-    if (strcasestr(name, "copymaster") != NULL) return true;
-    if (strcasestr(name, "bless") != NULL) return true;
-    if (strcasestr(name, "ALERTGEN") != NULL) return true;
-    if (strcasestr(name, "REALPASLIB") != NULL) return true;
-    if (strcasestr(name, "FPPASLIB") != NULL) return true;
-    if (strcasestr(name, "GDATALIST") != NULL) return true;
-    if (strcasestr(name, "cdchar") != NULL) return true;
-    if (strcasestr(name, "nwshell") != NULL) return true;
-    if (strcasestr(name, "cdCONFIG") != NULL) return true;
-    if (strcasestr(name, "TKALERT") != NULL) return true;
-    /* Non-source data files in APPS */
-    if (strcasestr(name, "T5LM") != NULL) return true;
-    if (strcasestr(name, "t5dbc") != NULL) return true;
-    if (strcasestr(name, "t8dialogs") != NULL) return true;
-    if (strcasestr(name, "t10menus") != NULL) return true;
-    if (strcasestr(name, "T10DBOX") != NULL) return true;
-    if (strcasestr(name, "-TABLES.TEXT") != NULL) return true;
-    /* LIBQD include fragments (assembled via DRAWLINE master file) */
-    if (strcasestr(name, "FASTLINE") != NULL) return true;
-    if (strcasestr(name, "LINE2") != NULL) return true;
-    if (strcasestr(name, "GRAFTYPES") != NULL) return true;
-    /* LIBQD: STRETCH is standalone assembly, not an include fragment */
-    /* Phrase/resource files, documentation, code generator templates */
-    if (strcasestr(name, "PABC") != NULL) return true;
-    if (strcasestr(name, "PASGEN") != NULL) return true;
-    if (strcasestr(name, "phquickport") != NULL) return true;
-    if (strcasestr(name, "INITFPFILE") != NULL) return true;
-    if (strcasestr(name, "qpsample") != NULL) return true;
-    if (strcasestr(name, "qpmake") != NULL) return true;
-    if (strcasestr(name, "make_qp") != NULL) return true;
-    if (strcasestr(name, "link_qp") != NULL) return true;
-    if (strcasestr(name, "lnewFPLIB") != NULL) return true;
-    if (strcasestr(name, "buildpref") != NULL) return true;
-    if (strcasestr(name, "MAKEHEUR") != NULL) return true;
-    /* Data/list files that aren't source code */
-    if (strcasestr(name, "-LIST.TEXT") != NULL) return true;
-    if (strcasestr(name, "-SIZES.TEXT") != NULL) return true;
-    if (strcasestr(name, "-EXEC.TEXT") != NULL) return true;
-    if (strcasestr(name, "LETTERCODES") != NULL) return true;
-    if (strcasestr(name, "KEYWORDS") != NULL) return true;
-    if (strcasestr(name, "FKEYWORDS") != NULL) return true;
-    /* Note: MENUS.TEXT and DBOX.TEXT patterns removed — they were catching
-     * LIBWM-MENUS.TEXT (real source with GetItem, CheckItem, etc.).
-     * App-level menu/dialog data files are already excluded by skip_dir(APPS). */
-    if (strcasestr(name, "CNBUILD") != NULL) return true;
-    if (strcasestr(name, "CIBUILD") != NULL) return true;
-    if (strcasestr(name, "BUILDPR") != NULL) return true;
-    if (strcasestr(name, "DWBTN") != NULL) return true;
-    if (strcasestr(name, "ciBTN") != NULL) return true;
-    if (strcasestr(name, "PARBTN") != NULL) return true;
-    if (strcasestr(name, "CNBTN") != NULL) return true;
-    return false;
-}
+/* Exclusion rules shared with audit_toolchain.c — see toolchain_fileset.c. */
+#define should_skip_dir(n)  tc_should_skip_dir(n)
+#define should_skip_file(n) tc_should_skip_file(n)
 
 static int find_source_files(const char *dir, source_file_t *files, int max_files) {
     int count = 0;

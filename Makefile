@@ -25,6 +25,7 @@ TOOL_SOURCES = $(TOOLDIR)/asm68k.c \
                $(TOOLDIR)/linker.c \
                $(TOOLDIR)/diskimage.c \
                $(TOOLDIR)/bootrom.c \
+               $(TOOLDIR)/toolchain_fileset.c \
                $(TOOLDIR)/toolchain_bridge.c
 
 OBJECTS = $(patsubst $(SRCDIR)/%.c,$(BUILDDIR)/%.o,$(SOURCES))
@@ -67,7 +68,8 @@ AUDIT_SRC = $(TOOLDIR)/audit_toolchain.c \
             $(TOOLDIR)/pascal_lexer.c \
             $(TOOLDIR)/pascal_codegen.c \
             $(TOOLDIR)/asm68k.c \
-            $(TOOLDIR)/linker.c
+            $(TOOLDIR)/linker.c \
+            $(TOOLDIR)/toolchain_fileset.c
 
 AUDIT = $(BUILDDIR)/audit_toolchain
 

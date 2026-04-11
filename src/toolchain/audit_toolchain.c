@@ -20,6 +20,7 @@
 #include "pascal_codegen.h"
 #include "asm68k.h"
 #include "linker.h"
+#include "toolchain_fileset.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -38,44 +39,10 @@ typedef struct {
     bool is_assembly;
 } source_file_t;
 
-static bool should_skip_dir(const char *name) {
-    if (strcasecmp(name, "BUILD") == 0) return true;
-    if (strcasecmp(name, "OS exec files") == 0) return true;
-    if (strcasecmp(name, "Linkmaps 3.0") == 0) return true;
-    if (strcasestr(name, "Linkmaps") != NULL) return true;
-    if (strcasecmp(name, "Fonts") == 0) return true;
-    if (strcasecmp(name, "APPS") == 0) return true;
-    if (strcasecmp(name, "Lisa_Toolkit") == 0) return true;
-    return false;
-}
-
-static bool should_skip_file(const char *name) {
-    /* Build scripts, documentation, non-source data */
-    static const char *skip_patterns[] = {
-        "INSTRUCT", "RELEASE", "relmemo",
-        "T5LM", "t5dbc", "t8dialogs", "t10menus", "T10DBOX",
-        "-TABLES.TEXT", "FASTLINE", "LINE2", "GRAFTYPES",
-        "PABC", "PASGEN", "phquickport", "INITFPFILE",
-        "qpsample", "qpmake", "make_qp", "link_qp",
-        "lnewFPLIB", "buildpref", "MAKEHEUR",
-        "-LIST.TEXT", "-SIZES.TEXT", "-EXEC.TEXT",
-        "LETTERCODES", "KEYWORDS", "FKEYWORDS",
-        /* MENUS.TEXT and DBOX.TEXT removed: caught LIBWM-MENUS (real source) */
-        "CNBUILD", "CIBUILD", "BUILDPR",
-        "DWBTN", "ciBTN", "PARBTN", "CNBTN",
-        "PASLIBDOC", "PASLIBCDOC", "linkmap-",
-        /* LIBHW include fragments — assembled via DRIVERS.TEXT master */
-        "libhw-CURSOR", "libhw-KEYBD", "libhw-LEGENDS",
-        "libhw-MACHINE", "libhw-MOUSE", "libhw-SPRKEYBD", "libhw-TIMERS",
-        NULL
-    };
-    for (int i = 0; skip_patterns[i]; i++) {
-        if (strcasestr(name, skip_patterns[i]) != NULL) return true;
-    }
-    /* LIBFP handled in find_source_files after content detection */
-    /* LIBQD: STRETCH was incorrectly skipped — it's standalone assembly */
-    return false;
-}
+/* Exclusion rules live in toolchain_fileset.c so audit_toolchain and
+ * toolchain_bridge can't drift apart. */
+#define should_skip_dir(n)  tc_should_skip_dir(n)
+#define should_skip_file(n) tc_should_skip_file(n)
 
 static int find_source_files(const char *dir, source_file_t *files, int max_files) {
     int count = 0;

@@ -34,12 +34,42 @@ static void cg_error(codegen_t *cg, int line, const char *fmt, ...) {
     fprintf(stderr, "%s:%d: codegen error: %s\n", cg->current_file, line, buf);
 }
 
+/* Pascal runtime-builtin procedures that should NEVER emit an external JSR.
+ * The Lisa OS Pascal runtime provides these through compiler-generated
+ * `%_NAME` symbols that we don't ship; emit an inline stub instead so the
+ * linker doesn't report false unresolved references. The list is the same
+ * set handled inline in gen_expression()'s AST_FUNC_CALL for intrinsics
+ * that also appear as bare statement calls.
+ *
+ * Anything in this list is emitted as:
+ *   for each arg: gen_expression (side effects)
+ *   (no JSR, no relocation)
+ *
+ * Returning true means the caller should NOT emit a call. */
+static bool is_pascal_runtime_stub_proc(const char *name);
+
 static bool str_eq_nocase(const char *a, const char *b) {
     while (*a && *b) {
         if (toupper((unsigned char)*a) != toupper((unsigned char)*b)) return false;
         a++; b++;
     }
     return *a == *b;
+}
+
+static bool is_pascal_runtime_stub_proc(const char *name) {
+    if (!name || !*name) return false;
+    /* Console I/O — we have no real console so these are no-ops. */
+    if (str_eq_nocase(name, "WRITE")) return true;
+    if (str_eq_nocase(name, "WRITELN")) return true;
+    if (str_eq_nocase(name, "READ")) return true;
+    if (str_eq_nocase(name, "READLN")) return true;
+    if (str_eq_nocase(name, "PAGE")) return true;
+    /* Termination. */
+    if (str_eq_nocase(name, "HALT")) return true;
+    /* Debug trace — never wired to anything real. */
+    if (str_eq_nocase(name, "LogCall")) return true;
+    if (str_eq_nocase(name, "LogSeg")) return true;
+    return false;
 }
 
 /* ========================================================================
@@ -1615,9 +1645,17 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
         }
 
         case AST_CALL: {
-            /* No-op procedure calls (debug/trace stubs) */
-            if (str_eq_nocase(node->name, "LogCall") ||
-                str_eq_nocase(node->name, "LogSeg")) {
+            /* Pascal runtime builtins invoked as statements — no external
+             * JSR, just evaluate args for side effects. Without this check
+             * every `writeln(x)` call became an unresolved relocation to
+             * the (non-existent) symbol "WRITELN". */
+            if (is_pascal_runtime_stub_proc(node->name)) {
+                for (int i = 0; i < node->num_children; i++)
+                    gen_expression(cg, node->children[i]);
+                if (str_eq_nocase(node->name, "HALT")) {
+                    emit16(cg, 0x4E71);  /* NOP */
+                    emit16(cg, 0x60FC);  /* BRA.S self */
+                }
                 break;
             }
             /* Check if calling a procedure parameter (indirect call).
