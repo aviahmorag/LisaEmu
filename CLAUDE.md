@@ -180,13 +180,90 @@ the fix applied advances dramatically further than prior runs:
 See `.claude-tmp/post_g_summary.md` for the event-order cheat
 sheet.
 
-**So the real blockers now are two emulator-side divergences, not
-Lisabug anymore:**
-1. **`PC=$302790 op=$4FBC`** — **forensic dump captured this session**
-   via new `[V4-TARGET]` one-shot instrumentation in `src/m68k.c`
-   main dispatch loop (fires pre-dispatch when `PC==$302790`).
-   PC ring proves this is a **sequential fall-through**, not a
-   miscomputed jump or corrupted RTS target:
+**Updated understanding (2026-04-11 late evening): `$302790` is NOT
+a bug — the real blocker is the `$234` bypass being too aggressive.**
+
+The on-screen banner on the latest Xcode run is the smoking gun:
+```
+*** SYSTEM ERROR   10738 ***
+ILLEGAL INSTRUCTION in system code !
+sr =       4  pc =  3155856         ← decimal, = $302790 exactly
+ saved registers at 13369278
+Going to Lisabug, use OSQUIT.
+```
+
+Lisa OS's Pascal `hard_excep` / `showregs` receives `pc = $302790`
+EXACTLY (proving the new `cpu->pc -= 2` rewind in
+`src/m68k.c:illegal_instruction` is correct — before the fix the
+banner showed `3155858` = `$302792`, off by 2). Then it displays
+"ILLEGAL INSTRUCTION in system code, Going to Lisabug, use OSQUIT."
+**This is Lisa OS's NORMAL reaction to a system-code illegal
+instruction** — not a crash. Real hardware would show the same
+banner and wait for the user to type `OSQUIT` at the Lisabug prompt
+to return to the OS.
+
+The "crash" / A7-nuke cascade we observe AFTER the banner is caused
+by our `$234` JMP→RTE bypass (`cae21c9`). That bypass was added for
+the **DB_INIT developer-breakpoint** path (Workshop image calling
+`MACSBUG` from `SOURCE-STARTUP.TEXT:302` boot init). It synthesizes
+an RTE to skip the debugger entry. **But Lisa OS also jumps to
+`$234` from the `hard_excep` path** — when a real system-code
+exception wants to drop the user into Lisabug. Our bypass fires for
+BOTH cases. For DB_INIT it works (the stack frame is the synthetic
+level-7 frame the bypass expects). For `hard_excep` it does NOT
+work (the stack frame is an actual Lisa OS exception frame that
+Lisabug was supposed to parse, display registers, and wait for
+`OSQUIT`). The RTE pops junk, A7 ends up at 0, CPU falls into the
+vector table, cascades to illegal at PC=0.
+
+**So the remaining blocker is: gate the `$234` bypass so it only
+fires on the DB_INIT boot path, not on exception-driven Lisabug
+entries.** Options:
+- Match on the level-7 synthetic-frame SR the DB_INIT path uses
+  (DB_INIT pushes SR with specific IPL=7), vs `hard_excep`'s SR
+  (which is the user process's SR at trap time)
+- Check PC-before-234 to see if we came from NMIHANDLER (DB_INIT)
+  vs EXCEPASM's `go_to_macsbug` path
+- Or drop the bypass and instead pre-queue an auto-`OSQUIT`
+  response via COPS when the $234 entry is detected
+
+**The `$302790` illegal itself is legitimate — the bytes are on
+disk ($4FBC $000C confirmed in `prebuilt/los_compilation_base.image`
+at offset 0x69DB4E), and Lisa OS's handler correctly dispatches it.
+Our emulator just needs to handle the debugger-entry side properly.**
+
+### PC-ring forensic findings (all captured by V4-TARGET dump)
+
+- **Caller A** at `$302726` (`LINK A6, #-8`) — initializes a data
+  table. Not in our ring, but visible in the code window dump.
+- **Function B** at `$3025B6` (`LINK A6, #0`) — called from caller A
+  at `$302786` (`JSR $3025B6` via PC-relative `$4EBA $FE2E`). B is
+  a big sequence of 16 PUSH-params + JSR calls to function C.
+- **Function C** at `$302570` (`LINK A6` / `MOVEM.L A3-A4`) — takes
+  5 byte/word parameters + A6, writes entries into an array indexed
+  by A4+offset. Returns via `MOVEA.L (A7)+,A0 / ADDA.W #$C,A7 /
+  JMP (A0)` (manual param-cleanup return). 12 bytes of params.
+- **For-loop at `$30278A..$3027A4`**: `CLR.B D7 / BRA test /
+  EXT.W D7 / $4FBC $000C / MOVE.L D7,D0 / ASL.W #1,D0 /
+  MOVE.W #1,$70(A4) / ADDQ.B #1,D7 / CMPI.B #$0C,D7 / BLE.S loop`.
+  Runs D7 from 0..12. The body contains `$4FBC $000C` which is
+  either (a) Pascal `INLINE(...)` output, (b) a custom opcode handled
+  via the illegal-instruction vector by Apple's Lisa OS, or (c) the
+  compiler emitted something the linker was supposed to patch and
+  didn't. Regardless of which, Lisa OS's `hard_excep` handler IS
+  wired to receive it and behaves correctly.
+- **The `$4FBC $000C` byte pattern exists exactly once in the 50MB
+  disk image** at offset `0x69DB4E`, with matching surrounding bytes
+  — Apple's release really contains those bytes.
+
+### Old/superseded hypotheses (for context, now disproved)
+
+1. **`PC=$302790 op=$4FBC`** (ORIGINAL HYPOTHESIS, now refined) — the
+   forensic dump captured this session via `[V4-TARGET]`
+   instrumentation in `src/m68k.c` main dispatch loop (fires
+   pre-dispatch when `PC==$302790`). PC ring proved it was a
+   **sequential fall-through**, not a miscomputed jump or corrupted
+   RTS target:
    ```
    [55] $302720  UNLK A6            ─┐ caller function
    [56] $302722  MOVE.L (A7)+, SP   │ epilogue (pop params
@@ -271,11 +348,30 @@ Fixes landed this session (all in one commit + one pending):
 - `src/m68k.c` main dispatch loop has a one-shot `[V4-TARGET]`
   forensic dump that fires pre-dispatch when `PC==$302790`.
   Prints all D/A registers, SR, SSP, USP, illegal-vector handler,
-  full 64-entry PC ring with opcodes, 17 code words around the
-  target, 32-long stack dump, and (via `lisa_dump_mmu_for_vaddr`
-  in `src/lisa.c`) the MMU segment mapping across all 5 contexts
-  plus raw physical RAM bytes vs virtual-read bytes for segment
-  24. One-shot, gated behind `static int v4_target_dumped`.
+  full **256-entry** PC ring with opcodes, wide code window
+  `$302500..$302800` via `cpu_read16` (shows function C, function
+  B, and caller A in full), 32-long stack dump, and (via
+  `lisa_dump_mmu_for_vaddr` in `src/lisa.c`) the MMU segment
+  mapping across all 5 contexts plus raw physical RAM bytes vs
+  virtual-read bytes. One-shot, gated behind `static int
+  v4_target_dumped`. **Decisive in proving `$4FBC` bytes are
+  legitimate Apple-release code and the `$234` bypass is the
+  real blocker.**
+- `src/m68k.c:illegal_instruction` now rewinds `cpu->pc -= 2`
+  before calling `take_exception`, so the stacked PC on
+  illegal-instruction exceptions is the address of the faulting
+  instruction itself (per M68000 PRM), not PC+2. Lisa OS's
+  `hard_excep` Pascal handler reads the stacked PC to show in the
+  "ILLEGAL INSTRUCTION in system code!" banner, and the banner
+  now shows `pc = 3155856` = `$302790` exactly (before the fix it
+  showed `3155858` = `$302792`, off by 2). Line-A/Line-F handlers
+  already did this rewind; illegal didn't.
+- `lisaOS/lisaOS/LisaDisplayView.swift:LisaDisplayNSView` now
+  overrides `viewDidMoveToWindow()` to call
+  `window?.makeFirstResponder(self)` on the main queue after
+  mount, so the emulator view grabs keyboard focus automatically
+  when the SwiftUI overlay mounts it after "Power On". No more
+  having to click into the view before typing.
 
 **Toolchain (source → image pipeline)** — green but does NOT yet boot
 end-to-end. **This is the real product track** — the prebuilt-image
