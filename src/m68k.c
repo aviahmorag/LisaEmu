@@ -464,6 +464,21 @@ int m68k_exception_histogram[256] = {0};
 int m68k_trap5_selector_histogram[256] = {0};
 
 static void take_exception(m68k_t *cpu, int vector) {
+    /* Per-vector first-fire trace: fires exactly once per vector number, so
+     * we can see in order which exceptions are hit during boot. The first
+     * non-trivial vector to fire on native-vs-sandbox divergence is the
+     * signal we're hunting. */
+    {
+        static bool ff_seen[256];
+        if (vector >= 0 && vector < 256 && !ff_seen[vector]) {
+            ff_seen[vector] = true;
+            uint32_t handler = cpu_read32(cpu, (uint32_t)vector * 4);
+            fprintf(stderr,
+                "[VEC-FIRST] v=%d PC=$%06X SR=$%04X SSP=$%08X USP=$%08X handler=$%08X\n",
+                vector, cpu->pc, cpu->sr, cpu->a[7], cpu->usp, handler);
+        }
+    }
+
     /* Count all exceptions by type */
     if (vector < 256) exception_histogram[vector]++;
     if (vector == 37) {
@@ -2785,6 +2800,37 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 }
             }
         }
+        /* Push-into-vector-table guard: fires when A7 drops into the
+         * exception-vector region ($0..$1000). Handoff lead is that SP
+         * briefly lands at $414 during process creation at PC=$20820C
+         * (op=$4FF8 LEA abs.W,A7) and a subsequent push would corrupt
+         * vector $414 = line-1010. We catch the LEA itself (not a push
+         * but also a write to A7), and any real push while SP<$1000. */
+        {
+            static uint32_t pg_prev_sp = 0;
+            static uint32_t pg_prev_pc = 0;
+            static uint16_t pg_prev_ir = 0;
+            static int pg_fired = 0;
+            uint32_t sp_now = cpu->a[7] & 0xFFFFFF;
+            if (pg_prev_sp != 0 && sp_now < pg_prev_sp && sp_now < 0x1000 && pg_fired < 10) {
+                pg_fired++;
+                fprintf(stderr,
+                    "!!! A7 INTO VECTORS[%d]: $%06X -> $%06X (delta=%d)\n"
+                    "    caused by PC=$%06X ir=$%04X  now at PC=$%06X op=$%04X\n"
+                    "    A6=$%08X SR=$%04X D0=$%08X\n",
+                    pg_fired, pg_prev_sp, sp_now, (int)sp_now - (int)pg_prev_sp,
+                    pg_prev_pc, pg_prev_ir, cpu->pc, cpu_read16(cpu, cpu->pc),
+                    cpu->a[6], cpu->sr, cpu->d[0]);
+                fprintf(stderr, "    Last 20 PCs:");
+                for (int ri = 20; ri > 0; ri--)
+                    fprintf(stderr, " $%06X", pc_ring[(pc_ring_idx - ri) & 255]);
+                fprintf(stderr, "\n");
+            }
+            pg_prev_sp = sp_now;
+            pg_prev_pc = cpu->pc;
+            pg_prev_ir = cpu->ir;
+        }
+
         /* SP watermark: catch stack leak in both physical and mapped space */
         {
             static uint32_t lowest_sp = 0xFFFFFF;

@@ -77,31 +77,53 @@ Running the Xcode macOS app with `prebuilt/los_compilation_base.image`
 executes real Lisa OS through MMU init (215 DO_AN_MMU calls), COPS
 handshake, ProFile driver init, framebuffer paints, and into the
 driver polling loop. On the native Xcode build it then lands in
-Lisabug with a "Level 7 Interrupt" banner at PC=$1027FC — this is
-NOT a spurious CPU IPL7 but Lisa OS's `hard_excep` catching *some*
-exception and calling `pmacsbug` for a register-dump display
-(`SOURCE-EXCEPRES.TEXT:showregs` → `pmacsbug`). Typing `G` at the
-`>` prompt resumes briefly and hits another Level 7; a third `G`
-lands in a zeroed page and Lisa OS panics with `*** SYSTEM ERROR
-10738 ***` (`stup_find_boot`, `SOURCE-CD.TEXT:70`).
+Lisabug with a "Level 7 Interrupt" banner at PC=$1027FC. **That
+banner is NOT a real CPU exception in our emulator** — it is Lisa
+OS / Workshop Lisabug code drawing to the framebuffer along the
+normal execution path. Proof, via `src/m68k.c:take_exception`
+per-vector first-fire instrumentation added this session: across a
+1500-frame native Xcode run, only **two** vectors ever fire, both
+expected — v38 (TRAP #6, MMU accessor, at boot) and v37 (TRAP #5,
+HW-interface dispatcher, COPS polling). `VEC-HIST` at frame 1500
+shows `v37×135932` and nothing else. No bus error, no address
+error, no illegal inst, no line-1010/1111, no spurious interrupt.
+The sandbox SDL run produces a byte-identical CPU trace, so
+**there is no native-vs-sandbox CPU-level divergence** — the
+difference is screen-only. The banner's own SR=$2010 has IPL=0,
+confirming "Level 7" is just Lisabug's hard-coded header text, not
+an actual level-7 interrupt.
 
-The **headless SDL sandbox run** of the exact same binary does NOT
-hit Level 7 — it reaches steady-state TRAP #5 / COPS polling
-cleanly (`v37×46589` over 300 diag frames, advancing past frame
-800 without incident). So there is a real native-vs-sandbox
-divergence that has not been root-caused yet. The leading suspect
-is a transient `SP=$414` window in process creation at PC=$20820C
-(`op=$4FF8` LEA abs.W,A7) visible in the log as `!!! SP LOW: $000414`
-— while SP sits in the exception-vector region any push would
-corrupt vector $414 (line-1010 emulator), which could later fire
-and land in `hard_excep`. Unconfirmed.
+The previously-suspected `SP=$414` transient at PC=$20820C is also
+**benign**: the sequence is `LEA ($0450).W, A7` (load — not push;
+old SP discarded) followed by `MOVEM.L D0-D7/A0-A6, -(A7)` at
+$208210 which pushes 15 longwords = 60 bytes = $3C, landing SP at
+$450 - $3C = $414, **above** the vector table (ends at $3FF). This
+is normal **process-creation prologue** for Lisa OS process #4
+(matches `P#=00004` in the banner). No vector is corrupted.
 
-Attempted bypass: `src/lisa_mmu.c:lisa_mem_write16` intercepts writes
-of `$4EF9` (JMP abs.L opcode) to `$234` and replaces with `$4E75`
-(RTS). That blocks the Pascal-level `MACSBUG;` path via
-`enter_macsbug .equ $234`, but did NOT stop the native Level 7 —
-proving the entry path is via `hard_excep`/`pmacsbug`, not the
-direct Pascal call.
+After the dump is drawn the CPU continues to `PC=$52045C` (COPS
+polling loop) and sits there cleanly for as long as the app runs —
+verified to frame 1500 in Xcode. Typing `G` at the Lisabug `>`
+prompt eventually lands on a `*** SYSTEM ERROR 10738 ***`
+(`stup_find_boot`, `SOURCE-CD.TEXT:70`) but that is a downstream
+consequence of Lisabug's Go-path, not the initial "crash".
+
+**Remaining mystery**: *which* Lisa OS / Workshop Lisabug code path
+draws the register dump to the framebuffer during process #4
+creation. It is not an exception handler (none fire). Most likely
+Workshop Lisabug installs a developer-entry breakpoint and Pascal
+code calls into `showregs`/`pmacsbug` directly. Finding that call
+site is the next root-cause step. An obvious technique: instrument
+framebuffer writes landing in the Lisabug text region with a PC
+breakpoint, capture the call chain the first time "Level 7
+Interrupt" bytes get written.
+
+Attempted bypass from a prior session: `src/lisa_mmu.c:lisa_mem_write16`
+intercepts writes of `$4EF9` (JMP abs.L opcode) to `$234` and
+replaces with `$4E75` (RTS). That blocks the Pascal-level
+`MACSBUG;` path via `enter_macsbug .equ $234` but did not stop the
+on-screen banner — consistent with the banner coming from a
+different Lisabug entry point.
 
 Fixes landed this session (all in one commit + one pending):
 
@@ -130,6 +152,18 @@ Fixes landed this session (all in one commit + one pending):
   auto-repeats via `event.isARepeat`. Lisa OS runs its own repeat
   timer from `libhw-KEYBD RepeatTable`; forwarding OS-level repeats
   was compounding them.
+- `src/m68k.c:take_exception` has a per-vector first-fire trace
+  (`static bool ff_seen[256]`) that logs `[VEC-FIRST]` once per
+  unique vector with PC/SR/SSP/USP/handler. Used to disprove the
+  "Level 7 = real exception" theory.
+- `src/m68k.c` main dispatch loop has an "A7 INTO VECTORS" guard
+  that tracks `a[7]` across instructions and logs when SP drops
+  below `$1000`, identifying the instruction that moved it. Used
+  to prove the `SP=$414` event is a benign `LEA abs.W,A7` +
+  `MOVEM.L -(A7)` process-creation prologue, not stack corruption.
+- `src/main_sdl.c` has `--headless [frames]` mode that skips SDL
+  init and runs the emulator loop printing CPU state every 50
+  frames. Used for fast sandbox baseline runs vs native Xcode.
 
 **Toolchain (source → image pipeline)** — green but does NOT yet boot
 end-to-end:

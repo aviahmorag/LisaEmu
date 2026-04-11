@@ -103,8 +103,17 @@ int main(int argc, char *argv[]) {
     if (argc < 2) {
         printf("Usage: %s <Lisa_Source_dir>    (build from source)\n", argv[0]);
         printf("       %s --image <profile_image>  (boot pre-built disk image)\n", argv[0]);
+        printf("       %s --headless --image <profile_image> [frames]  (no SDL)\n", argv[0]);
         printf("       %s <rom_file> [profile_image] [floppy_image]\n", argv[0]);
         return 1;
+    }
+
+    int headless = 0;
+    int headless_frames = 600;
+    if (strcmp(argv[1], "--headless") == 0) {
+        headless = 1;
+        argv++; argc--;
+        if (argc >= 4) { headless_frames = atoi(argv[3]); argc = 3; }
     }
 
     /* Check for --image flag: boot directly from a pre-built ProFile image */
@@ -167,6 +176,20 @@ int main(int argc, char *argv[]) {
         }
         if (argc > 2) lisa_mount_profile(&lisa, argv[2]);
         if (argc > 3) lisa_mount_floppy(&lisa, argv[3]);
+    }
+
+    if (headless) {
+        lisa_reset(&lisa);
+        for (int f = 0; f < headless_frames; f++) {
+            lisa_run_frame(&lisa);
+            if (f % 50 == 0) {
+                printf("[frame %4d] PC=$%06X SR=$%04X A7=$%06X\n",
+                       f, lisa.cpu.pc, lisa.cpu.sr, lisa.cpu.a[7]);
+                fflush(stdout);
+            }
+        }
+        printf("headless: ran %d frames cleanly\n", headless_frames);
+        return 0;
     }
 
     /* Initialize SDL */
