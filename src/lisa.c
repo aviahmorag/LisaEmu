@@ -591,11 +591,12 @@ static uint8_t io_read_cb(uint32_t offset) {
     }
     lisa_t *lisa = g_lisa;
 
-    /* VIA1 - parallel/ProFile ($FCD800-$FCDCFF with aliases due to partial
-     * address decoding). The VIA uses RS0-RS3 from CPU A1-A4, so the register
-     * is (offset >> 1) & 0xF regardless of higher address bits. */
+    /* VIA1 - parallel/ProFile ($FCD800-$FCDCFF with aliases).
+     * VIA1 uses RS0-RS3 from CPU A3-A6 — register stride is 8 bytes.
+     * Per libhw-DRIVERS: PORTB1=$00, PORTA1=$08, DDRB1=$10, ..., IFR1=$68,
+     * IER1=$70. So register = (offset >> 3) & 0xF. */
     if (offset >= 0xD800 && offset < 0xDC00) {
-        uint8_t reg = (offset >> 1) & 0xF;
+        uint8_t reg = (offset >> 3) & 0xF;
         return via_read(&lisa->via1, reg);
     }
 
@@ -725,9 +726,9 @@ static uint8_t io_read_cb(uint32_t offset) {
 static void io_write_cb(uint32_t offset, uint8_t val) {
     lisa_t *lisa = g_lisa;
 
-    /* VIA1 ($FCD800-$FCDCFF with aliases) */
+    /* VIA1 ($FCD800-$FCDCFF with aliases) — stride 8 (see read path). */
     if (offset >= 0xD800 && offset < 0xDC00) {
-        uint8_t reg = (offset >> 1) & 0xF;
+        uint8_t reg = (offset >> 3) & 0xF;
         via_write(&lisa->via1, reg, val);
         return;
     }
@@ -2665,6 +2666,36 @@ bool lisa_hle_intercept(lisa_t *lisa, m68k_t *cpu) {
     if (pc == 0xFE0090)
         return hle_prof_entry(lisa, cpu);
 
+    /* DEBUG: one-shot dump of main init polling loop at first hit. */
+    {
+        static bool dumped_poll = false;
+        if (!dumped_poll && pc == 0x520952) {
+            dumped_poll = true;
+            fprintf(stderr, "\n=== POLL LOOP DUMP at PC=$520952 ===\n");
+            uint32_t base = 0x5207FE;
+            fprintf(stderr, "bytes at $%06X:", base);
+            for (int i = 0; i < 48; i++)
+                fprintf(stderr, " %02X", cpu->read8((base + i) & 0xFFFFFF));
+            fprintf(stderr, "\n");
+            fprintf(stderr, "bytes at $520952:");
+            for (int i = 0; i < 32; i++)
+                fprintf(stderr, " %02X", cpu->read8((0x520952 + i) & 0xFFFFFF));
+            fprintf(stderr, "\n");
+            /* Decode MOVE.B abs.L at $5207FE if opcode matches $1039 */
+            uint16_t op = (cpu->read8(0x5207FE) << 8) | cpu->read8(0x5207FF);
+            if (op == 0x1039) {
+                uint32_t ea = (cpu->read8(0x520800) << 24) |
+                              (cpu->read8(0x520801) << 16) |
+                              (cpu->read8(0x520802) << 8)  |
+                              cpu->read8(0x520803);
+                fprintf(stderr, "MOVE.B abs.L -> reads from $%08X\n", ea);
+            } else {
+                fprintf(stderr, "opcode at $5207FE = $%04X (not MOVE.B abs.L $1039)\n", op);
+            }
+            fprintf(stderr, "=== END DUMP ===\n\n");
+        }
+    }
+
     /* HLE: Level 2 interrupt handler (COPS) at $2082D2.
      * The binary's Level 2 handler enters a long initialization phase
      * that never completes (copies data through $FAxxxx-$FBxxxx for
@@ -2723,9 +2754,24 @@ bool lisa_hle_intercept(lisa_t *lisa, m68k_t *cpu) {
                  * On the real Lisa, CALLDRIVER(dinit) does this. */
                 via_write(&lisa->via1, VIA_DDRB, 0x1C);  /* Bits 2-4 output: DEN, RRW, CMD */
                 via_write(&lisa->via1, VIA_DDRA, 0xFF);   /* Port A all outputs (data bus) */
-                via_write(&lisa->via1, VIA_IER, 0x82);    /* Enable CA1 (BSY) interrupt */
-                fprintf(stderr, "HLE: ProFile init — DDRB=$%02X DDRA=$%02X IER=$%02X\n",
-                        lisa->via1.ddrb, lisa->via1.ddra, lisa->via1.ier);
+
+                /* Start VIA1 Timer1 free-run for the 20ms OS tick.
+                 * libhw-DRIVERS sets ACR=$48 (T1 continuous), writes T1 latches,
+                 * then IER=$C0 to enable T1 interrupt. 5MHz clock × 20ms = 100_000
+                 * cycles; with the VIA /2 prescaler that's counter value ~50_000
+                 * but the OS caller provides LCounterInit/HCounterInit. We pick
+                 * 20000 (~8ms) just to keep the flag pulsing — the OS cares about
+                 * T1 interrupts firing, not exact cadence. */
+                via_write(&lisa->via1, VIA_ACR,  0x48);
+                via_write(&lisa->via1, VIA_T1LL, 0x20);
+                via_write(&lisa->via1, VIA_T1LH, 0x4E);
+                via_write(&lisa->via1, VIA_T1CL, 0x20);
+                via_write(&lisa->via1, VIA_T1CH, 0x4E);  /* starts T1 */
+                via_write(&lisa->via1, VIA_IER,  0xC2);  /* T1 (bit 6) + CA1 (bit 1) */
+                fprintf(stderr, "HLE: ProFile init — DDRB=$%02X DDRA=$%02X "
+                        "ACR=$%02X IER=$%02X\n",
+                        lisa->via1.ddrb, lisa->via1.ddra,
+                        lisa->via1.acr, lisa->via1.ier);
 
                 /* Copy ProFile driver entry from $49C to $494 so the
                  * polling dispatcher at $208904 can find it. The dispatcher
