@@ -72,17 +72,27 @@ cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' bui
 
 ## Current Status
 
-Pre-built Lisa OS 3.1 image boots end-to-end into a live, interactive
-Lisabug developer shell. CPU, MMU, VIA1/VIA2, COPS, keyboard, video,
-interrupts, exception dispatch and TRAP #5 HW-interface dispatcher all
-verified end-to-end. Injected RETURN keypress reaches the Lisabug
-command parser and gets echoed as "Illegal Instruction" in the visible
-framebuffer (`./.claude-tmp/screen-frame1500-ALT.png`). The alt
-framebuffer at phys `$1F0000` now renders correctly alongside main at
-`$1F8000`; the Lisa OS console (SCREAD/SCWRITE) draws to alt during
-boot. See `NEXT_SESSION.md` for open questions (most notably: is the
-`los_compilation_base.image` supposed to boot into Lisabug as a
-developer shell, or are we entering it via a fault path?).
+**Toolchain (source → image pipeline)** — green:
+
+- Parser: **100%** (317/317 Pascal files)
+- Assembler: **100%** (103/103)
+- Linker: **Link OK: YES**, 8527/8527 symbols resolved, 2.2 MB output,
+  97.2% of JSR abs.L targets point at real code (up from 89.4%)
+- `build/lisaemu Lisa_Source` runs the full pipeline: compiles from
+  `Lisa_Source/`, writes `build/lisa_profile.image` (5.1 MB, 58 files,
+  9728 blocks) + `build/lisa_boot.rom`, then starts executing the
+  compiled 68000 code. It currently hits an Illegal Instruction at
+  PC=$B14 after a few TRAPs — the generated code is the next blocker,
+  not the toolchain.
+
+**Emulator core** — verified end-to-end against the prebuilt test
+fixture (`prebuilt/los_compilation_base.image`): CPU, MMU,
+VIA1/VIA2, COPS, keyboard, video, interrupts, exception dispatch and
+TRAP #5 HW-interface dispatcher all work; a pressed key reaches the
+Lisa OS event queue and drives visible framebuffer updates.
+
+See `NEXT_SESSION.md` (gitignored) for the live handoff and
+`.claude-handoffs/` for per-session archives.
 
 See `.claude-handoffs/` for per-session handoffs. Run `make audit` for
 toolchain metrics.
