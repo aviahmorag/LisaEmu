@@ -2431,6 +2431,22 @@ int lisa_run_frame(lisa_t *lisa) {
                     lisa_mem_read32(&lisa->mem, 0xCC5FFC - 8),
                     lisa_mem_read32(&lisa->mem, 0xCC5FFC - 4),
                     lisa_mem_read32(&lisa->mem, 0xCC5FFC));
+            /* Dump specific key globals by known A5 offsets */
+            fprintf(stderr, "  KEY GLOBALS (from A5=$CC5FFC):\n");
+            fprintf(stderr, "    sg_free_pool_addr (A5-148): $%08X\n",
+                    lisa_mem_read32(&lisa->mem, 0xCC5FFC - 148));
+            fprintf(stderr, "    size_sglobal      (A5-150): $%04X\n",
+                    lisa_mem_read16(&lisa->mem, 0xCC5FFC - 150));
+            fprintf(stderr, "    b_syslocal_ptr    (A5-358): $%08X\n",
+                    lisa_mem_read32(&lisa->mem, 0xCC5FFC - 358));
+            fprintf(stderr, "    mmrb_addr         (A5-1264): $%08X\n",
+                    lisa_mem_read32(&lisa->mem, 0xCC5FFC - 1264));
+            fprintf(stderr, "    b_sysglobal_ptr   (A5-1272): $%08X\n",
+                    lisa_mem_read32(&lisa->mem, 0xCC5FFC - 1272));
+            fprintf(stderr, "    sysg_free         (A5-1274): $%04X\n",
+                    lisa_mem_read16(&lisa->mem, 0xCC5FFC - 1274));
+            fprintf(stderr, "    grow_sysglobal    (A5-1314): $%02X\n",
+                    lisa_mem_read16(&lisa->mem, 0xCC5FFC - 1314) & 0xFF);
         }
         /* Check both framebuffers (main $1F8000, alt $1F0000). */
         {

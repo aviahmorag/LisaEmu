@@ -859,16 +859,17 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
     switch (node->type) {
         case AST_INT_LITERAL:
             if (node->int_val >= -128 && node->int_val <= 127) {
-                /* MOVEQ #imm,D0 */
+                /* MOVEQ #imm,D0 — sets all 32 bits (sign-extended) */
                 emit16(cg, 0x7000 | ((int8_t)node->int_val & 0xFF));
-            } else if (node->int_val >= -32768 && node->int_val <= 32767) {
-                /* MOVE.W #imm,D0 */
-                emit16(cg, 0x303C);
-                emit16(cg, (uint16_t)(int16_t)node->int_val);
             } else {
-                /* MOVE.L #imm,D0 */
+                /* MOVE.L #imm,D0 — always use 32-bit load.
+                 * MOVE.W only sets the low 16 bits of D0, leaving the upper
+                 * word stale.  When the value participates in a 32-bit
+                 * operation (ADD.L, CMP.L, etc.), the stale bits corrupt
+                 * the result.  The 2-byte code-size cost is worth correct
+                 * semantics everywhere. */
                 emit16(cg, 0x203C);
-                emit32(cg, (uint32_t)node->int_val);
+                emit32(cg, (uint32_t)(int32_t)node->int_val);
             }
             break;
 
@@ -1051,9 +1052,17 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
             bool use_long = (opsz == 4);
 
             gen_expression(cg, node->children[0]);
+            /* If using 32-bit ops but left operand is 16-bit, sign-extend.
+             * MOVE.W ea,D0 only sets D0[15:0]; the stale upper word corrupts
+             * any subsequent 32-bit operation (ADD.L, SUB.L, MULS, etc.). */
+            if (use_long && expr_size(cg, node->children[0]) <= 2)
+                emit16(cg, 0x48C0);  /* EXT.L D0 */
             /* Save left in D2 */
             emit16(cg, use_long ? 0x2400 : 0x3400);  /* MOVE.L/W D0,D2 */
             gen_expression(cg, node->children[1]);
+            /* Same for right operand */
+            if (use_long && expr_size(cg, node->children[1]) <= 2)
+                emit16(cg, 0x48C0);  /* EXT.L D0 */
             /* D2 = left, D0 = right */
             emit16(cg, use_long ? 0x2200 : 0x3200);  /* MOVE.L/W D0,D1 */
             emit16(cg, use_long ? 0x2002 : 0x3002);  /* MOVE.L/W D2,D0 */
@@ -1181,10 +1190,19 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
             /* Check for Pascal intrinsics — inline instead of JSR */
             const char *fn = node->name;
 
-            /* ORD(x), ORD4(x): convert to integer/longint — identity operation */
+            /* ORD(x): convert to integer — identity operation.
+             * ORD4(x): convert int2 → longint — sign-extend if arg is 16-bit.
+             * Without EXT.L, MOVE.W from a local/field leaves D0[31:16] stale,
+             * and any subsequent 32-bit operation (multiply, add) is corrupted. */
             if (str_eq_nocase(fn, "ORD") || str_eq_nocase(fn, "ORD4")) {
-                if (node->num_children > 0) gen_expression(cg, node->children[0]);
-                /* D0 already has the value */
+                if (node->num_children > 0) {
+                    gen_expression(cg, node->children[0]);
+                    if (str_eq_nocase(fn, "ORD4")) {
+                        int arg_sz = expr_size(cg, node->children[0]);
+                        if (arg_sz <= 2)
+                            emit16(cg, 0x48C0);  /* EXT.L D0 */
+                    }
+                }
                 break;
             }
 
@@ -1244,8 +1262,15 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                         }
                     }
                 }
-                emit16(cg, 0x303C);  /* MOVE.W #sz,D0 */
-                emit16(cg, (uint16_t)sz);
+                /* Use MOVEQ for 0..127 (sets full 32-bit D0), MOVE.L otherwise.
+                 * MOVE.W leaves the upper word of D0 stale — causes
+                 * corruption when the result is stored to an int4 field. */
+                if (sz >= 0 && sz <= 127) {
+                    emit16(cg, 0x7000 | (sz & 0xFF));  /* MOVEQ #sz,D0 */
+                } else {
+                    emit16(cg, 0x203C);  /* MOVE.L #sz,D0 */
+                    emit32(cg, (uint32_t)sz);
+                }
                 break;
             }
 
@@ -1689,7 +1714,12 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                     /* WITH field assignment: save RHS, load base, add offset, store */
                     int fsz = type_load_size(wrt->fields[fld].type);
                     if (fsz > 4) fsz = 4;
-                    if (rhs_sz > fsz) fsz = rhs_sz; /* don't truncate pointer RHS */
+                    /* Only widen store for pointer/longint fields — widening
+                     * int2 fields with MOVE.L overwrites adjacent record fields. */
+                    if (rhs_sz > fsz && wrt->fields[fld].type &&
+                        (wrt->fields[fld].type->kind == TK_POINTER ||
+                         (wrt->fields[fld].type->kind == TK_LONGINT && fsz < 4)))
+                        fsz = rhs_sz;
                     if (fsz == 4) {
                         emit16(cg, 0x2F00);  /* MOVE.L D0,-(SP) save RHS */
                     } else {
@@ -1716,7 +1746,11 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                 if (sym->is_param && sym->is_var_param) {
                     int sz = type_load_size(sym->type);
                     if (sz > 4) sz = 4;
-                    if (rhs_sz > sz) sz = rhs_sz; /* don't truncate pointer RHS */
+                    /* Only widen for pointer/longint — same guard as global store */
+                    if (rhs_sz > sz && sym->type &&
+                        (sym->type->kind == TK_POINTER ||
+                         (sym->type->kind == TK_LONGINT && sz < 4)))
+                        sz = rhs_sz;
                     int depth = find_local_depth(cg, lhs->name);
                     if (depth > 0) {
                         emit16(cg, 0x2200);  /* MOVE.L D0,D1 — save value */
@@ -1771,10 +1805,11 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                     emit16(cg, (uint16_t)(int16_t)sym->offset);
                 }
             } else if (lhs->type == AST_ARRAY_ACCESS || lhs->type == AST_FIELD_ACCESS || lhs->type == AST_DEREF) {
-                /* Complex LHS: size-aware save/restore/store */
+                /* Complex LHS: size-aware save/restore/store.
+                 * expr_size already returns 4 for pointer/longint via type_load_size,
+                 * so no unconditional widening — that overwrites adjacent fields. */
                 int sz = expr_size(cg, lhs);
                 if (sz > 4) sz = 4;
-                if (rhs_sz > sz) sz = rhs_sz; /* don't truncate pointer RHS */
                 if (sz == 4) {
                     emit16(cg, 0x2F00);  /* MOVE.L D0,-(SP) */
                     gen_lvalue_addr(cg, lhs);
