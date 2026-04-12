@@ -629,10 +629,20 @@ static void set_parser_source_root(parser_t *p) {
  * "libtk-UABC.TEXt" → "libtk-uabc" (no digit suffix)
  * "LIBTK-UABC2.TEXT" → "libtk-uabc2" (has digit suffix, sorts after)
  * Case-insensitive. */
+static int file_priority(const char *path) {
+    /* Priority: 0 = GLOBAL/DEFS/SYSCALL, 1 = PRIM, 2 = everything else */
+    if (strcasestr(path, "GLOBAL") || strcasestr(path, "DEFS") ||
+        strcasestr(path, "SYSCALL")) return 0;
+    if (strcasestr(path, "PRIM")) return 1;
+    return 2;
+}
+
 static int compare_source_files(const void *a, const void *b) {
     const source_file_t *fa = (const source_file_t *)a;
     const source_file_t *fb = (const source_file_t *)b;
-    /* Compare case-insensitive */
+    int pa = file_priority(fa->path);
+    int pb = file_priority(fb->path);
+    if (pa != pb) return pa - pb;
     return strcasecmp(fa->path, fb->path);
 }
 

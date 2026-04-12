@@ -467,20 +467,24 @@ build_result_t toolchain_build(const char *source_dir,
     snprintf(subdir, sizeof(subdir), "%s/LISA_OS", source_dir);
     num_files += find_source_files(subdir, files + num_files, MAX_SOURCE_FILES - num_files);
 
-    /* Sort files: interface/definition files first, then alphabetically.
-     * Files containing "GLOBAL", "DEFS", or "SYSCALL" in their name contain
-     * INTERFACE declarations that must be processed before their implementation
-     * files (SYSG1, SYSG2, etc.) which use inherited `(* params *)` syntax. */
+    /* Sort files: interface/definition files first, then primitives, then
+     * alphabetically.  Files containing "GLOBAL", "DEFS", or "SYSCALL"
+     * have INTERFACE declarations that must be processed before their
+     * implementation files.  Files containing "PRIM" define primitive types
+     * (sdb, mmrb, pcb, etc.) used by higher-level units (MM0, DS0, etc.)
+     * and must also be compiled early so their types are available. */
     for (int a = 0; a < num_files - 1; a++)
         for (int b = a + 1; b < num_files; b++) {
-            /* Interface files sort before implementation files */
-            int a_iface = (strcasestr(files[a].path, "GLOBAL") ||
-                          strcasestr(files[a].path, "DEFS") ||
-                          strcasestr(files[a].path, "SYSCALL")) ? 0 : 1;
-            int b_iface = (strcasestr(files[b].path, "GLOBAL") ||
-                          strcasestr(files[b].path, "DEFS") ||
-                          strcasestr(files[b].path, "SYSCALL")) ? 0 : 1;
-            if (a_iface != b_iface ? (a_iface > b_iface) :
+            /* Priority: 0 = GLOBAL/DEFS/SYSCALL, 1 = PRIM, 2 = everything else */
+            int a_pri = (strcasestr(files[a].path, "GLOBAL") ||
+                         strcasestr(files[a].path, "DEFS") ||
+                         strcasestr(files[a].path, "SYSCALL")) ? 0 :
+                        (strcasestr(files[a].path, "PRIM")) ? 1 : 2;
+            int b_pri = (strcasestr(files[b].path, "GLOBAL") ||
+                         strcasestr(files[b].path, "DEFS") ||
+                         strcasestr(files[b].path, "SYSCALL")) ? 0 :
+                        (strcasestr(files[b].path, "PRIM")) ? 1 : 2;
+            if (a_pri != b_pri ? (a_pri > b_pri) :
                 (strcasecmp(files[a].path, files[b].path) > 0)) {
                 source_file_t tmp = files[a]; files[a] = files[b]; files[b] = tmp;
             }
