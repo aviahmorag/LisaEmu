@@ -568,7 +568,10 @@ static int expr_size(codegen_t *cg, ast_node_t *node) {
         case AST_IDENT_EXPR: {
             cg_symbol_t *sym = find_symbol_any(cg, node->name);
             if (sym && sym->type) return type_load_size(sym->type);
-            if (sym && sym->is_const) return 2;
+            if (sym && sym->is_const) {
+                int cv = sym->offset;
+                return (cv < -32768 || cv > 32767) ? 4 : 2;
+            }
             /* Check built-in identifiers */
             if (str_eq_nocase(node->name, "nil")) return 4;
             if (str_eq_nocase(node->name, "true") || str_eq_nocase(node->name, "false")) return 2;

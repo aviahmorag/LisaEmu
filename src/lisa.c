@@ -2823,7 +2823,10 @@ static bool hle_handle_system_error(lisa_t *lisa __attribute__((unused)), m68k_t
                 cpu_read32(cpu, cpu->a[7]+4),
                 cpu_read32(cpu, cpu->a[7]+8),
                 cpu_read32(cpu, cpu->a[7]+12));
-        fprintf(stderr, "  PC=$%06X D0=$%08X\n", cpu->pc, cpu->d[0]);
+        fprintf(stderr, "  PC=$%06X D0=$%08X D1=$%08X D2=$%08X\n",
+                cpu->pc, cpu->d[0], cpu->d[1], cpu->d[2]);
+        fprintf(stderr, "  A0=$%08X A5=$%08X A6=$%08X\n",
+                cpu->a[0], cpu->a[5], cpu->a[6]);
     }
 
     /* Error 10738 = stup_find_boot: can't find boot CD in pram.
