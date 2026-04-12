@@ -1610,8 +1610,32 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
 
         case AST_ASSIGN: {
             /* Evaluate RHS into D0 */
+            int rhs_sz = expr_size(cg, node->children[1]);
             gen_expression(cg, node->children[1]);
-            /* Store to LHS */
+            /* Post-hoc: if the generated code ends with a 32-bit producer
+             * (MOVE.L A0,D0, MOVE.L #imm,D0, MOVE.L disp(An),D0, etc.),
+             * ensure the store uses 4 bytes even if expr_size missed it. */
+            if (rhs_sz < 4 && cg->code_size >= 2) {
+                uint16_t last_op = (cg->code[cg->code_size - 2] << 8) | cg->code[cg->code_size - 1];
+                /* Check for common MOVE.L ?,D0 patterns (opword 0x2xxx) */
+                if ((last_op & 0xF1C0) == 0x2000 ||   /* MOVE.L <ea>,D0 */
+                    last_op == 0x2008 ||                /* MOVE.L A0,D0 */
+                    last_op == 0x201F)                  /* MOVE.L (SP)+,D0 */
+                    rhs_sz = 4;
+                /* Also check 4 bytes back for MOVE.L with displacement */
+                if (rhs_sz < 4 && cg->code_size >= 4) {
+                    uint16_t prev_op = (cg->code[cg->code_size - 4] << 8) | cg->code[cg->code_size - 3];
+                    if (prev_op == 0x202E || /* MOVE.L disp(A6),D0 */
+                        prev_op == 0x202D || /* MOVE.L disp(A5),D0 */
+                        prev_op == 0x2028 || /* MOVE.L disp(A0),D0 */
+                        prev_op == 0x2010 || /* MOVE.L (A0),D0 */
+                        prev_op == 0x203C)   /* MOVE.L #imm,D0 */
+                        rhs_sz = 4;
+                }
+            }
+            /* Store to LHS — use the larger of target type size and RHS
+             * expression size to avoid truncating pointer/longint values
+             * when the target type descriptor has incorrect size info. */
             ast_node_t *lhs = node->children[0];
             cg_symbol_t *sym = NULL;
             /* Check if LHS is a WITH field before normal lookup */
@@ -1622,6 +1646,8 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                 if (fld >= 0 && wrt) {
                     /* WITH field assignment: save RHS, load base, add offset, store */
                     int fsz = type_load_size(wrt->fields[fld].type);
+                    if (fsz > 4) fsz = 4;
+                    if (rhs_sz > fsz) fsz = rhs_sz; /* don't truncate pointer RHS */
                     if (fsz == 4) {
                         emit16(cg, 0x2F00);  /* MOVE.L D0,-(SP) save RHS */
                     } else {
@@ -1647,6 +1673,8 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
             if (sym) {
                 if (sym->is_param && sym->is_var_param) {
                     int sz = type_load_size(sym->type);
+                    if (sz > 4) sz = 4;
+                    if (rhs_sz > sz) sz = rhs_sz; /* don't truncate pointer RHS */
                     int depth = find_local_depth(cg, lhs->name);
                     if (depth > 0) {
                         emit16(cg, 0x2200);  /* MOVE.L D0,D1 — save value */
@@ -1662,6 +1690,11 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                 } else if (sym->is_param || !sym->is_global) {
                     int depth = find_local_depth(cg, lhs->name);
                     int sz = type_load_size(sym->type);
+                    /* Clamp to a valid MOVE size (1, 2, or 4). Large types
+                     * (strings, records) would need block copy; for now use 4
+                     * which is the widest single MOVE can transfer. */
+                    if (sz > 4) sz = 4;
+                    if (rhs_sz > sz) sz = rhs_sz; /* don't truncate pointer RHS */
                     if (depth > 0) {
                         /* Outer scope: save D0, get frame, write via A0 */
                         emit16(cg, 0x2200);  /* MOVE.L D0,D1 — save value */
@@ -1677,6 +1710,8 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                     emit16(cg, (uint16_t)(int16_t)sym->offset);
                 } else {
                     int sz = type_load_size(sym->type);
+                    if (sz > 4) sz = 4;
+                    if (rhs_sz > sz) sz = rhs_sz; /* don't truncate pointer RHS */
                     if (sz == 4) emit16(cg, 0x2B40);
                     else if (sz == 1) emit16(cg, 0x1B40);
                     else emit16(cg, 0x3B40);  /* MOVE.W D0,offset(A5) */
@@ -1685,6 +1720,8 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
             } else if (lhs->type == AST_ARRAY_ACCESS || lhs->type == AST_FIELD_ACCESS || lhs->type == AST_DEREF) {
                 /* Complex LHS: size-aware save/restore/store */
                 int sz = expr_size(cg, lhs);
+                if (sz > 4) sz = 4;
+                if (rhs_sz > sz) sz = rhs_sz; /* don't truncate pointer RHS */
                 if (sz == 4) {
                     emit16(cg, 0x2F00);  /* MOVE.L D0,-(SP) */
                     gen_lvalue_addr(cg, lhs);
@@ -1877,9 +1914,11 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
             cg_symbol_t *var = find_symbol_any(cg, node->name);
 
             /* Initialize loop variable (size-aware store) */
+            int for_rhs_sz = expr_size(cg, node->children[0]);
             gen_expression(cg, node->children[0]);
             if (var) {
                 int sz = type_load_size(var->type);
+                if (for_rhs_sz > sz) sz = for_rhs_sz;
                 if (sz == 4)
                     emit16(cg, 0x2D40);  /* MOVE.L D0,offset(A6) */
                 else

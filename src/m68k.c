@@ -2601,6 +2601,19 @@ static void execute_one(m68k_t *cpu) {
 
             if ((op & 0xFFC0) == 0x4800) { op_nbcd(cpu); break; }
 
+            /* HLE: $4FBC is a Lisa Pascal INLINE custom opcode used in
+             * Workshop init code. It's illegal on plain 68000. The operand
+             * word follows immediately (e.g. $4FBC $000C). Skip as NOP so
+             * the init loop completes and boot continues past Lisabug. */
+            if (op == 0x4FBC) {
+                static int hle_4fbc_count = 0;
+                if (hle_4fbc_count++ < 5)
+                    fprintf(stderr, "[HLE] $%04X NOP-skip at PC=$%06X (operand=$%04X)\n",
+                            op, cpu->pc - 2, cpu_read16(cpu, cpu->pc));
+                cpu->pc += 2;
+                break;
+            }
+
             illegal_instruction(cpu);
             break;
 
