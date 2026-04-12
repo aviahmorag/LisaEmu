@@ -82,24 +82,26 @@ After `G` at Lisabug prompt, reaches OS LOADER → **SYSTEM ERROR 10100**
 ### Source compile (`Lisa_Source/` → disk image)
 
 Toolchain: 317 Pascal + 103 ASM files → linked binary → disk image.
-Boot reaches PASCALINIT → INITSYS → POOL_INIT → INIT_FREEPOOL (writes
-pool header to sysglobal heap at $CCA000) → MM_INIT → GETSPACE.
-Currently **SYSTEM_ERROR(10701)** — GETSPACE fails because the pool
-header written by INIT_FREEPOOL has corrupt values. The pool_size and
-firstfree fields contain wrong data, likely from another store-width
-overflow or parameter computation bug in POOL_INIT.
+Boot reaches PASCALINIT → INITSYS → POOL_INIT → MM_INIT → GETSPACE
+(succeeds) → continues into display/screen setup.
+Currently **SYSTEM_ERROR(10709)** — `stup_cantmapscreen`: screen MMU
+segment is too long. GETLDMAP copy of loader PARMS into INITSYS frame
+is misaligned — `l_scrdata` reads garbage instead of the emulator's
+$2000. Likely a frame layout mismatch (variable sizes or ordering).
 
 **Key progress (2026-04-12):**
-- Fixed compile order: PRIM files now compile before consumers (MM0, DS0)
-- Fixed field offsets: sdb.memaddr, mmrb.head_sdb now correct (INSERTSDB works)
-- Fixed store-width: non-pointer assignments no longer overflow (MOVE.W for int2)
-- Fixed global offset reuse: imported globals keep their assigned A5 offsets
+- P4: Fixed compile order, field offsets, store-width, global offset reuse
+- P5: Fixed stale-upper-word bugs throughout codegen:
+  - SIZEOF/integer literals now use MOVEQ/MOVE.L (never MOVE.W)
+  - ORD4 sign-extends 16-bit args to 32-bit
+  - Binary ops sign-extend operands when use_long=true
+  - Store-width guards on WITH-field, var-param, complex-LHS paths
+  - Result: GETSPACE works, MM_INIT completes, boot progresses
 
 ### Toolchain metrics
 - Parser: **100%** (317/317), Assembler: **100%** (103/103)
 - Linker: 8527 symbols, output ~2.2 MB
-- Codegen: P1 ptr-trunc-load fixed, P2 ptr-trunc-store fixed,
-  P3 ptr-deref-field fixed, P4 compile-order + store-width fixed
+- Codegen: P1-P4 ptr/store fixes, P5 stale-upper-word fixes
 
 ### Key HLE mechanisms
 - `$234` fetch bypass: IPL=7→RTE (DB_INIT skip), IPL=0→execute (Lisabug)

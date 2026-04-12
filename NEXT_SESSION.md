@@ -2,94 +2,109 @@
 
 ## TL;DR
 
-Fixed compilation order (PRIM before consumers) and store-width overflow
-(non-pointer assignments no longer use MOVE.L). POOL_INIT now writes to
-the sysglobal heap, but pool header values are corrupt → GETSPACE still
-fails with SYSTEM_ERROR(10701).
+Fixed the stale-upper-word class of codegen bugs (P5): integer literals,
+SIZEOF, ORD4, binary ops, and store-width guards. Boot now passes
+POOL_INIT → MM_INIT → GETSPACE (succeeds!) → continues into display
+setup. Currently **SYSTEM_ERROR(10709)** — "screen MMU is too long"
+(`l_scrdata > maxmmusize`). Root cause: GETLDMAP copy loop misaligns
+PARMS data into INITSYS's frame.
 
 ## Accomplished this session
 
-### P4 compile-order fix
-- `src/toolchain/toolchain_bridge.c:485-502` — 3-tier compilation sort:
-  tier 0 = GLOBAL/DEFS/SYSCALL, tier 1 = PRIM, tier 2 = everything else.
-  Previously MM0 compiled before MMPRIM, so types like `sdb_ptr`,
-  `mmrb_ptr` were unresolved → all field offsets were 0.
-- Same fix in `src/toolchain/audit_toolchain.c:641-658`
+### P5: Stale-upper-word fixes (`pascal_codegen.c`)
 
-### P4 store-width overflow fix
-- `src/toolchain/pascal_codegen.c:1757-1762` — the P3 post-hoc widening
-  `if (rhs_sz > sz) sz = rhs_sz` now only fires for pointer/longint LHS.
-  Previously, `size_sglobal := expr` (int2 = 2 bytes) with a 32-bit
-  RHS used MOVE.L, overwriting the adjacent `sg_free_pool_addr` global's
-  high word ($00CCA000 → $0000A000).
+All fixes address the same 68000 pattern: `MOVE.W` only sets `D0[15:0]`,
+leaving `D0[31:16]` stale. When the value is used in a 32-bit operation
+(ADD.L, SUB.L, CMP.L, MULS), the stale bits corrupt the result.
 
-### P4 global offset reuse
-- `src/toolchain/pascal_codegen.c:2181-2202` — before allocating a new
-  A5 offset for a global, check `imported_globals` for an existing
-  assignment. Prevents double-allocation in the shared A5 data area.
+1. **SIZEOF codegen** (line ~1251): MOVEQ for 0-127, MOVE.L for >127
+   (was MOVE.W). Fixes pool header `firstfree` field corruption.
+
+2. **Integer literals** (line ~860): MOVEQ for -128..127, MOVE.L for
+   everything else (was MOVE.W for 128-32767). Fixes `b_sysglobal_ptr`
+   computation: `ord(@sg_free_pool_addr) + 24575` no longer corrupted
+   by stale upper word in the literal.
+
+3. **ORD4 intrinsic** (line ~1192): EXT.L D0 when argument is 16-bit.
+   Fixes GETSPACE's `nextfree` computation where `ord4(newsize) * 2`
+   was corrupted by the stale upper word from reading newsize (local).
+
+4. **Binary ops** (line ~1054): EXT.L on each operand when use_long=true
+   but operand expr_size ≤ 2. General fix for mixed-width arithmetic.
+
+5. **Store-width guards** (lines ~1694, ~1726, ~1788): Only widen stores
+   for pointer/longint types. Prevents MOVE.L overwriting adjacent
+   fields in records (WITH-block, var-param, complex-LHS paths).
+
+6. **Constant expr_size** (line ~571): Returns 4 for values outside
+   -32768..32767 (was always 2). Fixes comparisons involving large
+   constants like `maxmmusize = 131072`.
+
+### Verification
+
+- `b_sysglobal_ptr`: was $0198BF67 (wrong), now $00CCBF67 (correct)
+- Pool header: was corrupt (`3FFC 00CC 0008 3FFC`), now correct
+  (`3FFC 0000 0008 3FFC`) immediately after INIT_FREEPOOL
+- GETSPACE: was SYSTEM_ERROR(10701), now succeeds
+- MM_INIT: completes, boot progresses to screen setup
 
 ## In progress
 
-### SYSTEM_ERROR(10701) — GETSPACE fails
+### SYSTEM_ERROR(10709) — screen MMU too long
 
-POOL_INIT now executes and INIT_FREEPOOL writes to the sgheap at $CCA000.
-But the pool header values are wrong: `3FFC 00CC 0008 3FFC` instead of
-properly computed pool_size, firstfree, freecount.
-
-**Root cause hypothesis**: INIT_FREEPOOL receives correct parameters
-(fp_ptr=$CCA000, fp_size=32768) but the codegen for INIT_FREEPOOL
-itself may have store-width or type issues. The pool header record
-(`hdr_freepool`) has `int2` fields that might be stored as MOVE.L.
-
-**INIT_FREEPOOL source** (source-SYSG1.TEXT, line 32-46):
+**Source**: STARTUP line 431-432:
 ```pascal
-hdr_ptr := pointer(fp_ptr);
-with hdr_ptr^ do begin
-  pool_size := (fp_size - sizeof(hdr_freepool)) DIV 2;
-  firstfree := sizeof(hdr_freepool);
-  freecount := pool_size;
-  ent_ptr := pointer(fp_ptr + firstfree);
-  with ent_ptr^ do begin
-    size := pool_size;
-    next := stopper;
-  end;
-end;
+if l_scrdata > maxmmusize then
+    SYSTEM_ERROR(stup_cantmapscreen);
 ```
 
-**Next steps**:
-1. Check `hdr_freepool` record layout — what are the field types and
-   offsets for pool_size, firstfree, freecount?
-2. Disassemble INIT_FREEPOOL at $5834 to verify field access offsets
-3. The `3FFC 00CC 0008 3FFC` pattern in the pool header suggests fields
-   are written at wrong offsets or with wrong widths
-4. The store-width fix may need to also apply to WITH-statement field
-   assignments (gen_with_base path), not just simple identifier assignments
+**Emulator writes**: l_scrdata = $2000 (8192), maxmmusize = $20000 (131072).
+8192 < 131072, so the check should NOT trigger. But it does.
 
-**Also check**: the `stopper` constant used in INIT_FREEPOOL — if it's
-defined in SYSGLOBAL, does the codegen resolve it correctly?
+**Root cause**: GETLDMAP (STARTUP line 250-257) copies the loader's PARMS
+data word-by-word into INITSYS's local frame. The frame layout must
+exactly match the PARMS block layout. But the frame layout depends on:
+
+1. INITSYS's own locals (8 vars × 2 bytes = 16 bytes)
+2. The `(*$i source/parms.text*)` include variables
+3. Nested procedure activation records (GETLDMAP, INIT_PE, etc.)
+
+**Diagnosis approach**: The frame dump at error time shows l_scrdata is
+at A6-98. The value there is $000D4514 (garbage, > 131072). This
+confirms the PARMS copy is misaligned — the emulator's l_scrdata ($2000)
+ended up at a different frame offset than the compiler expects.
+
+**Next steps**:
+1. Trace the GETLDMAP copy: dump `@version` address and `@parmend` address
+   at runtime to see how big the frame region is
+2. Compare against the emulator's PARMS block size
+3. Check if nested procedure declarations affect frame layout (they
+   shouldn't, but verify)
+4. Check if `maxsegments = 48` is properly resolved for the array
+   declarations in parms.text (array size mismatches would shift offsets)
+5. The most likely issue: the emulator's PARMS writer puts fields at
+   fixed offsets, but the codegen allocates frame space differently.
+   The fix is to either adjust the PARMS writer to match the codegen's
+   frame layout, or vice versa.
 
 ## Key file pointers
 
 ```
-src/toolchain/pascal_codegen.c     P4 fixes (store-width, global reuse)
-src/toolchain/toolchain_bridge.c   P4 compile-order fix
-src/toolchain/audit_toolchain.c    P4 compile-order fix (audit tool)
-src/lisa.c:~2800                   SYSTEM_ERROR HLE handler
+src/toolchain/pascal_codegen.c     P5 fixes (stale-upper-word)
+src/lisa.c:~1580                   PARMS writer (emulator)
+src/lisa.c:~2811                   SYSTEM_ERROR HLE handler
 
-Lisa_Source/LISA_OS/OS/source-SYSG1.TEXT.unix.txt:5-46
-                                   INIT_FREEPOOL — current issue
-Lisa_Source/LISA_OS/OS/source-SYSG1.TEXT.unix.txt:729-772
-                                   POOL_INIT — calls INIT_FREEPOOL
-Lisa_Source/LISA_OS/OS/source-SYSGLOBAL.TEXT.unix.txt
-                                   hdr_freepool, ent_freepool types
+Lisa_Source/LISA_OS/OS/SOURCE-STARTUP.TEXT.unix.txt:239-258
+                                   GETLDMAP — PARMS copy loop
+Lisa_Source/LISA_OS/OS/source-parms.text.unix.txt
+                                   PARMS variable declarations
 ```
 
 ## Pick up here
 
-> Source boot reaches POOL_INIT which calls INIT_FREEPOOL. The pool
-> header at $CCA000 now has data (not zeros) but the values are corrupt.
-> Disassemble INIT_FREEPOOL ($5834) and check: (1) are hdr_freepool
-> field offsets correct? (2) are the WITH-statement field stores using
-> the right widths? (3) does `sizeof(hdr_freepool)` resolve to the
-> correct value? The store-width fix may need extending to cover
-> WITH-block field assignments.
+> Boot reaches error 10709 (screen MMU). The GETLDMAP copy from the
+> emulator's PARMS block into INITSYS's frame is misaligned. Trace the
+> copy: (1) add logging in GETLDMAP to show `@version` and `@parmend`
+> addresses, (2) compare the frame span against the emulator's PARMS
+> span, (3) identify which variable(s) have size mismatches causing
+> the alignment shift, (4) fix either the emulator or the codegen.
