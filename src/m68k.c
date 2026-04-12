@@ -2234,11 +2234,7 @@ static bool hle_trap6_do_an_mmu(m68k_t *cpu) {
     uint32_t d3 = cpu->d[3] & 0xFFFF;
 
     uint32_t smt_ptr = cpu_read32(cpu, (cpu->a[5] - 4) & 0xFFFFFF);
-    if (smt_ptr == 0 || smt_ptr > 0xFFFFFF) {
-        extern uint32_t g_hle_smt_base;
-        smt_ptr = g_hle_smt_base;
-    }
-    if (smt_ptr == 0 || smt_ptr > 0xFFFFFF) return false;
+    if (smt_ptr > 0xFFFFFF) return false;
 
     DBGSTATIC(int, hle_t6_count, 0);
     if (hle_t6_count < 5)
