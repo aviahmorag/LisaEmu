@@ -550,44 +550,6 @@ static uint8_t cops_dequeue(cops_queue_t *q) {
  * Memory callback bridge (CPU -> Memory system)
  * ======================================================================== */
 
-/* Debug helper: dump MMU mapping + physical bytes for a virtual address.
- * Used by m68k.c V4-TARGET instrumentation. */
-void lisa_dump_mmu_for_vaddr(uint32_t vaddr) {
-    if (!g_lisa) { fprintf(stderr, "  (no g_lisa)\n"); return; }
-    lisa_mem_t *mem = &g_lisa->mem;
-    int seg = (vaddr >> 17) & 0x7F;
-    int ctx = mem->current_context;
-    uint32_t offset = vaddr & 0x1FFFF;
-    fprintf(stderr, "  MMU: mmu_enabled=%d ctx=%d seg=%d offset=$%05X\n",
-            mem->mmu_enabled ? 1 : 0, ctx, seg, offset);
-    for (int c = 0; c < MMU_NUM_CONTEXTS; c++) {
-        mmu_segment_t *s = &mem->segments[c][seg];
-        uint32_t phys_base = ((uint32_t)s->sor << 9);
-        uint32_t phys = (phys_base + offset) & 0xFFFFFF;
-        fprintf(stderr, "    ctx[%d] seg[%d]: SLR=$%04X SOR=$%04X changed=$%02X  phys_base=$%06X  phys($%06X)=$%06X\n",
-                c, seg, s->slr, s->sor, s->changed, phys_base, vaddr, phys);
-    }
-    /* Print raw physical bytes at the translated phys for the active context */
-    mmu_segment_t *sa = &mem->segments[ctx][seg];
-    uint32_t phys = ((((uint32_t)sa->sor) << 9) + offset) & 0xFFFFFF;
-    fprintf(stderr, "  Phys RAM bytes at $%06X..+$20:\n   ", phys);
-    for (int i = 0; i < 0x22; i += 2) {
-        uint32_t pa = (phys + i) & 0xFFFFFF;
-        uint16_t w = 0;
-        if (pa + 1 < LISA_RAM_SIZE) {
-            w = ((uint16_t)mem->ram[pa] << 8) | mem->ram[pa + 1];
-        }
-        fprintf(stderr, " $%04X", w);
-    }
-    fprintf(stderr, "\n");
-    /* And through the virtual read path (what CPU sees) */
-    fprintf(stderr, "  Virt read bytes at $%06X..+$20:\n   ", vaddr);
-    for (int i = 0; i < 0x22; i += 2) {
-        uint16_t w = lisa_mem_read16(mem, (vaddr + i) & 0xFFFFFF);
-        fprintf(stderr, " $%04X", w);
-    }
-    fprintf(stderr, "\n");
-}
 
 static uint8_t mem_read8_cb(uint32_t addr) {
     return lisa_mem_read8(&g_lisa->mem, addr);
@@ -2787,7 +2749,7 @@ static bool hle_prof_entry(lisa_t *lisa, m68k_t *cpu) {
      * no deinterleaving needed. */
 
     static int prof_reads = 0;
-    if (prof_reads < 30)
+    if (prof_reads < 5)
         fprintf(stderr, "PROF_ENTRY[%d]: sector %u → tag@$%06X data@$%06X\n",
                 prof_reads, sector, tag_dest, data_dest);
     prof_reads++;

@@ -953,15 +953,6 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                 } else if (sym->is_param || !sym->is_global) {
                     /* Local/param: size-aware load from stack frame.
                      * For outer-scope variables, follow frame chain first. */
-                    if (sym->is_param && !sym->is_var_param) {
-                        static int vp_warn = 0;
-                        if (vp_warn++ < 30)
-                            fprintf(stderr, "  [VARDIAG] PARAM '%s' at +%d type=%s sz=%d is_var=0 in %s (code_off=$%X)\n",
-                                    node->name, sym->offset,
-                                    sym->type ? sym->type->name : "NULL",
-                                    sym->type ? sym->type->size : -1,
-                                    cg->current_file, cg->code_size);
-                    }
                     int depth = find_local_depth(cg, node->name);
                     int sz = type_load_size(sym->type);
                     if (depth > 0) {
@@ -2303,14 +2294,6 @@ static void gen_proc_or_func(codegen_t *cg, ast_node_t *node) {
     if (!has_param_list) {
         cg_proc_sig_t *sig = find_proc_sig(cg, node->name);
         if (sig && sig->num_params > 0) {
-            fprintf(stderr, "  INHERITED PARAMS for %s: %d params from signature\n", node->name, sig->num_params);
-            for (int j = 0; j < sig->num_params; j++) {
-                fprintf(stderr, "    param[%d]: '%s' size=%d var=%d type=%s\n",
-                        j, sig->param_name[j],
-                        sig->param_type[j] ? sig->param_type[j]->size : -1,
-                        sig->param_is_var[j],
-                        sig->param_type[j] ? sig->param_type[j]->name : "NULL");
-            }
             for (int j = 0; j < sig->num_params; j++) {
                 type_desc_t *ptype = sig->param_type[j];
                 if (!ptype) ptype = find_type(cg, "integer");
