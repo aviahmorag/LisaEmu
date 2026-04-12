@@ -467,6 +467,41 @@ static void gen_expression(codegen_t *cg, ast_node_t *node);
 static void gen_statement(codegen_t *cg, ast_node_t *node);
 static void gen_lvalue_addr(codegen_t *cg, ast_node_t *node);
 
+/* Generate an expression whose result will be used as a pointer (32-bit).
+ * Calls gen_expression then retroactively patches any 16-bit MOVE to D0
+ * into a 32-bit MOVE to D0, so that the subsequent MOVEA.L D0,A0 gets
+ * the full 32-bit value instead of a sign-extended 16-bit value. */
+static void gen_ptr_expression(codegen_t *cg, ast_node_t *node) {
+    uint32_t before = cg->code_size;
+    gen_expression(cg, node);
+    uint32_t after = cg->code_size;
+    /* Check if the emitted code ends with a 16-bit MOVE to D0 that we
+     * can safely widen to 32-bit. Pattern: 0x30xx xxxx (4 bytes) where
+     * the high byte 0x30 means MOVE.W <ea>,D0.
+     * 0x302E = MOVE.W disp(A6),D0 → 0x202E = MOVE.L disp(A6),D0
+     * 0x3028 = MOVE.W disp(A0),D0 → 0x2028 = MOVE.L disp(A0),D0
+     * 0x302D = MOVE.W disp(A5),D0 → 0x202D = MOVE.L disp(A5),D0
+     * 0x303C = MOVE.W #imm,D0     — need to widen to MOVE.L #imm,D0
+     *   but this changes instruction size, so skip and use EXT.L instead.
+     */
+    if (after - before >= 4) {
+        uint16_t opword = (cg->code[after - 4] << 8) | cg->code[after - 3];
+        if (opword == 0x302E || opword == 0x3028 || opword == 0x302D) {
+            /* Patch 0x30xx to 0x20xx (MOVE.W → MOVE.L) */
+            cg->code[after - 4] = 0x20;
+        }
+    }
+    /* If we couldn't patch (e.g. result came from MOVEQ, register op,
+     * MOVE.W #imm, or a complex expression), the value in D0 may be
+     * 16-bit. Sign-extend is wrong for pointers; we need the full value.
+     * But if the emitted code already produced a MOVE.L or MOVEQ, this
+     * is harmless — SWAP+CLR+SWAP on a full-width value would corrupt it.
+     * So only emit an extend if we KNOW we have a 16-bit result. */
+    /* For now, the opword patch handles the dominant case (frame/global
+     * MOVE.W → MOVE.L). The type_load_size fix handles TK_POINTER types
+     * at source. Together they should cover nearly all pointer loads. */
+}
+
 /* Check if an identifier is a field of an active WITH record.
  * Returns the field index and sets *out_type to the record type,
  * or returns -1 if not found. Searches from innermost WITH outward. */
@@ -496,12 +531,23 @@ static void gen_with_base(codegen_t *cg, int with_idx) {
      * For variable: get its address into A0. */
     if (expr->type == AST_DEREF) {
         /* WITH ptr^ DO ... → evaluate ptr, move to A0 */
-        gen_expression(cg, expr->children[0]);
+        gen_ptr_expression(cg, expr->children[0]);
         emit16(cg, 0x2040);  /* MOVEA.L D0,A0 */
     } else {
         /* WITH var DO ... → LEA var,A0 */
         gen_lvalue_addr(cg, expr);
     }
+}
+
+/* Return the correct load size for a type descriptor.
+ * Pointers are ALWAYS 4 bytes regardless of what type->size says —
+ * some types get created with size=2 before being resolved to pointers. */
+static int type_load_size(type_desc_t *t) {
+    if (!t) return 2;
+    if (t->kind == TK_POINTER) return 4;
+    if (t->kind == TK_LONGINT) return 4;
+    if (t->kind == TK_PROC || t->kind == TK_FUNC) return 4; /* procedure/function pointers */
+    return t->size > 0 ? t->size : 2;
 }
 
 /* Determine the byte size of an expression's result type.
@@ -518,7 +564,7 @@ static int expr_size(codegen_t *cg, ast_node_t *node) {
             return 4; /* pointer */
         case AST_IDENT_EXPR: {
             cg_symbol_t *sym = find_symbol_any(cg, node->name);
-            if (sym && sym->type) return sym->type->size > 0 ? sym->type->size : 2;
+            if (sym && sym->type) return type_load_size(sym->type);
             if (sym && sym->is_const) return 2;
             /* Check built-in identifiers */
             if (str_eq_nocase(node->name, "nil")) return 4;
@@ -528,7 +574,7 @@ static int expr_size(codegen_t *cg, ast_node_t *node) {
                 type_desc_t *wrt = NULL;
                 int fld = with_lookup_field(cg, node->name, &wrt, NULL);
                 if (fld >= 0 && wrt && wrt->fields[fld].type)
-                    return wrt->fields[fld].type->size > 0 ? wrt->fields[fld].type->size : 2;
+                    return type_load_size(wrt->fields[fld].type);
             }
             return 2;
         }
@@ -543,7 +589,7 @@ static int expr_size(codegen_t *cg, ast_node_t *node) {
                         for (int i = 0; i < rt->num_fields; i++) {
                             if (str_eq_nocase(rt->fields[i].name, node->name)) {
                                 if (rt->fields[i].type)
-                                    return rt->fields[i].type->size > 0 ? rt->fields[i].type->size : 2;
+                                    return type_load_size(rt->fields[i].type);
                                 break;
                             }
                         }
@@ -559,7 +605,7 @@ static int expr_size(codegen_t *cg, ast_node_t *node) {
                     type_desc_t *at = arr->type;
                     if (at->kind == TK_POINTER && at->base_type) at = at->base_type;
                     if (at->kind == TK_ARRAY && at->element_type)
-                        return at->element_type->size > 0 ? at->element_type->size : 2;
+                        return type_load_size(at->element_type);
                     if (at->kind == TK_STRING)
                         return 1;  /* string subscript returns a char */
                 }
@@ -570,7 +616,7 @@ static int expr_size(codegen_t *cg, ast_node_t *node) {
             if (node->children[0] && node->children[0]->type == AST_IDENT_EXPR) {
                 cg_symbol_t *ptr = find_symbol_any(cg, node->children[0]->name);
                 if (ptr && ptr->type && ptr->type->kind == TK_POINTER && ptr->type->base_type)
-                    return ptr->type->base_type->size > 0 ? ptr->type->base_type->size : 2;
+                    return type_load_size(ptr->type->base_type);
             }
             return 2;
         }
@@ -595,7 +641,7 @@ static int expr_size(codegen_t *cg, ast_node_t *node) {
                 }
                 /* Look up function return type */
                 cg_symbol_t *fsym = find_symbol_any(cg, node->name);
-                if (fsym && fsym->type && fsym->type->size > 0) return fsym->type->size;
+                if (fsym && fsym->type) return type_load_size(fsym->type);
             }
             return 2; /* Default to word */
         }
@@ -786,7 +832,7 @@ static void gen_lvalue_addr(codegen_t *cg, ast_node_t *node) {
         }
         /* If offset is 0, no ADDA needed */
     } else if (node->type == AST_DEREF) {
-        gen_expression(cg, node->children[0]); /* pointer value in D0 */
+        gen_ptr_expression(cg, node->children[0]); /* pointer value in D0 */
         emit16(cg, 0x2040);  /* MOVEA.L D0,A0 */
     }
 }
@@ -903,12 +949,21 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                     }
                     emit16(cg, (uint16_t)(int16_t)sym->offset);
                     /* Size-aware dereference of VAR parameter */
-                    emit_read_a0_to_d0(cg, sym->type ? sym->type->size : 2);
+                    emit_read_a0_to_d0(cg, type_load_size(sym->type));
                 } else if (sym->is_param || !sym->is_global) {
                     /* Local/param: size-aware load from stack frame.
                      * For outer-scope variables, follow frame chain first. */
+                    if (sym->is_param && !sym->is_var_param) {
+                        static int vp_warn = 0;
+                        if (vp_warn++ < 30)
+                            fprintf(stderr, "  [VARDIAG] PARAM '%s' at +%d type=%s sz=%d is_var=0 in %s (code_off=$%X)\n",
+                                    node->name, sym->offset,
+                                    sym->type ? sym->type->name : "NULL",
+                                    sym->type ? sym->type->size : -1,
+                                    cg->current_file, cg->code_size);
+                    }
                     int depth = find_local_depth(cg, node->name);
-                    int sz = sym->type ? sym->type->size : 2;
+                    int sz = type_load_size(sym->type);
                     if (depth > 0) {
                         /* Outer scope: follow static link chain into A0, then use A0 */
                         emit_frame_access(cg, depth);
@@ -922,8 +977,8 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                     }
                     emit16(cg, (uint16_t)(int16_t)sym->offset);
                 } else {
-                    /* Global: MOVE.W offset(A5),D0 */
-                    int sz = sym->type ? sym->type->size : 2;
+                    /* Global: size-aware load from A5 */
+                    int sz = type_load_size(sym->type);
                     if (sz == 4) {
                         emit16(cg, 0x202D);
                     } else if (sz == 1) {
@@ -946,7 +1001,7 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                         emit16(cg, 0xD0FC);  /* ADDA.W #offset,A0 */
                         emit16(cg, (uint16_t)(int16_t)foff);
                     }
-                    int fsz = (wrt->fields[fld].type) ? wrt->fields[fld].type->size : 2;
+                    int fsz = type_load_size(wrt->fields[fld].type);
                     emit_read_a0_to_d0(cg, fsz);
                 } else {
                     /* Not a WITH field — fall through to unknown/constant */
@@ -1209,7 +1264,7 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
 
             /* LENGTH(s): first byte of string = length */
             if (str_eq_nocase(fn, "LENGTH")) {
-                if (node->num_children > 0) gen_expression(cg, node->children[0]);
+                if (node->num_children > 0) gen_ptr_expression(cg, node->children[0]);
                 emit16(cg, 0x2040);  /* MOVEA.L D0,A0 */
                 emit16(cg, 0x7000);  /* MOVEQ #0,D0 */
                 emit16(cg, 0x1010);  /* MOVE.B (A0),D0 */
@@ -1513,7 +1568,7 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
             break;
 
         case AST_DEREF:
-            gen_expression(cg, node->children[0]);
+            gen_ptr_expression(cg, node->children[0]);
             emit16(cg, 0x2040);  /* MOVEA.L D0,A0 */
             emit_read_a0_to_d0(cg, expr_size(cg, node));
             break;
@@ -1566,7 +1621,7 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                 int fld = with_lookup_field(cg, lhs->name, &wrt, &widx);
                 if (fld >= 0 && wrt) {
                     /* WITH field assignment: save RHS, load base, add offset, store */
-                    int fsz = (wrt->fields[fld].type) ? wrt->fields[fld].type->size : 2;
+                    int fsz = type_load_size(wrt->fields[fld].type);
                     if (fsz == 4) {
                         emit16(cg, 0x2F00);  /* MOVE.L D0,-(SP) save RHS */
                     } else {
@@ -1591,7 +1646,7 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                 sym = find_symbol_any(cg, lhs->name);
             if (sym) {
                 if (sym->is_param && sym->is_var_param) {
-                    int sz = sym->type ? sym->type->size : 2;
+                    int sz = type_load_size(sym->type);
                     int depth = find_local_depth(cg, lhs->name);
                     if (depth > 0) {
                         emit16(cg, 0x2200);  /* MOVE.L D0,D1 — save value */
@@ -1606,7 +1661,7 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                     }
                 } else if (sym->is_param || !sym->is_global) {
                     int depth = find_local_depth(cg, lhs->name);
-                    int sz = sym->type ? sym->type->size : 2;
+                    int sz = type_load_size(sym->type);
                     if (depth > 0) {
                         /* Outer scope: save D0, get frame, write via A0 */
                         emit16(cg, 0x2200);  /* MOVE.L D0,D1 — save value */
@@ -1621,7 +1676,7 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                     }
                     emit16(cg, (uint16_t)(int16_t)sym->offset);
                 } else {
-                    int sz = sym->type ? sym->type->size : 2;
+                    int sz = type_load_size(sym->type);
                     if (sz == 4) emit16(cg, 0x2B40);
                     else if (sz == 1) emit16(cg, 0x1B40);
                     else emit16(cg, 0x3B40);  /* MOVE.W D0,offset(A5) */
@@ -1824,7 +1879,7 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
             /* Initialize loop variable (size-aware store) */
             gen_expression(cg, node->children[0]);
             if (var) {
-                int sz = var->type ? var->type->size : 2;
+                int sz = type_load_size(var->type);
                 if (sz == 4)
                     emit16(cg, 0x2D40);  /* MOVE.L D0,offset(A6) */
                 else
@@ -1833,7 +1888,7 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
             }
 
             /* Evaluate end value, save in D3 (size-aware) */
-            int vsz = (var && var->type) ? var->type->size : 2;
+            int vsz = type_load_size(var ? var->type : NULL);
             gen_expression(cg, node->children[1]);
             if (vsz == 4)
                 emit16(cg, 0x2600);  /* MOVE.L D0,D3 */

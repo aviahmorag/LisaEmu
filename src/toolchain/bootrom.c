@@ -105,6 +105,12 @@ uint8_t *bootrom_generate(void) {
     emit16(&b, 0x4E71);          /* NOP */
     emit16(&b, 0x60FC);          /* BRA.S self (halt forever) */
 
+    /* $FE0088: prom_message — ROM display-string facility.
+     * Called by starasm1 to print boot progress on screen.
+     * Cosmetic only — boot proceeds fine without output. */
+    b.pc = 0x0088;
+    emit16(&b, 0x4E75);          /* RTS */
+
     /* $FE0090: prof_entry — ProFile block read.
      * Just RTS — the LDRLDR will get empty/zero data but the boot
      * process won't crash. Eventually we need a real implementation. */
@@ -112,6 +118,12 @@ uint8_t *bootrom_generate(void) {
     emit16(&b, 0x4E75);          /* RTS (2 bytes: $90-$91) */
     /* pad */
     emit16(&b, 0x4E71);          /* NOP (2 bytes: $92-$93) */
+
+    /* $FE00B0: prom_value — ROM display-value facility.
+     * Called by starasm1 to print hex/decimal values during boot.
+     * Cosmetic only — boot proceeds fine without output. */
+    b.pc = 0x00B0;
+    emit16(&b, 0x4E75);          /* RTS */
 
     /* $FE0094: twig_entry — Twiggy/Sony block read (stub) */
     b.pc = 0x0094;

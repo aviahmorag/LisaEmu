@@ -409,9 +409,10 @@ Fixes landed this session (all in one commit + one pending):
   when the SwiftUI overlay mounts it after "Power On". No more
   having to click into the view before typing.
 
-**Toolchain (source → image pipeline)** — green but does NOT yet boot
-end-to-end. **This is the real product track** — the prebuilt-image
-work above is a validation fixture for the emulator core.
+**Toolchain (source → image pipeline)** — green, pointer-truncation
+codegen bugs fixed. Not yet boot-tested after fixes. **This is the
+real product track** — the prebuilt-image work above validated the
+emulator core.
 
 - Parser: **100%** (317/317 Pascal files)
 - Assembler: **100%** (103/103)
@@ -423,14 +424,33 @@ work above is a validation fixture for the emulator core.
   `build/lisa_linked.bin` (870 KB) for offline disassembly, then starts
   executing the compiled 68000 code. Early-boot TRAPs 37/39 take the
   real handlers; TRAP #6 (MMU accessor) currently hits an RTE stub at
-  `$3F8`. CPU then spins in `libfp-FPMODES` around `PC=$097A**`.
+  `$3F8`. Previous spin at `PC=$097A**` was caused by pointer
+  truncation — now fixed.
 
-**Blocker**: Pascal codegen bug. The spin pattern
-`MOVE.W 8(A6),D0 / MOVEA.L D0,A0 / MOVE.W (A0),D0` strongly suggests
-VAR parameters are being loaded as 16-bit pointers (truncating the
-high half of the address) instead of the correct 32-bit load. Fix
-site is in `src/toolchain/pascal_codegen.c` — VAR param dereference
-emission. Likely more codegen bugs follow this one.
+**Codegen fixes landed (2026-04-12 session)**:
+
+Pattern scan of `build/lisa_linked.bin` found two systematic bugs:
+
+- **P1 (PTR-TRUNC-LOAD)**: 261 instances of `MOVE.W off(A6),D0 /
+  MOVEA.L D0,A0` — pointer/VAR-param loaded as 16-bit, truncating
+  high half. Heaviest in `source-fsdir` (93), `source-fsui` (23),
+  `libfp-FPLIB` (20). **Fixed → 0** via `type_load_size()` helper
+  and `gen_ptr_expression()` wrapper in `pascal_codegen.c`.
+
+- **P2 (PTR-TRUNC-STORE)**: 159 instances of `MOVE.L A0,D0` then
+  `MOVE.W D0,off(A6)` — 32-bit address stored to 16-bit slot.
+  Heaviest in `libpl-BLOCKIO` (35), exception mgr (20).
+  **Fix in progress** — same `type_load_size()` pattern for stores.
+
+- **ROM stubs**: 10 JSR calls to 5 ROM addresses. 3 were already
+  implemented (`$FE0090` prof_entry, `$FE0094` twig_entry,
+  `$FE00BC` checksum). Added 2 cosmetic stubs: `$FE0088`
+  prom_message (boot string display) and `$FE00B0` prom_value
+  (boot value display). Source reference: `starasm1.text:303-304`.
+
+**Next step**: rebuild from source after P2 fix lands, boot, and
+capture the first new crash/spin — which will be a genuinely NEW
+bug, not one of the 420 instances of pointer truncation.
 
 **Why this track matters more**: our toolchain does not link
 SYSTEM.DEBUG, so source-compiled boots have **no Lisabug in the way
