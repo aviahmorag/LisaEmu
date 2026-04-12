@@ -81,16 +81,20 @@ After `G` at Lisabug prompt, reaches OS LOADER → **SYSTEM ERROR 10100**
 
 ### Source compile (`Lisa_Source/` → disk image)
 
-Toolchain: 317 Pascal + 103 ASM files → 870 KB linked binary → disk image.
+Toolchain: 317 Pascal + 103 ASM files → linked binary → disk image.
 Boot reaches PASCALINIT, sets up A5/sysglobal, TRAP #6 fires (DO_AN_MMU
-runs from loaded code). **Spins at `$097AA6`** in LIBFP area — loop exit
-condition never triggers. Pointer loads are correct (P1/P2 fixed). Likely
-data initialization issue upstream.
+runs from loaded code). Past LIBFP (P3 fixed), now **spins at `$09A64C`**
+in Memory Manager (source-MM0.TEXT, `INSERTSDB`). The SDB linked-list
+traversal `while left_sdb^.memaddr <= c_sdb^.memaddr` loops infinitely —
+the list data is uninitialized (sysglobal pool is zeroed). This is a
+**runtime initialization issue**, not codegen.
 
 ### Toolchain metrics
 - Parser: **100%** (317/317), Assembler: **100%** (103/103)
-- Linker: 8527 symbols, 870 KB output
-- Codegen: P1 ptr-trunc-load 261→0, P2 ptr-trunc-store 159→0
+- Linker: 8527 symbols, output ~2.2 MB (larger with P3 MOVE.L fixes)
+- Codegen: P1 ptr-trunc-load 261→0, P2 ptr-trunc-store 159→0,
+  P3 ptr-deref-field: forward-ref fixup + POINTER() gen_ptr_expression +
+  assignment post-hoc patch
 
 ### Key HLE mechanisms
 - `$234` fetch bypass: IPL=7→RTE (DB_INIT skip), IPL=0→execute (Lisabug)
