@@ -82,19 +82,24 @@ After `G` at Lisabug prompt, reaches OS LOADER → **SYSTEM ERROR 10100**
 ### Source compile (`Lisa_Source/` → disk image)
 
 Toolchain: 317 Pascal + 103 ASM files → linked binary → disk image.
-Boot reaches PASCALINIT, sets up A5/sysglobal, TRAP #6 fires (DO_AN_MMU
-runs from loaded code). Past LIBFP (P3 fixed), now **spins at `$09A64C`**
-in Memory Manager (source-MM0.TEXT, `INSERTSDB`). The SDB linked-list
-traversal `while left_sdb^.memaddr <= c_sdb^.memaddr` loops infinitely —
-the list data is uninitialized (sysglobal pool is zeroed). This is a
-**runtime initialization issue**, not codegen.
+Boot reaches PASCALINIT → INITSYS → POOL_INIT → INIT_FREEPOOL (writes
+pool header to sysglobal heap at $CCA000) → MM_INIT → GETSPACE.
+Currently **SYSTEM_ERROR(10701)** — GETSPACE fails because the pool
+header written by INIT_FREEPOOL has corrupt values. The pool_size and
+firstfree fields contain wrong data, likely from another store-width
+overflow or parameter computation bug in POOL_INIT.
+
+**Key progress (2026-04-12):**
+- Fixed compile order: PRIM files now compile before consumers (MM0, DS0)
+- Fixed field offsets: sdb.memaddr, mmrb.head_sdb now correct (INSERTSDB works)
+- Fixed store-width: non-pointer assignments no longer overflow (MOVE.W for int2)
+- Fixed global offset reuse: imported globals keep their assigned A5 offsets
 
 ### Toolchain metrics
 - Parser: **100%** (317/317), Assembler: **100%** (103/103)
-- Linker: 8527 symbols, output ~2.2 MB (larger with P3 MOVE.L fixes)
-- Codegen: P1 ptr-trunc-load 261→0, P2 ptr-trunc-store 159→0,
-  P3 ptr-deref-field: forward-ref fixup + POINTER() gen_ptr_expression +
-  assignment post-hoc patch
+- Linker: 8527 symbols, output ~2.2 MB
+- Codegen: P1 ptr-trunc-load fixed, P2 ptr-trunc-store fixed,
+  P3 ptr-deref-field fixed, P4 compile-order + store-width fixed
 
 ### Key HLE mechanisms
 - `$234` fetch bypass: IPL=7→RTE (DB_INIT skip), IPL=0→execute (Lisabug)
