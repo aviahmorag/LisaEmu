@@ -2146,6 +2146,62 @@ int lisa_run_frame(lisa_t *lisa) {
         fprintf(stderr, "\n  D0=$%08X D1=$%08X A0=$%08X A6=$%08X SP=$%08X\n",
                 lisa->cpu.d[0], lisa->cpu.d[1], lisa->cpu.a[0], lisa->cpu.a[6], lisa->cpu.a[7]);
     }
+    /* Trace POOL_INIT: check if its code was reached by frame 10 */
+    if (frame_count == 10 && lisa->hle.system_error) {
+        /* POOL_INIT address is at the JSR target before ADDA.W #24,SP in STARTUP */
+        uint32_t pool_init_addr = 0;
+        for (uint32_t a = 0x4F00; a < 0x5100 && a + 10 < LISA_RAM_SIZE; a += 2) {
+            uint16_t w = (lisa->mem.ram[a] << 8) | lisa->mem.ram[a+1];
+            if (w == 0x4EB9) {
+                uint32_t tgt = ((uint32_t)lisa->mem.ram[a+2]<<24) | ((uint32_t)lisa->mem.ram[a+3]<<16) |
+                               ((uint32_t)lisa->mem.ram[a+4]<<8) | lisa->mem.ram[a+5];
+                uint16_t after = (lisa->mem.ram[a+6] << 8) | lisa->mem.ram[a+7];
+                if (tgt >= 0x5000 && tgt < 0x10000 && after == 0xDEFC) {
+                    uint16_t clean = (lisa->mem.ram[a+8] << 8) | lisa->mem.ram[a+9];
+                    if (clean == 0x0018) { pool_init_addr = tgt; break; }
+                }
+            }
+        }
+        if (pool_init_addr) {
+            /* Dump POOL_INIT function prologue to see if it was modified/reached */
+            fprintf(stderr, "  POOL_INIT @$%06X (first 32 bytes): ", pool_init_addr);
+            for (uint32_t i = 0; i < 32; i += 2)
+                fprintf(stderr, "%04X ", lisa_mem_read16(&lisa->mem, pool_init_addr + i));
+            fprintf(stderr, "\n");
+            /* Check INIT_FREEPOOL address from first JSR in POOL_INIT */
+            for (uint32_t a = pool_init_addr; a < pool_init_addr + 0x100; a += 2) {
+                uint16_t w2 = lisa_mem_read16(&lisa->mem, a);
+                if (w2 == 0x4EB9) {
+                    uint32_t tgt = lisa_mem_read32(&lisa->mem, a + 2);
+                    fprintf(stderr, "  POOL_INIT calls JSR $%06X at $%06X\n", tgt, a);
+                    break;
+                }
+            }
+        }
+        /* Check STARTUP call chain: dump INITSYS body hex and JSR targets */
+        fprintf(stderr, "  INITSYS @$4F34 first 32 bytes (phys RAM): ");
+        for (int i = 0; i < 32; i += 2)
+            fprintf(stderr, "%02X%02X ", lisa->mem.ram[0x4F34+i], lisa->mem.ram[0x4F34+i+1]);
+        fprintf(stderr, "\n  INITSYS @$4F34 first 32 bytes (MMU read): ");
+        for (int i = 0; i < 32; i += 2)
+            fprintf(stderr, "%04X ", lisa_mem_read16(&lisa->mem, 0x4F34+i));
+        /* Debug: verify RAM read at known JSR location $4F46 */
+        fprintf(stderr, "\n  RAM[$4F46]=%02X%02X (expect 4EB9), word=%04X\n",
+                lisa->mem.ram[0x4F46], lisa->mem.ram[0x4F47],
+                (uint16_t)((lisa->mem.ram[0x4F46] << 8) | lisa->mem.ram[0x4F47]));
+        fprintf(stderr, "  INITSYS JSR targets ($4F34-$5140):\n    ");
+        int jsr_count = 0;
+        for (uint32_t a = 0x4F34; a < 0x5140; a += 2) {
+            uint16_t w = (uint16_t)((lisa->mem.ram[a] << 8) | lisa->mem.ram[a+1]);
+            if (w == 0x4EB9) {
+                uint32_t tgt = ((uint32_t)lisa->mem.ram[a+2]<<24) | ((uint32_t)lisa->mem.ram[a+3]<<16) |
+                               ((uint32_t)lisa->mem.ram[a+4]<<8) | lisa->mem.ram[a+5];
+                fprintf(stderr, "$%06X→$%06X  ", a, tgt);
+                if (++jsr_count % 4 == 0) fprintf(stderr, "\n    ");
+            }
+        }
+        fprintf(stderr, "(found %d JSRs)\n", jsr_count);
+    }
     if (frame_count == 10 || frame_count == 60 || frame_count == 300 || frame_count == 800 || frame_count == 1500 || frame_count == 3000 || frame_count == 6000) {
         fprintf(stderr, "DIAG frame %d: PC=$%06X SR=$%04X stopped=%d pending_irq=%d setup=%d\n",
                 frame_count, lisa->cpu.pc, lisa->cpu.sr, lisa->cpu.stopped,
