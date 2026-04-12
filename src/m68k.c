@@ -2223,6 +2223,9 @@ static void op_bit_static(m68k_t *cpu) {
  */
 static bool hle_trap6_do_an_mmu(m68k_t *cpu) {
     uint32_t handler = cpu_read32(cpu, 0x98);
+    DBGSTATIC(int, t6_dbg, 0);
+    if (t6_dbg++ < 3)
+        fprintf(stderr, "[HLE-TRAP6] check: handler@$98=$%08X\n", handler);
     if (handler != 0x3F8) return false;
 
     uint32_t d0 = cpu->d[0] & 0xFFFF;
