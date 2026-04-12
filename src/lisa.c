@@ -1357,6 +1357,16 @@ void lisa_reset(lisa_t *lisa) {
     via_reset(&lisa->via1);
     via_reset(&lisa->via2);
 
+    /* Cold reset: clear video RAM (both framebuffer pages) and the
+     * rendered framebuffer so the display goes blank instead of
+     * showing the previous run's last frame. Main FB at $1F8000,
+     * alt (debug) FB at $1F0000 — clear the top 64KB which covers
+     * both. Full RAM is deliberately NOT cleared here because the
+     * OS image reload below rewrites everything it cares about. */
+    memset(&lisa->mem.ram[0x1F0000], 0, 0x10000);
+    memset(lisa->framebuffer, 0,
+           sizeof(uint32_t) * LISA_SCREEN_WIDTH * LISA_SCREEN_HEIGHT);
+
     /* Reset loader filesystem state for fresh boot */
     memset(&ldr_fs, 0, sizeof(ldr_fs));
     ldr_fs.initialized = false;

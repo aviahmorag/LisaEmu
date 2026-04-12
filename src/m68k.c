@@ -2818,6 +2818,68 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             }
         }
 
+        /* One-shot upstream trace at PC=$302726 — the entry of "caller A",
+         * the function whose for-loop falls through into the $302790 illegal.
+         * Fires once, BEFORE V4-TARGET, so we capture who called A and with
+         * what state. Goal: decide whether this code path is a legitimate
+         * Lisa OS initialization routine or a phantom call introduced by
+         * an upstream emulator divergence. */
+        {
+            static int caller_a_dumped = 0;
+            if (!caller_a_dumped && (cpu->pc & 0xFFFFFF) == 0x302726) {
+                caller_a_dumped = 1;
+                fprintf(stderr, "\n=== [CALLER-A] PC=$302726 entry ===\n");
+                fprintf(stderr, "  SR=$%04X  SSP=$%08X  USP=$%08X\n",
+                        cpu->sr, cpu->a[7], cpu->usp);
+                fprintf(stderr, "  D0=$%08X D1=$%08X D2=$%08X D3=$%08X\n",
+                        cpu->d[0], cpu->d[1], cpu->d[2], cpu->d[3]);
+                fprintf(stderr, "  D4=$%08X D5=$%08X D6=$%08X D7=$%08X\n",
+                        cpu->d[4], cpu->d[5], cpu->d[6], cpu->d[7]);
+                fprintf(stderr, "  A0=$%08X A1=$%08X A2=$%08X A3=$%08X\n",
+                        cpu->a[0], cpu->a[1], cpu->a[2], cpu->a[3]);
+                fprintf(stderr, "  A4=$%08X A5=$%08X A6=$%08X A7=$%08X\n",
+                        cpu->a[4], cpu->a[5], cpu->a[6], cpu->a[7]);
+                /* Return address is at (SSP) for a typical JSR entry */
+                fprintf(stderr, "  Return addr @ (SSP) = $%08X\n",
+                        cpu_read32(cpu, cpu->a[7] & 0xFFFFFF));
+                /* Full 256-entry PC ring — shows the call chain that led
+                 * into $302726. We want to see JSR/BSR instructions and
+                 * their originating PCs several frames deep. */
+                fprintf(stderr, "  PC ring (oldest -> newest, 256 entries):\n");
+                for (int ri = 256; ri > 0; ri--) {
+                    uint32_t rpc = pc_ring[(pc_ring_idx - ri) & 255];
+                    uint16_t ropc = cpu_read16(cpu, rpc);
+                    fprintf(stderr, "    [%3d] PC=$%06X op=$%04X\n",
+                            256 - ri, rpc, ropc);
+                }
+                /* Stack dump — 32 longs from SSP. The top long is the
+                 * return address; subsequent longs are either saved
+                 * registers from the caller's prologue or further up
+                 * the call stack (A6 frame chain). */
+                fprintf(stderr, "  Stack at SSP=$%08X (32 longs):\n", cpu->a[7]);
+                for (int i = 0; i < 32; i++) {
+                    if ((i & 3) == 0) fprintf(stderr, "    +%02X:", i * 4);
+                    fprintf(stderr, " $%08X",
+                            cpu_read32(cpu, (cpu->a[7] + i * 4) & 0xFFFFFF));
+                    if ((i & 3) == 3) fprintf(stderr, "\n");
+                }
+                /* A6 frame chain — walk saved A6 back as many frames as
+                 * we can without segfaulting. Each frame has (old A6)
+                 * and (return PC) at fixed offsets. */
+                fprintf(stderr, "  A6 frame chain:\n");
+                uint32_t fp = cpu->a[6];
+                for (int f = 0; f < 12 && fp && fp < 0x00F80000; f++) {
+                    uint32_t saved_a6 = cpu_read32(cpu, fp & 0xFFFFFF);
+                    uint32_t ret_pc   = cpu_read32(cpu, (fp + 4) & 0xFFFFFF);
+                    fprintf(stderr, "    frame %d: A6=$%08X  saved_A6=$%08X  ret=$%08X\n",
+                            f, fp, saved_a6, ret_pc);
+                    if (saved_a6 == fp || saved_a6 == 0) break;
+                    fp = saved_a6;
+                }
+                fprintf(stderr, "=== [CALLER-A] end ===\n\n");
+            }
+        }
+
         /* Trace PROG_MMU entry to check SMT state before TRAP #6.
          * PROG_MMU is at $120462 (from TRAP6 trace). At entry, the stack
          * has parameters pushed by the BOOTINIT Pascal code. */

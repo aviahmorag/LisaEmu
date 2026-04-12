@@ -78,8 +78,14 @@ final class EmulatorViewModel {
             return
         }
 
-        // Load ROM if we have a path but haven't loaded yet
-        if !romLoaded, let romPath = builtRomPath {
+        // Full teardown + re-init so every Power On is a true cold boot.
+        // Without this, the second Power On inherits stale CPU, MMU, VIA,
+        // and COPS state from the previous run and boot diverges.
+        emu_destroy()
+        emu_init()
+
+        // Re-load ROM if we have a path (the destroy above cleared it)
+        if let romPath = builtRomPath {
             if emu_load_rom(romPath) {
                 romLoaded = true
                 log("Boot ROM loaded: \(romPath)")
@@ -118,7 +124,15 @@ final class EmulatorViewModel {
         emulatorTimer = nil
         isRunning = false
         emu_set_running(false)
-        statusMessage = "Stopped"
+        displayImage = nil
+        // Restore a "ready to boot" message so the placeholder shows the
+        // same welcome text it would on a fresh launch.
+        if let imagePath = builtImagePath {
+            let name = (imagePath as NSString).lastPathComponent
+            statusMessage = "Last image: \(name). Power On to boot."
+        } else {
+            statusMessage = "Click 'Build from Source' to compile Lisa OS, or load a ROM"
+        }
         log("Power Off")
     }
 
@@ -432,6 +446,7 @@ final class EmulatorViewModel {
             0x27: 0x5B, // '
             0x2B: 0x5D, // ,
             0x2F: 0x5E, // .
+            0x2C: 0x4C, // / ?
             0x32: 0x68, // `
 
             // Control keys

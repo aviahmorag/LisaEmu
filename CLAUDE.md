@@ -245,6 +245,24 @@ register dump AND the subsequent ILLEGAL INSTRUCTION SYSTEM ERROR
 banner, with a `>` prompt ready for the user to type `OSQUIT` or
 `G`.
 
+**2026-04-12 empirical session notes**:
+- At the first (DB_INIT) `>` prompt, typing `G`+Return correctly
+  resumes through the `$302790` illegal → `hard_excep` path and
+  paints the second (SYSTEM ERROR 10738) banner, confirming the
+  IPL gate is routing entry #3 correctly end-to-end.
+- At the second prompt, typing `OSQUIT` as a bare command gets
+  "What ?" from Lisabug — Lisabug's command parser expects a verb
+  (G/T/S/DM/…) and doesn't treat an unknown token as a symbol
+  lookup. The correct incantation is almost certainly `G OSQUIT`
+  (Go at the address of symbol OSQUIT), mirroring the `g pc+2`
+  pattern in `apim-imevtloop.TEXT:1182`. Not yet empirically
+  verified — next step.
+- Keyboard map was missing `/` (and therefore `?` via shift).
+  macOS `0x2C` → Lisa `$4C` per `LIBHW-LEGENDS.TEXT:126`
+  (row `$48..$4F`: Return, Pad-0, _, _, `/`, Pad-1, _, _). Fixed
+  in both `lisaOS/lisaOS/EmulatorViewModel.swift:mapKeyCode` and
+  `src/main_sdl.c:sdl_to_lisa_key` this session.
+
 **The `$302790` illegal itself is legitimate — the bytes are on
 disk ($4FBC $000C confirmed in `prebuilt/los_compilation_base.image`
 at offset 0x69DB4E), and Lisa OS's handler correctly dispatches it.

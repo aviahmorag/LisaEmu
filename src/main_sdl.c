@@ -69,6 +69,7 @@ static int sdl_to_lisa_key(SDL_Scancode sc) {
         case SDL_SCANCODE_APOSTROPHE:   return 0x5B;
         case SDL_SCANCODE_COMMA:        return 0x5D;
         case SDL_SCANCODE_PERIOD:       return 0x5E;
+        case SDL_SCANCODE_SLASH:        return 0x4C;
         case SDL_SCANCODE_GRAVE:        return 0x68;
 
         case SDL_SCANCODE_RETURN:    return 0x48;
