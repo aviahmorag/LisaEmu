@@ -178,6 +178,9 @@ static type_desc_t *resolve_type(codegen_t *cg, ast_node_t *node) {
         case AST_TYPE_POINTER: {
             type_desc_t *t = add_type(cg, "", TK_POINTER, 4);
             t->base_type = find_type(cg, node->name);
+            /* Store base type name for forward-reference resolution */
+            strncpy(t->base_name, node->name, sizeof(t->base_name) - 1);
+            t->base_name[63] = '\0';
             return t;
         }
 
@@ -409,13 +412,7 @@ static cg_symbol_t *find_imported(codegen_t *cg, const char *name) {
 
 static cg_symbol_t *find_symbol_any(codegen_t *cg, const char *name) {
     cg_symbol_t *s = find_local(cg, name);
-    if (s) {
-        return s;
-    }
-    if (strcasecmp(name, "fp_ptr") == 0) {
-        fprintf(stderr, "  LOOKUP fp_ptr: NOT LOCAL (scope=%d), checking global/imported in '%s'\n",
-                cg->scope_depth, cg->current_file);
-    }
+    if (s) return s;
     s = find_global(cg, name);
     if (s) return s;
     return find_imported(cg, name);
@@ -486,6 +483,15 @@ static void gen_ptr_expression(codegen_t *cg, ast_node_t *node) {
         if (opword == 0x302E || opword == 0x3028 || opword == 0x302D) {
             /* Patch 0x30xx to 0x20xx (MOVE.W → MOVE.L) */
             cg->code[after - 4] = 0x20;
+        }
+    }
+    /* Also patch MOVE.W (A0),D0 → MOVE.L (A0),D0 (P3 pattern:
+     * dereferencing a pointer whose type was unresolved, resulting
+     * in a 16-bit read of what should be a 32-bit pointer value). */
+    if (after - before >= 2) {
+        uint16_t opword = (cg->code[after - 2] << 8) | cg->code[after - 1];
+        if (opword == 0x3010) {  /* MOVE.W (A0),D0 */
+            cg->code[after - 2] = 0x20;  /* → MOVE.L (A0),D0 = 0x2010 */
         }
     }
     /* If we couldn't patch (e.g. result came from MOVEQ, register op,
@@ -576,20 +582,32 @@ static int expr_size(codegen_t *cg, ast_node_t *node) {
             return 2;
         }
         case AST_FIELD_ACCESS: {
-            /* Look up the field type in the record */
+            /* Look up the field type in the record.
+             * Must handle both rec.field (IDENT_EXPR) and ptr^.field (DEREF). */
+            type_desc_t *rt = NULL;
             if (node->children[0] && node->children[0]->type == AST_IDENT_EXPR) {
                 cg_symbol_t *rec = find_symbol_any(cg, node->children[0]->name);
                 if (rec && rec->type) {
-                    type_desc_t *rt = rec->type;
+                    rt = rec->type;
                     if (rt->kind == TK_POINTER && rt->base_type) rt = rt->base_type;
-                    if (rt->kind == TK_RECORD) {
-                        for (int i = 0; i < rt->num_fields; i++) {
-                            if (str_eq_nocase(rt->fields[i].name, node->name)) {
-                                if (rt->fields[i].type)
-                                    return type_load_size(rt->fields[i].type);
-                                break;
-                            }
-                        }
+                }
+            } else if (node->children[0] && node->children[0]->type == AST_DEREF) {
+                ast_node_t *ptr_node = node->children[0]->children[0];
+                if (ptr_node && ptr_node->type == AST_IDENT_EXPR) {
+                    cg_symbol_t *ptr_sym = find_symbol_any(cg, ptr_node->name);
+                    if (ptr_sym && ptr_sym->type && ptr_sym->type->kind == TK_POINTER &&
+                        ptr_sym->type->base_type) {
+                        rt = ptr_sym->type->base_type;
+                        if (rt->kind == TK_POINTER && rt->base_type) rt = rt->base_type;
+                    }
+                }
+            }
+            if (rt && rt->kind == TK_RECORD) {
+                for (int i = 0; i < rt->num_fields; i++) {
+                    if (str_eq_nocase(rt->fields[i].name, node->name)) {
+                        if (rt->fields[i].type)
+                            return type_load_size(rt->fields[i].type);
+                        break;
                     }
                 }
             }
@@ -1170,9 +1188,12 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                 break;
             }
 
-            /* POINTER(x): cast integer to pointer — identity */
+            /* POINTER(x): cast integer to pointer — ensure 32-bit value.
+             * The argument might have been loaded as 16-bit (MOVE.W) if its
+             * type was unresolvable. Since the result is a pointer (32-bit),
+             * use gen_ptr_expression to retroactively patch 16→32-bit loads. */
             if (str_eq_nocase(fn, "POINTER")) {
-                if (node->num_children > 0) gen_expression(cg, node->children[0]);
+                if (node->num_children > 0) gen_ptr_expression(cg, node->children[0]);
                 break;
             }
 
@@ -1619,6 +1640,39 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                         prev_op == 0x2010 || /* MOVE.L (A0),D0 */
                         prev_op == 0x203C)   /* MOVE.L #imm,D0 */
                         rhs_sz = 4;
+                }
+            }
+            /* P3 post-hoc: if the LHS is pointer-sized (4 bytes) but the RHS
+             * emitted MOVE.W (A0),D0 or MOVE.W disp(An),D0, patch it to
+             * MOVE.L. This handles ptr := ptr^.field where the field type
+             * couldn't be resolved through the type chain. */
+            {
+                ast_node_t *lhs = node->children[0];
+                int lhs_sz = expr_size(cg, lhs);
+                /* Also check direct type_load_size for LHS ident */
+                if (lhs_sz < 4 && lhs->type == AST_IDENT_EXPR) {
+                    cg_symbol_t *ls = find_symbol_any(cg, lhs->name);
+                    if (ls && ls->type) {
+                        int tls = type_load_size(ls->type);
+                        if (tls > lhs_sz) lhs_sz = tls;
+                    }
+                }
+                if (lhs_sz >= 4 && rhs_sz < 4 && cg->code_size >= 2) {
+                    uint16_t last_op = (cg->code[cg->code_size - 2] << 8) | cg->code[cg->code_size - 1];
+                    if (last_op == 0x3010 ||  /* MOVE.W (A0),D0 */
+                        last_op == 0x3018) {  /* MOVE.W (A0)+,D0 */
+                        cg->code[cg->code_size - 2] = 0x20;  /* → MOVE.L */
+                        rhs_sz = 4;
+                    }
+                }
+                if (lhs_sz >= 4 && rhs_sz < 4 && cg->code_size >= 4) {
+                    uint16_t prev_op = (cg->code[cg->code_size - 4] << 8) | cg->code[cg->code_size - 3];
+                    if (prev_op == 0x3028 || /* MOVE.W disp(A0),D0 */
+                        prev_op == 0x302E || /* MOVE.W disp(A6),D0 */
+                        prev_op == 0x302D) { /* MOVE.W disp(A5),D0 */
+                        cg->code[cg->code_size - 4] = 0x20;  /* → MOVE.L */
+                        rhs_sz = 4;
+                    }
                 }
             }
             /* Store to LHS — use the larger of target type size and RHS
@@ -2236,6 +2290,15 @@ static void process_declarations(codegen_t *cg, ast_node_t *node, bool is_global
             }
             default:
                 break;
+        }
+    }
+
+    /* Forward-reference fixup: resolve pointer base_type that was NULL
+     * because the pointed-to type hadn't been declared yet. */
+    for (int i = 0; i < cg->num_types; i++) {
+        type_desc_t *t = &cg->types[i];
+        if (t->kind == TK_POINTER && !t->base_type && t->base_name[0]) {
+            t->base_type = find_type(cg, t->base_name);
         }
     }
 }

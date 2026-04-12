@@ -71,6 +71,7 @@ typedef struct type_desc {
 
     /* For pointers */
     struct type_desc *base_type;
+    char base_name[64];         /* Unresolved base type name (for forward refs) */
 
     /* For strings */
     int max_length;
