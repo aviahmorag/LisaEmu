@@ -452,9 +452,13 @@ static uint32_t read_ea_mode(m68k_t *cpu, int mode, int reg, int size) {
  * ======================================================================== */
 
 static int exception_count = 0;
+static int exception_count_gen = 0;
 static uint32_t pascalinit_addr = 0;
+static int pascalinit_addr_gen = 0;  /* gen vars for file-scope statics — reset in take_exception */
+static int illegal_opcode_histogram[16] = {0};
 uint32_t g_last_cpu_pc = 0;  /* Visible to lisa_mmu.c for write watchpoints */
 
+int g_emu_generation = 0;
 int m68k_exception_histogram[256] = {0};
 #define exception_histogram m68k_exception_histogram
 
@@ -464,12 +468,23 @@ int m68k_exception_histogram[256] = {0};
 int m68k_trap5_selector_histogram[256] = {0};
 
 static void take_exception(m68k_t *cpu, int vector) {
+    /* Reset file-scope debug statics on power cycle */
+    if (exception_count_gen != g_emu_generation) {
+        exception_count = 0; exception_count_gen = g_emu_generation;
+        pascalinit_addr = 0; pascalinit_addr_gen = g_emu_generation;
+        memset(m68k_exception_histogram, 0, sizeof(m68k_exception_histogram));
+        memset(m68k_trap5_selector_histogram, 0, sizeof(m68k_trap5_selector_histogram));
+        memset(illegal_opcode_histogram, 0, sizeof(illegal_opcode_histogram));
+    }
+
     /* Per-vector first-fire trace: fires exactly once per vector number, so
      * we can see in order which exceptions are hit during boot. The first
      * non-trivial vector to fire on native-vs-sandbox divergence is the
      * signal we're hunting. */
     {
         static bool ff_seen[256];
+        static int ff_gen = 0;
+        if (ff_gen != g_emu_generation) { memset(ff_seen, 0, sizeof(ff_seen)); ff_gen = g_emu_generation; }
         if (vector >= 0 && vector < 256 && !ff_seen[vector]) {
             ff_seen[vector] = true;
             uint32_t handler = cpu_read32(cpu, (uint32_t)vector * 4);
@@ -488,7 +503,7 @@ static void take_exception(m68k_t *cpu, int vector) {
 
     /* Detect stack overflow — allow mapped stack addresses ($CA0000+ and $F60000+) */
     if (cpu->a[7] < 0x1000 || (cpu->a[7] > 0x1FF000 && cpu->a[7] < 0xCA0000)) {
-        static int overflow_reported = 0;
+        DBGSTATIC(int, overflow_reported, 0);
         if (!overflow_reported) {
             overflow_reported = 1;
             fprintf(stderr, "STACK OVERFLOW: A7=$%08X at PC=$%06X, vector=%d\n",
@@ -504,7 +519,7 @@ static void take_exception(m68k_t *cpu, int vector) {
 
     /* Detect crash at PC=$2A — dump last PCs to understand the jump */
     if (vector == 4 && (cpu->pc & 0xFFFFFF) < 0x100) {
-        static int crash_traced = 0;
+        DBGSTATIC(int, crash_traced, 0);
         if (crash_traced++ < 1) {
             /* Print total trap counts */
             extern int g_trap6_total;
@@ -525,7 +540,7 @@ static void take_exception(m68k_t *cpu, int vector) {
 
     /* Count TRAP #6 calls */
     if (vector == 38) {
-        static int trap6_count = 0;
+        DBGSTATIC(int, trap6_count, 0);
         trap6_count++;
         if (trap6_count <= 5) {
             fprintf(stderr, "TRAP6[%d] at PC=$%06X: D0-7=$%08X $%08X $%08X $%08X $%08X $%08X $%08X $%08X\n",
@@ -585,7 +600,7 @@ static void take_exception(m68k_t *cpu, int vector) {
         if ((handler_op & 0xF000) == 0xA000 || (handler_op & 0xF000) == 0xF000) {
             /* Handler starts with Line-A/F opcode — would recurse. Skip. */
             handler = (vector == 10) ? 0x00FE0320 : 0x00FE0310;
-            static int recurse_warned = 0;
+            DBGSTATIC(int, recurse_warned, 0);
             if (recurse_warned++ < 3)
                 fprintf(stderr, "WARNING: Line-%c handler at $%06X starts with $%04X (would recurse), using ROM handler\n",
                         vector == 10 ? 'A' : 'F',
@@ -600,8 +615,6 @@ static void take_exception(m68k_t *cpu, int vector) {
 static void privilege_violation(m68k_t *cpu) {
     take_exception(cpu, VEC_PRIVILEGE);
 }
-
-static int illegal_opcode_histogram[16] = {0};
 
 static void illegal_instruction(m68k_t *cpu) {
     /* Track which opcode groups trigger illegal instruction */
@@ -1618,7 +1631,7 @@ static void op_bcc(m68k_t *cpu) {
         uint32_t target = base + disp;
         /* Debug: trace when BRA produces a bad target */
         if ((target & 0xFFFFFF) >= 0x200000 && (target & 0xFFFFFF) < 0xFE0000) {
-            static int bra_bad = 0;
+            DBGSTATIC(int, bra_bad, 0);
             if (bra_bad++ < 3)
                 fprintf(stderr, "!!! BAD BRA: from PC=$%06X base=$%06X disp=%d($%04X) → target=$%08X op=$%04X\n",
                         cpu->pc - (disp8 == 0 ? 4 : 2), base, disp,
@@ -1709,7 +1722,7 @@ static void op_rte(m68k_t *cpu) {
     uint32_t new_pc = pop32(cpu);
     /* Trace RTE from DO_AN_MMU */
     {
-        static int rte_trace = 0;
+        DBGSTATIC(int, rte_trace, 0);
         uint32_t old_pc = cpu->pc & 0xFFFFFF;
         if (old_pc >= 0xA84000 && old_pc < 0xA84200 && rte_trace < 5) {
             rte_trace++;
@@ -2216,6 +2229,8 @@ static void op_trap(m68k_t *cpu) {
     /* Count ALL traps */
     {
         static int trap_count[16] = {0};
+        static int trap_count_gen = 0;
+        if (trap_count_gen != g_emu_generation) { memset(trap_count, 0, sizeof(trap_count)); trap_count_gen = g_emu_generation; }
         trap_count[vector]++;
         if (vector == 6) { extern int g_trap6_total; g_trap6_total++; }
         if (vector == 6 && trap_count[6] >= 211 && trap_count[6] <= 220) {
@@ -2606,7 +2621,7 @@ static void execute_one(m68k_t *cpu) {
              * word follows immediately (e.g. $4FBC $000C). Skip as NOP so
              * the init loop completes and boot continues past Lisabug. */
             if (op == 0x4FBC) {
-                static int hle_4fbc_count = 0;
+                DBGSTATIC(int, hle_4fbc_count, 0);
                 if (hle_4fbc_count++ < 5)
                     fprintf(stderr, "[HLE] $%04X NOP-skip at PC=$%06X (operand=$%04X)\n",
                             op, cpu->pc - 2, cpu_read16(cpu, cpu->pc));
@@ -2768,6 +2783,8 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         /* PC ring buffer — trace crashes and escapes */
         static uint32_t pc_ring[256];
         static int pc_ring_idx = 0;
+        static int pc_ring_gen = 0;
+        if (pc_ring_gen != g_emu_generation) { memset(pc_ring, 0, sizeof(pc_ring)); pc_ring_idx = 0; pc_ring_gen = g_emu_generation; }
         pc_ring[pc_ring_idx++ & 255] = cpu->pc;
         g_last_cpu_pc = cpu->pc;
 
@@ -2779,10 +2796,10 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
          * vector $414 = line-1010. We catch the LEA itself (not a push
          * but also a write to A7), and any real push while SP<$1000. */
         {
-            static uint32_t pg_prev_sp = 0;
-            static uint32_t pg_prev_pc = 0;
-            static uint16_t pg_prev_ir = 0;
-            static int pg_fired = 0;
+            DBGSTATIC(uint32_t, pg_prev_sp, 0);
+            DBGSTATIC(uint32_t, pg_prev_pc, 0);
+            DBGSTATIC(uint16_t, pg_prev_ir, 0);
+            DBGSTATIC(int, pg_fired, 0);
             uint32_t sp_now = cpu->a[7] & 0xFFFFFF;
             if (pg_prev_sp != 0 && sp_now < pg_prev_sp && sp_now < 0x1000 && pg_fired < 10) {
                 pg_fired++;
@@ -2805,13 +2822,13 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
 
         /* SP watermark: catch stack leak in both physical and mapped space */
         {
-            static uint32_t lowest_sp = 0xFFFFFF;
+            DBGSTATIC(uint32_t, lowest_sp, 0xFFFFFF);
             uint32_t sp = cpu->a[7] & 0xFFFFFF;
             if (sp < lowest_sp && sp > 0x100) {
                 lowest_sp = sp;
                 /* Trigger at various thresholds */
                 if ((sp < 0x20000 || (sp > 0xC00000 && sp < 0xCB0000)) && sp != 0) {
-                    static int sp_log = 0;
+                    DBGSTATIC(int, sp_log, 0);
                     if (sp_log++ < 5) {
                         fprintf(stderr, "!!! SP LOW: $%06X at PC=$%06X A6=$%08X\n",
                                 sp, cpu->pc, cpu->a[6]);
@@ -2825,8 +2842,8 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         }
         /* Monitor A5 for corruption */
         {
-            static uint32_t last_a5 = 0;
-            static int a5_log = 0;
+            DBGSTATIC(uint32_t, last_a5, 0);
+            DBGSTATIC(int, a5_log, 0);
             if (a5_log < 3 && cpu->a[5] != last_a5 && last_a5 != 0) {
                 if ((last_a5 < 0x200000 && cpu->a[5] > 0x200000) ||
                     (last_a5 > 0x200000 && cpu->a[5] < 0x200000 && cpu->a[5] != 0)) {
@@ -2839,7 +2856,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         }
         /* Trace PASCALINIT internals: monitor the $DFC00-$DFD00 range */
         {
-            static int pi_trace = 0;
+            DBGSTATIC(int, pi_trace, 0);
             /* Detect PASCALINIT entry dynamically from the main body JSR */
             if (cpu->pc >= 0x4000 && cpu->pc < 0x5000 && pascalinit_addr == 0) {
                 /* Read the JSR target from the main body */
@@ -2866,12 +2883,12 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         }
         /* Watch A5: catch when it drops from normal range (>$10000) to small value */
         {
-            static uint32_t prev_a5 = 0;
-            static int a5_drop = 0;
-            if (prev_a5 > 0x10000 && cpu->a[5] < 0x1000 && a5_drop < 3) {
+            DBGSTATIC(uint32_t, prev_a5_drop, 0);
+            DBGSTATIC(int, a5_drop, 0);
+            if (prev_a5_drop > 0x10000 && cpu->a[5] < 0x1000 && a5_drop < 3) {
                 a5_drop++;
                 fprintf(stderr, "!!! A5 DROP: $%08X → $%08X at PC=$%06X op=$%04X (ir=$%04X)\n",
-                        prev_a5, cpu->a[5], cpu->pc, cpu_read16(cpu, cpu->pc), cpu->ir);
+                        prev_a5_drop, cpu->a[5], cpu->pc, cpu_read16(cpu, cpu->pc), cpu->ir);
                 fprintf(stderr, "    Last 30 PCs:");
                 for (int ri = 30; ri > 0; ri--)
                     fprintf(stderr, " $%06X", pc_ring[(pc_ring_idx - ri) & 255]);
@@ -2883,11 +2900,11 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                     fprintf(stderr, " $%08X", cpu_read32(cpu, (cpu->a[7] + si*4) & 0xFFFFFF));
                 fprintf(stderr, "\n");
             }
-            prev_a5 = cpu->a[5];
+            prev_a5_drop = cpu->a[5];
         }
         /* Detect when PC enters non-code I/O space ($FF0000+, excluding ROM $FE0000-$FEFFFF) */
         {
-            static int io_exec = 0;
+            DBGSTATIC(int, io_exec, 0);
             uint32_t mpc = cpu->pc & 0xFFFFFF;
             if (mpc >= 0xFF0000 && io_exec < 3) {
                 io_exec++;
@@ -2902,7 +2919,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         /* Detect PC entering vector table ($0-$3EF) — indicates stack corruption
          * or null function pointer. $3F0 is the stub, so exclude that. */
         {
-            static int vec_exec_count = 0;
+            DBGSTATIC(int, vec_exec_count, 0);
             uint32_t masked = cpu->pc & 0xFFFFFF;
             if (masked < 0x3F0 && masked > 0 && vec_exec_count < 3) {
                 vec_exec_count++;
@@ -2925,7 +2942,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
          * $2A is 2 bytes into the Line-A vector entry at $28. Something is
          * jumping/returning here. Dump full ring buffer, regs, and stack. */
         {
-            static int pc2a_count = 0;
+            DBGSTATIC(int, pc2a_count, 0);
             uint32_t masked = cpu->pc & 0xFFFFFF;
             if (masked == 0x2A && pc2a_count < 5) {
                 pc2a_count++;
@@ -2977,7 +2994,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         }
         /* Detect PC in unmapped RAM ($200000-$FBFFFF) — past 2MB, before I/O */
         {
-            static int unmapped_trace_count = 0;
+            DBGSTATIC(int, unmapped_trace_count, 0);
             uint32_t masked = cpu->pc & 0xFFFFFF;
             if (masked >= 0x200000 && masked < 0xFC0000 && unmapped_trace_count < 1) {
                 unmapped_trace_count++;
@@ -3014,8 +3031,8 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         }
         /* Detect when PC returns to $4000-$5000 (INITSYS/main body) after PASCALINIT */
         {
-            static int pi_state = 0;  /* 0=before, 1=in PASCALINIT, 2=left */
-            static int low_trace = 0;
+            DBGSTATIC(int, pi_state, 0);  /* 0=before, 1=in PASCALINIT, 2=left */
+            DBGSTATIC(int, low_trace, 0);
             if (pi_state == 0 && cpu->pc >= 0xDF000 && cpu->pc < 0xE0000) pi_state = 1;
             if (pi_state == 1 && cpu->pc < 0xDF000) pi_state = 2;
             if (pi_state == 2 && cpu->pc >= 0x4000 && cpu->pc < 0x5000 && low_trace < 5) {
@@ -3026,8 +3043,8 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         }
         /* Track large SP changes */
         {
-            static uint32_t prev_sp = 0;
-            static int sp_trace = 0;
+            DBGSTATIC(uint32_t, prev_sp, 0);
+            DBGSTATIC(int, sp_trace, 0);
             if (prev_sp > 0 && sp_trace < 3) {
                 int32_t delta = (int32_t)cpu->a[7] - (int32_t)prev_sp;
                 if (prev_sp > 0x1000 && cpu->a[7] < 0x1000 && cpu->a[7] > 0) {
@@ -3040,8 +3057,8 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         }
         /* Track when SP hits $78FBC (after %initstdio MOVEM push) going UP */
         {
-            static uint32_t prev_sp2 = 0;
-            static int sp_up = 0;
+            DBGSTATIC(uint32_t, prev_sp2, 0);
+            DBGSTATIC(int, sp_up, 0);
             if (sp_up < 3 && prev_sp2 < 0x78FBC && cpu->a[7] >= 0x78FBC && cpu->a[7] <= 0x78FFC) {
                 fprintf(stderr, ">>> SP UP TO $%08X at PC=$%06X (MOVEM restore?)\n",
                         cpu->a[7], cpu->pc);
@@ -3051,20 +3068,20 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         }
         /* Track A5 corruption */
         {
-            static uint32_t prev_a5 = 0;
-            static int a5_trace = 0;
-            if (a5_trace < 5 && prev_a5 != cpu->a[5] && prev_a5 != 0) {
-                if (cpu->a[5] > 0x100000 && prev_a5 < 0x100000) {
+            DBGSTATIC(uint32_t, prev_a5_corrupt, 0);
+            DBGSTATIC(int, a5_trace, 0);
+            if (a5_trace < 5 && prev_a5_corrupt != cpu->a[5] && prev_a5_corrupt != 0) {
+                if (cpu->a[5] > 0x100000 && prev_a5_corrupt < 0x100000) {
                     fprintf(stderr, ">>> A5 CORRUPT: $%08X → $%08X at PC=$%06X\n",
-                            prev_a5, cpu->a[5], cpu->pc);
+                            prev_a5_corrupt, cpu->a[5], cpu->pc);
                     a5_trace++;
                 }
             }
-            prev_a5 = cpu->a[5];
+            prev_a5_corrupt = cpu->a[5];
         }
         /* Trace wait loops */
         if ((cpu->pc & 0xFFFFFF) == 0xCB012) {
-            static int wait_trace = 0;
+            DBGSTATIC(int, wait_trace, 0);
             if (wait_trace < 3) {
                 fprintf(stderr, "WAIT@$CB012 #%d: D0=$%08X D7=$%08X SR=$%04X A0=$%08X A4=$%08X\n",
                         ++wait_trace, cpu->d[0], cpu->d[7], cpu->sr, cpu->a[0], cpu->a[4]);
@@ -3077,7 +3094,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         }
         /* Dump FP code at NEWFPSUB when loop is first entered */
         if (cpu->pc == 0xC11CE) {
-            static int fp_trace = 0;
+            DBGSTATIC(int, fp_trace, 0);
             if (fp_trace++ < 1) {
                 fprintf(stderr, "=== NEWFPSUB entry at $C11CE ===\n");
                 fprintf(stderr, "  D0=$%08X D1=$%08X D2=$%08X D3=$%08X\n",
@@ -3097,7 +3114,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         }
         /* Trace CALLDRIVER loop — find who called it */
         if (cpu->pc == 0xC120E) {
-            static int calldriver_count = 0;
+            DBGSTATIC(int, calldriver_count, 0);
             if (calldriver_count < 1) {
                 calldriver_count++;
                 uint32_t a3 = cpu->a[3];
@@ -3148,7 +3165,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         }
         /* Detect SYSTEM_ERROR calls */
         if (cpu->pc == 0xD8FAC) {
-            static int syserr_count = 0;
+            DBGSTATIC(int, syserr_count, 0);
             if (syserr_count++ < 5) {
                 /* Error number is on the stack as parameter */
                 uint16_t errnum = cpu_read16(cpu, cpu->a[7] + 4);
@@ -3159,7 +3176,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         }
         /* Log calls to stub ($3F0) — shows which functions are missing */
         if (cpu->pc == 0x3F0) {
-            static int stub_call_count = 0;
+            DBGSTATIC(int, stub_call_count, 0);
             if (stub_call_count < 20) {
                 uint32_t caller = cpu_read32(cpu, cpu->a[7]);
                 fprintf(stderr, "STUB CALL from $%06X (call #%d)\n", caller - 6, ++stub_call_count);
@@ -3167,7 +3184,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         }
         /* Trace first escape past loaded OS code ($6B000) */
         {
-            static int code_escape_count = 0;
+            DBGSTATIC(int, code_escape_count, 0);
             uint32_t masked_pc = cpu->pc & 0xFFFFFF;
             if (code_escape_count < 3 &&
                 ((masked_pc >= 0x6B000 && masked_pc < 0xFC0000) || cpu->pc > 0xFFFFFF)) {
@@ -3209,7 +3226,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
 
 
         /* Log TRAP exceptions with call context */
-        static int trap_detail_count = 0;
+        DBGSTATIC(int, trap_detail_count, 0);
         if (trap_detail_count < 10) {
             uint16_t opword2 = cpu_read16(cpu, cpu->pc);
             if ((opword2 & 0xFFF0) == 0x4E40) {
@@ -3232,7 +3249,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         }
 
         /* Trace PASCALINIT entry and critical values */
-        static int pascalinit_logged = 0;
+        DBGSTATIC(int, pascalinit_logged, 0);
         {
             /* Detect PASCALINIT by its first instruction: MOVE.L $218.L,A2 (opcode $2479) */
             uint16_t pi_op = cpu_read16(cpu, cpu->pc);
@@ -3256,7 +3273,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         }
 
         /* Detect odd PC — should never happen on 68000 */
-        static int odd_pc_logged = 0;
+        DBGSTATIC(int, odd_pc_logged, 0);
         if (!odd_pc_logged && (cpu->pc & 1) && cpu->pc >= 0x400 && cpu->pc < 0x100000) {
             fprintf(stderr, ">>> ODD PC: $%06X! Last 30 PCs:\n", cpu->pc);
             for (int ri = 30; ri > 0; ri--) {
@@ -3270,7 +3287,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
 
         /* Trace entry to STARTUP at $400 */
         {
-            static int startup_entry_logged = 0;
+            DBGSTATIC(int, startup_entry_logged, 0);
             if (!startup_entry_logged && cpu->pc == 0x400) {
                 fprintf(stderr, ">>> STARTUP entry: A5=$%08X A6=$%08X A7=$%08X SSP=$%08X USP=$%08X SR=$%04X\n",
                         cpu->a[5], cpu->a[6], cpu->a[7], cpu->ssp, cpu->usp, cpu->sr);
@@ -3278,7 +3295,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             }
         }
         /* Trace GETLDMAP and parameter block */
-        static int getldmap_logged = 0;
+        DBGSTATIC(int, getldmap_logged, 0);
         if (!getldmap_logged && cpu->pc == 0x45A) {
             /* At entry (before LINK): SP → return addr, SP+4 → ldmapbase */
             uint32_t ldm = cpu_read32(cpu, cpu->a[7] + 4);
@@ -3301,7 +3318,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             getldmap_logged = 1;
         }
         /* Trace REG_TO_MAPPED entry — locals should be filled by GETLDMAP */
-        static int r2m_logged = 0;
+        DBGSTATIC(int, r2m_logged, 0);
         if (!r2m_logged && cpu->pc == 0xD1B64) {
             r2m_logged = 1;
             /* At REG_TO_MAPPED entry: SP → return addr, SP+4 → e_us, SP+8 → b_sg */
@@ -3328,7 +3345,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         }
 
         /* Trace SYSTEM_ERROR call */
-        static int syserr_logged = 0;
+        DBGSTATIC(int, syserr_logged, 0);
         if (!syserr_logged && cpu->pc >= 0x4AF00 && cpu->pc <= 0x4AF20) {
             uint16_t op = cpu_read16(cpu, cpu->pc);
             if (op == 0x2079) {
@@ -3354,7 +3371,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         }
 
         /* Trace when A7 goes to 0 or near 0 */
-        static int a7_zero_logged = 0;
+        DBGSTATIC(int, a7_zero_logged, 0);
         if (!a7_zero_logged && cpu->a[7] < 0x100 && cpu->pc >= 0x400) {
             fprintf(stderr, ">>> A7 ZEROED: PC=$%06X A7=$%08X\n", cpu->pc, cpu->a[7]);
             fprintf(stderr, "  Last 30 PCs:\n");
@@ -3370,13 +3387,13 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         }
 
         /* Track highest PC reached in OS code and detect escape from kernel */
-        static uint32_t max_os_pc = 0;
-        static int escape_logged = 0;
+        DBGSTATIC(uint32_t, max_os_pc, 0);
+        DBGSTATIC(int, escape_logged, 0);
         if (cpu->pc >= 0x400 && cpu->pc < 0x100000 && cpu->pc > max_os_pc)
             max_os_pc = cpu->pc;
         /* Track transition: last PC in valid kernel code, first PC past it */
-        static uint32_t last_valid_pc = 0;
-        static uint16_t last_valid_op = 0;
+        DBGSTATIC(uint32_t, last_valid_pc, 0);
+        DBGSTATIC(uint16_t, last_valid_op, 0);
         if (cpu->pc >= 0x400 && cpu->pc < 0x53000) {
             last_valid_pc = cpu->pc;
             last_valid_op = cpu_read16(cpu, cpu->pc);
@@ -3402,8 +3419,8 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         }
 
         /* Log when PC enters vector table after being in OS code */
-        static uint32_t prev_pc = 0;
-        static int crash_logged = 0;
+        DBGSTATIC(uint32_t, prev_pc, 0);
+        DBGSTATIC(int, crash_logged, 0);
         if (!crash_logged && cpu->pc < 0x400 && prev_pc >= 0x400 && prev_pc < 0x200000) {
             fprintf(stderr, "CRASH TO VECTORS: prev_pc=$%06X → pc=$%06X opcode=$%04X A7=$%08X\n",
                     prev_pc, cpu->pc, cpu_read16(cpu, prev_pc), cpu->a[7]);
@@ -3424,7 +3441,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
 
         /* Trace crash function: dump opcodes and track A6 */
         {
-            static int crash_fn_dumped = 0;
+            DBGSTATIC(int, crash_fn_dumped, 0);
             /* Trace FPMODES function at $022892 */
             if (cpu->pc == 0x022892 && !crash_fn_dumped) {
                 fprintf(stderr, "\n>>> ENTERING FPMODES fn at $022892, A6=$%08X SP=$%08X\n",
@@ -3460,8 +3477,8 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             }
             /* Trace when A6 becomes $FFFFFFDE (garbage) */
             {
-                static uint32_t prev_a6 = 0;
-                static int a6_corrupt_log = 0;
+                DBGSTATIC(uint32_t, prev_a6, 0);
+                DBGSTATIC(int, a6_corrupt_log, 0);
                 if (cpu->a[6] == 0xFFFFFFDE && prev_a6 != 0xFFFFFFDE && a6_corrupt_log < 5) {
                     a6_corrupt_log++;
                     fprintf(stderr, "\n!!! A6 CORRUPTED: $%08X → $FFFFFFDE at PC=$%06X op=$%04X\n",
@@ -3513,7 +3530,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             uint16_t stacked_sr = cpu_read16(cpu, cpu->a[7] & 0xFFFFFF);
             uint32_t stacked_pc = cpu_read32(cpu, (cpu->a[7] + 2) & 0xFFFFFF);
             int ipl = (stacked_sr >> 8) & 7;
-            static int hle_seen = 0;
+            DBGSTATIC(int, hle_seen, 0);
             if (hle_seen++ < 8) {
                 fprintf(stderr, "[HLE] $234 entry #%d: stacked SR=$%04X "
                         "(IPL=%d) PC=$%06X SSP=$%08X → %s\n",
@@ -3538,7 +3555,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             uint32_t sp_after = cpu->a[7];
             int32_t delta = (int32_t)sp_after - (int32_t)sp_before;
             if (delta > 0x1000 || delta < -0x1000) {
-                static int sp_delta_log = 0;
+                DBGSTATIC(int, sp_delta_log, 0);
                 if (sp_delta_log++ < 10) {
                     fprintf(stderr, "\n!!! SP DELTA: $%08X → $%08X (delta=%+d) at PC=$%06X op=$%04X\n",
                             sp_before, sp_after, delta, pc_before, cpu_read16(cpu, pc_before));

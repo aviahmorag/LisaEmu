@@ -104,4 +104,18 @@ extern int m68k_exception_histogram[256];
 /* TRAP #5 selector histogram (D7 & 0xFF at entry). Reset by consumer. */
 extern int m68k_trap5_selector_histogram[256];
 
+/* Generation counter — bumped on every lisa_init() so that function-local
+ * static debug variables (print budgets, one-shot flags, etc.) can detect
+ * a power cycle and reset themselves.  Use the DBGSTATIC macro. */
+extern int g_emu_generation;
+
+/* Declare a debug static that auto-resets on power cycle.
+ * Usage:  DBGSTATIC(int, my_counter, 0);
+ * Expands to a static variable + a static generation tracker; when the
+ * generation changes, the variable is reset to its initial value. */
+#define DBGSTATIC(type, name, init) \
+    static type name = (init); \
+    static int name##_gen = 0; \
+    if (name##_gen != g_emu_generation) { name = (init); name##_gen = g_emu_generation; }
+
 #endif /* M68K_H */

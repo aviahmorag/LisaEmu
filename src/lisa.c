@@ -581,7 +581,7 @@ static void mem_write32_cb(uint32_t addr, uint32_t val) {
 
 static uint8_t io_read_cb(uint32_t offset) {
     {
-        static int io_trace = 0;
+        DBGSTATIC(int, io_trace, 0);
         extern uint32_t g_last_cpu_pc;
         uint32_t pc = g_last_cpu_pc & 0xFFFFFF;
         io_trace++;
@@ -605,7 +605,7 @@ static uint8_t io_read_cb(uint32_t offset) {
     if (offset >= 0xDC00 && offset < 0xE000) {
         uint8_t reg = (offset >> 1) & 0xF;
         uint8_t val = via_read(&lisa->via2, reg);
-        static int v2trace = 0;
+        DBGSTATIC(int, v2trace, 0);
         if (v2trace < 30) {
             extern uint32_t g_last_cpu_pc;
             v2trace++;
@@ -783,7 +783,7 @@ static void io_write_cb(uint32_t offset, uint8_t val) {
      * accumulate 4 bytes into a 32-bit address. The actual operation
      * triggers on the last byte (offset 0xC103). */
     if (offset >= 0xC100 && offset <= 0xC103) {
-        static uint32_t loader_parms_addr = 0;
+        DBGSTATIC(uint32_t, loader_parms_addr, 0);
         int byte_pos = offset - 0xC100;
         loader_parms_addr &= ~(0xFFU << (24 - byte_pos * 8));
         loader_parms_addr |= ((uint32_t)val << (24 - byte_pos * 8));
@@ -970,7 +970,7 @@ static void via1_portb_write(uint8_t val, uint8_t ddr, void *ctx) {
     (void)ddr;
     /* Trace first 10 ORB writes */
     {
-        static int orb_trace_count = 0;
+        DBGSTATIC(int, orb_trace_count, 0);
         if (orb_trace_count < 10) {
             fprintf(stderr, "VIA1_ORB_WRITE #%d: val=$%02X ddr=$%02X (CMD=%d DIR=%d)\n",
                     ++orb_trace_count, val, ddr,
@@ -1120,7 +1120,7 @@ static void via2_porta_write(uint8_t val, uint8_t ddr, void *ctx) {
      * $70-$77 = Mouse OFF
      * $78-$7F = Mouse ON with interval
      * $80-$FF = NOP */
-    static int cops_cmd_count = 0;
+    DBGSTATIC(int, cops_cmd_count, 0);
     cops_cmd_count++;
     if (cops_cmd_count <= 10)
         fprintf(stderr, "COPS CMD[%d]: $%02X\n", cops_cmd_count, val);
@@ -1174,7 +1174,7 @@ static uint8_t via2_porta_read(void *ctx) {
     /* Read byte from COPS */
     if (lisa->cops_rx.count > 0) {
         uint8_t val = cops_dequeue(&lisa->cops_rx);
-        static int read_count = 0;
+        DBGSTATIC(int, read_count, 0);
         if (read_count++ < 10)
             fprintf(stderr, "COPS READ[%d]: $%02X (remain=%d) PC=$%06X\n",
                     read_count, val, lisa->cops_rx.count, lisa->cpu.pc & 0xFFFFFF);
@@ -1256,6 +1256,7 @@ static bool hle_cpu_check(void *ctx, void *cpu);
 void lisa_init(lisa_t *lisa) {
     memset(lisa, 0, sizeof(lisa_t));
     g_lisa = lisa;
+    g_emu_generation++;
 
     /* Initialize components */
     m68k_init(&lisa->cpu);
@@ -1981,6 +1982,8 @@ int lisa_run_frame(lisa_t *lisa) {
     #define PC_HIST_SLOTS 64
     static uint32_t pc_hist_page[PC_HIST_SLOTS];
     static uint32_t pc_hist_cnt[PC_HIST_SLOTS];
+    static int pc_hist_gen = 0;
+    if (pc_hist_gen != g_emu_generation) { memset(pc_hist_page, 0, sizeof(pc_hist_page)); memset(pc_hist_cnt, 0, sizeof(pc_hist_cnt)); pc_hist_gen = g_emu_generation; }
 
     while (cycles_this_frame < LISA_CYCLES_PER_FRAME) {
         int batch = 64;
@@ -2017,7 +2020,7 @@ int lisa_run_frame(lisa_t *lisa) {
     }
 
     /* Debug: log CPU/VIA/vector state once after significant execution */
-    static int frame_count = 0;
+    DBGSTATIC(int, frame_count, 0);
     frame_count++;
 
     /* Don't force-unmask interrupts or generate vretrace during init.
@@ -2624,7 +2627,7 @@ static bool hle_handle_calldriver(lisa_t *lisa, m68k_t *cpu) {
             return false;  /* Real driver, let OS handle */
     }
 
-    static int hle_trace = 0;
+    DBGSTATIC(int, hle_trace, 0);
     if (hle_trace < 50) {
         hle_trace++;
         fprintf(stderr, "HLE CALLDRIVER: fnctn=%d config=$%06X params=$%06X\n",
@@ -2701,7 +2704,7 @@ static bool hle_handle_system_error(lisa_t *lisa __attribute__((unused)), m68k_t
     int16_t err_code = (int16_t)cpu_read16(cpu, cpu->a[7] + 4);
 
     /* Log all SYSTEM_ERROR calls with stack context */
-    static int se_trace = 0;
+    DBGSTATIC(int, se_trace, 0);
     if (se_trace < 10) {
         se_trace++;
         fprintf(stderr, "HLE SYSTEM_ERROR(%d) at ret=$%06X SP=$%08X A6=$%08X\n",
@@ -2748,7 +2751,7 @@ static bool hle_prof_entry(lisa_t *lisa, m68k_t *cpu) {
      * order. So the sector number we receive IS the physical block number —
      * no deinterleaving needed. */
 
-    static int prof_reads = 0;
+    DBGSTATIC(int, prof_reads, 0);
     if (prof_reads < 5)
         fprintf(stderr, "PROF_ENTRY[%d]: sector %u → tag@$%06X data@$%06X\n",
                 prof_reads, sector, tag_dest, data_dest);
@@ -2835,7 +2838,7 @@ bool lisa_hle_intercept(lisa_t *lisa, m68k_t *cpu) {
             /* Read all available COPS data (like the real handler would) */
             while (lisa->cops_rx.count > 0) {
                 uint8_t byte = via_read(&lisa->via2, VIA_ORA);
-                static int hle_cops = 0;
+                DBGSTATIC(int, hle_cops, 0);
                 if (hle_cops++ < 20)
                     fprintf(stderr, "HLE COPS: read $%02X (remain=%d)\n",
                             byte, lisa->cops_rx.count);
@@ -2861,7 +2864,7 @@ bool lisa_hle_intercept(lisa_t *lisa, m68k_t *cpu) {
      * the ProFile driver polling pointer at $494. The hardcoded OS init
      * skips the CALLDRIVER(dinit) that would normally do this. */
     {
-        static bool intson_done = false;
+        DBGSTATIC(bool, intson_done, false);
         if (!intson_done && pc >= 0x520840 && pc <= 0x520844) {
             uint16_t sr = cpu->sr;
             if ((sr & 0x0700) >= 0x0400) {  /* IPL >= 4 */
