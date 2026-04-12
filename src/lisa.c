@@ -551,6 +551,39 @@ static uint8_t cops_dequeue(cops_queue_t *q) {
  * ======================================================================== */
 
 
+void lisa_hle_prog_mmu(uint32_t domain, uint32_t index,
+                       uint32_t count, uint32_t smt_base) {
+    if (!g_lisa) return;
+    lisa_mem_t *mem = &g_lisa->mem;
+
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t seg = index + i;
+        if (seg >= MMU_NUM_SEGMENTS) break;
+
+        uint32_t entry_addr = (smt_base + domain * 512 + seg * 4) & 0xFFFFFF;
+        uint16_t origin = (mem->ram[entry_addr] << 8) | mem->ram[entry_addr + 1];
+        uint8_t access = mem->ram[entry_addr + 2];
+        uint8_t limit = mem->ram[entry_addr + 3];
+
+        uint16_t sor = origin;
+        uint16_t slr = ((uint16_t)access << 8) | limit;
+
+        if (domain < 4) {
+            int ctx = 1 + (int)domain;
+            if (ctx >= MMU_NUM_CONTEXTS) ctx = MMU_NUM_CONTEXTS - 1;
+            mem->segments[ctx][seg].sor = sor & 0xFFF;
+            mem->segments[ctx][seg].slr = slr & 0xFFF;
+            mem->segments[ctx][seg].changed = 3;
+            if (ctx == 1)
+                mem->segments[0][seg] = mem->segments[1][seg];
+            if (seg == 84 || seg == 126 || seg == 127) {
+                for (int c = 0; c < MMU_NUM_CONTEXTS; c++)
+                    if (c != ctx) mem->segments[c][seg] = mem->segments[ctx][seg];
+            }
+        }
+    }
+}
+
 static uint8_t mem_read8_cb(uint32_t addr) {
     return lisa_mem_read8(&g_lisa->mem, addr);
 }

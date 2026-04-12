@@ -2221,12 +2221,36 @@ static void op_bit_static(m68k_t *cpu) {
  * The handler reads from smt_base (at the end of do_an_mmu code)
  * which contains: origin(16) | access(8) | length(8) per segment.
  */
-/* HLE TRAP#6 removed — the OS handler handles MMU programming now. */
+static bool hle_trap6_do_an_mmu(m68k_t *cpu) {
+    uint32_t handler = cpu_read32(cpu, 0x98);
+    if (handler != 0x3F8) return false;
+
+    uint32_t d0 = cpu->d[0] & 0xFFFF;
+    uint32_t d1 = cpu->d[1] & 0xFFFF;
+    uint32_t d2 = cpu->d[2] & 0xFFFF;
+    uint32_t d3 = cpu->d[3] & 0xFFFF;
+
+    uint32_t smt_ptr = cpu_read32(cpu, (cpu->a[5] - 4) & 0xFFFFFF);
+    if (smt_ptr == 0 || smt_ptr > 0xFFFFFF) return false;
+
+    DBGSTATIC(int, hle_t6_count, 0);
+    if (hle_t6_count < 5)
+        fprintf(stderr, "[HLE-TRAP6] #%d: d2=%d d3=%d count=%d SMT@$%06X\n",
+                hle_t6_count + 1, d2, d3, d1, smt_ptr);
+    hle_t6_count++;
+
+    extern void lisa_hle_prog_mmu(uint32_t domain, uint32_t index,
+                                  uint32_t count, uint32_t smt_base);
+    lisa_hle_prog_mmu(d2, d3, d1, smt_ptr);
+
+    (void)d0;
+    cpu->cycles += 34;
+    return true;
+}
 
 static void op_trap(m68k_t *cpu) {
     int vector = cpu->ir & 0xF;
 
-    /* Count ALL traps */
     {
         static int trap_count[16] = {0};
         static int trap_count_gen = 0;
@@ -2234,7 +2258,6 @@ static void op_trap(m68k_t *cpu) {
         trap_count[vector]++;
         if (vector == 6) { extern int g_trap6_total; g_trap6_total++; }
         if (vector == 6 && trap_count[6] >= 211 && trap_count[6] <= 220) {
-            /* Dump the SMT entry for the INSTALL_LLD call */
             uint32_t smt_ptr = cpu_read32(cpu, (cpu->a[5] - 4) & 0xFFFFFF);
             uint32_t d2v = cpu->d[2] & 0xFFFF;
             uint32_t d3v = cpu->d[3] & 0xFFFF;
@@ -2246,6 +2269,10 @@ static void op_trap(m68k_t *cpu) {
                     trap_count[6], d2v, d3v, smt_entry, origin, access, limit);
         }
     }
+
+    if (vector == 6 && hle_trap6_do_an_mmu(cpu))
+        return;
+
     take_exception(cpu, VEC_TRAP_BASE + vector);
     cpu->cycles += 34;
 }
