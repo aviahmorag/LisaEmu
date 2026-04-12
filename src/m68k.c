@@ -536,7 +536,7 @@ static void take_exception(m68k_t *cpu, int vector) {
     }
 
     /* Trace exceptions for debugging */
-    if (exception_count < 50) {
+    if (exception_count < 10) {
         static const char *vec_names[] = {
             [2] = "Bus Error", [3] = "Address Error", [4] = "Illegal Instruction",
             [5] = "Zero Divide", [6] = "CHK", [7] = "TRAPV",
@@ -2218,7 +2218,7 @@ static void op_trap(m68k_t *cpu) {
         static int trap_count[16] = {0};
         trap_count[vector]++;
         if (vector == 6) { extern int g_trap6_total; g_trap6_total++; }
-        if (vector == 6 && trap_count[6] >= 211) {
+        if (vector == 6 && trap_count[6] >= 211 && trap_count[6] <= 220) {
             /* Dump the SMT entry for the INSTALL_LLD call */
             uint32_t smt_ptr = cpu_read32(cpu, (cpu->a[5] - 4) & 0xFFFFFF);
             uint32_t d2v = cpu->d[2] & 0xFFFF;
@@ -2850,7 +2850,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 }
             }
             /* Once we know PASCALINIT's address, trace key points */
-            if (pascalinit_addr > 0 && pi_trace < 60) {
+            if (pascalinit_addr > 0 && pi_trace < 5) {
                 /* Trace when PC is within PASCALINIT's code (assume ~100 bytes) */
                 if (cpu->pc >= pascalinit_addr && cpu->pc < pascalinit_addr + 120) {
                     uint32_t offset = cpu->pc - pascalinit_addr;
@@ -3385,8 +3385,8 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         if (!escape_logged && cpu->pc >= 0x53000 && cpu->pc < 0x200000) {
             fprintf(stderr, ">>> KERNEL ESCAPE: PC=$%06X (past kernel end ~$52000)\n", cpu->pc);
             fprintf(stderr, "  Last valid PC: $%06X opcode=$%04X\n", last_valid_pc, last_valid_op);
-            fprintf(stderr, "  Last 100 PCs:\n");
-            for (int ri = 100; ri > 0; ri--) {
+            fprintf(stderr, "  Last 20 PCs:\n");
+            for (int ri = 20; ri > 0; ri--) {
                 uint32_t rpc = pc_ring[(pc_ring_idx - ri) & 255];
                 uint16_t rop = cpu_read16(cpu, rpc);
                 fprintf(stderr, "  PC=$%06X opcode=$%04X%s\n", rpc, rop,

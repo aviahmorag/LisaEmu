@@ -410,9 +410,6 @@ static cg_symbol_t *find_imported(codegen_t *cg, const char *name) {
 static cg_symbol_t *find_symbol_any(codegen_t *cg, const char *name) {
     cg_symbol_t *s = find_local(cg, name);
     if (s) {
-        if (strcasecmp(name, "fp_ptr") == 0)
-            fprintf(stderr, "  LOOKUP fp_ptr: FOUND LOCAL at offset=%d is_param=%d scope=%d in '%s'\n",
-                    s->offset, s->is_param, cg->scope_depth, cg->current_file);
         return s;
     }
     if (strcasecmp(name, "fp_ptr") == 0) {
@@ -2264,10 +2261,6 @@ static void gen_proc_or_func(codegen_t *cg, ast_node_t *node) {
     if (entry) entry->offset = (int)cg->code_size;
 
     push_scope(cg);
-    if (strcasestr(cg->current_file, "STARTUP"))
-        fprintf(stderr, "  SCOPE PUSH: %s depth=%d frame_size=%d\n",
-                node->name, cg->scope_depth,
-                cg->scope_depth > 0 ? cg->scopes[cg->scope_depth-1].frame_size : -1);
 
     /* Process parameters */
     int param_offset = 8; /* After saved A6 and return address */
@@ -2300,8 +2293,6 @@ static void gen_proc_or_func(codegen_t *cg, ast_node_t *node) {
                 cg_symbol_t *s = add_local(cg, sig->param_name[j], ptype, true, sig->param_is_var[j]);
                 if (s) {
                     s->offset = param_offset;
-                    fprintf(stderr, "      → registered '%s' at A6+%d (size=%d)\n",
-                            sig->param_name[j], param_offset, ptype ? ptype->size : 2);
                     param_offset += sig->param_is_var[j] ? 4 : (ptype ? ptype->size : 2);
                     if (param_offset % 2) param_offset++;
                 }
@@ -2322,9 +2313,6 @@ static void gen_proc_or_func(codegen_t *cg, ast_node_t *node) {
     for (int i = 0; i < node->num_children; i++) {
         ast_node_t *child = node->children[i];
         if (child->type == AST_VAR_DECL) {
-            if (strcasestr(cg->current_file, "STARTUP") &&
-                strcasestr(node->name, "INITSYS"))
-                fprintf(stderr, "  LOCAL VAR: %s in %s\n", child->name, node->name);
             process_var_decl(cg, child, false);
         }
     }
@@ -2394,12 +2382,7 @@ static void gen_unit(codegen_t *cg, ast_node_t *unit) {
                     impl->children[j]->type == AST_FUNC_DECL)
                     impl_funcs++;
             }
-            if (impl_funcs > 0) {
-                const char *bn = strrchr(cg->current_file, '/');
-                bn = bn ? bn + 1 : cg->current_file;
-                fprintf(stderr, "  IMPL: %s — %d procs/funcs in IMPLEMENTATION\n",
-                        bn, impl_funcs);
-            }
+            (void)impl_funcs;
 
             /* Generate code for procedures/functions and methods */
             for (int j = 0; j < impl->num_children; j++) {
@@ -2492,10 +2475,6 @@ void codegen_free(codegen_t *cg) {
 static void register_proc_sig(codegen_t *cg, const char *name, ast_node_t *params[], int num_params) {
     if (!cg->proc_sigs || cg->num_proc_sigs >= CODEGEN_MAX_PROC_SIGS) return;
     /* Log signature registrations for key boot procedures */
-    if (strcasecmp(name, "INTSOFF") == 0 || strcasecmp(name, "INTSON") == 0 ||
-        strcasecmp(name, "POOL_INIT") == 0 || strcasecmp(name, "INIT_TRAPV") == 0) {
-        fprintf(stderr, "  REGISTER SIG: %s (%d params) in %s\n", name, num_params, cg->current_file);
-    }
     cg_proc_sig_t *sig = &cg->proc_sigs[cg->num_proc_sigs++];
     strncpy(sig->name, name, 63);
     sig->num_params = num_params < CODEGEN_MAX_PARAMS ? num_params : CODEGEN_MAX_PARAMS;

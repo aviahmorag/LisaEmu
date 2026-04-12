@@ -1122,7 +1122,7 @@ static void via2_porta_write(uint8_t val, uint8_t ddr, void *ctx) {
      * $80-$FF = NOP */
     static int cops_cmd_count = 0;
     cops_cmd_count++;
-    if (cops_cmd_count <= 50)
+    if (cops_cmd_count <= 10)
         fprintf(stderr, "COPS CMD[%d]: $%02X\n", cops_cmd_count, val);
 
     /* Start CRDY handshake: next port B read will see CRDY=1 (sanity),

@@ -181,28 +181,7 @@ static bool compile_pascal_file(const char *path, linker_t *lk) {
 
     ast_node_t *ast = parser_parse(&parser);
 
-    if (is_startup && ast) {
-        fprintf(stderr, "STARTUP AST: type=%d name='%s' children=%d errors=%d\n",
-                ast->type, ast->name, ast->num_children, parser.num_errors);
-        for (int i = 0; i < ast->num_children && i < 40; i++) {
-            ast_node_t *c = ast->children[i];
-            fprintf(stderr, "  child[%d]: type=%d name='%s' children=%d\n",
-                    i, c->type, c->name, c->num_children);
-            /* For INITSYS, dump its nested declarations */
-            if ((c->type == 11 || c->type == 12) &&
-                strcasecmp(c->name, "INITSYS") == 0) {
-                for (int j = 0; j < c->num_children && j < 45; j++) {
-                    ast_node_t *ic = c->children[j];
-                    fprintf(stderr, "    INITSYS child[%d]: type=%d name='%s' children=%d\n",
-                            j, ic->type, ic->name, ic->num_children);
-                }
-            }
-        }
-    }
-
-    if (is_startup)
-        fprintf(stderr, "STARTUP PARSE: %d errors, lexer at line %d\n",
-                parser.num_errors, parser.lex.line);
+    (void)is_startup;
     if (parser.num_errors > 0) {
         /* Log errors but continue — partial code is better than no code.
          * Previously we discarded the entire file, losing all its symbols. */
@@ -245,62 +224,13 @@ static bool compile_pascal_file(const char *path, linker_t *lk) {
                 if (!found) fprintf(stderr, "  MISSING CONST: %s\n", check_names[ci]);
             }
         }
-        /* Check for key signatures */
-        int found_intsoff = 0;
-        for (int i = 0; i < num_shared_proc_sigs; i++) {
-            if (strcasecmp(shared_proc_sigs[i].name, "INTSOFF") == 0) {
-                fprintf(stderr, "  IMPORTED SIG[%d]: %s (%d params) ext=%d\n",
-                        i, shared_proc_sigs[i].name, shared_proc_sigs[i].num_params,
-                        shared_proc_sigs[i].is_external);
-                found_intsoff++;
-            }
-        }
-        if (!found_intsoff) {
-            fprintf(stderr, "  WARNING: INTSOFF not in shared_proc_sigs! First 5 sigs:\n");
-            for (int i = 0; i < 5 && i < num_shared_proc_sigs; i++)
-                fprintf(stderr, "    [%d] %s (%d params)\n", i, shared_proc_sigs[i].name, shared_proc_sigs[i].num_params);
-        }
-    }
-
-    /* Debug: log AST type for every file to trace symbol issues */
-    if (ast && (strcasestr(path, "UNITHZ") || strcasestr(path, "UNITSTD"))) {
-        fprintf(stderr, "  DEBUG AST: %s → type=%d (%s) children=%d\n",
-                strrchr(path, '/') ? strrchr(path, '/') + 1 : path,
-                ast->type, ast->name, ast->num_children);
-        for (int i = 0; i < ast->num_children && i < 10; i++) {
-            fprintf(stderr, "    child[%d] type=%d name='%s'\n",
-                    i, ast->children[i]->type, ast->children[i]->name);
-        }
     }
 
     codegen_generate(cg, ast);
 
     if (is_startup) {
-        /* Dump bytes around offset $EC to debug odd BRA target */
-        fprintf(stderr, "STARTUP bytes at $E8-$FF: ");
-        for (uint32_t i = 0xE8; i < 0x100 && i < cg->code_size; i++)
-            fprintf(stderr, "%02X ", cg->code[i]);
-        fprintf(stderr, "\n");
-        /* Check for relocations near offset $EC */
-        for (int ri = 0; ri < cg->num_relocs; ri++) {
-            if (cg->relocs[ri].offset >= 0xE8 && cg->relocs[ri].offset <= 0xF4)
-                fprintf(stderr, "  RELOC at $%X: sym='%s' size=%d\n",
-                        cg->relocs[ri].offset, cg->relocs[ri].symbol, cg->relocs[ri].size);
-        }
-        /* Count statements in main body */
-        for (int i = 0; i < ast->num_children; i++) {
-            if (ast->children[i]->type == 30) { /* AST_BLOCK */
-                fprintf(stderr, "STARTUP MAIN BODY: %d statements\n",
-                        ast->children[i]->num_children);
-            }
-        }
         fprintf(stderr, "STARTUP CODEGEN: %u bytes code, %d globals, %d relocs\n",
                 cg->code_size, cg->num_globals, cg->num_relocs);
-        for (int i = 0; i < cg->num_globals && i < 30; i++) {
-            fprintf(stderr, "  global[%d]: '%s' offset=%d ext=%d\n",
-                    i, cg->globals[i].name, cg->globals[i].offset,
-                    cg->globals[i].is_external);
-        }
     }
 
     /* Export this file's globals to the shared table for cross-unit access */
