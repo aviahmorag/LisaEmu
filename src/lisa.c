@@ -551,6 +551,8 @@ static uint8_t cops_dequeue(cops_queue_t *q) {
  * ======================================================================== */
 
 
+uint32_t g_hle_smt_base = 0;
+
 void lisa_hle_prog_mmu(uint32_t domain, uint32_t index,
                        uint32_t count, uint32_t smt_base) {
     if (!g_lisa) return;
@@ -1597,6 +1599,8 @@ void lisa_reset(lisa_t *lisa) {
          * Must be ABOVE os_end to avoid overlapping with OS code. */
         uint32_t smt_base    = os_end;
         uint32_t l_smt       = 0x800;     /* 2KB for 512 entries */
+        extern uint32_t g_hle_smt_base;
+        g_hle_smt_base = smt_base;
         uint32_t b_sysjt     = smt_base + l_smt;
         uint32_t l_sysjt     = 0x1000;    /* 4KB jump table */
         uint32_t b_sysglobal = b_sysjt + l_sysjt;
