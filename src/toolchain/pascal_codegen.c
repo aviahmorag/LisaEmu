@@ -1736,7 +1736,11 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                      * (strings, records) would need block copy; for now use 4
                      * which is the widest single MOVE can transfer. */
                     if (sz > 4) sz = 4;
-                    if (rhs_sz > sz) sz = rhs_sz; /* don't truncate pointer RHS */
+                    /* Only widen for pointer-typed LHS */
+                    if (rhs_sz > sz && sym->type &&
+                        (sym->type->kind == TK_POINTER ||
+                         (sym->type->kind == TK_LONGINT && sz < 4)))
+                        sz = rhs_sz;
                     if (depth > 0) {
                         /* Outer scope: save D0, get frame, write via A0 */
                         emit16(cg, 0x2200);  /* MOVE.L D0,D1 — save value */
@@ -1753,7 +1757,14 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                 } else {
                     int sz = type_load_size(sym->type);
                     if (sz > 4) sz = 4;
-                    if (rhs_sz > sz) sz = rhs_sz; /* don't truncate pointer RHS */
+                    /* Only widen store for pointer-typed LHS to prevent pointer
+                     * truncation. Non-pointer variables (int2, boolean, etc.)
+                     * must use their declared size — widening overwrites adjacent
+                     * globals in the shared A5 data area. */
+                    if (rhs_sz > sz && sym->type &&
+                        (sym->type->kind == TK_POINTER ||
+                         (sym->type->kind == TK_LONGINT && sz < 4)))
+                        sz = rhs_sz;
                     if (sz == 4) emit16(cg, 0x2B40);
                     else if (sz == 1) emit16(cg, 0x1B40);
                     else emit16(cg, 0x3B40);  /* MOVE.W D0,offset(A5) */
@@ -2179,17 +2190,37 @@ static void process_var_decl(codegen_t *cg, ast_node_t *node, bool is_global) {
         while (*tok == ' ') tok++;
         int sz = type_size(type);
         if (is_global) {
+            /* Check if this global was already defined in a previously compiled
+             * unit (imported). If so, reuse its offset to avoid double-allocation
+             * of the shared A5-relative global data area. All OS kernel units share
+             * one A5 frame; allocating a new offset for an already-placed global
+             * causes overlapping variables (e.g., sg_free_pool_addr at A5-192
+             * overlapping with size_sglobal at A5-194). */
+            cg_symbol_t *existing_import = NULL;
+            if (cg->imported_globals) {
+                for (int ig = 0; ig < cg->imported_globals_count; ig++) {
+                    if (str_eq_nocase(cg->imported_globals[ig].name, tok)) {
+                        existing_import = &cg->imported_globals[ig];
+                        break;
+                    }
+                }
+            }
             cg_symbol_t *s = add_global_sym(cg, tok, type);
             if (s) {
-                /* Assign global offset (grow DOWNWARD from A5).
-                 * Lisa Pascal convention: A5 points to the top of the global
-                 * data area. Globals use negative offsets: A5-2, A5-4, etc.
-                 * Uses a process-wide counter because all kernel units
-                 * share the same A5-relative global data area. */
-                static int global_offset = 0;
-                if (sz >= 2 && (global_offset % 2)) global_offset++;
-                global_offset += sz;
-                s->offset = -global_offset;
+                if (existing_import && existing_import->offset != 0) {
+                    /* Use the previously assigned offset */
+                    s->offset = existing_import->offset;
+                } else {
+                    /* Assign new global offset (grow DOWNWARD from A5).
+                     * Lisa Pascal convention: A5 points to the top of the global
+                     * data area. Globals use negative offsets: A5-2, A5-4, etc.
+                     * Uses a process-wide counter because all kernel units
+                     * share the same A5-relative global data area. */
+                    static int global_offset = 0;
+                    if (sz >= 2 && (global_offset % 2)) global_offset++;
+                    global_offset += sz;
+                    s->offset = -global_offset;
+                }
             }
         } else {
             cg_scope_t *sc = current_scope(cg);
