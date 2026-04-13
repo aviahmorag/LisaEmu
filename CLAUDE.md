@@ -83,11 +83,9 @@ After `G` at Lisabug prompt, reaches OS LOADER → **SYSTEM ERROR 10100**
 
 Toolchain: 317 Pascal + 103 ASM files → linked binary → disk image.
 Boot reaches PASCALINIT → INITSYS → GETLDMAP → REG_TO_MAPPED →
-POOL_INIT → MM_INIT. Currently **SYSTEM_ERROR(10701)** — `GETSPACE`
-fails in `MM_INIT` (can't allocate MMRB from sysglobal heap). POOL_INIT
-receives correct parameters (mb_sgheap=$CCA000) but INIT_FREEPOOL's
-setup of the free pool data structures may be broken, or the pool header
-is corrupt. The sg_free_pool_addr global at A5-150 needs verification.
+POOL_INIT → MM_INIT. Currently **SYSTEM_ERROR(10701)** — second `GETSPACE` call in `MM_INIT`
+fails (SIZEOF(mrbt) allocation). First GETSPACE (mmrb) now succeeds.
+Pool correctly initialized at $CCA000 with ~16K words.
 
 **Key progress (2026-04-13):**
 - P6: Boolean size (1→2 bytes) — Lisa Pascal stores booleans as words.
@@ -102,6 +100,10 @@ is corrupt. The sg_free_pool_addr global at A5-150 needs verification.
 - P8: No EXT.L on function call results in binary ops.
   Function calls return full 32-bit values; EXT.L zeroed MMU_BASE's
   $CC0000 return value, corrupting POOL_INIT's mb_sgheap parameter.
+- P9: Boolean NOT — bitwise NOT.W (1→$FFFE) replaced with logical
+  TST/SEQ/ANDI (1→0, 0→1). ALL `if not func(...)` patterns were
+  always-true due to this bug.
+- P9: l_sgheap $8000→$7E00 (page-aligned, fits int2).
 - Memory layout: himem = b_dbscreen, bothimem = lomem.
 
 **Key progress (2026-04-12):**
@@ -116,7 +118,7 @@ is corrupt. The sg_free_pool_addr global at A5-150 needs verification.
 ### Toolchain metrics
 - Parser: **100%** (317/317), Assembler: **100%** (103/103)
 - Linker: 8527 symbols, output ~2.2 MB
-- Codegen: P1-P5 ptr/store/stale-word, P6 boolean+const, P7 interface syms, P8 local-const+func-EXT
+- Codegen: P1-P5 ptr/store/stale-word, P6 boolean+const, P7 interface syms, P8 local-const+func-EXT, P9 bool-NOT
 
 ### Key HLE mechanisms
 - `$234` fetch bypass: IPL=7→RTE (DB_INIT skip), IPL=0→execute (Lisabug)

@@ -1,96 +1,87 @@
-# LisaEmu — Next Session Handoff (2026-04-13, session 2)
+# LisaEmu — Next Session Handoff (2026-04-13, session 3)
 
 ## TL;DR
 
-Fixed 4 codegen bugs (P6-P8) + 2 memory layout issues. Boot now reaches
-POOL_INIT with correct parameters (mb_sgheap=$CCA000) but GETSPACE in
-MM_INIT still fails (error 10701). INIT_FREEPOOL's setup of the sysglobal
-free pool is suspect — the pool data structures may be corrupt or the
-pool header size computation is wrong.
+Fixed 6 codegen bugs (P6-P9) + memory layout issues. Boot now passes
+POOL_INIT, INIT_FREEPOOL, MM_INIT's first GETSPACE (mmrb allocation).
+Currently **SYSTEM_ERROR(10701)** from MM_INIT's second GETSPACE call
+(SIZEOF(mrbt) allocation at line 290). The boolean NOT fix (P9)
+resolved the most critical issue: `NOT.W TRUE = $FFFE (non-zero)`,
+making ALL `if not func(...)` patterns fail.
 
 ## Accomplished this session
 
-### P6: Boolean size + const expr_size (pascal_codegen.c)
+### P6: Boolean size + const expr_size (`pascal_codegen.c`)
 - Boolean: 1→2 bytes (Lisa Pascal word-sized)
 - expr_size: check is_const BEFORE type for large constants
 
-### P7: Interface symbol suppression (pascal_codegen.c)
-- UNIT INTERFACE proc/func declarations no longer export linker symbols
-  at offset 0. Previously GETFREE, BLDPGLEN, MAKE_REGION all jumped to
-  the module base instead of their real code.
+### P7: Interface symbol suppression (`pascal_codegen.c`)
+- UNIT INTERFACE proc/func declarations no longer export linker
+  symbols at offset 0 (was shadowing real IMPLEMENTATION addresses)
 
-### P8: Local consts + function EXT.L (pascal_codegen.c)
-- Procedure-local CONST declarations (nospace=10701 in MM_INIT) now
-  processed in gen_proc_or_func
-- Binary op EXT.L skipped for AST_FUNC_CALL operands — functions
-  return correct 32-bit values, EXT.L was zeroing MMU_BASE's $CC0000
+### P8: Local consts + function EXT.L (`pascal_codegen.c`)
+- Procedure-local CONST declarations now processed in gen_proc_or_func
+- Binary op EXT.L skipped for AST_FUNC_CALL operands
 
-### Memory layout (lisa.c)
-- himem = b_dbscreen (below screen buffers, ~$230000)
-- bothimem = lomem (no loader to protect)
+### P9: Boolean NOT + page-aligned sgheap (`pascal_codegen.c`, `lisa.c`)
+- `NOT.W D0` (bitwise) → `TST/SEQ/ANDI` (logical) for boolean operands
+- l_sgheap: $8000→$7E00 (page-aligned, fits int2)
+
+### Memory layout (`lisa.c`)
+- himem = b_dbscreen, bothimem = lomem (from earlier)
 
 ## In progress
 
-### SYSTEM_ERROR(10701) — GETSPACE fails in MM_INIT
+### SYSTEM_ERROR(10701) — second GETSPACE in MM_INIT
 
-POOL_INIT receives correct parameters (verified):
-- mb_sysglob = $CC0000 (MMU_BASE(102))
-- l_sysglob = $6000 (24KB)
-- mb_sgheap = $CCA000 (correctly computed now)
-- l_sgheap = $8000 (32KB)
-- mb_syslocal = $CE0000 (MMU_BASE(103))
-- l_syslocal = $4000
+MM_INIT line 290:
+```pascal
+if not GETSPACE(SIZEOF(mrbt), b_sysglobal_ptr, s_mrbt_addr) then
+    SYSTEM_ERROR(nospace);
+```
 
-But GETSPACE(SIZEOF(mmrb), b_sysglobal_ptr, mmrb_addr) fails.
+The first GETSPACE (SIZEOF(mmrb), line 211) now succeeds.
+The pool has ~15977 words free after the first allocation.
 
-**Key finding**: The codegen places `sg_free_pool_addr` at A5-150
-(LEA -$96(A5)) but the earlier diagnostic dump read A5-148. The
-hardcoded diagnostic offset was wrong. Need to verify the actual
-value at A5-150 after POOL_INIT runs.
+**Possible causes for the second failure:**
+1. SIZEOF(mrbt) returns wrong value — if too large, GETSPACE
+   rejects with `amount > 32764` check
+2. The pool header is corrupt after the first allocation
+3. The second `not GETSPACE(...)` pattern isn't caught by the
+   boolean NOT heuristic (but AST_FUNC_CALL should match)
+4. GETSPACE internally calls another function that returns boolean
+   and hits the same NOT bug (nested NOT pattern)
+5. Parameter passing mismatch: SIZEOF returns int2, GETSPACE
+   expects int2, but codegen pushes 4 bytes
 
-**Possible causes**:
-1. INIT_FREEPOOL (at $5914) code has bugs — it sets up the free
-   pool header at the mapped sgheap address ($CCA000). Pool header
-   has `size` (negative for free), `pool_size`, etc. If the header
-   is corrupt, GETSPACE can't find free space.
-2. A5-relative offset mismatch: POOL_INIT stores to A5-150 but
-   GETSPACE reads from a different offset (different compilation
-   unit may have different global_offset counter state).
-3. The free pool write goes to unmapped/wrong physical memory.
-   Segment 102 (sysglobmmu) maps $CC0000→physical $DD800. The
-   sgheap at $CCA000 maps to physical $DD800 + $A000 = $E7800.
-   This IS within physical RAM.
+**Next steps:**
+1. Add trace at the GETSPACE function entry (dynamic address —
+   find via linker debug output) to see the `amount` parameter
+2. If amount is reasonable, trace through GETSPACE's search loop
+3. Check if EXP_POOLSPACE is called and whether it fails
+4. Check if there are nested boolean NOT patterns in the pool
+   expansion code
 
-**Next steps**:
-1. Add a trace at INIT_FREEPOOL ($5914) to dump its parameters
-   and verify the pool header after initialization
-2. After POOL_INIT returns, read the pool header at the ACTUAL
-   A5-150 mapped address and verify it contains valid data
-3. Check if GETSPACE reads sg_free_pool_addr from the correct
-   A5 offset (should match the one POOL_INIT writes to)
-4. If the offsets don't match, investigate the global_offset
-   counter consistency between compilation units
-
-## Key file pointers
+## Key files
 
 ```
-src/toolchain/pascal_codegen.c:150   boolean size (P6)
-src/toolchain/pascal_codegen.c:570   const expr_size ordering (P6)
-src/toolchain/pascal_codegen.c:2362  interface symbol suppression (P7)
-src/toolchain/pascal_codegen.c:2461  procedure-local consts (P8)
-src/toolchain/pascal_codegen.c:1064  function call EXT.L skip (P8)
-src/lisa.c:1628-1633                 himem/bothimem fix
+src/toolchain/pascal_codegen.c:1049   boolean NOT fix (P9)
+src/toolchain/pascal_codegen.c:150    boolean size (P6)
+src/toolchain/pascal_codegen.c:570    const expr_size (P6)
+src/toolchain/pascal_codegen.c:2362   interface symbol suppression (P7)
+src/toolchain/pascal_codegen.c:2461   procedure-local consts (P8)
+src/toolchain/pascal_codegen.c:1064   function call EXT.L skip (P8)
+src/lisa.c:1628-1633                  himem/bothimem/sgheap fixes
 
-Lisa_Source/LISA_OS/OS/source-SYSG1.TEXT.unix.txt:729  POOL_INIT
-Lisa_Source/LISA_OS/OS/source-SYSG1.TEXT.unix.txt       INIT_FREEPOOL, GETSPACE
-Lisa_Source/LISA_OS/OS/source-MM4.TEXT.unix.txt:193     MM_INIT (calls GETSPACE)
-Lisa_Source/LISA_OS/OS/source-MMPRIM.TEXT.unix.txt:773  MMU_BASE
+Lisa_Source/LISA_OS/OS/source-MM4.TEXT.unix.txt:193    MM_INIT
+Lisa_Source/LISA_OS/OS/source-SYSG1.TEXT.unix.txt:158  GETSPACE
+Lisa_Source/LISA_OS/OS/source-SYSG1.TEXT.unix.txt:5    INIT_FREEPOOL
 ```
 
 ## Pick up here
 
-> GETSPACE fails in MM_INIT despite POOL_INIT receiving correct
-> parameters. The sysglobal free pool (at $CCA000, 32KB) should be
-> initialized by INIT_FREEPOOL. Trace INIT_FREEPOOL to verify the
-> pool header is set up correctly. Then verify GETSPACE reads
-> sg_free_pool_addr from the same A5 offset that POOL_INIT wrote to.
+> Boot passes first GETSPACE in MM_INIT but fails on second (SIZEOF(mrbt)).
+> Trace GETSPACE entry to see the amount parameter and pool state.
+> The boolean NOT fix is the biggest single improvement — it affects
+> every `if not func(...)` pattern throughout the OS. Check if nested
+> boolean patterns (NOT inside function results) are also handled.
