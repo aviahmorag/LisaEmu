@@ -147,7 +147,7 @@ static void init_builtin_types(codegen_t *cg) {
     add_type(cg, "int2", TK_INTEGER, 2);
     add_type(cg, "int4", TK_LONGINT, 4);
     add_type(cg, "longint", TK_LONGINT, 4);
-    add_type(cg, "boolean", TK_BOOLEAN, 1);
+    add_type(cg, "boolean", TK_BOOLEAN, 2);  /* Lisa Pascal: word-sized on 68000 */
     add_type(cg, "char", TK_CHAR, 1);
     add_type(cg, "real", TK_REAL, 4);
     add_type(cg, "byte", TK_BYTE, 1);
@@ -567,11 +567,14 @@ static int expr_size(codegen_t *cg, ast_node_t *node) {
             return 4; /* pointer */
         case AST_IDENT_EXPR: {
             cg_symbol_t *sym = find_symbol_any(cg, node->name);
-            if (sym && sym->type) return type_load_size(sym->type);
+            /* Constants: size is determined by VALUE, not declared type.
+             * A const like maxmmusize=131072 is typed "integer" but needs
+             * 4 bytes. Check is_const BEFORE type to avoid EXT.L corruption. */
             if (sym && sym->is_const) {
                 int cv = sym->offset;
                 return (cv < -32768 || cv > 32767) ? 4 : 2;
             }
+            if (sym && sym->type) return type_load_size(sym->type);
             /* Check built-in identifiers */
             if (str_eq_nocase(node->name, "nil")) return 4;
             if (str_eq_nocase(node->name, "true") || str_eq_nocase(node->name, "false")) return 2;
