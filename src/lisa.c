@@ -2850,45 +2850,6 @@ static bool hle_handle_system_error(lisa_t *lisa __attribute__((unused)), m68k_t
         return true;
     }
 
-    /* Dump PARMS context for memory errors.
-     * Walk A6 chain and show each level, then read PARMS from innermost
-     * frame that looks like INITSYS (version=22 at A6-104). */
-    if (err_code == 10701 || err_code == 10709) {
-        uint32_t a6 = cpu->a[6];
-        fprintf(stderr, "  A6 chain:");
-        uint32_t ia6 = a6;
-        for (int i = 0; i < 8 && ia6; i++) {
-            fprintf(stderr, " $%08X", ia6);
-            uint32_t next = cpu_read32(cpu, ia6);
-            if (next == 0 || next == ia6) break;
-            ia6 = next;
-        }
-        fprintf(stderr, "\n");
-        /* Try each A6 in chain to find INITSYS (version=22 at A6-104) */
-        ia6 = a6;
-        for (int i = 0; i < 8 && ia6; i++) {
-            uint16_t ver = cpu_read16(cpu, ia6 - 104);
-            if (ver == 22) {
-                fprintf(stderr, "  Found INITSYS frame at $%08X (depth %d)\n", ia6, i);
-                fprintf(stderr, "  himem=$%08X lomem=$%08X l_phymem=$%08X\n",
-                        cpu_read32(cpu, ia6 - 204), cpu_read32(cpu, ia6 - 208),
-                        cpu_read32(cpu, ia6 - 212));
-                break;
-            }
-            uint32_t next = cpu_read32(cpu, ia6);
-            if (next == 0 || next == ia6) break;
-            ia6 = next;
-        }
-    }
-
-    /* Dump code at the call site for diagnosis */
-    if (se_trace < 2) {
-        fprintf(stderr, "  Code @ret-20:");
-        for (int ci = 20; ci >= 0; ci -= 2)
-            fprintf(stderr, " %04X", cpu_read16(cpu, ret_addr - ci));
-        fprintf(stderr, "\n");
-    }
-
     /* SYSTEM_ERROR should halt — it never returns on a real Lisa.
      * Stop the CPU to prevent infinite recursion. */
     fprintf(stderr, "SYSTEM_ERROR(%d): HALTING CPU\n", err_code);
@@ -3084,55 +3045,6 @@ bool lisa_hle_intercept(lisa_t *lisa, m68k_t *cpu) {
 
     if (!lisa->hle.active) return false;
 
-    /* Trace MMU_BASE and POOL_INIT */
-    {
-        DBGSTATIC(int, dbg_mmub, 0);
-        DBGSTATIC(int, dbg_pool, 0);
-        if (pc == 0xD430 && dbg_mmub < 5) {
-            dbg_mmub++;
-            fprintf(stderr, ">>> MMU_BASE #%d ENTRY: param=$%04X A6=$%08X\n",
-                    dbg_mmub, cpu_read16(cpu, cpu->a[7] + 4), cpu->a[6]);
-        }
-        /* Also trace MMU_BASE's RTS (at the end of the function) */
-        {
-            /* Check if we just returned from MMU_BASE by looking at return addr */
-            DBGSTATIC(uint32_t, last_mmub_sp, 0);
-            if (pc == 0xD430) last_mmub_sp = cpu->a[7];
-            /* After MMU_BASE returns, trace D0 */
-            DBGSTATIC(int, dbg_mmub_ret, 0);
-            if (dbg_mmub > 0 && dbg_mmub_ret < dbg_mmub) {
-                /* Look for the RTS: check if PC is the return address from MMU_BASE */
-                uint32_t expected_ret = cpu_read32(cpu, last_mmub_sp);
-                if (pc == expected_ret && dbg_mmub_ret < dbg_mmub) {
-                    dbg_mmub_ret++;
-                    fprintf(stderr, ">>> MMU_BASE #%d RETURN: D0=$%08X D2=$%08X\n",
-                            dbg_mmub_ret, cpu->d[0], cpu->d[2]);
-                }
-            }
-        }
-        if (pc == 0x66AC && dbg_pool == 0) {
-            dbg_pool = 1;
-            fprintf(stderr, ">>> POOL_INIT ENTRY: A5=$%08X A6=$%08X A7=$%08X\n",
-                    cpu->a[5], cpu->a[6], cpu->a[7]);
-            /* All 6 params pushed as absptr (4 bytes each). SP layout:
-             * SP+0: return addr, SP+4: first param (mb_sysglob), ... */
-            uint32_t sp = cpu->a[7];
-            fprintf(stderr, "  Raw stack:");
-            for (int si = 0; si < 32; si += 4)
-                fprintf(stderr, " $%08X", cpu_read32(cpu, sp + si));
-            fprintf(stderr, "\n");
-            /* Dump code at the call site (ret_addr=$50F0, JSR at $50EA) */
-            uint32_t ret_a = cpu_read32(cpu, sp);
-            fprintf(stderr, "  Code before JSR (ret=$%X):\n", ret_a);
-            for (int line = 0; line < 4; line++) {
-                uint32_t base = ret_a - 120 + line * 30;
-                fprintf(stderr, "    $%05X:", base);
-                for (int w = 0; w < 15; w++)
-                    fprintf(stderr, " %04X", cpu_read16(cpu, base + w*2));
-                fprintf(stderr, "\n");
-            }
-        }
-    }
 
     /* Intercept CALLDRIVER */
     if (pc == lisa->hle.calldriver) return hle_handle_calldriver(lisa, cpu);
