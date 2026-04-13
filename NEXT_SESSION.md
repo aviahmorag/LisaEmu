@@ -1,58 +1,76 @@
 # LisaEmu — Next Session Handoff (2026-04-13)
 
-## TL;DR
+## Accomplished this session
 
-**MAJOR MILESTONE**: Boot passes ALL of INITSYS initialization and
-reaches the scheduler idle loop. 600 frames, zero SYSTEM_ERRORs.
-Fixed 12 codegen bugs (P1-P12) total across multiple sessions.
+### Codegen fixes (src/toolchain/pascal_codegen.c)
 
-## Current state
+| Fix | Line(s) | Description |
+|-----|---------|-------------|
+| P6 | :150, :570 | Boolean size 1→2 bytes; expr_size checks is_const before type |
+| P7 | :2362 | Interface proc/func declarations no longer export linker symbols |
+| P8 | :2461, :1064 | Procedure-local CONST processing; no EXT.L on function call results |
+| P9 | :1049 | Boolean NOT: bitwise NOT.W → logical TST/SEQ/ANDI |
+| P10 | :2520-2550, :2574-2588 | Function result local variable + load into D0 before RTS |
+| P11 | :1091-1118 | Nested binary ops save D2 on stack when right operand is complex |
+| P12 | :1019-1032 | true/false/nil recognized inside WITH block fallthrough path |
 
-The CPU runs at PC ~$A17xx (memory manager / scheduler area) in a
-polling loop. SR=$2714 (supervisor mode, IPL=7). The boot successfully:
+### Memory layout fixes (src/lisa.c)
 
-- PASCALINIT → INITSYS → GETLDMAP → REG_TO_MAPPED
-- POOL_INIT → INIT_FREEPOOL (sysglobal + syslocal pools)
-- MM_INIT → GETSPACE (both mmrb and mrbt allocations)
-- INIT_TRAPV → INIT_SCTAB → DB_INIT
-- AVAIL_INIT → MAKE_FREE → MAKE_REGION (all memory regions)
-- INIT_CONFIG → GET_BOOTSPACE → GETFREE
-- INIT_PROCESS → scheduler setup
-- Reaches the idle/polling loop
+| Line(s) | Fix |
+|---------|-----|
+| :1628 | himem = b_dbscreen (below screen buffers, ~$230000) |
+| :1630 | bothimem = lomem (no resident loader to protect) |
+| :1611 | l_sgheap = $7E00 (page-aligned, fits signed int2) |
 
-## What's needed next
+### Linker (src/toolchain/linker.c)
 
-The scheduler loop at $A17xx is likely waiting for:
-1. **Timer interrupts** — VIA1 T1 timer for scheduler tick. The VIA
-   is initialized but interrupts may not be enabled yet.
-2. **Disk I/O completion** — the OS may be trying to load the root
-   process or init its file system, which needs ProFile I/O.
-3. **Process creation** — the scheduler needs at least one runnable
-   process. INIT_PROCESS creates the memory manager process, but
-   the root process might not be created yet.
+| Line | Fix |
+|------|-----|
+| :858 | Added MAKE_FREE, INSERTSDB, AVAIL_INIT, etc. to debug symbol list |
 
-**Investigation approach:**
-1. Run more frames (2000+) and check if the loop makes progress
-2. Check if HLE CALLDRIVER intercepts are firing (disk I/O)
-3. Check VIA interrupt state — are timer interrupts enabled?
-4. Check TRAP #1 system call activity — is the scheduler dispatching?
-5. Look at the PC ring buffer for the loop pattern
+### Result
 
-## Codegen fixes this session (P6-P12)
+**MILESTONE**: Boot passes ALL of INITSYS initialization and reaches
+the scheduler idle loop at ~$A17xx. 600 headless frames, zero
+SYSTEM_ERRORs. Previously stuck at SYSTEM_ERROR(10709).
 
-| Fix | Bug | Impact |
-|-----|-----|--------|
-| P6 | Boolean 1→2, const expr_size | PARMS misaligned, EXT.L |
-| P7 | Interface symbol suppression | Wrong function addresses |
-| P8 | Local consts, no func EXT.L | Wrong constants, zeroed returns |
-| P9 | Boolean NOT | All `if not f()` always TRUE |
-| P10 | Function result variable | Functions returned garbage |
-| P11 | D2 stack save for nested ops | Compound conditions wrong |
-| P12 | true/false inside WITH | `x := true` stored false |
+## In progress
 
-## Key files
+The scheduler loop at ~$A17xx runs but doesn't progress. The CPU
+polls at SR=$2714 (supervisor mode, IPL=7 — all interrupts masked).
 
-```
-src/toolchain/pascal_codegen.c   All P6-P12 fixes
-src/lisa.c                       Memory layout + HLE
-```
+Likely needs:
+1. **Timer interrupts** — VIA1 T1 should fire scheduler ticks.
+   The VIA is initialized (see HLE ProFile init ~lisa.c:3030) but
+   IPL=7 masks all interrupts. The OS should lower IPL via INTSON
+   at some point during initialization.
+2. **Disk I/O** — the OS may be waiting for ProFile I/O to load
+   the root process. HLE CALLDRIVER is active but may not be
+   getting invoked from the polling loop.
+3. **TRAP #1 system calls** — check if the scheduler is dispatching.
+   INIT_SCTAB sets up the syscall table. The idle loop may be
+   waiting for a TRAP #1 that never fires.
+
+## Blocked / open questions
+
+- The boot runs in **supervisor mode** throughout (started by
+  REG_TO_MAPPED's ANDI #$DFFF,SR but something switches back).
+  IPL=7 masks all interrupts. Need to understand when the OS
+  expects interrupts to be enabled.
+- The `(* params *)` pattern (commented-out parameter lists in
+  IMPLEMENTATION bodies) works via proc_sig import, but some
+  functions may still have wrong parameter offsets if their
+  signatures weren't imported. Watch for parameter mismatches.
+- The D2 stack-save fix (P11) adds 4 bytes per nested binary op.
+  This increases code size. If any jump displacements overflow
+  16-bit signed range ($7FFF), BRA.W/BEQ.W would fail silently.
+
+## Pick up here
+
+> Boot reaches the scheduler idle loop with zero errors. The CPU
+> polls at $A17xx with IPL=7 (all interrupts masked). Run 2000+
+> headless frames and check: (1) is HLE CALLDRIVER being invoked?
+> (2) are any TRAP #1 syscalls firing? (3) what does the PC ring
+> buffer show? The most likely blocker is that the OS never lowers
+> IPL to enable timer interrupts — check the INTSON calls after
+> INIT_PROCESS and see if they execute.
