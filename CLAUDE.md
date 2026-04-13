@@ -70,7 +70,7 @@ make audit-linker       # Stage 4: Full pipeline + linker
 cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' build 2>&1 | grep -E "(error:|BUILD)"
 ```
 
-## Current Status (2026-04-12)
+## Current Status (2026-04-13)
 
 ### Prebuilt image (`prebuilt/los_compilation_base.image`)
 
@@ -82,12 +82,24 @@ After `G` at Lisabug prompt, reaches OS LOADER → **SYSTEM ERROR 10100**
 ### Source compile (`Lisa_Source/` → disk image)
 
 Toolchain: 317 Pascal + 103 ASM files → linked binary → disk image.
-Boot reaches PASCALINIT → INITSYS → POOL_INIT → MM_INIT → GETSPACE
-(succeeds) → continues into display/screen setup.
-Currently **SYSTEM_ERROR(10709)** — `stup_cantmapscreen`: screen MMU
-segment is too long. GETLDMAP copy of loader PARMS into INITSYS frame
-is misaligned — `l_scrdata` reads garbage instead of the emulator's
-$2000. Likely a frame layout mismatch (variable sizes or ordering).
+Boot reaches PASCALINIT → INITSYS → GETLDMAP → REG_TO_MAPPED →
+POOL_INIT → MM_INIT → GETSPACE → AVAIL_INIT (screen MMU setup,
+MAKE_REGION, MAKE_FREE) → INIT_CONFIG → GET_BOOTSPACE.
+Currently **SYSTEM_ERROR(10701)** — `GETFREE` fails in
+`GET_BOOTSPACE`. Free pool not populated despite correct `lomem`/`himem`.
+Root cause: MAKE_FREE compiled code or pool data structure init issue.
+
+**Key progress (2026-04-13):**
+- P6: Boolean size (1→2 bytes) — Lisa Pascal stores booleans as words.
+  Fixed PARMS frame misalignment: swappedin[1..48] of boolean was
+  48 bytes instead of 96, shifting all subsequent variables.
+- P6: expr_size const ordering — check is_const BEFORE type.
+  Constants like maxmmusize=131072 were typed "integer" (size 2) but
+  need 4 bytes. The wrong expr_size caused EXT.L to zero the upper
+  word of $20000→$0, making comparisons fail.
+- Memory layout: himem set to b_dbscreen (below screen buffers)
+  instead of hardcoded $0FF800. bothimem set to lomem (no loader
+  to protect). Free space now ~1.2MB.
 
 **Key progress (2026-04-12):**
 - P4: Fixed compile order, field offsets, store-width, global offset reuse
@@ -101,7 +113,7 @@ $2000. Likely a frame layout mismatch (variable sizes or ordering).
 ### Toolchain metrics
 - Parser: **100%** (317/317), Assembler: **100%** (103/103)
 - Linker: 8527 symbols, output ~2.2 MB
-- Codegen: P1-P4 ptr/store fixes, P5 stale-upper-word fixes
+- Codegen: P1-P5 ptr/store/stale-word fixes, P6 boolean+const fixes
 
 ### Key HLE mechanisms
 - `$234` fetch bypass: IPL=7→RTE (DB_INIT skip), IPL=0→execute (Lisabug)
