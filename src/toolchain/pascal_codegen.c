@@ -2355,9 +2355,14 @@ static void process_declarations(codegen_t *cg, ast_node_t *node, bool is_global
                         sig->is_function = is_func;
                     }
                 }
-                /* Register as external symbol */
-                cg_symbol_t *psym = add_global_sym(cg, child->name, NULL);
-                if (psym && is_ext) psym->is_external = true;
+                /* Only register as a linker symbol if EXTERNAL.
+                 * INTERFACE/FORWARD declarations must NOT create linker symbols
+                 * at offset 0 — that shadows the real IMPLEMENTATION symbol.
+                 * gen_proc_or_func handles symbol creation for implementations. */
+                if (is_ext) {
+                    cg_symbol_t *psym = add_global_sym(cg, child->name, NULL);
+                    if (psym) psym->is_external = true;
+                }
                 break;
             }
             default:
