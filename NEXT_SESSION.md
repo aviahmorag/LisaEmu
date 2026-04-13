@@ -1,87 +1,92 @@
-# LisaEmu — Next Session Handoff (2026-04-13, session 3)
+# LisaEmu — Next Session Handoff (2026-04-13, final)
 
 ## TL;DR
 
-Fixed 6 codegen bugs (P6-P9) + memory layout issues. Boot now passes
-POOL_INIT, INIT_FREEPOOL, MM_INIT's first GETSPACE (mmrb allocation).
-Currently **SYSTEM_ERROR(10701)** from MM_INIT's second GETSPACE call
-(SIZEOF(mrbt) allocation at line 290). The boolean NOT fix (P9)
-resolved the most critical issue: `NOT.W TRUE = $FFFE (non-zero)`,
-making ALL `if not func(...)` patterns fail.
+Fixed 8 codegen bugs (P6-P10) + 3 memory layout issues this session.
+Boot now passes POOL_INIT + INIT_FREEPOOL (pool correctly created at
+$CCA000 with 16124 words). Still **SYSTEM_ERROR(10701)** — GETSPACE
+returns false despite valid pool. The search loop doesn't find free
+space. Root cause: likely a `WITH c_pool_ptr^` field offset mismatch
+in GETSPACE (the `hdr_freepool` record fields may have wrong offsets
+in the codegen, causing `firstfree` to read the wrong word from the
+pool header).
 
 ## Accomplished this session
 
-### P6: Boolean size + const expr_size (`pascal_codegen.c`)
-- Boolean: 1→2 bytes (Lisa Pascal word-sized)
-- expr_size: check is_const BEFORE type for large constants
+### Codegen fixes (pascal_codegen.c)
+| Fix | Bug | Impact |
+|-----|-----|--------|
+| P6 | Boolean 1→2 bytes | PARMS frame misaligned 48+ bytes |
+| P6 | expr_size: is_const before type | Large consts ($20000) zeroed |
+| P7 | Interface symbol suppression | GETFREE etc. at wrong address |
+| P8 | Procedure-local consts | nospace=610 instead of 10701 |
+| P8 | No EXT.L on func call results | MMU_BASE $CC0000→$0 |
+| P9 | Boolean NOT (bitwise→logical) | ALL `if not func()` always TRUE |
+| P10 | Function result local + D0 load | Functions never returned results |
 
-### P7: Interface symbol suppression (`pascal_codegen.c`)
-- UNIT INTERFACE proc/func declarations no longer export linker
-  symbols at offset 0 (was shadowing real IMPLEMENTATION addresses)
-
-### P8: Local consts + function EXT.L (`pascal_codegen.c`)
-- Procedure-local CONST declarations now processed in gen_proc_or_func
-- Binary op EXT.L skipped for AST_FUNC_CALL operands
-
-### P9: Boolean NOT + page-aligned sgheap (`pascal_codegen.c`, `lisa.c`)
-- `NOT.W D0` (bitwise) → `TST/SEQ/ANDI` (logical) for boolean operands
-- l_sgheap: $8000→$7E00 (page-aligned, fits int2)
-
-### Memory layout (`lisa.c`)
-- himem = b_dbscreen, bothimem = lomem (from earlier)
+### Memory layout fixes (lisa.c)
+- himem = b_dbscreen (below screen buffers, ~$230000)
+- bothimem = lomem (no loader to protect)
+- l_sgheap = $7E00 (page-aligned, fits int2)
 
 ## In progress
 
-### SYSTEM_ERROR(10701) — second GETSPACE in MM_INIT
+### GETSPACE returns false despite valid pool
 
-MM_INIT line 290:
-```pascal
-if not GETSPACE(SIZEOF(mrbt), b_sysglobal_ptr, s_mrbt_addr) then
-    SYSTEM_ERROR(nospace);
-```
+**Verified correct:**
+- INIT_FREEPOOL receives fp_ptr=$CCA000, fp_size=$7E00 ✓
+- Pool header: pool_size=16124, firstfree=8, freecount=16124 ✓
+- First free entry: size=16124, next=0 (stopper) ✓
+- GETSPACE params: amount=292, b_area=$CCBF65 ✓
+- b_sysglobal_ptr comparison: b_area = b_sysglobal_ptr → adjust ✓
+- c_pool_ptr via x^ = $CCA000 ✓
+- Function result at A6-32, loaded into D0 before RTS ✓
 
-The first GETSPACE (SIZEOF(mmrb), line 211) now succeeds.
-The pool has ~15977 words free after the first allocation.
+**What fails:**
+D0 = $CC0000 on return (low word $0000 = false). The function
+result local was never set to TRUE, meaning the search loop's
+"free space found" branch never executed.
 
-**Possible causes for the second failure:**
-1. SIZEOF(mrbt) returns wrong value — if too large, GETSPACE
-   rejects with `amount > 32764` check
-2. The pool header is corrupt after the first allocation
-3. The second `not GETSPACE(...)` pattern isn't caught by the
-   boolean NOT heuristic (but AST_FUNC_CALL should match)
-4. GETSPACE internally calls another function that returns boolean
-   and hits the same NOT bug (nested NOT pattern)
-5. Parameter passing mismatch: SIZEOF returns int2, GETSPACE
-   expects int2, but codegen pushes 4 bytes
+**Root cause hypothesis:**
+The search loop uses `WITH c_pool_ptr^ DO ... currfree := pointer(
+ord(c_pool_ptr) + firstfree)`. The `firstfree` field access through
+WITH uses the `hdr_freepool` record's field offsets. If the codegen
+doesn't know the correct field layout (field offsets imported from
+SYSGLOBAL), it reads the wrong word.
+
+Pool header: `3EFC 0000 0008 3EFC` (pool_size, ???, firstfree, freecount)
+If firstfree offset is wrong (e.g., offset 0 instead of 4), the code
+reads $3EFC (pool_size) as firstfree. Then currfree = $CCA000 + $3EFC
+= $CCE3FC — pointing beyond the pool. The loop test
+`ord(currfree) <> ord(c_pool_ptr)` would be TRUE, and `currfree^.size`
+at $CCE3FC would read garbage < newsize → loop continues until
+currfree wraps to c_pool_ptr → "no free space".
 
 **Next steps:**
-1. Add trace at the GETSPACE function entry (dynamic address —
-   find via linker debug output) to see the `amount` parameter
-2. If amount is reasonable, trace through GETSPACE's search loop
-3. Check if EXP_POOLSPACE is called and whether it fails
-4. Check if there are nested boolean NOT patterns in the pool
-   expansion code
+1. Dump the WITH block's base pointer and field offsets for
+   hdr_freepool in GETSPACE's compiled code
+2. Compare against the actual pool header layout
+3. Fix the record field offset resolution for imported types
+4. Alternatively: check if the `stopper` constant (used for the
+   free list terminator) has the right value — if stopper = 0
+   and next = 0, the loop might terminate correctly
 
-## Key files
+## Key file pointers
 
 ```
-src/toolchain/pascal_codegen.c:1049   boolean NOT fix (P9)
-src/toolchain/pascal_codegen.c:150    boolean size (P6)
-src/toolchain/pascal_codegen.c:570    const expr_size (P6)
-src/toolchain/pascal_codegen.c:2362   interface symbol suppression (P7)
-src/toolchain/pascal_codegen.c:2461   procedure-local consts (P8)
-src/toolchain/pascal_codegen.c:1064   function call EXT.L skip (P8)
-src/lisa.c:1628-1633                  himem/bothimem/sgheap fixes
+src/toolchain/pascal_codegen.c   All codegen fixes (P6-P10)
+src/lisa.c:1608-1635             Memory layout fixes
 
-Lisa_Source/LISA_OS/OS/source-MM4.TEXT.unix.txt:193    MM_INIT
 Lisa_Source/LISA_OS/OS/source-SYSG1.TEXT.unix.txt:158  GETSPACE
 Lisa_Source/LISA_OS/OS/source-SYSG1.TEXT.unix.txt:5    INIT_FREEPOOL
+Lisa_Source/LISA_OS/OS/source-SYSGLOBAL.TEXT.unix.txt  hdr_freepool type def
+Lisa_Source/LISA_OS/OS/source-MM4.TEXT.unix.txt:193    MM_INIT
 ```
 
 ## Pick up here
 
-> Boot passes first GETSPACE in MM_INIT but fails on second (SIZEOF(mrbt)).
-> Trace GETSPACE entry to see the amount parameter and pool state.
-> The boolean NOT fix is the biggest single improvement — it affects
-> every `if not func(...)` pattern throughout the OS. Check if nested
-> boolean patterns (NOT inside function results) are also handled.
+> GETSPACE search loop doesn't find free space. Dump the WITH block
+> field access code for c_pool_ptr^ in GETSPACE to check if firstfree
+> is read from the correct offset (should be +4 based on the pool
+> header: word 0=pool_size, word 1=???, word 2=firstfree). If the
+> offset is wrong, fix the hdr_freepool record type resolution.
