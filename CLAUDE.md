@@ -83,11 +83,10 @@ After `G` at Lisabug prompt, reaches OS LOADER → **SYSTEM ERROR 10100**
 
 Toolchain: 317 Pascal + 103 ASM files → linked binary → disk image.
 Boot reaches PASCALINIT → INITSYS → GETLDMAP → REG_TO_MAPPED →
-POOL_INIT → MM_INIT. Currently **SYSTEM_ERROR(10701)** — `GETSPACE` in `MM_INIT` fails.
-Pool correctly initialized ($CCA000, 16K words). GETSPACE reads
-c_pool_ptr as $CCA008 (pool_base+8) instead of $CCA000 — a 2-byte
-A5-relative offset mismatch for `sg_free_pool_addr` between the
-POOL_INIT store and the GETSPACE read paths.
+POOL_INIT → MM_INIT. Boot passes ALL of INITSYS initialization and reaches the scheduler
+idle loop (~$A17xx). Runs 600 frames cleanly with no SYSTEM_ERROR.
+Next: investigate why the scheduler loop doesn't progress (likely
+needs interrupts/timer setup or disk I/O for process loading).
 
 **Key progress (2026-04-13):**
 - P6: Boolean size (1→2 bytes) — Lisa Pascal stores booleans as words.
@@ -110,8 +109,10 @@ POOL_INIT store and the GETSPACE read paths.
   load into D0 before RTS.
 - P11: Nested binary ops save D2 on stack — when the right operand
   is complex (binary op, func call, unary), use MOVE.L D0,-(SP)
-  instead of D2 to prevent clobbering. This fixes compound
-  conditions like `(a > b) or (c <= d)`.
+  instead of D2 to prevent clobbering.
+- P12: true/false/nil inside WITH blocks — the WITH fallthrough
+  handler emitted MOVE.W #0 instead of checking for built-in
+  constants. Every `x := true` inside a WITH block stored false.
 - Memory layout: himem = b_dbscreen, bothimem = lomem.
 
 **Key progress (2026-04-12):**
@@ -126,7 +127,7 @@ POOL_INIT store and the GETSPACE read paths.
 ### Toolchain metrics
 - Parser: **100%** (317/317), Assembler: **100%** (103/103)
 - Linker: 8527 symbols, output ~2.2 MB
-- Codegen: P1-P5 ptr/store, P6 bool+const, P7 iface syms, P8 local-const, P9 bool-NOT, P10 func-result, P11 D2-stack
+- Codegen: P1-P5 ptr/store, P6 bool+const, P7 iface, P8 local-const, P9 bool-NOT, P10 func-result, P11 D2-stack, P12 WITH-true
 
 ### Key HLE mechanisms
 - `$234` fetch bypass: IPL=7→RTE (DB_INIT skip), IPL=0→execute (Lisabug)
