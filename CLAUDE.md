@@ -83,9 +83,11 @@ After `G` at Lisabug prompt, reaches OS LOADER → **SYSTEM ERROR 10100**
 
 Toolchain: 317 Pascal + 103 ASM files → linked binary → disk image.
 Boot reaches PASCALINIT → INITSYS → GETLDMAP → REG_TO_MAPPED →
-POOL_INIT → MM_INIT. Currently **SYSTEM_ERROR(10701)** — second `GETSPACE` call in `MM_INIT`
-fails (SIZEOF(mrbt) allocation). First GETSPACE (mmrb) now succeeds.
-Pool correctly initialized at $CCA000 with ~16K words.
+POOL_INIT → MM_INIT. Currently **SYSTEM_ERROR(10701)** — `GETSPACE` in `MM_INIT` fails.
+Pool correctly initialized ($CCA000, 16K words). Search loop finds
+free space (currfree ≠ c_pool_ptr), but the "found" branch's
+`getspace := true` is never reached — likely another codegen bug
+in the allocation code within the nested WITH blocks.
 
 **Key progress (2026-04-13):**
 - P6: Boolean size (1→2 bytes) — Lisa Pascal stores booleans as words.
@@ -104,6 +106,12 @@ Pool correctly initialized at $CCA000 with ~16K words.
   TST/SEQ/ANDI (1→0, 0→1). ALL `if not func(...)` patterns were
   always-true due to this bug.
 - P9: l_sgheap $8000→$7E00 (page-aligned, fits int2).
+- P10: Function result variables — create local for return value,
+  load into D0 before RTS.
+- P11: Nested binary ops save D2 on stack — when the right operand
+  is complex (binary op, func call, unary), use MOVE.L D0,-(SP)
+  instead of D2 to prevent clobbering. This fixes compound
+  conditions like `(a > b) or (c <= d)`.
 - Memory layout: himem = b_dbscreen, bothimem = lomem.
 
 **Key progress (2026-04-12):**
@@ -118,7 +126,7 @@ Pool correctly initialized at $CCA000 with ~16K words.
 ### Toolchain metrics
 - Parser: **100%** (317/317), Assembler: **100%** (103/103)
 - Linker: 8527 symbols, output ~2.2 MB
-- Codegen: P1-P5 ptr/store/stale-word, P6 boolean+const, P7 interface syms, P8 local-const+func-EXT, P9 bool-NOT
+- Codegen: P1-P5 ptr/store, P6 bool+const, P7 iface syms, P8 local-const, P9 bool-NOT, P10 func-result, P11 D2-stack
 
 ### Key HLE mechanisms
 - `$234` fetch bypass: IPL=7→RTE (DB_INIT skip), IPL=0→execute (Lisabug)
