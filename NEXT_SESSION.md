@@ -1,91 +1,78 @@
-# LisaEmu — Next Session Handoff (2026-04-13, session 4)
+# LisaEmu — Next Session Handoff (2026-04-13, final)
 
 ## TL;DR
 
-Fixed 10 codegen bugs (P6-P11) + memory layout fixes across 3 sessions.
-Boot passes POOL_INIT, INIT_FREEPOOL, and the search loop in GETSPACE
-correctly finds free space. But `getspace := true` in the "found"
-branch is never reached at runtime. The allocation code in the nested
-WITH blocks (with c_pool_ptr^ do / with currfree^ do) likely has
-another codegen issue.
+Fixed 10 codegen bugs (P6-P11) + memory layout. Boot passes POOL_INIT,
+INIT_FREEPOOL. GETSPACE correctly enters "found" branch (currfree ≠
+c_pool_ptr) but c_pool_ptr has wrong value: $CCA008 (pool_base+8)
+instead of $CCA000 (pool_base). Root cause: A5-relative offset mismatch
+for `sg_free_pool_addr` or `b_sysglobal_ptr` between compilation units.
 
-## Accomplished today
+## Key finding from this session's debugging
 
-### Codegen fixes (pascal_codegen.c)
-| Fix | Bug | Impact |
-|-----|-----|--------|
-| P6 | Boolean 1→2 bytes | PARMS frame misaligned 48+ bytes |
-| P6 | expr_size: is_const before type | Large consts ($20000) zeroed by EXT.L |
-| P7 | Interface symbol suppression | GETFREE etc. at wrong address |
-| P8 | Procedure-local consts | nospace=610 instead of 10701 |
-| P8 | No EXT.L on func call results | MMU_BASE $CC0000→$0 |
-| P9 | Boolean NOT (bitwise→logical) | ALL `if not func()` always TRUE |
-| P10 | Function result local + D0 load | Functions never returned results |
-| P11 | Nested binary ops: D2→stack save | Compound conditions always TRUE |
+**GETSPACE c_pool_ptr is $CCA008 instead of $CCA000.**
 
-### Memory layout (lisa.c)
-- himem = b_dbscreen, bothimem = lomem, l_sgheap = $7E00
+The trace shows:
+```
+PC=$5E6E: MOVE.L -10(A6),D0  → D0=$CCA008 (c_pool_ptr)
+```
 
-## In progress
+$CCA008 = pool_base + sizeof(hdr_freepool) = first free entry address.
+The correct value should be $CCA000 (pool base).
 
-### GETSPACE "found" branch never executes `getspace := true`
+**How c_pool_ptr is derived:**
+```pascal
+x := pointer(b_area);      → x = pointer of sg_free_pool_addr address
+c_pool_ptr := pointer(x^); → c_pool_ptr = VALUE of sg_free_pool_addr
+```
 
-**Verified working:**
-- Pool at $CCA000: pool_size=16124, firstfree=8, freecount=16124 ✓
-- GETSPACE amount=292, b_area=$CCBF65, adjust works ✓
-- `(amount > 32764) or (amount <= 0)` → FALSE (D2 fix works!) ✓
-- Search loop: currfree=$CCA008, currfree^.size=16124 ≥ newsize=147 ✓
-- Loop doesn't execute (first entry big enough) ✓
-- currfree ≠ c_pool_ptr → "found" branch decision ✓
-- Assignment codegen for `getspace := true`: correctly targets A6-32 ✓
+b_area arrives as `b_sysglobal_ptr` = `ord(@sg_free_pool_addr) + 24575`.
+After adjustment: `b_area - 24575` = `@sg_free_pool_addr` = A5-150.
 
-**What fails:**
-The function result at A6-32 is never written to 1 (TRUE). The
-memory watchpoint shows only one write (initialization to 0 by LINK).
-The `getspace := true` instruction at line 292 is never reached.
+If `sg_free_pool_addr` at A5-150 contains $CCA000, then `x^` = $CCA000.
+But the actual read gives $CCA008.
 
-**Root cause hypothesis:**
-The "found" branch has complex code: nested WITH blocks, pointer
-arithmetic (`ord4(newsize)*2`), field assignments via WITH, and
-`INTSON` call. One of these likely has a codegen bug that causes
-an early exit or exception:
+**Possible causes:**
+1. `sg_free_pool_addr` itself was modified after POOL_INIT wrote $CCA000
+   (e.g., by `size_sglobal` store at an overlapping A5 offset)
+2. The A5 offset for sg_free_pool_addr differs between the POOL_INIT
+   store and the GETSPACE read (global offset counter desync)
+3. The `b_sysglobal_ptr` computation has a 2-byte error, causing `x`
+   to point to A5-148 instead of A5-150 — reading the bytes 2 positions
+   higher gives $CCA008 instead of $CCA000 if there's an $0008 prefix
 
-1. **`ord4(newsize)*2` in `pointer(ord(currfree)+ord4(newsize)*2)`:**
-   The `*2` is a binary op. `ord4(newsize)` is a function call (intrinsic).
-   The D2 stack-save fix should handle this, but verify.
-
-2. **`leftfree^.next := ord(nextfree) - ord(c_pool_ptr)`:**
-   Multiple pointer dereferences and WITH field accesses. Might
-   generate a bus error on misaligned addresses.
-
-3. **`size := -newsize` inside WITH currfree^:**
-   This stores to currfree^.size. The WITH base is currfree.
-   If the codegen writes to the wrong offset, it could corrupt
-   the pool structure.
-
-4. **INTSON call with wrong stack cleanup:** If INTSON is callee-clean
-   but doesn't pop its params, SP is misaligned and subsequent code
-   breaks.
+**Most likely:** Cause #3 — the `@sg_free_pool_addr + 24575` computation
+uses `ord(@sg_free_pool_addr)` which should give A5-150. But if the
+sg_free_pool_addr offset differs by 2 between POOL_INIT (which writes)
+and MM_INIT (which passes b_sysglobal_ptr), the pointer is off by 2.
 
 **Next steps:**
-1. Add a PC trace in the "found" branch to find where execution
-   stops. Decode the code from the BEQ (if/else decision) forward
-   to locate the exact failing instruction.
-2. Check for bus errors / address errors during GETSPACE execution.
-3. Look at the `ord4(newsize)*2` multiplication — on 68000, if
-   newsize is in D0 as a word, `ord4` should EXT.L, then `*2`
-   can be ADD.L D0,D0. But codegen might generate a full 32-bit
-   multiply.
+1. Verify b_sysglobal_ptr value at GETSPACE entry: should be
+   `A5 - 150 + 24575`. If it's `A5 - 148 + 24575`, the offset is wrong.
+2. Check if different compilation units assign different A5 offsets
+   for `sg_free_pool_addr` and `b_sysglobal_ptr`.
+3. Dump 8 bytes at the adjusted b_area to see what values are there.
+4. If the offset is misaligned: check the `imported_globals` mechanism
+   to see if A5 offsets are properly synchronized across units.
+
+## Codegen fixes this session (P6-P11)
+
+| Fix | Bug | Impact |
+|-----|-----|--------|
+| P6 | Boolean 1→2 bytes | PARMS frame misaligned |
+| P6 | is_const before type in expr_size | Large const EXT.L corruption |
+| P7 | Interface symbol suppression | Wrong function addresses |
+| P8 | Procedure-local consts | Wrong error constants |
+| P8 | No EXT.L on func call results | Function return values zeroed |
+| P9 | Boolean NOT (bitwise→logical) | All `if not f()` always TRUE |
+| P10 | Function result local + D0 load | Functions never returned results |
+| P11 | D2 → stack save for nested binops | Compound conditions corrupted |
 
 ## Key files
 
 ```
-src/toolchain/pascal_codegen.c:1091-1118  D2 stack-save fix (P11)
-src/toolchain/pascal_codegen.c:1049       Boolean NOT fix (P9)
-src/toolchain/pascal_codegen.c:2572-2588  Function result load (P10)
-src/lisa.c:1608-1635                      Memory layout
-
-Lisa_Source/LISA_OS/OS/source-SYSG1.TEXT.unix.txt:158   GETSPACE
-Lisa_Source/LISA_OS/OS/source-SYSG1.TEXT.unix.txt:256   "found" branch
-Lisa_Source/LISA_OS/OS/source-SYSGLOBAL.TEXT.unix.txt:540  hdr_freepool record
+src/toolchain/pascal_codegen.c     All P6-P11 codegen fixes
+src/lisa.c                         Memory layout fixes
+Lisa_Source/LISA_OS/OS/source-SYSG1.TEXT.unix.txt   GETSPACE, POOL_INIT
+Lisa_Source/LISA_OS/OS/source-SYSGLOBAL.TEXT.unix.txt  hdr_freepool, globals
 ```

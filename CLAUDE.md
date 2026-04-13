@@ -84,10 +84,10 @@ After `G` at Lisabug prompt, reaches OS LOADER → **SYSTEM ERROR 10100**
 Toolchain: 317 Pascal + 103 ASM files → linked binary → disk image.
 Boot reaches PASCALINIT → INITSYS → GETLDMAP → REG_TO_MAPPED →
 POOL_INIT → MM_INIT. Currently **SYSTEM_ERROR(10701)** — `GETSPACE` in `MM_INIT` fails.
-Pool correctly initialized ($CCA000, 16K words). Search loop finds
-free space (currfree ≠ c_pool_ptr), but the "found" branch's
-`getspace := true` is never reached — likely another codegen bug
-in the allocation code within the nested WITH blocks.
+Pool correctly initialized ($CCA000, 16K words). GETSPACE reads
+c_pool_ptr as $CCA008 (pool_base+8) instead of $CCA000 — a 2-byte
+A5-relative offset mismatch for `sg_free_pool_addr` between the
+POOL_INIT store and the GETSPACE read paths.
 
 **Key progress (2026-04-13):**
 - P6: Boolean size (1→2 bytes) — Lisa Pascal stores booleans as words.
