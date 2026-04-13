@@ -1608,7 +1608,10 @@ void lisa_reset(lisa_t *lisa) {
         uint32_t b_superstack = b_sysglobal + l_sysglobal;
         uint32_t l_superstack = 0x4000;   /* 16KB supervisor stack */
         uint32_t b_sgheap    = b_superstack + l_superstack;
-        uint32_t l_sgheap    = 0x8000;    /* 32KB sysglobal heap */
+        uint32_t l_sgheap    = 0x7E00;    /* ~31.5KB sysglobal heap.
+                                          * Must be (a) page-aligned ($200 = 512 bytes)
+                                          * for MMU SOR consistency, and (b) ≤ 32767 because
+                                          * INIT_FREEPOOL takes fp_size as int2. */
         /* Screen at top of 2MB RAM, like real Lisa */
         uint32_t l_screen    = 0x8000;    /* 32KB screen buffer */
         uint32_t l_dbscreen  = 0x8000;

@@ -1048,7 +1048,28 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                 emit16(cg, (sz == 4) ? 0x4480 : 0x4440);  /* NEG.L/W D0 */
             } else if (node->op == TOK_NOT) {
                 int sz = expr_size(cg, node->children[0]);
-                emit16(cg, (sz == 4) ? 0x4680 : 0x4640);  /* NOT.L/W D0 */
+                /* Check if operand is boolean (comparison result, function returning
+                 * boolean, or boolean variable). Boolean NOT needs logical negation
+                 * (1→0, 0→1), not bitwise NOT (1→$FFFE, 0→$FFFF).
+                 * Use: TST.W D0; SEQ D0; ANDI.W #1,D0 for boolean operands.
+                 * Bitwise NOT for integer/longint operands (Pascal BIT operations). */
+                bool is_boolean = false;
+                ast_node_t *child = node->children[0];
+                if (child->type == AST_FUNC_CALL || child->type == AST_BINARY_OP)
+                    is_boolean = true;  /* function results and comparisons are boolean */
+                if (child->type == AST_IDENT_EXPR) {
+                    cg_symbol_t *sym = find_symbol_any(cg, child->name);
+                    if (sym && sym->type && sym->type->kind == TK_BOOLEAN)
+                        is_boolean = true;
+                }
+                if (is_boolean) {
+                    emit16(cg, 0x4A40);  /* TST.W D0 */
+                    emit16(cg, 0x57C0);  /* SEQ D0 — set if zero (NOT logic) */
+                    emit16(cg, 0x0240);  /* ANDI.W #1,D0 */
+                    emit16(cg, 0x0001);
+                } else {
+                    emit16(cg, (sz == 4) ? 0x4680 : 0x4640);  /* NOT.L/W D0 */
+                }
             }
             break;
 
@@ -2431,14 +2452,25 @@ static void gen_proc_or_func(codegen_t *cg, ast_node_t *node) {
      * the INTERFACE/FORWARD declaration's stored signature */
     if (!has_param_list) {
         cg_proc_sig_t *sig = find_proc_sig(cg, node->name);
+        if (!sig && strcasestr(cg->current_file, "SYSG1"))
+            fprintf(stderr, "  WARNING: no sig for '%s' in %s (has_param_list=0)\n",
+                    node->name, cg->current_file);
         if (sig && sig->num_params > 0) {
+            if (strcasestr(cg->current_file, "SYSG1"))
+                fprintf(stderr, "  RECONST '%s': %d params\n", node->name, sig->num_params);
             for (int j = 0; j < sig->num_params; j++) {
                 type_desc_t *ptype = sig->param_type[j];
                 if (!ptype) ptype = find_type(cg, "integer");
                 cg_symbol_t *s = add_local(cg, sig->param_name[j], ptype, true, sig->param_is_var[j]);
                 if (s) {
                     s->offset = param_offset;
-                    param_offset += sig->param_is_var[j] ? 4 : (ptype ? ptype->size : 2);
+                    int psz = sig->param_is_var[j] ? 4 : (ptype ? ptype->size : 2);
+                    if (strcasestr(cg->current_file, "SYSG1") &&
+                        strcasestr(node->name, "POOL_INIT"))
+                        fprintf(stderr, "    param '%s' offset=%d sz=%d type=%s\n",
+                                sig->param_name[j], param_offset, psz,
+                                ptype ? ptype->name : "NULL");
+                    param_offset += psz;
                     if (param_offset % 2) param_offset++;
                 }
             }
