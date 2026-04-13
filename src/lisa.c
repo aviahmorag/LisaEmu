@@ -1625,7 +1625,11 @@ void lisa_reset(lisa_t *lisa) {
         uint32_t b_drivers   = b_vmbuffer + l_vmbuffer;
         uint32_t l_drivers   = 0x2000;    /* 8KB driver data */
         uint32_t lomem       = b_drivers + l_drivers;
-        uint32_t himem       = 0x0FF800;
+        /* himem = highest free byte + 1.  Must be below the screen
+         * buffers (which sit at top of physical RAM).  For a 2MB Lisa,
+         * the debug screen is at $1F0000 and main screen at $1F8000.
+         * Free memory extends from lomem up to the debug screen base. */
+        uint32_t himem       = b_dbscreen;
 
         /* Build parameter block — Lisa Pascal lays out variables DOWNWARD.
          * GETLDMAP copies word-by-word, decrementing both pointers.
@@ -1706,8 +1710,10 @@ void lisa_reset(lisa_t *lisa) {
         W16D(0);             /* have_lisabug = false */
         W16D(0);             /* two_screens = false */
         W32D(b_sysglobal + 32); /* ldr_A5 */
-        W32D(lomem);         /* toplomem */
-        W32D(himem);         /* bothimem */
+        W32D(lomem);         /* toplomem — highest legal value of the lo-memory ptr */
+        W32D(lomem);         /* bothimem — lowest legal value of the hi-memory ptr.
+                              * Guards against overwriting the loader during allocation.
+                              * Set to lomem since we have no resident loader to protect. */
         W16D(0xFFFF);        /* parmend sentinel */
 
         #undef W32D
@@ -2842,6 +2848,37 @@ static bool hle_handle_system_error(lisa_t *lisa __attribute__((unused)), m68k_t
         cpu->pc = ret_addr;
         cpu->cycles += 20;
         return true;
+    }
+
+    /* Dump PARMS context for memory errors.
+     * Walk A6 chain and show each level, then read PARMS from innermost
+     * frame that looks like INITSYS (version=22 at A6-104). */
+    if (err_code == 10701 || err_code == 10709) {
+        uint32_t a6 = cpu->a[6];
+        fprintf(stderr, "  A6 chain:");
+        uint32_t ia6 = a6;
+        for (int i = 0; i < 8 && ia6; i++) {
+            fprintf(stderr, " $%08X", ia6);
+            uint32_t next = cpu_read32(cpu, ia6);
+            if (next == 0 || next == ia6) break;
+            ia6 = next;
+        }
+        fprintf(stderr, "\n");
+        /* Try each A6 in chain to find INITSYS (version=22 at A6-104) */
+        ia6 = a6;
+        for (int i = 0; i < 8 && ia6; i++) {
+            uint16_t ver = cpu_read16(cpu, ia6 - 104);
+            if (ver == 22) {
+                fprintf(stderr, "  Found INITSYS frame at $%08X (depth %d)\n", ia6, i);
+                fprintf(stderr, "  himem=$%08X lomem=$%08X l_phymem=$%08X\n",
+                        cpu_read32(cpu, ia6 - 204), cpu_read32(cpu, ia6 - 208),
+                        cpu_read32(cpu, ia6 - 212));
+                break;
+            }
+            uint32_t next = cpu_read32(cpu, ia6);
+            if (next == 0 || next == ia6) break;
+            ia6 = next;
+        }
     }
 
     /* SYSTEM_ERROR should halt — it never returns on a real Lisa.
