@@ -3048,6 +3048,57 @@ bool lisa_hle_intercept(lisa_t *lisa, m68k_t *cpu) {
 
     if (!lisa->hle.active) return false;
 
+    /* Trace GETSPACE calls */
+    {
+        DBGSTATIC(int, dbg_gs, 0);
+        /* Also trace return from GETSPACE */
+        {
+            DBGSTATIC(uint32_t, gs_ret_addr, 0);
+            if (pc == 0x5CE8) gs_ret_addr = cpu_read32(cpu, cpu->a[7]);
+            if (gs_ret_addr && pc == gs_ret_addr && dbg_gs > 0 && dbg_gs <= 10) {
+                fprintf(stderr, ">>> GETSPACE RETURN: D0=$%08X\n", cpu->d[0]);
+                gs_ret_addr = 0;
+            }
+        }
+        if (pc == 0x5CE8 && dbg_gs == 0) {
+            /* Dump GETSPACE code to verify function result handling */
+            fprintf(stderr, ">>> GETSPACE code @$5CE8:\n");
+            for (int line = 0; line < 3; line++) {
+                fprintf(stderr, "  $%05X:", 0x5CE8 + line*20);
+                for (int w = 0; w < 10; w++)
+                    fprintf(stderr, " %04X", cpu_read16(cpu, 0x5CE8 + line*20 + w*2));
+                fprintf(stderr, "\n");
+            }
+        }
+        if (pc == 0x5CE8 && dbg_gs < 10) {
+            dbg_gs++;
+            uint32_t sp = cpu->a[7];
+            int16_t amount = (int16_t)cpu_read16(cpu, sp + 4);
+            uint32_t b_area = cpu_read32(cpu, sp + 6);
+            uint32_t a5 = cpu->a[5];
+            fprintf(stderr, ">>> GETSPACE #%d: amount=%d b_area=$%08X ret=$%08X\n",
+                    dbg_gs, amount, b_area, cpu_read32(cpu, sp));
+            /* Check b_sysglobal_ptr from GETSPACE's perspective */
+            /* b_sysglobal_ptr is at A5-$4FC (from STARTUP compile) but might
+             * be at a different offset in SYSG1 */
+            fprintf(stderr, "  A5=$%08X b_sysglobal_ptr(A5-$4FC)=$%08X\n",
+                    a5, cpu_read32(cpu, a5 - 0x4FC));
+            /* After adjust: b_area - 24575 should = &sg_free_pool_addr */
+            uint32_t adj = b_area - 24575;
+            fprintf(stderr, "  adj b_area=$%08X sg_free_pool_addr(A5-150)=$%08X\n",
+                    adj, cpu_read32(cpu, a5 - 150));
+            /* What x^ gives */
+            uint32_t x_val = cpu_read32(cpu, adj);
+            fprintf(stderr, "  x=pointer($%X) x^=$%08X\n", adj, x_val);
+            /* Pool header */
+            if (x_val > 0 && x_val < 0x01000000) {
+                fprintf(stderr, "  Pool@$%X:", x_val);
+                for (int w = 0; w < 6; w++)
+                    fprintf(stderr, " %04X", cpu_read16(cpu, x_val + w*2));
+                fprintf(stderr, "\n");
+            }
+        }
+    }
 
     /* Intercept CALLDRIVER */
     if (pc == lisa->hle.calldriver) return hle_handle_calldriver(lisa, cpu);

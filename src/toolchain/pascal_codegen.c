@@ -2515,6 +2515,46 @@ static void gen_proc_or_func(codegen_t *cg, ast_node_t *node) {
         }
     }
 
+    /* For functions, create a local variable for the return value.
+     * Must be done BEFORE LINK so frame_size includes the result slot. */
+    /* For functions, create a local variable for the return value.
+     * In Lisa Pascal, `funcname := expr` assigns to the result slot.
+     * We load D0 from this slot before RTS. */
+    bool is_function = (node->type == AST_FUNC_DECL);
+    int func_result_offset = 0;
+    if (is_function && node->name[0]) {
+        cg_symbol_t *existing = find_local(cg, node->name);
+        if (!existing) {
+            /* Try to find return type from function declaration children */
+            type_desc_t *rtype = NULL;
+            for (int i = 0; i < node->num_children; i++) {
+                ast_node_t *ch = node->children[i];
+                if (ch->type == AST_IDENT_EXPR && ch->name[0]) {
+                    type_desc_t *t = find_type(cg, ch->name);
+                    if (t) { rtype = t; break; }
+                }
+            }
+            if (!rtype) rtype = find_type(cg, "boolean"); /* common default for functions */
+            int rsz = rtype ? rtype->size : 2;
+            if (rsz < 2) rsz = 2;
+            cg_scope_t *fsc2 = current_scope(cg);
+            if (fsc2) {
+                if (rsz >= 2 && (fsc2->frame_size % 2)) fsc2->frame_size++;
+                fsc2->frame_size += rsz;
+                cg_symbol_t *rv = add_local(cg, node->name, rtype, false, false);
+                if (rv) {
+                    rv->offset = -(int)fsc2->frame_size;
+                    func_result_offset = rv->offset;
+                    if (strcasestr(node->name, "GETSPACE") || strcasestr(node->name, "GETFREE"))
+                        fprintf(stderr, "  FUNC_RESULT '%s' offset=%d sz=%d type=%s\n",
+                                node->name, rv->offset, rsz, rtype ? rtype->name : "?");
+                }
+            }
+        } else {
+            func_result_offset = existing->offset;
+        }
+    }
+
     cg_scope_t *sc = current_scope(cg);
     int frame_size = sc ? sc->frame_size : 0;
 
@@ -2535,6 +2575,18 @@ static void gen_proc_or_func(codegen_t *cg, ast_node_t *node) {
         if (node->children[i]->type == AST_BLOCK) {
             gen_statement(cg, node->children[i]);
         }
+    }
+
+    /* For functions: load result variable into D0 before returning */
+    if (is_function && func_result_offset != 0) {
+        int rsz = 2; /* default */
+        cg_symbol_t *rv = find_local(cg, node->name);
+        if (rv && rv->type) rsz = type_load_size(rv->type);
+        if (rsz == 4)
+            emit16(cg, 0x202E);  /* MOVE.L offset(A6),D0 */
+        else
+            emit16(cg, 0x302E);  /* MOVE.W offset(A6),D0 */
+        emit16(cg, (uint16_t)(int16_t)func_result_offset);
     }
 
     /* UNLK A6; RTS */
