@@ -1,114 +1,96 @@
-# LisaEmu — Next Session Handoff (2026-04-13)
+# LisaEmu — Next Session Handoff (2026-04-13, session 2)
 
 ## TL;DR
 
-Fixed two P6 codegen bugs (boolean size, const expr_size) and two
-memory layout issues (himem, bothimem). Boot now passes GETLDMAP,
-screen MMU setup, AVAIL_INIT, reaches INIT_CONFIG → GET_BOOTSPACE.
-Currently **SYSTEM_ERROR(10701)** — `GETFREE` fails (no free pages).
-Root cause under investigation: free pool may not be populated by
-MAKE_FREE, or the pool data structures are corrupt.
+Fixed 4 codegen bugs (P6-P8) + 2 memory layout issues. Boot now reaches
+POOL_INIT with correct parameters (mb_sgheap=$CCA000) but GETSPACE in
+MM_INIT still fails (error 10701). INIT_FREEPOOL's setup of the sysglobal
+free pool is suspect — the pool data structures may be corrupt or the
+pool header size computation is wrong.
 
 ## Accomplished this session
 
-### P6: Boolean size fix (`pascal_codegen.c`)
+### P6: Boolean size + const expr_size (pascal_codegen.c)
+- Boolean: 1→2 bytes (Lisa Pascal word-sized)
+- expr_size: check is_const BEFORE type for large constants
 
-**Line 150**: `boolean` type size changed from 1 to 2 bytes.
+### P7: Interface symbol suppression (pascal_codegen.c)
+- UNIT INTERFACE proc/func declarations no longer export linker symbols
+  at offset 0. Previously GETFREE, BLDPGLEN, MAKE_REGION all jumped to
+  the module base instead of their real code.
 
-Lisa Pascal stores boolean variables as words (2 bytes) on the 68000.
-The 1-byte size caused PARMS frame misalignment: the boolean array
-`swappedin[1..48]` was 48 bytes instead of 96, shifting all
-subsequent PARMS variables by 48+ bytes. This caused GETLDMAP's
-word-by-word copy to misalign the data in INITSYS's frame.
+### P8: Local consts + function EXT.L (pascal_codegen.c)
+- Procedure-local CONST declarations (nospace=10701 in MM_INIT) now
+  processed in gen_proc_or_func
+- Binary op EXT.L skipped for AST_FUNC_CALL operands — functions
+  return correct 32-bit values, EXT.L was zeroing MMU_BASE's $CC0000
 
-### P6: Const expr_size ordering fix (`pascal_codegen.c`)
-
-**Line ~570**: Swapped the `is_const` check to come BEFORE `sym->type`.
-
-All constants are created with `type = integer` (size 2). The old code
-checked `sym->type` first, returning `type_load_size(integer) = 2` for
-ALL constants regardless of value. This meant `maxmmusize = 131072`
-had expr_size = 2, causing a spurious `EXT.L D0` after `MOVE.L #$20000,D0`
-which zeroed the upper word ($20000 → $0). The comparison
-`l_scrdata > maxmmusize` then evaluated `$2000 > $0 = true`.
-
-### Memory layout fixes (`lisa.c`)
-
-1. **himem**: Changed from hardcoded `$0FF800` (1MB boundary) to
-   `b_dbscreen` ($230000, below screen buffers). The OS binary at
-   ~896KB left zero free space with the old 1MB boundary.
-
-2. **bothimem**: Changed from `himem` to `lomem`. bothimem guards against
-   overwriting the loader during allocation. Since we have no resident
-   loader, setting it equal to himem blocked ALL allocations.
-
-### Verification
-
-- Error 10709 (screen MMU) is FIXED — boot passes the `l_scrdata > maxmmusize` check
-- PARMS data correctly copied: l_scrdata = $2000 via static link through MMU
-- Free memory: lomem=$FF800, himem=$230000 (~1.2MB free)
-- Boot progresses to INIT_CONFIG → GET_BOOTSPACE → GETFREE
+### Memory layout (lisa.c)
+- himem = b_dbscreen (below screen buffers, ~$230000)
+- bothimem = lomem (no loader to protect)
 
 ## In progress
 
-### SYSTEM_ERROR(10701) — GETFREE fails
+### SYSTEM_ERROR(10701) — GETSPACE fails in MM_INIT
 
-**Source**: GET_BOOTSPACE (STARTUP line 1171):
-```pascal
-if not GETFREE( (size + mempgsize - 1) div mempgsize, page_got) then
-   SYSTEM_ERROR(10701);
-```
+POOL_INIT receives correct parameters (verified):
+- mb_sysglob = $CC0000 (MMU_BASE(102))
+- l_sysglob = $6000 (24KB)
+- mb_sgheap = $CCA000 (correctly computed now)
+- l_sgheap = $8000 (32KB)
+- mb_syslocal = $CE0000 (MMU_BASE(103))
+- l_syslocal = $4000
 
-**GETFREE** (source-MM4.TEXT): Gets the last free area from the free
-memory list (`c_mmrb^.tail_sdb.freechain.bkwd_link`). Returns false
-if `f_sdb^.memsize < size`.
+But GETSPACE(SIZEOF(mmrb), b_sysglobal_ptr, mmrb_addr) fails.
 
-**MAKE_FREE** (source-MM0.TEXT): Called by AVAIL_INIT to register
-free pages. Creates an SDB at `ord4(maddr) * hmempgsize * 2 + logrealmem`
-and inserts it into the free chain via INSERTSDB.
-
-**Diagnostic data**:
-- PARMS lomem/himem correct: $FF800 / $230000
-- sg_free_pool_addr (A5-148) = $A0000000 — looks suspicious
-- GETFREE at $A101E, MAKE_FREE in MMPRIM
+**Key finding**: The codegen places `sg_free_pool_addr` at A5-150
+(LEA -$96(A5)) but the earlier diagnostic dump read A5-148. The
+hardcoded diagnostic offset was wrong. Need to verify the actual
+value at A5-150 after POOL_INIT runs.
 
 **Possible causes**:
-1. MAKE_FREE never called (AVAIL_INIT code path broken)
-2. MAKE_FREE called but INSERTSDB doesn't work (free chain not linked)
-3. BLDPGLEN computation wrong (freebase or freelen = 0)
-4. The MMRB (memory manager resource block) not initialized properly
-5. `mmrb_addr` global has wrong value
+1. INIT_FREEPOOL (at $5914) code has bugs — it sets up the free
+   pool header at the mapped sgheap address ($CCA000). Pool header
+   has `size` (negative for free), `pool_size`, etc. If the header
+   is corrupt, GETSPACE can't find free space.
+2. A5-relative offset mismatch: POOL_INIT stores to A5-150 but
+   GETSPACE reads from a different offset (different compilation
+   unit may have different global_offset counter state).
+3. The free pool write goes to unmapped/wrong physical memory.
+   Segment 102 (sysglobmmu) maps $CC0000→physical $DD800. The
+   sgheap at $CCA000 maps to physical $DD800 + $A000 = $E7800.
+   This IS within physical RAM.
 
 **Next steps**:
-1. Add a trace at MAKE_FREE's address to verify it's called and
-   inspect its parameters (maddr, msize)
-2. After MAKE_FREE returns, dump the free chain to see if any
-   free SDBs were created
-3. Check if AVAIL_INIT actually computes freebase/freelen from
-   lomem/himem correctly (these are accessed via static link)
-4. Check if the `const expr_size` fix affected any MMPRIM computations
-   (e.g., hmempgsize = 256 fits in 16 bits, so should be fine)
+1. Add a trace at INIT_FREEPOOL ($5914) to dump its parameters
+   and verify the pool header after initialization
+2. After POOL_INIT returns, read the pool header at the ACTUAL
+   A5-150 mapped address and verify it contains valid data
+3. Check if GETSPACE reads sg_free_pool_addr from the correct
+   A5 offset (should match the one POOL_INIT writes to)
+4. If the offsets don't match, investigate the global_offset
+   counter consistency between compilation units
 
 ## Key file pointers
 
 ```
-src/toolchain/pascal_codegen.c:150   boolean size fix
-src/toolchain/pascal_codegen.c:570   const expr_size fix
-src/lisa.c:1628-1631                 himem/bothimem fix
-src/lisa.c:2835-2860                 SYSTEM_ERROR HLE handler
+src/toolchain/pascal_codegen.c:150   boolean size (P6)
+src/toolchain/pascal_codegen.c:570   const expr_size ordering (P6)
+src/toolchain/pascal_codegen.c:2362  interface symbol suppression (P7)
+src/toolchain/pascal_codegen.c:2461  procedure-local consts (P8)
+src/toolchain/pascal_codegen.c:1064  function call EXT.L skip (P8)
+src/lisa.c:1628-1633                 himem/bothimem fix
 
-Lisa_Source/LISA_OS/OS/source-MM0.TEXT.unix.txt     MAKE_FREE
-Lisa_Source/LISA_OS/OS/source-MM4.TEXT.unix.txt      GETFREE, BLDPGLEN
-Lisa_Source/LISA_OS/OS/SOURCE-STARTUP.TEXT.unix.txt:309  AVAIL_INIT
-Lisa_Source/LISA_OS/OS/SOURCE-STARTUP.TEXT.unix.txt:1158 GET_BOOTSPACE
-Lisa_Source/LISA_OS/OS/SOURCE-STARTUP.TEXT.unix.txt:1103 INIT_CONFIG
+Lisa_Source/LISA_OS/OS/source-SYSG1.TEXT.unix.txt:729  POOL_INIT
+Lisa_Source/LISA_OS/OS/source-SYSG1.TEXT.unix.txt       INIT_FREEPOOL, GETSPACE
+Lisa_Source/LISA_OS/OS/source-MM4.TEXT.unix.txt:193     MM_INIT (calls GETSPACE)
+Lisa_Source/LISA_OS/OS/source-MMPRIM.TEXT.unix.txt:773  MMU_BASE
 ```
 
 ## Pick up here
 
-> Boot reaches error 10701 (GETFREE fails). MAKE_FREE should have
-> populated the free pool from AVAIL_INIT with pages from $FF800
-> to $230000 (~1.2MB). Trace MAKE_FREE execution: (1) add PC trace
-> at MAKE_FREE's linked address, (2) check that freebase/freelen
-> are non-zero when MAKE_FREE is called, (3) dump the free chain
-> after MAKE_FREE returns, (4) check MMRB initialization.
+> GETSPACE fails in MM_INIT despite POOL_INIT receiving correct
+> parameters. The sysglobal free pool (at $CCA000, 32KB) should be
+> initialized by INIT_FREEPOOL. Trace INIT_FREEPOOL to verify the
+> pool header is set up correctly. Then verify GETSPACE reads
+> sg_free_pool_addr from the same A5 offset that POOL_INIT wrote to.

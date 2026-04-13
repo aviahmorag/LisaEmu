@@ -83,23 +83,26 @@ After `G` at Lisabug prompt, reaches OS LOADER → **SYSTEM ERROR 10100**
 
 Toolchain: 317 Pascal + 103 ASM files → linked binary → disk image.
 Boot reaches PASCALINIT → INITSYS → GETLDMAP → REG_TO_MAPPED →
-POOL_INIT → MM_INIT → GETSPACE → AVAIL_INIT (screen MMU setup,
-MAKE_REGION, MAKE_FREE) → INIT_CONFIG → GET_BOOTSPACE.
-Currently **SYSTEM_ERROR(10701)** — `GETFREE` fails in
-`GET_BOOTSPACE`. Free pool not populated despite correct `lomem`/`himem`.
-Root cause: MAKE_FREE compiled code or pool data structure init issue.
+POOL_INIT → MM_INIT. Currently **SYSTEM_ERROR(10701)** — `GETSPACE`
+fails in `MM_INIT` (can't allocate MMRB from sysglobal heap). POOL_INIT
+receives correct parameters (mb_sgheap=$CCA000) but INIT_FREEPOOL's
+setup of the free pool data structures may be broken, or the pool header
+is corrupt. The sg_free_pool_addr global at A5-150 needs verification.
 
 **Key progress (2026-04-13):**
 - P6: Boolean size (1→2 bytes) — Lisa Pascal stores booleans as words.
-  Fixed PARMS frame misalignment: swappedin[1..48] of boolean was
-  48 bytes instead of 96, shifting all subsequent variables.
+  Fixed PARMS frame misalignment (swappedin[1..48] was half-sized).
 - P6: expr_size const ordering — check is_const BEFORE type.
-  Constants like maxmmusize=131072 were typed "integer" (size 2) but
-  need 4 bytes. The wrong expr_size caused EXT.L to zero the upper
-  word of $20000→$0, making comparisons fail.
-- Memory layout: himem set to b_dbscreen (below screen buffers)
-  instead of hardcoded $0FF800. bothimem set to lomem (no loader
-  to protect). Free space now ~1.2MB.
+  Fixes large constants like maxmmusize=131072 treated as 16-bit.
+- P7: Interface declarations no longer export linker symbols.
+  Fixed GETFREE/BLDPGLEN/MAKE_REGION all resolving to module base
+  (offset 0) instead of their actual code offsets.
+- P8: Procedure-local const declarations now processed in gen_proc_or_func.
+  Fixes nospace=610 (imported) overriding local nospace=10701.
+- P8: No EXT.L on function call results in binary ops.
+  Function calls return full 32-bit values; EXT.L zeroed MMU_BASE's
+  $CC0000 return value, corrupting POOL_INIT's mb_sgheap parameter.
+- Memory layout: himem = b_dbscreen, bothimem = lomem.
 
 **Key progress (2026-04-12):**
 - P4: Fixed compile order, field offsets, store-width, global offset reuse
@@ -113,7 +116,7 @@ Root cause: MAKE_FREE compiled code or pool data structure init issue.
 ### Toolchain metrics
 - Parser: **100%** (317/317), Assembler: **100%** (103/103)
 - Linker: 8527 symbols, output ~2.2 MB
-- Codegen: P1-P5 ptr/store/stale-word fixes, P6 boolean+const fixes
+- Codegen: P1-P5 ptr/store/stale-word, P6 boolean+const, P7 interface syms, P8 local-const+func-EXT
 
 ### Key HLE mechanisms
 - `$234` fetch bypass: IPL=7→RTE (DB_INIT skip), IPL=0→execute (Lisabug)
