@@ -1060,14 +1060,19 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
             gen_expression(cg, node->children[0]);
             /* If using 32-bit ops but left operand is 16-bit, sign-extend.
              * MOVE.W ea,D0 only sets D0[15:0]; the stale upper word corrupts
-             * any subsequent 32-bit operation (ADD.L, SUB.L, MULS, etc.). */
-            if (use_long && expr_size(cg, node->children[0]) <= 2)
+             * any subsequent 32-bit operation (ADD.L, SUB.L, MULS, etc.).
+             * BUT: skip EXT.L for function calls — they already return
+             * properly-sized results in D0. EXT.L would zero the upper word
+             * of a 32-bit return value like MMU_BASE → $CC0000 → $0000. */
+            if (use_long && expr_size(cg, node->children[0]) <= 2 &&
+                node->children[0]->type != AST_FUNC_CALL)
                 emit16(cg, 0x48C0);  /* EXT.L D0 */
             /* Save left in D2 */
             emit16(cg, use_long ? 0x2400 : 0x3400);  /* MOVE.L/W D0,D2 */
             gen_expression(cg, node->children[1]);
             /* Same for right operand */
-            if (use_long && expr_size(cg, node->children[1]) <= 2)
+            if (use_long && expr_size(cg, node->children[1]) <= 2 &&
+                node->children[1]->type != AST_FUNC_CALL)
                 emit16(cg, 0x48C0);  /* EXT.L D0 */
             /* D2 = left, D0 = right */
             emit16(cg, use_long ? 0x2200 : 0x3200);  /* MOVE.L/W D0,D1 */
@@ -2449,11 +2454,21 @@ static void gen_proc_or_func(codegen_t *cg, ast_node_t *node) {
         }
     }
 
-    /* Process local declarations */
+    /* Process local declarations (vars, consts, types) */
     for (int i = 0; i < node->num_children; i++) {
         ast_node_t *child = node->children[i];
         if (child->type == AST_VAR_DECL) {
             process_var_decl(cg, child, false);
+        } else if (child->type == AST_CONST_DECL) {
+            /* Procedure-local const: add/update in global symbol table.
+             * This ensures locally declared constants (e.g. nospace=10701
+             * in MM_INIT) override imported ones (nospace=610 from ARCHIVE). */
+            type_desc_t *t = find_type(cg, "integer");
+            cg_symbol_t *s = add_global_sym(cg, child->name, t);
+            if (s && child->num_children > 0) {
+                s->offset = (int)child->children[0]->int_val;
+                s->is_const = true;
+            }
         }
     }
 
