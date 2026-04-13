@@ -1017,9 +1017,18 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                     int fsz = type_load_size(wrt->fields[fld].type);
                     emit_read_a0_to_d0(cg, fsz);
                 } else {
-                    /* Not a WITH field — fall through to unknown/constant */
-                    emit16(cg, 0x303C);  /* MOVE.W #0,D0 placeholder */
-                    emit16(cg, 0);
+                    /* Not a WITH field — check for built-in constants
+                     * before falling through to placeholder */
+                    if (str_eq_nocase(node->name, "true")) {
+                        emit16(cg, 0x7001);  /* MOVEQ #1,D0 */
+                    } else if (str_eq_nocase(node->name, "false")) {
+                        emit16(cg, 0x7000);  /* MOVEQ #0,D0 */
+                    } else if (str_eq_nocase(node->name, "nil")) {
+                        emit16(cg, 0x7000);  /* MOVEQ #0,D0 (nil = 0) */
+                    } else {
+                        emit16(cg, 0x303C);  /* MOVE.W #0,D0 placeholder */
+                        emit16(cg, 0);
+                    }
                 }
             } else {
                 /* Check for built-in constants */
