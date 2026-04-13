@@ -1088,16 +1088,33 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
             if (use_long && expr_size(cg, node->children[0]) <= 2 &&
                 node->children[0]->type != AST_FUNC_CALL)
                 emit16(cg, 0x48C0);  /* EXT.L D0 */
-            /* Save left in D2 */
-            emit16(cg, use_long ? 0x2400 : 0x3400);  /* MOVE.L/W D0,D2 */
-            gen_expression(cg, node->children[1]);
-            /* Same for right operand */
-            if (use_long && expr_size(cg, node->children[1]) <= 2 &&
-                node->children[1]->type != AST_FUNC_CALL)
-                emit16(cg, 0x48C0);  /* EXT.L D0 */
-            /* D2 = left, D0 = right */
-            emit16(cg, use_long ? 0x2200 : 0x3200);  /* MOVE.L/W D0,D1 */
-            emit16(cg, use_long ? 0x2002 : 0x3002);  /* MOVE.L/W D2,D0 */
+            /* Save left result for later.
+             * If the right operand is complex (binary op, function call,
+             * unary op), it will use D2 internally and clobber our saved
+             * value. In that case, save to the stack instead. */
+            {
+                ast_node_t *rhs = node->children[1];
+                bool rhs_complex = (rhs->type == AST_BINARY_OP ||
+                                    rhs->type == AST_UNARY_OP ||
+                                    rhs->type == AST_FUNC_CALL);
+                if (rhs_complex) {
+                    emit16(cg, 0x2F00);  /* MOVE.L D0,-(SP) — save left on stack */
+                } else {
+                    emit16(cg, use_long ? 0x2400 : 0x3400);  /* MOVE.L/W D0,D2 */
+                }
+                gen_expression(cg, rhs);
+                /* Same for right operand */
+                if (use_long && expr_size(cg, rhs) <= 2 &&
+                    rhs->type != AST_FUNC_CALL)
+                    emit16(cg, 0x48C0);  /* EXT.L D0 */
+                /* D0 = right, restore left from D2 or stack */
+                emit16(cg, use_long ? 0x2200 : 0x3200);  /* MOVE.L/W D0,D1 (right → D1) */
+                if (rhs_complex) {
+                    emit16(cg, 0x201F);  /* MOVE.L (SP)+,D0 — restore left from stack */
+                } else {
+                    emit16(cg, use_long ? 0x2002 : 0x3002);  /* MOVE.L/W D2,D0 */
+                }
+            }
 
             switch (node->op) {
                 case TOK_PLUS:
