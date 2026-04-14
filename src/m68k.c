@@ -2818,6 +2818,73 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         pc_ring[pc_ring_idx++ & 255] = cpu->pc;
         g_last_cpu_pc = cpu->pc;
 
+        /* Jump-only ring: records (src_pc, dst_pc) pairs when PC changes
+         * discontinuously (JSR, JMP, RTS, BRA, BSR with distance > 8). */
+        static struct { uint32_t src, dst; } jmp_ring[128];
+        static int jmp_idx = 0;
+        static int jmp_ring_gen = 0;
+        static uint32_t prev_pc_for_jmp = 0;
+        if (jmp_ring_gen != g_emu_generation) { memset(jmp_ring, 0, sizeof(jmp_ring)); jmp_idx = 0; jmp_ring_gen = g_emu_generation; prev_pc_for_jmp = 0; }
+        if (prev_pc_for_jmp) {
+            int32_t d = (int32_t)cpu->pc - (int32_t)prev_pc_for_jmp;
+            if (d > 8 || d < -4) {
+                jmp_ring[jmp_idx & 127].src = prev_pc_for_jmp;
+                jmp_ring[jmp_idx & 127].dst = cpu->pc;
+                jmp_idx++;
+            }
+        }
+        prev_pc_for_jmp = cpu->pc;
+
+        /* One-shot caller trace for the MODEMA poll hang at $A17BC-$A17F6.
+         * Dumps the last 64 PCs so we can see which init routine entered
+         * here, plus the enclosing JSR targets. */
+        {
+            DBGSTATIC(int, modema_fired, 0);
+            if (!modema_fired && cpu->pc >= 0xA17BC && cpu->pc <= 0xA17F6) {
+                modema_fired = 1;
+                fprintf(stderr, "=== MODEMA-POLL CALLER TRACE (first hit at PC=$%06X) ===\n", cpu->pc);
+                fprintf(stderr, "  SR=$%04X A0=$%08X A5=$%08X A6=$%08X SP=$%08X\n",
+                        cpu->sr, cpu->a[0], cpu->a[5], cpu->a[6], cpu->a[7]);
+                fprintf(stderr, "  Last 64 PCs (oldest first):\n   ");
+                for (int ri = 64; ri > 0; ri--) {
+                    uint32_t rpc = pc_ring[(pc_ring_idx - ri) & 255];
+                    fprintf(stderr, " $%06X", rpc);
+                    if ((ri % 8) == 1) fprintf(stderr, "\n   ");
+                }
+                fprintf(stderr, "\n");
+                /* Also walk stack looking for saved return PCs (JSR pushes PC+4-byte) */
+                fprintf(stderr, "  Stack walk (A7..A7+64) for saved PCs:\n");
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                for (int off = 0; off <= 64; off += 4) {
+                    uint32_t v = cpu_read32(cpu, sp + off);
+                    /* Print anything in text-segment range $400..$E0000 */
+                    if (v >= 0x400 && v < 0xE0000)
+                        fprintf(stderr, "    [SP+%2d] = $%06X\n", off, v);
+                }
+                fprintf(stderr, "  Last 128 jumps (src → dst):\n");
+                uint32_t last_src=0, last_dst=0; int repeat=0;
+                for (int ji = 128; ji > 0; ji--) {
+                    int idx = (jmp_idx - ji) & 127;
+                    uint32_t s=jmp_ring[idx].src, d=jmp_ring[idx].dst;
+                    if (!s && !d) continue;
+                    if (s==last_src && d==last_dst) { repeat++; continue; }
+                    if (repeat) { fprintf(stderr, "      (× %d more)\n", repeat); repeat=0; }
+                    fprintf(stderr, "    $%06X → $%06X\n", s, d);
+                    last_src=s; last_dst=d;
+                }
+                if (repeat) fprintf(stderr, "      (× %d more)\n", repeat);
+                /* Dump opcodes at the critical call site and target */
+                fprintf(stderr, "  Bytes at $000950..$00097F:");
+                for (int b=0; b<48; b+=2) fprintf(stderr, " %04X", cpu_read16(cpu, 0x950 + b));
+                fprintf(stderr, "\n  Bytes at $0A18E0..$0A190F:");
+                for (int b=0; b<48; b+=2) fprintf(stderr, " %04X", cpu_read16(cpu, 0xA18E0 + b));
+                fprintf(stderr, "\n  Bytes at $0A1990..$0A19BF:");
+                for (int b=0; b<48; b+=2) fprintf(stderr, " %04X", cpu_read16(cpu, 0xA1990 + b));
+                fprintf(stderr, "\n");
+                fprintf(stderr, "=== END MODEMA CALLER TRACE ===\n");
+            }
+        }
+
 
         /* Push-into-vector-table guard: fires when A7 drops into the
          * exception-vector region ($0..$1000). Handoff lead is that SP

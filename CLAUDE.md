@@ -83,10 +83,20 @@ After `G` at Lisabug prompt, reaches OS LOADER → **SYSTEM ERROR 10100**
 
 Toolchain: 317 Pascal + 103 ASM files → linked binary → disk image.
 Boot reaches PASCALINIT → INITSYS → GETLDMAP → REG_TO_MAPPED →
-POOL_INIT → MM_INIT. Boot passes ALL of INITSYS initialization and reaches the scheduler
-idle loop (~$A17xx). Runs 600 frames cleanly with no SYSTEM_ERROR.
-Next: investigate why the scheduler loop doesn't progress (likely
-needs interrupts/timer setup or disk I/O for process loading).
+POOL_INIT → MM_INIT. Passes ALL of INITSYS initialization, then
+hangs in a tight poll at **$0A17BC-$0A17F6 with IPL=7** (all
+interrupts masked). Runs 2000+ frames cleanly, no SYSTEM_ERROR.
+**Important correction (2026-04-15):** prior handoffs labeled this
+"scheduler idle loop" — it is NOT. The segment map places $A17BC
+inside `SOURCE-MODEMA.TEXT.unix.txt` ($0A067C-$0A303F). The loop
+reads memory via A0=$B9F608 in 8-byte strides (likely FINDBIT or
+a serial buffer scan). The real scheduler binary is at
+$0B81E2-$0B8BBD. Boot hangs **before** reaching the scheduler
+proper, inside a device-init poll that spins against unemulated
+serial/SCC hardware.
+Next: identify which caller enters MODEMA during boot (PC ring
+trace from the last JSR before $A17BC) and decide whether to HLE
+the SCC poll or short-circuit the modem driver init.
 
 **Key progress (2026-04-13):**
 - P6: Boolean size (1→2 bytes) — Lisa Pascal stores booleans as words.
