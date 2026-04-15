@@ -340,7 +340,42 @@ static type_desc_t *resolve_type(codegen_t *cg, ast_node_t *node) {
         }
 
         case AST_TYPE_SET: {
-            type_desc_t *t = add_type(cg, "", TK_SET, 32); /* 256-bit set */
+            /* P65: size sets based on their base type's cardinality so
+             * record layouts match Apple's. blk_type = set of wait_types
+             * (5 values) must be 1 byte, NOT 32. Otherwise PCB.domain
+             * lands at offset 48 instead of 17 (per PASCALDEFS).
+             *
+             * Lisa Pascal rounds the set size up to the next byte
+             * boundary; small sets (<= 8 elements) take 1 byte,
+             * 9..16 take 2 bytes, etc. Default to 32 bytes (256-bit)
+             * when the base type is unknown. */
+            int sz = 32;
+            if (node->num_children > 0) {
+                type_desc_t *base = resolve_type(cg, node->children[0]);
+                int card = 0;
+                if (base) {
+                    if (base->kind == TK_ENUM) {
+                        card = base->range_high - base->range_low + 1;
+                        if (card <= 0 && base->size > 0)
+                            card = base->size * 256;  /* rough estimate */
+                    } else if (base->kind == TK_SUBRANGE) {
+                        card = base->range_high - base->range_low + 1;
+                    } else if (base->kind == TK_BOOLEAN) {
+                        card = 2;
+                    } else if (base->kind == TK_CHAR) {
+                        card = 256;
+                    }
+                }
+                if (card > 0) {
+                    int bytes = (card + 7) / 8;
+                    /* Align small set sizes to 1/2/4/32 byte slots */
+                    if (bytes <= 1) sz = 1;
+                    else if (bytes <= 2) sz = 2;
+                    else if (bytes <= 4) sz = 4;
+                    else sz = 32;
+                }
+            }
+            type_desc_t *t = add_type(cg, "", TK_SET, sz);
             return t;
         }
 
