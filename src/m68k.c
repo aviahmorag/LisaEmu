@@ -2234,8 +2234,23 @@ static bool hle_trap6_do_an_mmu(m68k_t *cpu) {
     uint32_t d2 = cpu->d[2] & 0xFFFF;
     uint32_t d3 = cpu->d[3] & 0xFFFF;
 
-    uint32_t smt_ptr = cpu_read32(cpu, (cpu->a[5] - 4) & 0xFFFFFF);
-    if (smt_ptr > 0xFFFFFF) return false;
+    /* smt_base is a fixed assembler symbol inside LDASM — do_an_mmu
+     * references it as `lea smt_base,a1`. Our source-compiled build
+     * resolves it via the linker map; fall back to g_hle_smt_base (set
+     * by the synthetic-loader init path) if the map lookup fails. */
+    extern uint32_t g_hle_smt_base;
+    extern uint32_t boot_progress_lookup(const char *name);
+    static uint32_t smt_ptr_cached = 0;
+    if (smt_ptr_cached == 0) {
+        /* Source-compiled build: smt_base is an LDASM symbol in the
+         * linker map, and DO_AN_MMU hard-references it. Prefer that
+         * over g_hle_smt_base (which the synthetic-loader init path
+         * sets to os_end — wrong for compile-from-source). */
+        smt_ptr_cached = boot_progress_lookup("smt_base");
+        if (smt_ptr_cached == 0) smt_ptr_cached = g_hle_smt_base;
+    }
+    uint32_t smt_ptr = smt_ptr_cached;
+    if (smt_ptr == 0 || smt_ptr > 0xFFFFFF) return false;
 
     DBGSTATIC(int, hle_t6_count, 0);
     if (hle_t6_count < 5)

@@ -41,4 +41,7 @@ void boot_progress_reset(void);
 /* Free all state. */
 void boot_progress_shutdown(void);
 
+/* Look up a symbol by name. Returns its address if found, else 0. */
+uint32_t boot_progress_lookup(const char *name);
+
 #endif

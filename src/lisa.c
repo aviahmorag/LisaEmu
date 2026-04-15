@@ -574,6 +574,16 @@ void lisa_hle_prog_mmu(uint32_t domain, uint32_t index,
         if (domain < 4) {
             int ctx = 1 + (int)domain;
             if (ctx >= MMU_NUM_CONTEXTS) ctx = MMU_NUM_CONTEXTS - 1;
+            if (seg == 85 || ((sor & 0xFFF) == 0 && seg > 2 && seg < 126)) {
+                extern uint32_t g_last_cpu_pc;
+                fprintf(stderr,
+                        "HLE-PROG-MMU: PC=$%06X dom=%u seg=%u sor=$%03X slr=$%03X "
+                        "smt=$%06X entry=$%06X raw=%02X %02X %02X %02X\n",
+                        g_last_cpu_pc, domain, seg, sor & 0xFFF, slr & 0xFFF,
+                        smt_base, entry_addr,
+                        mem->ram[entry_addr], mem->ram[entry_addr + 1],
+                        mem->ram[entry_addr + 2], mem->ram[entry_addr + 3]);
+            }
             mem->segments[ctx][seg].sor = sor & 0xFFF;
             mem->segments[ctx][seg].slr = slr & 0xFFF;
             mem->segments[ctx][seg].changed = 3;

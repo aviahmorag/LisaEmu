@@ -237,6 +237,13 @@ void boot_progress_reset(void) {
     for (int m = 0; m < NUM_MILESTONES; m++) milestones[m].reached = false;
 }
 
+uint32_t boot_progress_lookup(const char *name) {
+    if (!sym || !name) return 0;
+    int idx = sym_find_by_name(name);
+    if (idx < 0) return 0;
+    return sym[idx].addr;
+}
+
 void boot_progress_shutdown(void) {
     free(sym); sym = NULL;
     free(pc_to_idx); pc_to_idx = NULL;

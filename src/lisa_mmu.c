@@ -111,6 +111,33 @@ static void mmu_reg_write(lisa_mem_t *mem, uint32_t addr, uint16_t data) {
         fprintf(stderr, "MMU REG[%d]: ctx=%d seg=%d %s=$%03X (addr=$%06X)\n",
                 mmu_write_count, context, seg, (addr & 8) ? "SOR" : "SLR", data, addr);
     }
+
+    /* SYSTEM_ERROR(10201) diagnosis: track every unique (ctx,seg) SOR/SLR
+     * first-set + every seg-85 write + every SOR=0 write (seg<126). */
+    {
+        extern uint32_t g_last_cpu_pc;
+        static uint8_t seen_sor[MMU_NUM_CONTEXTS][128];
+        static uint8_t seen_slr[MMU_NUM_CONTEXTS][128];
+        static int s85_gen = -1;
+        extern int g_emu_generation;
+        if (s85_gen != g_emu_generation) {
+            memset(seen_sor, 0, sizeof(seen_sor));
+            memset(seen_slr, 0, sizeof(seen_slr));
+            s85_gen = g_emu_generation;
+        }
+        int is_sor = (addr & 8) != 0;
+        uint8_t *seen = is_sor ? &seen_sor[context][seg] : &seen_slr[context][seg];
+        int first = (*seen == 0);
+        *seen = 1;
+        int interesting = (seg == 85) ||
+                          (is_sor && data == 0 && seg > 2 && seg < 126) ||
+                          first;
+        if (interesting) {
+            fprintf(stderr, "MMU-W: PC=$%06X ctx=%d seg=%-3d %s=$%03X%s\n",
+                    g_last_cpu_pc, context, seg,
+                    is_sor ? "SOR" : "SLR", data, first ? " [first]" : "");
+        }
+    }
 }
 
 /* Translate address through MMU */
@@ -252,6 +279,15 @@ void lisa_mem_write8(lisa_mem_t *mem, uint32_t addr, uint8_t val) {
                 if (w2600_count++ < 32) {
                     fprintf(stderr, "WATCH-$2600 [%d]: PC=$%06X log=$%06X phys=$%06X val=$%02X\n",
                             w2600_count, g_last_cpu_pc, addr, phys, val);
+                    if (w2600_count == 1) {
+                        for (int c = 0; c < MMU_NUM_CONTEXTS; c++) {
+                            mmu_segment_t *s85 = &mem->segments[c][85];
+                            fprintf(stderr, "  SEG85 ctx=%d sor=$%03X slr=$%03X changed=$%X\n",
+                                    c, s85->sor, s85->slr, s85->changed);
+                        }
+                        fprintf(stderr, "  current_context=%d mmu_enabled=%d setup_mode=%d\n",
+                                mem->current_context, mem->mmu_enabled, mem->setup_mode);
+                    }
                 }
             }
             mem->ram[phys] = val;
