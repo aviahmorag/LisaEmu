@@ -2154,7 +2154,27 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                  * the element type drives sz, so when sz=4 but rhs_sz<4 and
                  * the load was MOVE.W, the upper word of D0 is stale. EXT.L
                  * sign-extends to a proper 32-bit value. */
-                if (sz == 4 && rhs_sz < 4) {
+                /* P54: skip EXT.L if RHS computes from a function whose
+                 * return type might be 4 bytes. expr_size's default of 2
+                 * for unresolved-type FUNC_CALLs mis-classifies pointer
+                 * returns; EXT.L would then zero the upper word of a
+                 * legitimate 32-bit pointer result (e.g. `MMU_Base(x) +
+                 * Sizeof(y)` where MMU_Base returns absptr). Conservatively
+                 * preserve the full longword when we see a func call in
+                 * the RHS subtree. */
+                bool rhs_has_funcall = false;
+                {
+                    ast_node_t *rhs_root = node->children[1];
+                    ast_node_t *stk[16]; int stki = 0;
+                    if (rhs_root) stk[stki++] = rhs_root;
+                    while (stki && !rhs_has_funcall) {
+                        ast_node_t *nd = stk[--stki];
+                        if (nd->type == AST_FUNC_CALL) { rhs_has_funcall = true; break; }
+                        for (int i = 0; i < nd->num_children && stki < 16; i++)
+                            if (nd->children[i]) stk[stki++] = nd->children[i];
+                    }
+                }
+                if (sz == 4 && rhs_sz < 4 && !rhs_has_funcall) {
                     emit16(cg, 0x48C0);  /* EXT.L D0 */
                 }
                 if (sz == 4) {
@@ -2831,12 +2851,42 @@ static void process_declarations(codegen_t *cg, ast_node_t *node, bool is_global
                         sig->is_function = is_func;
                     }
                 }
+                /* P54: capture the return type of functions so expr_size()
+                 * correctly sizes FUNC_CALL expressions. Without this, a
+                 * function returning absptr (e.g. MMU_Base) looks like a
+                 * 2-byte return → binary-op use_long=false → ADD.W + an
+                 * EXT.L store-widen that zeroes the high word of a 32-bit
+                 * pointer sum. Bug: Build_Syslocal's final assignment
+                 * `sloc_ptr^.sl_free_pool_addr := MMU_Base(syslocmmu) +
+                 * Sizeof(syslocal)` wrote \$0B0000 (EXT.L-of-\$01EE) to
+                 * the wrong place, cascading into the unitio spin. */
+                type_desc_t *ret_type = NULL;
+                if (is_func) {
+                    for (int j = 0; j < child->num_children; j++) {
+                        ast_node_t *c = child->children[j];
+                        /* RETURN_TYPE is a TYPE_* node sitting between
+                         * PARAM_LIST and the body (BLOCK/decls). */
+                        if (c->type == AST_TYPE_IDENT ||
+                            c->type == AST_TYPE_SUBRANGE ||
+                            c->type == AST_TYPE_ARRAY ||
+                            c->type == AST_TYPE_RECORD ||
+                            c->type == AST_TYPE_SET ||
+                            c->type == AST_TYPE_POINTER ||
+                            c->type == AST_TYPE_STRING ||
+                            c->type == AST_TYPE_PACKED ||
+                            c->type == AST_TYPE_ENUM ||
+                            c->type == AST_TYPE_FILE) {
+                            ret_type = resolve_type(cg, c);
+                            break;
+                        }
+                    }
+                }
                 /* Only register as a linker symbol if EXTERNAL.
                  * INTERFACE/FORWARD declarations must NOT create linker symbols
                  * at offset 0 — that shadows the real IMPLEMENTATION symbol.
                  * gen_proc_or_func handles symbol creation for implementations. */
                 if (is_ext) {
-                    cg_symbol_t *psym = add_global_sym(cg, child->name, NULL);
+                    cg_symbol_t *psym = add_global_sym(cg, child->name, ret_type);
                     if (psym) psym->is_external = true;
                 }
                 break;
@@ -2861,7 +2911,29 @@ static void gen_proc_or_func(codegen_t *cg, ast_node_t *node) {
 
     /* Check for EXTERNAL/FORWARD */
     if (str_eq_nocase(node->str_val, "EXTERNAL") || str_eq_nocase(node->str_val, "FORWARD")) {
-        cg_symbol_t *s = add_global_sym(cg, node->name, NULL);
+        /* P54: capture the function return type so callers' expr_size()
+         * can correctly size FUNC_CALL expressions. Crucial for pointer-
+         * returning funcs like MMU_Base(). */
+        type_desc_t *ret_type = NULL;
+        if (node->type == AST_FUNC_DECL) {
+            for (int j = 0; j < node->num_children; j++) {
+                ast_node_t *c = node->children[j];
+                if (c->type == AST_TYPE_IDENT ||
+                    c->type == AST_TYPE_SUBRANGE ||
+                    c->type == AST_TYPE_ARRAY ||
+                    c->type == AST_TYPE_RECORD ||
+                    c->type == AST_TYPE_SET ||
+                    c->type == AST_TYPE_POINTER ||
+                    c->type == AST_TYPE_STRING ||
+                    c->type == AST_TYPE_PACKED ||
+                    c->type == AST_TYPE_ENUM ||
+                    c->type == AST_TYPE_FILE) {
+                    ret_type = resolve_type(cg, c);
+                    break;
+                }
+            }
+        }
+        cg_symbol_t *s = add_global_sym(cg, node->name, ret_type);
         if (s) {
             s->is_external = str_eq_nocase(node->str_val, "EXTERNAL");
             s->is_forward = str_eq_nocase(node->str_val, "FORWARD");
