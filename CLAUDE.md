@@ -70,7 +70,50 @@ make audit-linker       # Stage 4: Full pipeline + linker
 cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' build 2>&1 | grep -E "(error:|BUILD)"
 ```
 
-## Current Status (2026-04-15 PM10)
+## Current Status (2026-04-15 PM11)
+
+### Diagnosis (this round): Build_Syslocal epilogue corrupts stack
+
+Structural `P48` (subrange-word) + dynamic HLE lookup (`P42`)
+let us disable `P35` (SYS_PROC_INIT bypass) and watch boot flow
+naturally into `SYS_PROC_INIT → Make_SProcess → CreateProcess →
+Build_Syslocal`. Boot then hangs in unitio at virt $0B0000.
+
+Traced root cause via memory-write watcher on $CBFD4C:
+- At PC=$0B3184 (end of Build_Syslocal), `$CBFD4C` gets set to
+  `$000B0000`. Prior instruction at $0B3182 is `MOVE.L D0,-(SP)`,
+  pushing D0.
+- D0 at that point was computed by:
+  `MOVE.L (A7)+,D0 ; ADD.W D1,D0 ; EXT.L D0` — so D0 = popped +
+  D1.W (signed), then sign-extended. D1.W = $01EE.
+- For D0.L to end up $0B0000, either the popped value had $000B in
+  its upper word AND the ADD.W overflow flowed through (but ADD.W
+  doesn't propagate to upper), or EXT.L isn't producing the
+  expected sign-extend. Neither fits cleanly — **more instrumentation
+  needed next session**.
+- The post-push `MOVEA.L (A6),A0 ; MOVE.L -4(A0),D0 ; MOVEA.L D0,A0
+  ; MOVE.L (A7)+,D0 ; MOVE.L D0,(A0)` is the correct emit for
+  `sloc_ptr^.sl_free_pool_addr := <computed>` (sloc_ptr is at
+  `-4(A6)` of the outer CreateProcess, and sl_free_pool_addr is
+  at offset 0 of syslocal). So the pointer chase is correct;
+  the stale $0B0000 that ends up back on stack is the bug.
+
+Once `Build_Syslocal` pushes a corrupt retPC, later RTS/JMP
+chases into $0B0000 = mid-unitio. unitio's UNLK+RTS re-reads
+that corrupt retPC, bouncing PC back to itself → spin.
+
+**Next real fix candidate**: find the Pascal expression being
+computed before $0B3182's push. Likely a codegen bug in the
+`MMU_Base(syslocmmu) + Sizeof(syslocal)` expression evaluation
+— the pop+ADD.W+EXT.L pattern indicates mixed widths and may
+have a sign-extend or upper-word propagation issue specific to
+pointer + integer arithmetic.
+
+Baseline (P35 enabled): 20/27 milestones, audit 100% clean.
+Post-P35-disabled: boots farther but the Build_Syslocal spin
+still blocks reaching SYS_PROC_INIT's natural RTS.
+
+### Fix (P42): dynamic HLE address lookup via `boot_progress_lookup`
 
 ### Fix (P42): dynamic HLE address lookup via `boot_progress_lookup`
 
