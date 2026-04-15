@@ -70,7 +70,56 @@ make audit-linker       # Stage 4: Full pipeline + linker
 cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' build 2>&1 | grep -E "(error:|BUILD)"
 ```
 
-## Current Status (2026-04-15 PM16) — **24/27 (22 real + 2 bypass-fired)**
+## Current Status (2026-04-15 PM17) — **24/27 (22 real + 2 bypass-fired)**
+
+### Exploration: Apple's actual artifacts vs ours
+
+**Size delta**: `prebuilt/system_os.bin` = 181KB (Apple's real
+compiled SYSTEM.OS). Our linked output is much larger. Apple's
+toolchain produces tighter code; ours emits more per-expression
+instructions (the MOVE.B zero-extends, narrow-to-wide EXT.L
+chain, case-dispatch save/restore stack frames, etc.).
+
+**Source patches**: `_inspiration/LisaSourceCompilation-main/
+scripts/patch_files.py` has ~30 documented patches to Apple's
+released source code (the release itself has bugs). OS-scope
+patches (PROFILE disksize check, DRIVERDEFS/PASCALDEFS debug
+flags) are already applied in our working copy. App-scope
+patches (APIM, APLW, etc.) don't affect our current OS boot.
+
+**Real Lisa linkmaps**: `Lisa_Source/LISA_OS/Linkmaps 3.0/`
+has linkmaps for shell, sys1lib, sys2lib, individual apps —
+but NOT for SYSTEM.OS itself. So we can't directly compare
+our linker map to Apple's for the kernel binary.
+
+**The `--image` mode** boots Apple's prebuilt disk image
+through ROM → loader → SYSTEM.OS. With HLE symbol tracking
+disabled (no symbol table for Apple's binary), milestones
+don't fire. Boot reaches Setup_IUInfo and hits SYSTEM_ERROR
+10100 (IU directory file can't open — filesystem I/O gap in
+our emulator's disk backing).
+
+### Path to 27 legitimate — status of known work
+
+1. **FS_INIT** — case-4 in BOOT_IO_INIT's for-loop never
+   fires. P66 fixed multi-label dispatch but loop still exits
+   before iteration 4. Needs loop-counter trace.
+2. **SYS_PROC_INIT body** — crashes at FS_Setup with bogus
+   \$FF9C0000 seg_ptr from MAKE_DATASEG. Root cause is our
+   compiled DS_OPEN chain producing wrong seg_ptr because disk
+   I/O backing isn't functional. Real fix: implement the disk-
+   side of data-segment allocation.
+3. **MEM_CLEANUP** — body now runs legit (P67) but spins in
+   ADDTO_MMLIST because SYS_PROC_INIT didn't set up SRB
+   lists. Blocked by #2.
+4. **FS_CLEANUP** — body spins in FIND_REFNCB_ENTRY because
+   filesystem refnum chain isn't real. Needs functional FS.
+5. **PR_CLEANUP** — body is ENTER_SCHEDULER idle loop;
+   blocked by #2-4.
+6. **SHELL / WS_MAIN** — separate compile targets + real OS
+   loader pulling them from disk. Biggest architectural lift.
+
+### Fix (P67): retired P36 MEM_CLEANUP bypass — +1 real milestone
 
 ### Fix (P67): retired P36 MEM_CLEANUP bypass — +1 real milestone
 

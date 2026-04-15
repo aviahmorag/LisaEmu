@@ -3033,13 +3033,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             cpu->pc = ret;
             continue;
         }
-        /* P69 HLE: MAKE_DATASEG — dormant (if 0 gated). Tried during
-         * P35 retirement attempt; providing a fake seg_ptr unlocked
-         * SYS_PROC_INIT body past FS_Setup but hit F-line trap deeper
-         * in the chain. Need proper disk-I/O backing, not just a
-         * stub seg_ptr. Keep for future reference. */
         if (0)
-        /* Original HLE body: */
         /* P69 HLE: MAKE_DATASEG — our disk-I/O + segment-allocator chain
          * returns garbage seg_ptr ($FF9C0000) to callers because our
          * compiled DS_OPEN chain doesn't have functional disk backing.
@@ -3070,7 +3064,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 static uint32_t fake_next = 0;
                 DBGSTATIC(int, fake_gen, 0);
                 if (fake_gen != g_emu_generation) {
-                    fake_next = 0xCE2000;  /* start after syslocal pool */
+                    fake_next = 0x180000;  /* past OS code, before screen */
                     fake_gen = g_emu_generation;
                 }
                 uint32_t sp = cpu->a[7] & 0xFFFFFF;
