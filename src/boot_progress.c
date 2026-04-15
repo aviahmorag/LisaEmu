@@ -144,6 +144,16 @@ bool boot_progress_init(const char *map_path) {
     fclose(f);
 
     resolve_milestones();
+    /* Ensure pc_to_idx[milestone_addr] resolves to the milestone's symbol
+     * rather than to some earlier-registered collision (e.g., app/library
+     * symbol at the same offset). Without this, milestones like INIT_EM
+     * that share an address with TDialogImage.ComeForward never fire. */
+    for (int m = 0; m < NUM_MILESTONES; m++) {
+        int mi = milestones[m].sym_idx;
+        if (mi < 0) continue;
+        uint32_t slot = sym[mi].addr & LOOKUP_MASK;
+        pc_to_idx[slot] = (uint16_t)(mi + 1);
+    }
     int m_resolved = 0;
     for (int i = 0; i < NUM_MILESTONES; i++)
         if (milestones[i].sym_idx >= 0) m_resolved++;

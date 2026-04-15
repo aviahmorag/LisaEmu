@@ -2889,12 +2889,31 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         pc_ring[pc_ring_idx++ & 255] = cpu->pc;
         g_last_cpu_pc = cpu->pc;
 
+        /* P41: Cache all HLE bypass addresses by symbol name rather
+         * than hardcoding post-link offsets. This makes every HLE
+         * robust against codegen changes that shift the linker map
+         * (e.g. adding ANDI.W instructions widens code regions). */
+        static uint32_t pc_FS_CLEANUP, pc_PR_CLEANUP, pc_MEM_CLEANUP;
+        static uint32_t pc_SYS_PROC_INIT, pc_excep_setup, pc_REG_OPEN_LIST;
+        static uint32_t pc_QUEUE_PR, pc_GETSPACE;
+        static int hle_pc_gen = -1;
+        if (hle_pc_gen != g_emu_generation) {
+            pc_FS_CLEANUP    = boot_progress_lookup("FS_CLEANUP");
+            pc_PR_CLEANUP    = boot_progress_lookup("PR_CLEANUP");
+            pc_MEM_CLEANUP   = boot_progress_lookup("MEM_CLEANUP");
+            pc_SYS_PROC_INIT = boot_progress_lookup("SYS_PROC_INIT");
+            pc_excep_setup   = boot_progress_lookup("excep_setup");
+            pc_REG_OPEN_LIST = boot_progress_lookup("REG_OPEN_LIST");
+            pc_QUEUE_PR      = boot_progress_lookup("QUEUE_PR");
+            pc_GETSPACE      = boot_progress_lookup("GETSPACE");
+            hle_pc_gen = g_emu_generation;
+        }
         /* P37 HLE bypass: FS_CLEANUP (fsinit.text:136). Fires the
          * milestone on entry then bypasses — its body crashes into
          * $F8xxxx wild-PC space because downstream calls hit a
          * code-corruption / miscompile region that P31 didn't
          * catch. No args. */
-        if (cpu->pc == 0x00082E12) {
+        if (pc_FS_CLEANUP && cpu->pc == pc_FS_CLEANUP) {
             boot_progress_record_pc(cpu->pc);
             uint32_t sp = cpu->a[7] & 0xFFFFFF;
             uint32_t ret = cpu_read32(cpu, sp);
@@ -2906,7 +2925,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
          * Real proc enters scheduler then SYSTEM_ERROR(stup_didntblock);
          * since our scheduler isn't functional, bypass after firing
          * milestone. */
-        if (cpu->pc == 0x0000518A) {
+        if (pc_PR_CLEANUP && cpu->pc == pc_PR_CLEANUP) {
             boot_progress_record_pc(cpu->pc);
             uint32_t sp = cpu->a[7] & 0xFFFFFF;
             uint32_t ret = cpu_read32(cpu, sp);
@@ -2919,7 +2938,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
          * SYS_PROC_INIT (P35), those args are uninitialized globals
          * and MEM_CLEANUP jumps to garbage. Let PC enter so the
          * milestone fires, then pop args+return. 2 longword args. */
-        if (cpu->pc == 0x000AC4CC) {
+        if (pc_MEM_CLEANUP && cpu->pc == pc_MEM_CLEANUP) {
             boot_progress_record_pc(cpu->pc);   /* ensure milestone */
             uint32_t sp = cpu->a[7] & 0xFFFFFF;
             uint32_t ret = cpu_read32(cpu, sp);
@@ -2935,7 +2954,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
          * offset class). Bypass entirely for now — boot may reach
          * INIT_DRIVER_SPACE / FS_CLEANUP without functional system
          * processes. No args (parameterless). */
-        if (cpu->pc == 0x00004FAE) {
+        if (pc_SYS_PROC_INIT && cpu->pc == pc_SYS_PROC_INIT) {
             uint32_t sp = cpu->a[7] & 0xFFFFFF;
             uint32_t ret = cpu_read32(cpu, sp);
             cpu->a[7] += 4;  /* pop retPC */
@@ -2948,7 +2967,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
          * uninitialized syslocal pointer; the inner GETSPACE then
          * fails → SYSTEM_ERROR(10207). Let the first call (valid
          * b_sloc_ptr from INIT_PROCESS) execute normally. */
-        if (cpu->pc == 0x00074B6A) {
+        if (pc_excep_setup && cpu->pc == pc_excep_setup) {
             uint32_t sp = cpu->a[7] & 0xFFFFFF;
             uint32_t arg = cpu_read32(cpu, sp + 4);
             if (arg & 0xFF000000) {
@@ -2961,7 +2980,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         /* P33 HLE bypass: REG_OPEN_LIST (fsui1.text:1071). Walks
          * mounttable[device]^.openchain — same Pascal-vs-asm
          * sentinel-init class as QUEUE_PR. Set ecode^:=0 and return. */
-        if (cpu->pc == 0x00087862) {
+        if (pc_REG_OPEN_LIST && cpu->pc == pc_REG_OPEN_LIST) {
             uint32_t sp = cpu->a[7] & 0xFFFFFF;
             uint32_t ret    = cpu_read32(cpu, sp);
             uint32_t ecode_addr = cpu_read32(cpu, sp + 4);  /* VAR ecode */
@@ -2981,7 +3000,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         /* P32 disabled post-P39 — pin makes RQSCAN head-init correct.
          * Kept as if(0) for easy re-enable if downstream scheduler
          * is exercised and PCB priority-compare still spins. */
-        if (0 && cpu->pc == 0x000E0A64) {
+        if (0 && pc_QUEUE_PR && cpu->pc == pc_QUEUE_PR) {
             uint32_t sp = cpu->a[7] & 0xFFFFFF;
             uint32_t ret = cpu_read32(cpu, sp);
             cpu->a[7] += 10;
@@ -3007,7 +3026,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 gs_pending_ret = 0; gs_pending_varptr = 0;
                 gs_pending_amount = 0; gs_pending_gen = g_emu_generation;
             }
-            if (cpu->pc == 0x00005FAA) {
+            if (pc_GETSPACE && cpu->pc == pc_GETSPACE) {
                 uint32_t sp = cpu->a[7] & 0xFFFFFF;
                 gs_pending_ret    = cpu_read32(cpu, sp) & 0xFFFFFF;
                 gs_pending_amount = cpu_read16(cpu, sp + 4);
