@@ -216,11 +216,23 @@ computation.
   `__variant_end__` sentinels; type builder resets offset at
   each arm boundary so arms overlap (proper Pascal semantics).
 
-Boot now passes MM_INIT head_sdb init + first INSERTSDB walk.
-New blocker: SYSTEM_ERROR(10701) from **INIT_PROCESS**
-(STARTUP.TEXT:554) — its GETSPACE call for `mrbt` (size $1F0 =
-496 bytes) against **b_area=$CE0000 (syslocal pool)** fails
-because **$CE0000 is empty** (pool header = $00000000).
+Boot passes MM_INIT + INSERTSDB + INIT_PROCESS. Latest blocker:
+**SYSTEM_ERROR(10207)** `e_excep_setup` from INIT_EM /
+EXCEP_SETUP — "no system data space in excep_setup".
+
+Earlier blocker (resolved by source-file patch):
+**SYSTEM_ERROR(10701)** from INIT_PROCESS's GETSPACE for `mrbt`
+against an empty syslocal pool at \$CE0000. Root cause: Apple's
+released Lisa source has a TYPO in source-SYSG1.TEXT.unix.txt —
+POOL_INIT writes `sl_free_pool_adr` but syslocal record declares
+`sl_free_pool_addr` (with double `d`). Old Apple Pascal likely
+truncated identifiers; ours doesn't, so the store silently went
+to address 0. **Fix: patched Lisa_Source/.../source-SYSG1.TEXT.unix.txt**
+to use `sl_free_pool_addr` consistently (3 occurrences on lines
+766, 768, 769). This is a source patch, not a codegen fix — the
+Apple source file is user-supplied and per-user patchable, same
+approach the `_inspiration/LisaSourceCompilation-main` project
+uses for its own set of fix-ups.
 
 Evidence chain:
 - GETSPACE correctly gets amount=$1F0 (496 bytes, = 124 × 4-byte
