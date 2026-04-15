@@ -70,6 +70,49 @@ make audit-linker       # Stage 4: Full pipeline + linker
 cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' build 2>&1 | grep -E "(error:|BUILD)"
 ```
 
+## Current Status (2026-04-15 PM16) — **24/27 (22 real + 2 bypass-fired)**
+
+### Fix (P67): retired P36 MEM_CLEANUP bypass — +1 real milestone
+
+MEM_CLEANUP's body now executes naturally until it hits
+ADDTO_MMLIST / DEL_MMLIST at PC=\$00E4F4. Those functions walk
+the memory-manager free-list chain; sentinels aren't fully
+initialized for cleanup phase because SYS_PROC_INIT's body is
+still bypassed (P35) so SRB lists never get set up. Real count:
+21 → 22.
+
+### Diagnosis (P68): SYS_PROC_INIT body crashes at FS_Setup
+
+Probed FS_Setup entry: `sl_ptr=\$FF9C0000` — BOGUS value. The
+`sloc_ptr` passed to FS_Setup comes from
+`pointer(sloc_handle.seg_ptr)`; sloc_handle is populated by
+`Make_SysDataseg(..., seg_ptr, ...)` in Get_Resources.
+
+Make_SysDataseg is defined in `source-DS2.TEXT` ($I-included by
+DS0). Its body calls MAKE_DATASEG which creates a data segment
+by allocating physical memory AND binding an MMU entry. Our
+emulator's MMU works, but the full disk I/O + segment-binding
+pipeline relies on filesystem code (LDPROF/LDTWIG etc.) that's
+$I-pulled but may not be fully functional.
+
+The bogus \$FF9C0000 suggests Pascal's ord/pointer conversion
+with a relptr that has its high byte unset. Next session:
+instrument Make_SysDataseg → MAKE_DATASEG → MMU bind to find
+where seg_ptr gets its bad value.
+
+### Structural fixes accumulating
+
+This session's bank of durable codegen improvements (apply to
+any Pascal compile, not just SYSTEM.OS):
+- P48 subrange fields default word-sized in unpacked records
+- P54 EXT.L skip when RHS has FUNC_CALL (pointer arithmetic)
+- P57 scope compile to OS + LIBHW (3x smaller binary)
+- P58-P61 compile_targets registry + $I no-space + dedup
+- P62 full PASCALDEFS pin table (17 A5-relative globals)
+- P65 set-type sizing by base-type cardinality
+- P66 Pascal case statement: multi-labels + selector preservation
+- P67 MEM_CLEANUP bypass retired (real body runs partially)
+
 ## Current Status (2026-04-15 PM15) — **25/27 (21 real + 4 bypass-fired)**
 
 **HONEST count**: 21 milestones are reached by actual Pascal/asm
