@@ -2924,6 +2924,39 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
          * which procedures have been entered. O(1) lookup, cheap. */
         boot_progress_record_pc(cpu->pc);
 
+        /* HLE: bypass SRCH_SDSCB.Find_it. The nested Find_it walks
+         * c_mmrb^.hd_sdscb_list; when the chain's self-sentinel
+         * isn't correctly initialized (suspected MM_INIT codegen bug
+         * for `hd_sdscb_list.fwd_link := ord(@hd_sdscb_list.fwd_link)
+         * - b_sysglobal_ptr` inside WITH c_mmrb^), the walk spins
+         * forever following bogus fwd_links. Bypass by just RTSing —
+         * c_sdscb_ptr (the enclosing-scope var searchers use) was set
+         * to nil at SRCH_SDSCB entry, so "not found" is the outcome.
+         * For an empty FS at boot this is the correct answer anyway.
+         *
+         * Find_it is a nested proc: Pascal calls pass no args via
+         * stack (uplink for enclosing locals is implicit), so the
+         * bypass is pop-retaddr + RTS. */
+        {
+            extern uint32_t boot_progress_lookup(const char *name);
+            static uint32_t find_it_addr = 0;
+            static int fi_probed = 0;
+            if (!fi_probed) { fi_probed = 1; find_it_addr = boot_progress_lookup("Find_it"); }
+            if (find_it_addr && cpu->pc == find_it_addr) {
+                /* Nested-proc frame: there's 1 argument (key: integer)
+                 * pushed as a word, plus retaddr. Pop both. */
+                uint32_t retaddr = cpu_read32(cpu, cpu->a[7]);
+                cpu->a[7] += 6;  /* retaddr (4) + key (2) */
+                cpu->pc = retaddr;
+                cpu->cycles += 20;
+                DBGSTATIC(int, fi_count, 0);
+                if (fi_count++ < 3)
+                    fprintf(stderr, "[HLE-Find_it #%d] bypassed, return to $%06X\n",
+                            fi_count, retaddr);
+                continue;
+            }
+        }
+
         /* HLE: bypass Setup_IUInfo. Our source-compile boot doesn't
          * have INTRINSIC.LIB populated via a real loader, so
          * Build_Unit_Directory's `for i := 1 to nUnits do GetObjVar(..)`

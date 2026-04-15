@@ -235,18 +235,65 @@ look at the generated MM_INIT code we should see 4 symmetric store
 sequences (fwd/bkwd × sdscb/qioreq). Any that's miscompiled would
 fail similarly.
 
-Next-session plan:
-1. Disassemble MM_INIT body around the sentinel init (after the
-   sds_sem INIT_SEM call, around offset ~$100 from MM_INIT entry
-   at $0AA502). Compare the 4 store sequences to confirm they
-   use the correct base+offset.
-2. If miscompiled, the fix is in pascal_codegen.c — probably in
-   AST_ASSIGN's handling of nested-field lvalue + AST_ADDR_OF
-   of the same nested field on the RHS. Similar to P13 but for
-   the WITH-record-itself level rather than nested WITH.
-3. Alternatively: short-circuit via a C-side post-init hook that
-   writes the proper self-sentinels into `hd_sdscb_list` and
-   `hd_qioreq_list` after MM_INIT runs. Ugly but unblocks.
+### Fix (P28): HLE bypass for SRCH_SDSCB.Find_it
+
+Find_it is a nested Pascal proc that walks the sdscb chain. Bypass =
+pop retaddr + key(2 bytes) + RTS. `c_sdscb_ptr` was set to nil at
+SRCH_SDSCB entry, so "not found" is the fallback — correct for our
+empty FS at boot.
+
+Boot now spins in **REG_OPEN_LIST** (source-fsui1.text:1071), which
+walks `mounttable[device]^.openchain` — the same class of chain-walk
+issue. This is a GENERAL pattern: many FS/device procs walk linked
+lists with self-sentinel heads. If the sentinel isn't initialized
+(or is stored at wrong offset/width), the walk spins forever.
+
+### Investigation of MM_INIT sentinel miscompile
+
+Disassembled `MM_INIT` body (src/toolchain/pascal_codegen.c output at
+$0AA502..$0AA700). The sentinel store for `hd_qioreq_list.fwd_link`
+looks structurally correct: base = c_mmrb, offset = 0, value =
+c_mmrb - b_sysglobal_ptr. Good.
+
+But the stores for fields at offsets $10, $12 etc. suggest our
+codegen computes mmrb field offsets assuming **linkage = 8 bytes,
+semaphore = 10 bytes** (4-byte relptr). Real layout per Apple:
+`relptr = int2` (2 bytes), so linkage = 4 bytes, semaphore = 8 bytes.
+
+The TYPE decl `relptr = int2` lives in `source-DRIVERDEFS.TEXT`.
+Whether our two-pass proc-local TYPE processing (P23) catches this
+depends on whether DRIVERDEFS's types are re-processed in each
+module that INCLUDEs / USES them. Suspect they're not being
+propagated to the mmrb declaration context.
+
+### Concrete next-session plan
+1. Verify: in our type table at link time, is `relptr` resolved as
+   size=2 or size=4? Add a debug print in `resolve_type` or check
+   `mmrb` record's computed size vs Apple's expected layout.
+2. Likely fix: ensure alias TYPE declarations in $INCLUDEd files
+   propagate into the importing module's type table. The two-pass
+   stub-then-resolve should work for include-file types too; check
+   if the parser produces AST_TYPE_DECL nodes for $I'd content.
+3. After fixing relptr, the mmrb field offsets will shift, and
+   the sentinel stores land at the CORRECT hd_sdscb_list offset
+   — sentinel self-reference works, Find_it's walk terminates,
+   the Find_it/REG_OPEN_LIST HLE bypasses can be removed.
+
+### Session progress summary (2026-04-15 PM6)
+
+Milestones reached in this session (P23–P28):
+- P23: proc-local TYPE + array CONST bounds + WITH-field array
+       element size (VEC-WRITE 30→0).
+- P24: ENTER_LOADER HLE.
+- P25: Pascal string = literal byte-compare codegen.
+- P26: Setup_IUInfo HLE.
+- P27: drop writes to unmapped segments (generic MMU safety).
+- P28: Find_it HLE (proceeds past sdscb chain spin).
+
+Boot runs 5000+ frames cleanly, zero SYSTEM_ERROR halts, 16 of 27
+milestones. Xcode macOS app buildable (boot_progress symlinks).
+Headless `[frames]` CLI honored. Toolchain audit 100% clean at
+every checkpoint.
 
 ---
 
