@@ -116,8 +116,55 @@ sysglobal buffer. Toolchain audit still 100% clean (382 modules,
 Boot advances: still reaches `BOOT_IO_INIT` but now with a clean
 vector table. New blocker: **SYSTEM_ERROR(10201) at ret=$072CC6**
 during BOOT_IO_INIT → FS_INIT transition (next milestone `FS_INIT`
-not reached). Next session to diagnose — likely a separate bug in
-I/O subsystem init or first FS call, not related to INIT_JTDRIVER.
+not reached).
+
+### New diagnosis: ENTER_LOADER — JMP (A2) with A2=0
+
+Traced the post-P23 crash path:
+- Illegal-instr at PC=$000028 (opcode=$00FE, a byte of vector 10's
+  handler word); CPU reached $28 by JMPing to $0 and executing
+  sequentially through the CPU vector table.
+- The JMP to $0 came from `JMP (A2)` at `$0DF666` in **ENTER_LOADER**
+  (`source-STARASM2.TEXT:194-232`), with A2=0.
+
+ENTER_LOADER's structure (relevant part):
+```
+enter_loader:
+  move.l (SP)+,a2               ; pop return address into A2
+  move.l (SP)+,d1               ; pop loader's a5
+  move.l (SP)+,d2               ; pop params pointer
+  movem.l a2-a6/d4-d7,-(SP)     ; save
+  ; ... set up supervisor mode, switch stacks, load loader_link ...
+  move.l loader_link,a0         ; $204 → a0 = $FE0600 (ROM stub) ✓
+  jsr (a0)                      ; call → returns cleanly (ROM stub)
+  ; ... restore mode and stacks ...
+  movem.l (SP)+,a2-a6/d4-d7     ; restore
+  jmp (a2)                      ; ← A2=0 here
+```
+
+The ROM stub call at `loader_link` (set to `$00FE0600` by us) returns
+cleanly — trace shows `$FE0600 $FE0606 $0DF65A...`. So the bug is on
+the **save / restore** path: A2 was popped from SP at entry but SP
+was wrong, so A2 never got the real return address.
+
+Hypothesis: **Pascal caller in SOURCE-CD.TEXT:281 pushes args with
+wrong widths/order.**
+```pascal
+ENTER_LOADER(params, ldr_a5);   { params: var fake_parms; ldr_a5: longint }
+```
+If codegen pushes `ldr_a5` as a 2-byte integer instead of 4-byte
+longint (or swaps argument order, or forgets the VAR params pointer
+form), enter_loader's `move.l (SP)+,a2` pops garbage.
+
+Next session task:
+1. Disassemble the call site in the generated code for SOURCE-CD
+   around the ENTER_LOADER call. Confirm stack layout matches:
+     push @params (4 bytes), push ldr_a5 (4 bytes), JSR (pushes 4).
+2. If mismatch, fix in pascal_codegen.c's call-site argument emit
+   (either `AST_PROC_CALL` VAR-param handling or longint literal
+   push sizing).
+3. Re-run: VEC-WRITE should stay at 0; milestone should advance
+   past BOOT_IO_INIT toward FS_INIT.
 
 ---
 
