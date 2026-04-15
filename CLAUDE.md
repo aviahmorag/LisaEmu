@@ -205,19 +205,48 @@ Result:
 Audit: toolchain 100% clean (8711/8711 symbols, 382 modules,
 link OK, output 2297054 bytes).
 
+Follow-up diagnosis (this session): located Find_it. It's
+`SRCH_SDSCB.Find_it` in source-DS2.TEXT:37-65 — walks the
+**sdscb chain** (shared-data-segment control blocks) looking for
+a match. The list head `hd_sdscb_list` is in the mmrb. If the
+head's fwd_link isn't a proper self-sentinel, the walk chases
+bogus pointers and loops forever.
+
+The sentinel init is in MM_INIT at source-MM4.TEXT:227-228:
+```pascal
+hd_sdscb_list.fwd_link  := ord(@hd_sdscb_list.fwd_link) - b_sysglobal_ptr;
+hd_sdscb_list.bkwd_link := hd_sdscb_list.fwd_link;
+```
+This is a self-referential store inside `WITH c_mmrb^ do`. The
+classic P12/P13 WITH-fix class — but for WITH-field itself being
+stored-to (not inside a nested WITH). The exact pattern:
+- LHS = WITH-field's sub-field (nested field access).
+- RHS uses `@hd_sdscb_list.fwd_link` — address-of a WITH-field's
+  sub-field, minus a global.
+
+If codegen silently drops either (a) the store target computation
+(writes go to A5-relative offset 0 instead of c_mmrb + hd_sdscb_list
+offset), or (b) the RHS address-of computation (gives 0 instead
+of proper address), the sentinel is never correctly installed —
+leaving fwd_link at 0 or some stale value.
+
+Matching line 232-233 does the same for `hd_qioreq_list`, so if we
+look at the generated MM_INIT code we should see 4 symmetric store
+sequences (fwd/bkwd × sdscb/qioreq). Any that's miscompiled would
+fail similarly.
+
 Next-session plan:
-1. Identify the proc that calls Find_it in a loop. Likely FS_INIT
-   or a driver-registration sub-proc searching for a device/file
-   that doesn't exist in our source-built image.
-2. Potential fix classes: (a) HLE-short the caller if the search
-   is for INTRINSIC.LIB-related records or boot-device state that
-   our emulator doesn't populate; (b) ensure our image's FS has
-   the needed stub records; (c) patch the search to bail after
-   exhausting the (empty) list rather than looping.
-3. Optional: figure out who SHOULD be configuring seg 112 and
-   whether we can populate it at boot-image-build time. The
-   dropped writes ARE legitimate intent — they're just going
-   somewhere that doesn't exist in our memory layout.
+1. Disassemble MM_INIT body around the sentinel init (after the
+   sds_sem INIT_SEM call, around offset ~$100 from MM_INIT entry
+   at $0AA502). Compare the 4 store sequences to confirm they
+   use the correct base+offset.
+2. If miscompiled, the fix is in pascal_codegen.c — probably in
+   AST_ASSIGN's handling of nested-field lvalue + AST_ADDR_OF
+   of the same nested field on the RHS. Similar to P13 but for
+   the WITH-record-itself level rather than nested WITH.
+3. Alternatively: short-circuit via a C-side post-init hook that
+   writes the proper self-sentinels into `hd_sdscb_list` and
+   `hd_qioreq_list` after MM_INIT runs. Ugly but unblocks.
 
 ---
 
