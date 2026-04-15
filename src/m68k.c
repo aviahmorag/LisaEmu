@@ -2895,7 +2895,8 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
          * (e.g. adding ANDI.W instructions widens code regions). */
         static uint32_t pc_FS_CLEANUP, pc_PR_CLEANUP, pc_MEM_CLEANUP;
         static uint32_t pc_SYS_PROC_INIT, pc_excep_setup, pc_REG_OPEN_LIST;
-        static uint32_t pc_QUEUE_PR, pc_GETSPACE;
+        static uint32_t pc_QUEUE_PR, pc_GETSPACE, pc_Wait_sem, pc_MM_Setup;
+        static uint32_t pc_Make_SProcess;
         static int hle_pc_gen = -1;
         if (hle_pc_gen != g_emu_generation) {
             pc_FS_CLEANUP    = boot_progress_lookup("FS_CLEANUP");
@@ -2906,6 +2907,9 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             pc_REG_OPEN_LIST = boot_progress_lookup("REG_OPEN_LIST");
             pc_QUEUE_PR      = boot_progress_lookup("QUEUE_PR");
             pc_GETSPACE      = boot_progress_lookup("GETSPACE");
+            pc_Wait_sem      = boot_progress_lookup("Wait_sem");
+            pc_MM_Setup      = boot_progress_lookup("MM_Setup");
+            pc_Make_SProcess = boot_progress_lookup("Make_SProcess");
             hle_pc_gen = g_emu_generation;
         }
         /* P37 HLE bypass: FS_CLEANUP (fsinit.text:136). Fires the
@@ -2954,7 +2958,55 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
          * offset class). Bypass entirely for now — boot may reach
          * INIT_DRIVER_SPACE / FS_CLEANUP without functional system
          * processes. No args (parameterless). */
+        /* P43 HLE bypass: Wait_sem (procprims:721).
+         * Signature: procedure Wait_sem(var this_sem: semaphore; control: sem_control)
+         * Stack: retPC(4) + this_sem_ptr(4) + control(2 — set-of-2 enum).
+         * Real body decrements sem_count, may block, may raise priority.
+         * Our Pascal codegen's byte-subrange MOVE.B leaves stale D0 upper
+         * bits → `if priority < semPriority` incorrectly takes true branch,
+         * which writes $E2 into priority byte, which combined with norm_pri
+         * byte $FF at offset+1 gives RQSCAN a word-read of $E2FF and a
+         * never-terminating signed BLE loop.
+         *
+         * Tactical bypass: at boot-init, semaphores aren't contended — skip
+         * the entire body. Decrement sem_count in place so paired Signal_sem
+         * operations don't drift over time. */
+        /* P44 HLE bypass: MM_Setup (load2.text:637). Per-process syslocal
+         * setup during Make_SProcess. Body touches slocal_sdbRP chains that
+         * aren't set up correctly in our source-compiled OS. For init phase
+         * we just want Make_SProcess to return a "working enough" PCB so
+         * STARTUP main can proceed to INIT_DRIVER_SPACE etc. Signature:
+         *   (stk_refnum, sloc_refnum : int2;    { 2 + 2 = 4 }
+         *    jt_ptr : ptr_JumpTable;            { 4 }
+         *    plcbRP : relptr;                   { 2 }
+         *    var sl_sdbRP : relptr);            { 4 ptr }
+         * Total args = 16 bytes. Callee-clean. */
+        if (pc_MM_Setup && cpu->pc == pc_MM_Setup) {
+            uint32_t sp = cpu->a[7] & 0xFFFFFF;
+            uint32_t ret = cpu_read32(cpu, sp);
+            uint32_t varptr = cpu_read32(cpu, sp + 4);  /* VAR sl_sdbRP (last arg, pushed first) */
+            /* Write 0 into the VAR output so caller sees a defined value. */
+            if (varptr >= 0x400 && varptr < 0xFE0000)
+                cpu_write16(cpu, varptr, 0);
+            cpu->a[7] += 4 + 16;
+            cpu->pc = ret;
+            continue;
+        }
+        if (pc_Wait_sem && cpu->pc == pc_Wait_sem) {
+            uint32_t sp = cpu->a[7] & 0xFFFFFF;
+            uint32_t ret = cpu_read32(cpu, sp);
+            uint32_t this_sem = cpu_read32(cpu, sp + 4);
+            /* semaphore.sem_count is int2 at offset 0 */
+            if (this_sem >= 0x400 && this_sem < 0xFE0000) {
+                int16_t cnt = (int16_t)cpu_read16(cpu, this_sem);
+                cpu_write16(cpu, this_sem, (uint16_t)(cnt - 1));
+            }
+            cpu->a[7] += 4 + 4 + 2;  /* retPC + this_sem_ptr + control */
+            cpu->pc = ret;
+            continue;
+        }
         if (pc_SYS_PROC_INIT && cpu->pc == pc_SYS_PROC_INIT) {
+            boot_progress_record_pc(cpu->pc);  /* P45: ensure milestone fires even though body skipped */
             uint32_t sp = cpu->a[7] & 0xFFFFFF;
             uint32_t ret = cpu_read32(cpu, sp);
             cpu->a[7] += 4;  /* pop retPC */
