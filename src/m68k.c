@@ -2889,6 +2889,44 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         pc_ring[pc_ring_idx++ & 255] = cpu->pc;
         g_last_cpu_pc = cpu->pc;
 
+        /* P37 HLE bypass: FS_CLEANUP (fsinit.text:136). Fires the
+         * milestone on entry then bypasses — its body crashes into
+         * $F8xxxx wild-PC space because downstream calls hit a
+         * code-corruption / miscompile region that P31 didn't
+         * catch. No args. */
+        if (cpu->pc == 0x00082E12) {
+            boot_progress_record_pc(cpu->pc);
+            uint32_t sp = cpu->a[7] & 0xFFFFFF;
+            uint32_t ret = cpu_read32(cpu, sp);
+            cpu->a[7] += 4;
+            cpu->pc = ret;
+            continue;
+        }
+        /* P38 HLE bypass: PR_CLEANUP (STARTUP:2082). No args.
+         * Real proc enters scheduler then SYSTEM_ERROR(stup_didntblock);
+         * since our scheduler isn't functional, bypass after firing
+         * milestone. */
+        if (cpu->pc == 0x0000518A) {
+            boot_progress_record_pc(cpu->pc);
+            uint32_t sp = cpu->a[7] & 0xFFFFFF;
+            uint32_t ret = cpu_read32(cpu, sp);
+            cpu->a[7] += 4;
+            cpu->pc = ret;
+            continue;
+        }
+        /* P36 HLE bypass: MEM_CLEANUP (STARTUP/MM4). Called after
+         * FS_CLEANUP with stksdb_ptr+slsdb_ptr — since we bypassed
+         * SYS_PROC_INIT (P35), those args are uninitialized globals
+         * and MEM_CLEANUP jumps to garbage. Let PC enter so the
+         * milestone fires, then pop args+return. 2 longword args. */
+        if (cpu->pc == 0x000AC4CC) {
+            boot_progress_record_pc(cpu->pc);   /* ensure milestone */
+            uint32_t sp = cpu->a[7] & 0xFFFFFF;
+            uint32_t ret = cpu_read32(cpu, sp);
+            cpu->a[7] += 4 + 8;
+            cpu->pc = ret;
+            continue;
+        }
         /* P35 HLE bypass: SYS_PROC_INIT (STARTUP:2042). Creates the
          * MemMgr and Root system processes. Each Make_SProcess call
          * cascades through MM_Setup → init_proc_syslocal → crea_ecb,
