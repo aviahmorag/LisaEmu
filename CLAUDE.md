@@ -131,33 +131,66 @@ PC-trail decoded via linker map + targeted probes this session:
    30 1F         MOVE.W (A7)+,D0     ; pop low word (→ next iter store)
    ```
 
-4. Root cause: **A5 has a stale/wrong value during INIT_JTDRIVER**
-   (proc at $004124 — the jump-table driver installer). `LEA d16(A5),A0`
-   then `MOVE.W D0,(A0)` relies on A5 pointing to the sysjt/sysglobal
-   base. If A5 were the correct Pascal globals base (e.g. $CCA000), the
-   computed address would go to sysglobal, not $0010 (vec 4 MSB).
-   Instead the value written is $6152, which is `LEA $2AC(A5),A0` with
-   A5 ≈ $5EA6 (A5 uninitialized or holding something else).
+4. Root cause: **codegen record-size + WITH-double-deref bug in
+   INIT_JTDRIVER** (`SOURCE-STARTUP.TEXT:1761-1840`). The Pascal is:
+   ```pascal
+   CONST drivrjt = $210;
+   TYPE  djt = ^driverjt;
+         driverjt = record
+             jt: array[0..35] of record
+                 jmpinstr: integer;       { 2 bytes }
+                 routine:  ^integer       { 4 bytes }
+             end
+         end;
+   VAR   jtpointer: ^djt;
+   begin
+     if GETSPACE(sizeof(driverjt), ..., d_ptr) then begin
+       jtpointer := pointer(drivrjt);    { jtpointer := @$210 }
+       jtpointer^ := pointer(d_ptr);     { *$210 := d_ptr }
+       WITH jtpointer^^ do begin          { scope = **$210 = d_ptr }
+         for i := 0 to 35 do
+           jt[i].jmpinstr := $4EF9;
+         jt[0].routine := @CANCEL_REQ;
+         jt[1].routine := @ENQUEUE;
+         ...
+   ```
 
-   BUT — observed behavior says the probe-caught `addr` is $10 (vec 4),
-   NOT $6152. So A0 points to vec 4 while D0's low word IS $6152 (low
-   16 of some LEA $d16(A5) from an earlier iteration). That's consistent
-   with an off-by-one between the LEA-computed A0 (for next iter's
-   store) and what actually gets stored (prev iter's computed address).
-   Either way: A5 was wrong; the 17-step unrolled loop is installing
-   garbage handler addresses into the vector table.
+   Observed generated code (per-element):
+   - Record-element stride = `MULU.W #2,D1` → **size = 2**, but the
+     real record size is 6 (2-byte int + 4-byte pointer). Our codegen
+     is ignoring `routine: ^integer` when computing array-element size.
+   - Base address: `LEA $0,A0; ADDA.L D1,A0` → writes target
+     **address 0 + i*2**, i.e. straight into the low-memory vector
+     table. The `WITH jtpointer^^ do` scope (which should set A0 to
+     `(*$210)` = `d_ptr`) is dropped entirely — codegen treats WITH
+     over a double-deref as WITH over base 0.
+   - The handler addresses that each block tries to store — values
+     like `@CANCEL_REQ`, `@ENQUEUE`, `@GETSPACE`, `@SYSTEM_ERROR`,
+     etc. — are being computed as `LEA d16(A5),A0` where `d16` is
+     where the linker placed those procs. Those procs are Pascal
+     bodies at high addresses (e.g. `@SYSTEM_ERROR` → ~$53C6 + A5 =
+     garbage $6152xx because A5 holds sysglobal base). That's where
+     the high-byte-$61 values in VEC-WRITE come from.
 
-Next-session task:
-- Disassemble the proc entry for the enclosing function (likely
-  INIT_JTDRIVER at $004124 — map calls it out, though surrounded by
-  collided Office-System symbols). Find where A5 is set up at entry.
-  Is there a missing `LINK A5,#...` or a wrong MOVEM setup?
-- Compare against Lisa_Source source for INIT_JTDRIVER / INIT_SYSJT /
-  whichever proc walks a vector-installation table during BOOT_IO_INIT.
-- The fact that vec 4's MSB write fires from PC=$004296 and is the
-  very vector that becomes the crash PC when illegal-instr fires
-  confirms this is THE corruption path — fixing A5 here should
-  unblock the next stage.
+   So *two* codegen bugs (not one):
+   (a) Record-array element size ignores non-primitive tail fields.
+   (b) `WITH ptr^^ do ...` double-deref case forgets the base address
+       and emits zero.
+
+Next-session task (concrete):
+- Pascal codegen, `AST_WITH` handling: find the case that resolves
+  a pointer-deref-chain base. Likely only single `AST_DEREF` is
+  handled; add recursion for double-deref (AST_DEREF whose child
+  is AST_DEREF or an AST_VARREF that resolves to a pointer-to-
+  pointer).
+- Pascal codegen, record-size computation (`sizeof` for array
+  elements): for `array[0..N] of record F1: int; F2: ^T; end`, the
+  stride must be 6 (or 8 padded), not 2. Look at how expr_size
+  computes array element size — likely summing only the first field.
+- Verify: after fix, VEC-WRITE probe should fire only for the initial
+  clean pass (18 writes of $4E for $4EF9 opcodes). The 13 subsequent
+  garbage writes should move to their real sysjt destination (write
+  target near $CCA000 + offset, NOT near $00).
 
 Probes to keep in place (all committed this session):
 - `HIPC-TRIP` in m68k_execute (first PC with high byte → dump ring).
