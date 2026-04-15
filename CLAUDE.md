@@ -70,9 +70,51 @@ make audit-linker       # Stage 4: Full pipeline + linker
 cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' build 2>&1 | grep -E "(error:|BUILD)"
 ```
 
-## Current Status (2026-04-15 PM11)
+## Current Status (2026-04-15 PM12)
 
-### Diagnosis (this round): Build_Syslocal epilogue corrupts stack
+### Fix (P54): codegen EXT.L skip when RHS contains a FUNC_CALL
+
+Root-cause of the unitio spin diagnosed + fixed. The Pascal
+expression:
+
+```pascal
+sloc_ptr^.sl_free_pool_addr := MMU_Base(syslocmmu) + Sizeof(syslocal)
+```
+
+compiled to a sequence whose final store-widen EXT.L destroyed
+the high word of the 32-bit pointer sum. Trace at runtime:
+
+```
+JSR MMU_Base → D0 = $00CE0000 (absptr)
+MOVE.L D0,-(SP)              ; save
+MOVE.L #$01EE,D0             ; Sizeof → constant
+MOVE.W D0,D1                 ; D1 = low word
+MOVE.L (SP)+,D0              ; restore = $00CE0000
+ADD.W  D1,D0                 ; D0 = $00CE01EE  ✓
+EXT.L  D0                    ; D0 = $000001EE  ✗  ← the bug
+MOVE.L D0,-(SP)              ; store wrong value
+```
+
+The EXT.L came from the "complex LHS store-widen" path at
+`pascal_codegen.c:2158`, which fires when `sz == 4 && rhs_sz < 4`.
+`rhs_sz` was 2 because `expr_size(MMU_Base)` returned 2 (the
+default for unresolved FUNC_CALL return types).
+
+Fix: scan the RHS AST subtree for AST_FUNC_CALL; if found, skip
+the EXT.L. The function likely returns a proper 4-byte value,
+and the accumulated expression result must be preserved intact.
+Narrow enough not to affect other integer-widening paths.
+
+With P35 (SYS_PROC_INIT bypass) DISABLED, boot now runs
+Build_Syslocal cleanly, progresses through the rest of
+Make_SProcess, and halts at SYSTEM_ERROR(10204) inside vector 11
+(F-line trap) with faultPC=\$0DDDD8 = A5SETUP. The next layer
+requires diagnosing what made PC jump to A5SETUP's prologue
+area where an illegal \$FFFF word sits.
+
+Baseline (P35 enabled): 20/27 milestones, audit 100% clean.
+
+### Earlier diagnosis (prior round, now resolved by P54): Build_Syslocal epilogue corrupts stack
 
 Structural `P48` (subrange-word) + dynamic HLE lookup (`P42`)
 let us disable `P35` (SYS_PROC_INIT bypass) and watch boot flow
