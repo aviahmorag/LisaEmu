@@ -2708,6 +2708,27 @@ static void process_var_decl(codegen_t *cg, ast_node_t *node, bool is_global) {
         { "port_cb_ptrs", -24609 },
         { "size_sglobal", -24577 },
         { "sg_free_pool_addr", -24575 },
+        /* P62: add remaining PASCALDEFS-hardcoded globals so MM_INIT and
+         * other early init code can find these via asm-pinned offsets.
+         * Without these, Pascal's natural A5-relative placement differs
+         * from PASCALDEFS and asm code reads wrong memory. */
+        { "param_mem",    -24853 },
+        { "dct",          -24883 },
+        { "smt_addr",     -24887 },
+        { "pe_loc1",      -24889 },
+        { "pe_loc2",      -24893 },
+        { "pe_phase",     -24894 },
+        { "pe_access",    -24895 },
+        { "membase",      -24899 },
+        { "memleng",      -24903 },
+        { "schdaddr",     -24907 },
+        { "stataddr",     -24911 },
+        { "sctab",        -25661 },
+        { "lb_loaded",    -25662 },
+        { "lb_enabled",   -25663 },
+        { "domsmtba",     -25671 },
+        { "mmrb_addr",    -25691 },
+        { "meastabl",     -26491 },
         { NULL, 0 }
     };
 
