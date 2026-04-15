@@ -2889,6 +2889,58 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         pc_ring[pc_ring_idx++ & 255] = cpu->pc;
         g_last_cpu_pc = cpu->pc;
 
+        /* P30-followup: trap-region probe — dump PC ring + stack if PC
+         * enters the MAKE_BUILTIN F-line-trap region ($41F8..$41FE)
+         * so we can see the path that led there. */
+        {
+            static int fprobe_fired = 0;
+            static int fprobe_gen = -1;
+            if (fprobe_gen != g_emu_generation) { fprobe_fired = 0; fprobe_gen = g_emu_generation; }
+            if (fprobe_fired < 3 && cpu->pc == 0x0041FC) {
+                fprobe_fired++;
+                fprintf(stderr, "FPROBE #%d: PC=$%06X hit. Bytes via cpu_read at $41E0..$4210:\n", fprobe_fired, cpu->pc);
+                for (uint32_t pc = 0x41E0; pc < 0x4210; pc += 2) {
+                    uint16_t w = cpu_read16(cpu, pc);
+                    fprintf(stderr, "  $%06X: %04X\n", pc, w);
+                }
+                fprintf(stderr, "  Ring (newest first):\n");
+                for (int k = 0; k < 6; k++) {
+                    int idx = (pc_ring_idx - 1 - k + 256) & 0xFF;
+                    fprintf(stderr, "  [-%d] PC=$%08X\n", k+1, pc_ring[idx]);
+                }
+                fprintf(stderr, "  A0=$%08X A6=$%08X A7=$%08X SR=$%04X D0=$%08X\n",
+                        cpu->a[0], cpu->a[6], cpu->a[7], cpu->sr, cpu->d[0]);
+            }
+            /* P30-followup: BLD_SEG write-site probe — dumps the VAR-arg
+             * c_sdb_ptr and its deref value. Post-P30, VAR arg address
+             * at A6+30 is $FFE20000 (unmapped seg 113), deref returns
+             * garbage $2F0041EE, resulting in writes to physical $41Fx
+             * that corrupt OS code. Root cause is caller-side: whoever
+             * calls BLD_SEG is passing a wild pointer as VAR arg. */
+            static int bldprobe = 0;
+            static int bldprobe_gen = -1;
+            if (bldprobe_gen != g_emu_generation) { bldprobe = 0; bldprobe_gen = g_emu_generation; }
+            if (bldprobe < 4 && cpu->pc == 0x000A7AE0) {
+                bldprobe++;
+                uint32_t a6 = cpu->a[6];
+                uint32_t param_slot_addr = cpu_read32(cpu, a6 + 0x1E);
+                uint32_t derefd = cpu_read32(cpu, param_slot_addr);
+                fprintf(stderr, "BLD-WRITE #%d: PC=$A7AE0 A6=$%06X [A6+30]=$%08X (var-arg addr), *[A6+30]=$%08X (sdb_ptr val), final target=$%06X\n",
+                        bldprobe, a6, param_slot_addr, derefd, (derefd + 8) & 0xFFFFFF);
+            }
+            /* Also probe at $41F8 to see what gets fetched there */
+            static int fp2_fired = 0;
+            static int fp2_gen = -1;
+            if (fp2_gen != g_emu_generation) { fp2_fired = 0; fp2_gen = g_emu_generation; }
+            if (fp2_fired < 3 && cpu->pc == 0x000041F8) {
+                fp2_fired++;
+                uint16_t w0 = cpu_read16(cpu, 0x41F8);
+                uint16_t w1 = cpu_read16(cpu, 0x41FA);
+                fprintf(stderr, "FPROBE2 #%d: PC=$41F8 about to execute. cpu_read16($41F8)=$%04X $41FA=$%04X  A0=$%08X\n",
+                        fp2_fired, w0, w1, cpu->a[0]);
+            }
+        }
+
         /* Track last-JSR/BSR/JMP source so we can identify the caller when
          * execution ends up in a garbage-code region. Captured before the
          * instruction executes, i.e. at the call-site PC. */

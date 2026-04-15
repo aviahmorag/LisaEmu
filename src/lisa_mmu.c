@@ -329,6 +329,26 @@ void lisa_mem_write8(lisa_mem_t *mem, uint32_t addr, uint8_t val) {
                     }
                 }
             }
+            /* P30-followup: $41F7-$41FA watchpoint — post-P30, runtime
+             * bytes at these code locations got zeroed, causing F-line
+             * trap. Log who writes here. */
+            if (phys >= 0x41F0 && phys < 0x4200) {
+                extern uint32_t g_last_cpu_pc;
+                static int w41_count = 0;
+                static int w41_gen = -1;
+                extern int g_emu_generation;
+                if (w41_gen != g_emu_generation) { w41_count = 0; w41_gen = g_emu_generation; }
+                if (w41_count++ < 32) {
+                    int seg = (addr >> 17) & 0x7F;
+                    int ctx = mem->current_context;
+                    if (ctx >= MMU_NUM_CONTEXTS) ctx = 0;
+                    mmu_segment_t *s = &mem->segments[ctx][seg];
+                    fprintf(stderr, "WATCH-$41F0 [%d]: PC=$%06X log=$%06X phys=$%06X val=$%02X "
+                            "(seg=%d ctx=%d sor=$%03X slr=$%03X)\n",
+                            w41_count, g_last_cpu_pc, addr, phys, val,
+                            seg, ctx, s->sor, s->slr);
+                }
+            }
             /* $08658A watchpoint: post-P26 illegal-instr at this PC
              * with opcode $00CC, while linked binary has $3400 — code
              * overwrite, same class as the pre-P23 $2600 one. Log
