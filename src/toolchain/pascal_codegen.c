@@ -2880,7 +2880,26 @@ static void process_declarations(codegen_t *cg, ast_node_t *node, bool is_global
                 type_desc_t *t = find_type(cg, "integer");
                 cg_symbol_t *s = add_global_sym(cg, child->name, t);
                 if (s && child->num_children > 0) {
-                    s->offset = (int)child->children[0]->int_val; /* Store value in offset */
+                    /* P71: evaluate simple constant expressions. Apple's
+                     * Pascal allows `const X = -1` (unary minus on literal)
+                     * which parses as UNOP(MINUS, INT(1)). Taking int_val
+                     * directly from the UNOP node yields 0, not -1.
+                     * Handle unary +/- and identifier refs to prior CONSTs. */
+                    ast_node_t *v = child->children[0];
+                    int val = 0;
+                    if (v->type == AST_UNARY_OP &&
+                        v->num_children > 0 &&
+                        v->children[0]->type == AST_INT_LITERAL) {
+                        int inner = (int)v->children[0]->int_val;
+                        val = (v->op == TOK_MINUS) ? -inner : inner;
+                    } else if (v->type == AST_IDENT_EXPR) {
+                        cg_symbol_t *ref = find_global(cg, v->name);
+                        if (!ref) ref = find_imported(cg, v->name);
+                        if (ref && ref->is_const) val = ref->offset;
+                    } else {
+                        val = (int)v->int_val;
+                    }
+                    s->offset = val;
                     s->is_const = true;
                 }
                 break;
@@ -3146,7 +3165,22 @@ static void gen_proc_or_func(codegen_t *cg, ast_node_t *node) {
             type_desc_t *tc = find_type(cg, "integer");
             cg_symbol_t *s = add_global_sym(cg, child->name, tc);
             if (s && child->num_children > 0) {
-                s->offset = (int)child->children[0]->int_val;
+                /* P71: evaluate unary-minus + ident-ref CONST expressions. */
+                ast_node_t *v = child->children[0];
+                int val = 0;
+                if (v->type == AST_UNARY_OP &&
+                    v->num_children > 0 &&
+                    v->children[0]->type == AST_INT_LITERAL) {
+                    int inner = (int)v->children[0]->int_val;
+                    val = (v->op == TOK_MINUS) ? -inner : inner;
+                } else if (v->type == AST_IDENT_EXPR) {
+                    cg_symbol_t *ref = find_global(cg, v->name);
+                    if (!ref) ref = find_imported(cg, v->name);
+                    if (ref && ref->is_const) val = ref->offset;
+                } else {
+                    val = (int)v->int_val;
+                }
+                s->offset = val;
                 s->is_const = true;
             }
         }
