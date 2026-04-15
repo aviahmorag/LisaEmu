@@ -596,6 +596,19 @@ static int expr_size(codegen_t *cg, ast_node_t *node) {
                 if (rec && rec->type) {
                     rt = rec->type;
                     if (rt->kind == TK_POINTER && rt->base_type) rt = rt->base_type;
+                } else if (cg->with_depth > 0) {
+                    /* `foo.bar` where foo is a field of an outer WITH record.
+                     * Resolve foo via WITH stack so we can return bar's real
+                     * type (and thus width — critical for 4-byte pointer
+                     * stores that would otherwise truncate to MOVE.W). */
+                    type_desc_t *wrt = NULL;
+                    int fld = with_lookup_field(cg, node->children[0]->name, &wrt, NULL);
+                    if (fld >= 0 && wrt) {
+                        type_desc_t *ft = wrt->fields[fld].type;
+                        if (ft && ft->kind == TK_POINTER && ft->base_type)
+                            ft = ft->base_type;
+                        rt = ft;
+                    }
                 }
             } else if (node->children[0] && node->children[0]->type == AST_DEREF) {
                 ast_node_t *ptr_node = node->children[0]->children[0];
@@ -826,6 +839,28 @@ static void gen_lvalue_addr(codegen_t *cg, ast_node_t *node) {
                     if (str_eq_nocase(rt->fields[fi].name, node->name)) {
                         field_off = rt->fields[fi].offset;
                         break;
+                    }
+                }
+            } else if (!rec_sym && cg->with_depth > 0) {
+                /* WITH-field base: `foo.bar` where `foo` is a field of an outer
+                 * WITH record, not a standalone symbol. Find foo's record type
+                 * via the WITH stack and look up bar within it. Without this
+                 * the field offset stays 0, which silently corrupts the store
+                 * target (and, paired with the size miscalculation, causes the
+                 * sentinel writes in MM_INIT's head_sdb init to drop bytes). */
+                type_desc_t *wrt = NULL;
+                int wfld = with_lookup_field(cg, node->children[0]->name, &wrt, NULL);
+                if (wfld >= 0 && wrt) {
+                    type_desc_t *ft = wrt->fields[wfld].type;
+                    if (ft && ft->kind == TK_POINTER && ft->base_type)
+                        ft = ft->base_type;
+                    if (ft && ft->kind == TK_RECORD) {
+                        for (int fi = 0; fi < ft->num_fields; fi++) {
+                            if (str_eq_nocase(ft->fields[fi].name, node->name)) {
+                                field_off = ft->fields[fi].offset;
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -2160,6 +2195,25 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                         rt = sym->type;
                         if (rt->kind == TK_POINTER && rt->base_type)
                             rt = rt->base_type;
+                    } else if (cg->with_depth > 0) {
+                        /* Nested WITH: `with c_mmrb^ do ... with head_sdb do ...`
+                         * head_sdb is a field of the outer WITH's record, not a
+                         * standalone symbol. Resolve it via the WITH stack.
+                         * gen_with_base/gen_lvalue_addr already know how to emit
+                         * the field's address via the outer WITH — we just need
+                         * the correct field type here so the inner WITH's
+                         * record_type is non-NULL (otherwise field name lookups
+                         * in the body fall through to 'Unknown symbol' and emit
+                         * LEA #0,A0 — silently corrupting low memory). */
+                        type_desc_t *wrt = NULL;
+                        int widx = -1;
+                        int fld = with_lookup_field(cg, rec_expr->name, &wrt, &widx);
+                        if (fld >= 0 && wrt) {
+                            type_desc_t *ft = wrt->fields[fld].type;
+                            if (ft && ft->kind == TK_POINTER && ft->base_type)
+                                ft = ft->base_type;
+                            rt = ft;
+                        }
                     }
                 } else if (rec_expr->type == AST_ARRAY_ACCESS && rec_expr->children[0]) {
                     /* WITH arr[i] DO ... — get element type */

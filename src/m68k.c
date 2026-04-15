@@ -2860,7 +2860,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             /* Log entry/exit of MM_INIT and GETSPACE calls within it,
              * to see whether mmrb_addr gets written. */
             DBGSTATIC(int, mminit_state, 0); /* 0=before, 1=inside */
-            if (cpu->pc == 0xA69F2 && mminit_state == 0) {
+            if (cpu->pc == 0xA7056 && mminit_state == 0) {
                 mminit_state = 1;
                 fprintf(stderr, "=== ENTER MM_INIT @ $A69F2, mmrb_addr sysglobal value = ?\n");
                 /* dump the global mmrb_addr location — we need to know where it lives.
@@ -2870,8 +2870,56 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 fprintf(stderr, "    mmrb_addr at logical $%06X = $%08X (A5=$%08X)\n", ga, gv, cpu->a[5]);
             }
             /* Log each JSR to GETSPACE while in MM_INIT */
+            /* Turn off the giant trace — watch head_sdb memory writes instead. */
+            #if 0
+            /* Dump MM_INIT body around where head_sdb sentinels are written.
+             * We want to see the compiled bytes for 'memchain.fwd_link := @memchain.fwd_link'.
+             * Once we enter MM_INIT, scan forward and log PC + instruction for
+             * the first ~200 instructions, then we can trace by hand. */
+            DBGSTATIC(int, mminit_trace_count, 0);
+            if (mminit_state == 1 && mminit_trace_count < 180) {
+                /* Only log PCs we haven't seen (detect loops) and only log the first
+                 * ~180 distinct instructions by incrementing counter. */
+                static uint32_t last_logged_pc = 0;
+                if (cpu->pc != last_logged_pc) {
+                    last_logged_pc = cpu->pc;
+                    /* Filter: only log PCs in MM_INIT body range — $A6F1A..$A77FF (rough) */
+                    if (cpu->pc >= 0xA6F1A && cpu->pc <= 0xA7800) {
+                        fprintf(stderr, "MM_INIT trace[%3d]: PC=$%06X op=$%04X%04X\n",
+                                mminit_trace_count++, cpu->pc,
+                                cpu_read16(cpu, cpu->pc), cpu_read16(cpu, cpu->pc + 2));
+                    }
+                }
+            }
+
+            #endif
+
+            /* Watch writes into head_sdb region ($CCA020..$CCA03F) during MM_INIT.
+             * We can't hook the store directly here, but we can sample the memory
+             * region every instruction while inside MM_INIT and log changes. */
+            if (mminit_state == 1) {
+                static uint32_t sdb_prev[8] = {0,0,0,0,0,0,0,0};
+                static int sdb_prev_gen = 0;
+                static int sdb_log_count = 0;
+                if (sdb_prev_gen != g_emu_generation) {
+                    memset(sdb_prev, 0, sizeof(sdb_prev));
+                    sdb_log_count = 0;
+                    sdb_prev_gen = g_emu_generation;
+                }
+                for (int i = 0; i < 8 && sdb_log_count < 40; i++) {
+                    uint32_t a = 0xCCA020 + i*4;
+                    uint32_t v = cpu_read32(cpu, a);
+                    if (v != sdb_prev[i]) {
+                        fprintf(stderr, "  head_sdb write: $%06X = $%08X  (PC=$%06X op=$%04X)\n",
+                                a, v, cpu->pc, cpu_read16(cpu, cpu->pc));
+                        sdb_prev[i] = v;
+                        sdb_log_count++;
+                    }
+                }
+            }
+
             DBGSTATIC(int, gs_count, 0);
-            if (cpu->pc == 0x5CC6 && mminit_state == 1 && gs_count < 4) {
+            if (cpu->pc == 0x5CE6 && mminit_state == 1 && gs_count < 4) {
                 gs_count++;
                 /* GETSPACE signature: function GETSPACE(size: longint; ptrsysg: absptr; var addr: longint): boolean;
                  * params pushed right-to-left: var addr (4 bytes, ADDRESS), ptrsysg (4), size (4), return slot (2 or 4).
@@ -2885,7 +2933,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             }
             /* Dump head_sdb sentinels at $CCA020 on first INSERTSDB entry */
             DBGSTATIC(int, sentinel_dumped, 0);
-            if (cpu->pc == 0xA17A0 && !sentinel_dumped) {
+            if (cpu->pc == 0xA1D5C && !sentinel_dumped) {
                 sentinel_dumped = 1;
                 fprintf(stderr, "=== head_sdb sentinels at $CCA020 (should be self-refs):\n");
                 for (int off = 0; off < 40; off += 4) {
@@ -2896,7 +2944,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
 
             /* Dump the first 32 bytes of INSERTSDB ($A17A0) on first entry */
             DBGSTATIC(int, insertsdb_dumped, 0);
-            if (cpu->pc == 0xA17A0 && !insertsdb_dumped) {
+            if (cpu->pc == 0xA1D5C && !insertsdb_dumped) {
                 insertsdb_dumped = 1;
                 fprintf(stderr, "=== INSERTSDB prologue bytes at $A17A0-$A17BF:");
                 for (int b = 0; b < 32; b += 2)
