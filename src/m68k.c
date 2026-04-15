@@ -2918,6 +2918,29 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 }
             }
 
+            /* Log every GETSPACE call with correctly-sized args.
+             * GETSPACE signature (SYSG1.TEXT:158):
+             *   function GETSPACE(amount: int2; b_area: absptr; var ordaddr: absptr): boolean
+             * Stack after JSR: retPC(4) | amount(2) | b_area(4) | ordaddr-ptr(4). */
+            DBGSTATIC(int, gs_all_count, 0);
+            if (cpu->pc == 0x5CEA && gs_all_count < 25) {
+                gs_all_count++;
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                uint32_t ret_pc = cpu_read32(cpu, sp);
+                uint16_t amount = cpu_read16(cpu, sp + 4);
+                uint32_t b_area = cpu_read32(cpu, sp + 6);
+                uint32_t varptr = cpu_read32(cpu, sp + 10);
+                fprintf(stderr, "GETSPACE #%d  ret=$%06X  amount=$%X (%d)  b_area=$%08X  var=$%08X\n",
+                        gs_all_count, ret_pc, amount, amount, b_area, varptr);
+                /* Dump the 16 bytes before the JSR — the argument-push sequence */
+                if (ret_pc >= 0x400 && gs_all_count <= 4) {
+                    fprintf(stderr, "    bytes preceding JSR (ret-20..ret-2):");
+                    for (int b = -20; b < 0; b += 2)
+                        fprintf(stderr, " %04X", cpu_read16(cpu, ret_pc + b));
+                    fprintf(stderr, "\n");
+                }
+            }
+
             DBGSTATIC(int, gs_count, 0);
             if (cpu->pc == 0x5CEA && mminit_state == 1 && gs_count < 4) {
                 gs_count++;
@@ -2931,6 +2954,64 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 for (int off = 4; off <= 20; off += 2)
                     fprintf(stderr, "    SP+%2d = $%08X\n", off, cpu_read32(cpu, sp + off));
             }
+            /* On first SYSTEM_ERROR, dump the syslocal pool header at $CE0000
+             * to diagnose whether POOL_INIT initialized the syslocal pool. */
+            DBGSTATIC(int, syslocal_pool_dumped, 0);
+            if (cpu->pc == 0x5380 && !syslocal_pool_dumped) {
+                syslocal_pool_dumped = 1;
+                fprintf(stderr, "=== syslocal pool check ($CE0000):\n");
+                for (int off = 0; off < 32; off += 4) {
+                    uint32_t v = cpu_read32(cpu, 0xCE0000 + off);
+                    fprintf(stderr, "    $%06X = $%08X\n", 0xCE0000 + off, v);
+                }
+                fprintf(stderr, "=== sysglobal pool ($CC0000):\n");
+                for (int off = 0; off < 32; off += 4) {
+                    uint32_t v = cpu_read32(cpu, 0xCC0000 + off);
+                    fprintf(stderr, "    $%06X = $%08X\n", 0xCC0000 + off, v);
+                }
+            }
+
+            /* Trace first SYSTEM_ERROR call — dump caller chain and
+             * instruction bytes around the JSR site. */
+            DBGSTATIC(int, syserr_dumped, 0);
+            if (cpu->pc == 0x5380 && !syserr_dumped) {
+                syserr_dumped = 1;
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                uint32_t ret_pc = cpu_read32(cpu, sp);
+                uint16_t errcode = cpu_read16(cpu, sp + 4);
+                fprintf(stderr, "=== SYSTEM_ERROR entered: code=%d ret=$%06X SP=$%06X A6=$%06X\n",
+                        errcode, ret_pc, sp, cpu->a[6]);
+                fprintf(stderr, "  Bytes around caller (ret-16..ret+4):\n   ");
+                for (int b = -16; b < 8; b += 2)
+                    fprintf(stderr, " %04X", cpu_read16(cpu, ret_pc + b));
+                fprintf(stderr, "\n");
+                /* Grand-parent PC bytes */
+                uint32_t gpc = cpu_read32(cpu, (cpu->a[6] & 0xFFFFFF) + 4);
+                fprintf(stderr, "  Bytes around grand-parent (ret=$%06X -16..+4):\n   ", gpc);
+                for (int b = -16; b < 8; b += 2)
+                    fprintf(stderr, " %04X", cpu_read16(cpu, gpc + b));
+                fprintf(stderr, "\n");
+                /* D0-D7 + A0-A5 at the moment of SYSTEM_ERROR */
+                fprintf(stderr, "  Regs: D0=$%08X D1=$%08X D2=$%08X D7=$%08X A0=$%08X A5=$%08X\n",
+                        cpu->d[0], cpu->d[1], cpu->d[2], cpu->d[7], cpu->a[0], cpu->a[5]);
+                fprintf(stderr, "  Stack walk (looking for saved return PCs):\n");
+                for (int off = 0; off <= 80; off += 4) {
+                    uint32_t v = cpu_read32(cpu, sp + off);
+                    if (v >= 0x400 && v < 0xE0000)
+                        fprintf(stderr, "    [SP+%2d] = $%06X\n", off, v);
+                }
+                /* Also walk A6-link chain */
+                fprintf(stderr, "  A6-link chain:\n");
+                uint32_t a6 = cpu->a[6] & 0xFFFFFF;
+                for (int i = 0; i < 10 && a6 > 0x100 && a6 < 0xFFFFFF; i++) {
+                    uint32_t prev_a6 = cpu_read32(cpu, a6);
+                    uint32_t ret = cpu_read32(cpu, a6 + 4);
+                    fprintf(stderr, "    A6=$%06X prev_A6=$%06X ret=$%06X\n", a6, prev_a6, ret);
+                    if (prev_a6 == a6) break;
+                    a6 = prev_a6 & 0xFFFFFF;
+                }
+            }
+
             /* Dump P_ENQUEUE ($A1B00) prologue on first call */
             DBGSTATIC(int, penq_dumped, 0);
             if (cpu->pc == 0xA1C82 && !penq_dumped) {

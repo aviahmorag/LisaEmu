@@ -217,8 +217,32 @@ computation.
   each arm boundary so arms overlap (proper Pascal semantics).
 
 Boot now passes MM_INIT head_sdb init + first INSERTSDB walk.
-New blocker: SYSTEM_ERROR(10701) from GET_BOOTSPACE's GETFREE
-call (STARTUP.TEXT:1171) — free chain or CONFIG_DOWN flow.
+New blocker: SYSTEM_ERROR(10701) from **INIT_PROCESS**
+(STARTUP.TEXT:554) — its GETSPACE call for `mrbt` (size $1F0 =
+496 bytes) against **b_area=$CE0000 (syslocal pool)** fails
+because **$CE0000 is empty** (pool header = $00000000).
+
+Evidence chain:
+- GETSPACE correctly gets amount=$1F0 (496 bytes, = 124 × 4-byte
+  mrbtEnt) — sizing is fine.
+- b_area=$CE0000 (syslocal pool base) reads back NULL.
+- Earlier GETSPACE calls against **sysglobal** (b_area=$CCBF65)
+  all succeeded, so sysglobal pool is OK.
+- Conclusion: `POOL_INIT` either didn't initialize the syslocal
+  pool header, or the mb_syslocal/l_syslocal args were
+  miscompiled when passing 4-byte longints (possible P3-style
+  width bug when the caller passes `MMU_BASE(syslocmmu)` as an
+  absptr).
+
+Infrastructure added this session:
+- `build/lisa_linked.map` (sorted symbol map) — lookup is now O(1).
+- One-shot m68k.c probes for MM_INIT / INSERTSDB / MAKE_FREE /
+  P_ENQUEUE / GETSPACE / SYSTEM_ERROR entry points with caller
+  chain dumps.
+
+Next: trace POOL_INIT — is it being called for the syslocal
+pool, and does it write to $CE0000? Likely the fix is another
+arg-width bug on the POOL_INIT call from STARTUP main body.
 - Memory layout: himem = b_dbscreen, bothimem = lomem.
 
 **Key progress (2026-04-12):**
