@@ -191,11 +191,62 @@ is suppressed by an existing HLE. 10758 is NOT in the named error
 constants in SOURCE-CD.TEXT — likely a runtime-computed error code
 (e.g. from driver_init returning a specific code).
 
-Next session: locate the proc enclosing PC=$004280 (MAKE_BUILTIN
-$004244..$004284) — disassemble to find what value is passed to
-SYSTEM_ERROR there. Candidates: a GETSPACE failure, a driver table
-lookup failure, or a driver-init error code propagated from a
-builtin driver init proc.
+Diagnosis completed this session: PC=$004280 is in MAKE_BUILTIN,
+which computes 10000 + 758 = 10758 = `sys_err_base + cdtoomany`.
+Triggered when `FIND_EMPTYSLOT` returns false — i.e. no slot in
+`configinfo[]` has `devname = 'BITBKT'`.
+
+INIT_CONFIG at SOURCE-STARTUP.TEXT:1936-1937 runs
+`for index := 0 to maxdev do configinfo[index] := workptr;` with
+`workptr^.devname := 'BITBKT'`, so all 40 slots should hold BITBKT
+entries and FIND_EMPTYSLOT should succeed.
+
+FIND_EMPTYSLOT disassembly at `$067952` shows a broken string
+comparison: `configinfo[i]^.devname = 'BITBKT'` compiled to
+```
+MOVE.L (A0),D0       ; A0 = @configinfo[i], D0 = pointer value
+MOVEA.L D0,A0        ; A0 = *configinfo[i] (the devrec)
+MOVE.W (A0),D0       ; WRONG: reads first 2 bytes of devrec
+EXT.L D0             ;        (that's entry_pt high word, not devname)
+MOVE.L D0,D2
+LEA $6(PC),A0        ; A0 = ptr to 'BITBKT' literal
+...
+CMP.L D1,D0          ; compares pointer-to-literal vs ext-long word
+```
+Two codegen bugs compound:
+- Wrong field offset (reads offset 0 instead of the devname field's
+  actual offset in devrec).
+- Wrong compare semantics: Pascal `string = 'literal'` must call a
+  string-compare runtime primitive (byte-by-byte up to length), not
+  emit a word or long CMP.
+
+Next session: fix Pascal string equality in pascal_codegen.c.
+`=` and `<>` on string-typed operands should synthesize a call to
+a string-compare helper (or inline byte-by-byte compare up to
+min(len, 8)). Also verify FIELD_ACCESS offset for devname resolves
+correctly in the WITH context; if the record type info is fine, the
+sole bug may be the compare op itself.
+
+---
+
+## Inspiration projects (notes)
+
+`_inspiration/LisaSourceCompilation-main` is a 2025 working
+compilation of LOS 3.0 on a real Lisa (Apple's original Pascal
+compiler). Its `scripts/patch_files.py` catalogs every source patch
+needed. Most are Apps/Libraries scope (identifier renames, include
+paths). Two OS-scope patches checked this session:
+- `SOURCE-DRIVERDEFS`: `DEBUG1:=TRUE` → FALSE, `TWIGGYBUILD:=TRUE`
+  → FALSE. Already FALSE in our source copy — no action.
+- `SOURCE-PASCALDEFS`: same flags set to 0. Already 0 in ours.
+- `SOURCE-PROFILE`: widen disk-size check to `<= 9728 or > 500000`
+  (for modern large images). Not hit yet; keep in mind if ProFile
+  HLE later rejects our image.
+
+`_inspiration/lisaem-master` remains the reference for
+SCC / VIA / COPS / ProFile / floppy emulation if/when we need to
+revisit hardware-layer bugs. Currently our emulator layer is fine
+and the bugs are in the Pascal codegen.
 
 ---
 
