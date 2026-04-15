@@ -44,9 +44,4 @@ void boot_progress_shutdown(void);
 /* Look up a symbol by name. Returns its address if found, else 0. */
 uint32_t boot_progress_lookup(const char *name);
 
-/* Force-fire a milestone by name (bypasses PC-entry detection). Used
- * when the boot path is HLE-shortcircuited and we've logically passed
- * a milestone without executing its entry PC. */
-bool boot_progress_force(const char *symbol);
-
 #endif
