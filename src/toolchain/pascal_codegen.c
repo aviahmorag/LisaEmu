@@ -214,16 +214,28 @@ static type_desc_t *resolve_type(codegen_t *cg, ast_node_t *node) {
         case AST_TYPE_SUBRANGE: {
             type_desc_t *t = add_type(cg, "", TK_SUBRANGE, 2);
             if (node->num_children >= 2) {
-                /* Resolve CONST identifiers in subrange bounds */
-                t->range_low = (int)node->children[0]->int_val;
-                t->range_high = (int)node->children[1]->int_val;
+                /* P72: same fix as P71 for subrange bounds — handle
+                 * unary-minus (e.g. `-128..127`) and CONST identifier
+                 * references (e.g. `min_ldsn..max_ldsn`). Without this,
+                 * negative bounds collapse to 0 and arrays/subranges
+                 * are sized smaller than Apple's source intends. */
                 for (int bi = 0; bi < 2; bi++) {
                     ast_node_t *bound = node->children[bi];
-                    if (bound->type == AST_IDENT_EXPR && bound->int_val == 0 && bound->name[0]) {
+                    int val = 0;
+                    if (bound->type == AST_UNARY_OP &&
+                        bound->num_children > 0 &&
+                        bound->children[0]->type == AST_INT_LITERAL) {
+                        int inner = (int)bound->children[0]->int_val;
+                        val = (bound->op == TOK_MINUS) ? -inner : inner;
+                    } else if (bound->type == AST_IDENT_EXPR && bound->name[0]) {
                         cg_symbol_t *cs = find_global(cg, bound->name);
                         if (!cs) cs = find_imported(cg, bound->name);
-                        if (cs) { if (bi==0) t->range_low = cs->offset; else t->range_high = cs->offset; }
+                        if (cs) val = cs->offset;
+                    } else {
+                        val = (int)bound->int_val;
                     }
+                    if (bi == 0) t->range_low = val;
+                    else t->range_high = val;
                 }
                 int range = t->range_high - t->range_low;
                 if (cg->in_packed && range <= 255) t->size = 1;
