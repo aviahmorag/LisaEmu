@@ -239,6 +239,21 @@ void lisa_mem_write8(lisa_mem_t *mem, uint32_t addr, uint8_t val) {
                     (*cnt)++;
                 }
             }
+            /* Watchpoint: $002600..$00260F code region is overwritten during
+             * boot — causing SYSTEM_ERROR(10201). Log every write. */
+            if (phys >= 0x2600 && phys < 0x2610) {
+                extern uint32_t g_last_cpu_pc;
+                static int w2600_count = 0;
+                static int w2600_gen = -1;
+                extern int g_emu_generation;
+                if (w2600_gen != g_emu_generation) {
+                    w2600_count = 0; w2600_gen = g_emu_generation;
+                }
+                if (w2600_count++ < 32) {
+                    fprintf(stderr, "WATCH-$2600 [%d]: PC=$%06X log=$%06X phys=$%06X val=$%02X\n",
+                            w2600_count, g_last_cpu_pc, addr, phys, val);
+                }
+            }
             mem->ram[phys] = val;
             break;
         }
