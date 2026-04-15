@@ -525,17 +525,61 @@ build_result_t toolchain_build(const char *source_dir,
     }
 
     int num_files = 0;
+    source_file_t *candidates = calloc(MAX_SOURCE_FILES, sizeof(source_file_t));
+    int num_cand = 0;
     for (int d = 0; target->search_dirs[d]; d++) {
         char subdir[512];
         snprintf(subdir, sizeof(subdir), "%s/%s", source_dir, target->search_dirs[d]);
-        num_files += find_source_files(subdir, files + num_files,
-                                        MAX_SOURCE_FILES - num_files);
+        num_cand += find_source_files(subdir, candidates + num_cand,
+                                       MAX_SOURCE_FILES - num_cand);
     }
+
+    /* Check env var: LISAEMU_STRICT_MODULES=1 enforces module filter. */
+    const char *strict_env = getenv("LISAEMU_STRICT_MODULES");
+    bool strict = strict_env && strict_env[0] == '1';
 
     int modules_requested = 0;
     while (target->modules[modules_requested]) modules_requested++;
-    fprintf(stderr, "COMPILE TARGET '%s': %d modules requested, %d source files found (walking search_dirs)\n",
-            target->name, modules_requested, num_files);
+
+    if (strict) {
+        /* Filter candidates through the module list. */
+        for (int c = 0; c < num_cand; c++) {
+            const char *slash = strrchr(candidates[c].path, '/');
+            const char *base = slash ? slash + 1 : candidates[c].path;
+            bool matched = false;
+            const char *matched_mod = NULL;
+            for (int m = 0; target->modules[m] && !matched; m++) {
+                const char *mod = target->modules[m];
+                size_t mlen = strlen(mod);
+                for (const char *p = base; *p; p++) {
+                    if (strncasecmp(p, mod, mlen) != 0) continue;
+                    if (p != base) {
+                        char prev = *(p - 1);
+                        if (isalnum((unsigned char)prev)) continue;
+                    }
+                    char next = p[mlen];
+                    if (isalnum((unsigned char)next)) continue;
+                    matched = true;
+                    matched_mod = mod;
+                    break;
+                }
+            }
+            if (matched && num_files < MAX_SOURCE_FILES) {
+                files[num_files++] = candidates[c];
+                fprintf(stderr, "  [keep] %s (matches %s)\n", base, matched_mod);
+            }
+        }
+        fprintf(stderr, "COMPILE TARGET '%s' [STRICT]: %d modules, %d files matched (from %d candidates)\n",
+                target->name, modules_requested, num_files, num_cand);
+    } else {
+        for (int c = 0; c < num_cand; c++) {
+            if (num_files < MAX_SOURCE_FILES)
+                files[num_files++] = candidates[c];
+        }
+        fprintf(stderr, "COMPILE TARGET '%s' [LOOSE]: %d modules requested, %d source files (full walk)\n",
+                target->name, modules_requested, num_files);
+    }
+    free(candidates);
 
     /* Sort files: interface/definition files first, then primitives, then
      * alphabetically.  Files containing "GLOBAL", "DEFS", or "SYSCALL"
