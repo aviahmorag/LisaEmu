@@ -70,9 +70,60 @@ make audit-linker       # Stage 4: Full pipeline + linker
 cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' build 2>&1 | grep -E "(error:|BUILD)"
 ```
 
-## Current Status (2026-04-15 PM3)
+## Current Status (2026-04-15 PM4)
 
-### Diagnosis (P21 in progress): SYSTEM_ERROR(10201) at hard_excep+594
+### Fix (P22): TRAP #6 HLE reads SMT from linker `smt_base` symbol
+
+`DO_AN_MMU` (LDASM) hard-references `smt_base` via `lea smt_base,a1`.
+Our TRAP #6 HLE was reading `smt_ptr = (A5-4)` — a Pascal local slot
+with no SMT pointer — yielding `smt_base=$000000`. It then programmed
+segment 85 with SOR=0 from bytes at physical $154, so logical writes
+to $AA2600 (seg 85) aliased to **physical page 0**, overwriting
+SCTAB2 code and triggering **SYSTEM_ERROR(10201)**.
+
+Fix (`src/m68k.c` `hle_trap6_do_an_mmu`): resolve `smt_base` via
+`boot_progress_lookup` on the linker map (falls back to
+`g_hle_smt_base` for the synthetic-loader path). Exposed a public
+`boot_progress_lookup(name) → addr` accessor over the already-loaded
+symbol table.
+
+Boot progress: now **reaches BOOT_IO_INIT**. Three new milestones
+crossed since P21: INIT_MEASINFO, INIT_SCTAB completion, BOOT_IO_INIT.
+`WATCH-$2600` fires 0 times (was 17). Toolchain audit still 100% clean.
+
+### New blocker: illegal-instruction at $000094 during BOOT_IO_INIT
+
+After BOOT_IO_INIT the CPU takes vector 4 (illegal instruction) from
+PC=$000094, lands at `$615262A8` (garbage), A7 gets zeroed, PC hot
+pages show `$006D00 / $006E00 / $0A0600` — all in I/O init territory.
+Vectors taken before the crash: v39 (TRAP) × 3, v37 (TRAP) × 2.
+
+PC-trail decoded via linker map:
+- `$011CF0..$011DA4` = **TransPoint** (scheduler context-switch primitive)
+- `$011DD4..$011E24` = **AbortProcess** epilogue (UNLK, RTS)
+- After AbortProcess's RTS the CPU lands at `$615262DC` — a 32-bit
+  garbage address popped from the stack. The VEC-HIST shows v39 (TRAP)
+  × 3 and v37 (TRAP) × 2 immediately prior, so the corrupted return
+  address was pushed during one of those trap entries.
+
+So the real question: **which trap handler pushed a 32-bit return
+address with high half $6152 onto the supervisor stack?** This isn't
+an MMU bug — it's an exception-frame layout mismatch. Likely candidates:
+- `crea_ecb` or similar chain in INIT_EC pushes something wrong.
+- A TRAP #5 (syscall) entry computes a bogus return PC and the RTE
+  pops wrong.
+- One of our HLE handlers returns a register value instead of a PC.
+
+Next-session task: (a) instrument `take_exception` to log pushed PC
+for vectors 37/39 when the PC is non-canonical (high byte != 0);
+(b) log the source of the bogus $615262DC — scan for it being
+written to the stack or to A0 prior to AbortProcess's RTS.
+
+---
+
+## Prior Status (2026-04-15 PM3) — diagnosis that led to P22
+
+### Diagnosis (P21): SYSTEM_ERROR(10201) at hard_excep+594
 
 Added a targeted PC-probe in `src/m68k.c` that fires when PC=$002600 (the
 only hard-exception vector 4 site per VEC-FIRST log). Dump shows:
