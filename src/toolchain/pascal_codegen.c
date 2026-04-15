@@ -164,6 +164,7 @@ static int type_size(type_desc_t *t) {
 /* Forward declarations for symbol lookup (used in resolve_type for CONST) */
 static cg_symbol_t *find_global(codegen_t *cg, const char *name);
 static cg_symbol_t *find_imported(codegen_t *cg, const char *name);
+static cg_symbol_t *find_symbol_any(codegen_t *cg, const char *name);
 static void register_proc_sig(codegen_t *cg, const char *name, ast_node_t *params[], int num_params);
 static cg_proc_sig_t *find_proc_sig(codegen_t *cg, const char *name);
 
@@ -258,17 +259,25 @@ static type_desc_t *resolve_type(codegen_t *cg, ast_node_t *node) {
                 }
             } else
             if (node->num_children >= 3) {
-                /* Resolve array bounds — may be CONST identifiers */
+                /* Resolve array bounds — may be CONST identifiers. Use
+                 * find_symbol_any so that local CONSTs (declared inside
+                 * the enclosing proc's CONST section) are consulted in
+                 * addition to globals/imports. Without this, local
+                 * CONST bounds like `maxdtable = 35` inside
+                 * INIT_JTDRIVER fall back to 0, which collapses an
+                 * `array[0..maxdtable] of record` to a 1-element array
+                 * and makes sizeof(enclosing_record) = first-field-size
+                 * instead of count*record-size. Downstream effect: the
+                 * array-element stride in lvalue code is wrong AND the
+                 * GETSPACE sizeof arg is wrong. */
                 int lo = (int)node->children[0]->int_val;
                 int hi = (int)node->children[1]->int_val;
                 if (lo == 0 && node->children[0]->name[0]) {
-                    cg_symbol_t *cs = find_global(cg, node->children[0]->name);
-                    if (!cs) cs = find_imported(cg, node->children[0]->name);
+                    cg_symbol_t *cs = find_symbol_any(cg, node->children[0]->name);
                     if (cs && cs->is_const) lo = cs->offset;
                 }
                 if (hi == 0 && node->children[1]->name[0]) {
-                    cg_symbol_t *cs = find_global(cg, node->children[1]->name);
-                    if (!cs) cs = find_imported(cg, node->children[1]->name);
+                    cg_symbol_t *cs = find_symbol_any(cg, node->children[1]->name);
                     if (cs && cs->is_const) hi = cs->offset;
                 }
                 t->array_low = lo;
@@ -846,8 +855,21 @@ static void gen_lvalue_addr(codegen_t *cg, ast_node_t *node) {
             int array_low = 0;
             if (node->children[0]->type == AST_IDENT_EXPR) {
                 cg_symbol_t *arr_sym = find_symbol_any(cg, node->children[0]->name);
-                if (arr_sym && arr_sym->type) {
-                    type_desc_t *at = arr_sym->type;
+                type_desc_t *at = (arr_sym && arr_sym->type) ? arr_sym->type : NULL;
+                if (!at && cg->with_depth > 0) {
+                    /* WITH-field array access: the base name is a field of
+                     * an outer WITH record (e.g. `jt[i]` inside
+                     * `WITH jtpointer^^ do`). Resolve the field's type from
+                     * the WITH stack. Without this the element size falls
+                     * back to 2 bytes, which for record-of-record-array
+                     * collapses the stride to first-field-size and
+                     * silently scrambles every store target. */
+                    type_desc_t *wrt = NULL;
+                    int wfld = with_lookup_field(cg, node->children[0]->name, &wrt, NULL);
+                    if (wfld >= 0 && wrt)
+                        at = wrt->fields[wfld].type;
+                }
+                if (at) {
                     /* Follow pointer to get the array type */
                     if (at->kind == TK_POINTER && at->base_type)
                         at = at->base_type;
@@ -2400,6 +2422,21 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                         cg_symbol_t *sym = find_symbol_any(cg, ptr_node->name);
                         if (sym && sym->type && sym->type->kind == TK_POINTER && sym->type->base_type)
                             rt = sym->type->base_type;
+                    } else if (ptr_node->type == AST_DEREF && ptr_node->children[0]) {
+                        /* WITH ptr^^ DO ... — double-deref: follow the
+                         * pointer chain twice. Required for patterns like
+                         * INIT_JTDRIVER's `WITH jtpointer^^ do`. */
+                        ast_node_t *inner = ptr_node->children[0];
+                        if (inner->type == AST_IDENT_EXPR) {
+                            cg_symbol_t *sym = find_symbol_any(cg, inner->name);
+                            if (sym && sym->type && sym->type->kind == TK_POINTER && sym->type->base_type) {
+                                type_desc_t *t1 = sym->type->base_type;
+                                if (t1 && t1->kind == TK_POINTER && t1->base_type)
+                                    rt = t1->base_type;
+                                else
+                                    rt = t1;  /* one level was enough */
+                            }
+                        }
                     }
                 } else if (rec_expr->type == AST_IDENT_EXPR) {
                     /* WITH var DO ... — get variable's type */
@@ -2804,22 +2841,72 @@ static void gen_proc_or_func(codegen_t *cg, ast_node_t *node) {
         if (own_sym) own_sym->is_external = false;
     }
 
-    /* Process local declarations (vars, consts, types) */
+    /* Process local declarations (vars, consts, types).
+     * Order matters: CONSTs first (so TYPEs can reference them in
+     * array bounds and enum ranges), then TYPEs (so VARs can resolve
+     * their type names), then VARs. Previously TYPEs were never
+     * registered as local, so a local `type djt = ^driverjt` inside
+     * a proc stayed unresolved and `var x: ^djt` got an opaque base,
+     * making sizeof and array-stride wrong — the bug that let
+     * INIT_JTDRIVER corrupt the CPU vector table. */
     for (int i = 0; i < node->num_children; i++) {
         ast_node_t *child = node->children[i];
-        if (child->type == AST_VAR_DECL) {
-            process_var_decl(cg, child, false);
-        } else if (child->type == AST_CONST_DECL) {
-            /* Procedure-local const: add/update in global symbol table.
-             * This ensures locally declared constants (e.g. nospace=10701
-             * in MM_INIT) override imported ones (nospace=610 from ARCHIVE). */
-            type_desc_t *t = find_type(cg, "integer");
-            cg_symbol_t *s = add_global_sym(cg, child->name, t);
+        if (child->type == AST_CONST_DECL) {
+            type_desc_t *tc = find_type(cg, "integer");
+            cg_symbol_t *s = add_global_sym(cg, child->name, tc);
             if (s && child->num_children > 0) {
                 s->offset = (int)child->children[0]->int_val;
                 s->is_const = true;
             }
         }
+    }
+    /* Two-pass TYPE processing: (1) register each name as a stub so
+     * forward references resolve; (2) resolve the actual type
+     * definitions. This mirrors what process_declarations does for
+     * global types and lets `type djt = ^driverjt; driverjt = record...`
+     * work in either source order. */
+    for (int i = 0; i < node->num_children; i++) {
+        ast_node_t *child = node->children[i];
+        if (child->type == AST_TYPE_DECL && child->name[0]) {
+            if (!find_type(cg, child->name))
+                add_type(cg, child->name, TK_VOID, 0);
+        }
+    }
+    for (int i = 0; i < node->num_children; i++) {
+        ast_node_t *child = node->children[i];
+        if (child->type == AST_TYPE_DECL && child->num_children > 0 && child->name[0]) {
+            type_desc_t *t = resolve_type(cg, child->children[0]);
+            if (t) {
+                if (t->name[0] && !str_eq_nocase(t->name, child->name)) {
+                    type_desc_t *alias = find_type(cg, child->name);
+                    if (!alias) alias = add_type(cg, child->name, t->kind, t->size);
+                    if (alias) {
+                        char saved_name[64];
+                        strncpy(saved_name, child->name, sizeof(saved_name) - 1);
+                        saved_name[63] = '\0';
+                        *alias = *t;
+                        strncpy(alias->name, saved_name, sizeof(alias->name) - 1);
+                    }
+                } else {
+                    /* If stub already exists with this name, overwrite in place. */
+                    type_desc_t *existing = find_type(cg, child->name);
+                    if (existing && existing != t) {
+                        char saved_name[64];
+                        strncpy(saved_name, child->name, sizeof(saved_name) - 1);
+                        saved_name[63] = '\0';
+                        *existing = *t;
+                        strncpy(existing->name, saved_name, sizeof(existing->name) - 1);
+                    } else {
+                        strncpy(t->name, child->name, sizeof(t->name) - 1);
+                    }
+                }
+            }
+        }
+    }
+    for (int i = 0; i < node->num_children; i++) {
+        ast_node_t *child = node->children[i];
+        if (child->type == AST_VAR_DECL)
+            process_var_decl(cg, child, false);
     }
 
     /* Generate code for nested procedures/functions FIRST.

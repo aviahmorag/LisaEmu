@@ -70,7 +70,58 @@ make audit-linker       # Stage 4: Full pipeline + linker
 cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' build 2>&1 | grep -E "(error:|BUILD)"
 ```
 
-## Current Status (2026-04-15 PM4)
+## Current Status (2026-04-15 PM5)
+
+### Fix (P23): proc-local TYPE registration + WITH/array codegen
+
+Three related codegen bugs in `src/toolchain/pascal_codegen.c` that
+together caused `INIT_JTDRIVER` to scramble the CPU vector table:
+
+**(a) Procedure-local TYPE decls were never registered.** Global
+TYPE decls were processed in `process_declarations`, but proc-local
+TYPE decls were silently skipped in `gen_proc_or_func`'s declaration
+loop. So `type djt = ^driverjt; driverjt = record ... end;` inside a
+proc left both names as unregistered types — `^djt` fell back to an
+opaque pointer and driverjt's real record size was never computed.
+Fix: two-pass proc-local type processing in `gen_proc_or_func` —
+first register each `AST_TYPE_DECL` name as a stub (so forward
+references like `^driverjt` resolve before `driverjt` is fully
+defined), then resolve the actual bodies.
+
+**(b) Array-bounds lookup missed proc-local CONSTs.** Array
+`[lo..hi] of T` bound resolution used `find_global` / `find_imported`
+but not `find_symbol_any`, so a local `CONST maxdtable = 35` left the
+bounds at (0..0) → single-element array, record size collapsed to
+first field's size, sizeof wrong. Fix: switch to `find_symbol_any`
+for array-bound CONST resolution (bounds resolution happens in
+`AST_TYPE_ARRAY` case of `resolve_type`).
+
+**(c) ARRAY_ACCESS inside WITH couldn't see the array's element type.**
+When the array's base name is a field of an outer WITH record (e.g.
+`jt[i]` inside `WITH jtpointer^^ do`), `find_symbol_any` fails and
+the code fell back to `elem_size = 2`. Fix: mirror the existing
+FIELD_ACCESS WITH-lookup — if the base symbol isn't found and
+`with_depth > 0`, try `with_lookup_field` and use the field's type.
+
+Also fixed: `AST_WITH` handler didn't understand `WITH ptr^^ do` —
+only single-deref was handled. Added a `ptr^^` case so the record
+type resolves through the double pointer chain.
+
+Result: **VEC-WRITE probe fires 0 times** (was 30 — pre-fix all 17
+jump-table entries plus 13 garbage writes landed in the CPU vector
+table). `INIT_JTDRIVER` now installs the jump-table in the allocated
+sysglobal buffer. Toolchain audit still 100% clean (382 modules,
+8711/8711 symbols resolved, link OK). Output +8356 bytes vs P22.
+
+Boot advances: still reaches `BOOT_IO_INIT` but now with a clean
+vector table. New blocker: **SYSTEM_ERROR(10201) at ret=$072CC6**
+during BOOT_IO_INIT → FS_INIT transition (next milestone `FS_INIT`
+not reached). Next session to diagnose — likely a separate bug in
+I/O subsystem init or first FS call, not related to INIT_JTDRIVER.
+
+---
+
+## Prior Status (2026-04-15 PM4)
 
 ### Fix (P22): TRAP #6 HLE reads SMT from linker `smt_base` symbol
 
