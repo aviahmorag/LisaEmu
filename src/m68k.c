@@ -2924,6 +2924,35 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
          * which procedures have been entered. O(1) lookup, cheap. */
         boot_progress_record_pc(cpu->pc);
 
+        /* READ_DATA caller probe: locate the outer proc that keeps
+         * re-invoking READ_DATA during FS_INIT, and log its return
+         * chain so we can find the retry loop. */
+        {
+            extern uint32_t boot_progress_lookup(const char *name);
+            static uint32_t read_data_addr = 0;
+            static int rd_probed = 0;
+            if (!rd_probed) { rd_probed = 1; read_data_addr = boot_progress_lookup("READ_DATA"); }
+            if (read_data_addr && cpu->pc == read_data_addr) {
+                DBGSTATIC(int, rd_count, 0);
+                rd_count++;
+                if (rd_count < 6 || rd_count == 100 || rd_count == 1000) {
+                    uint32_t sp = cpu->a[7];
+                    uint32_t r0 = cpu_read32(cpu, sp);
+                    /* Walk A6 chain a few links to find the deep caller */
+                    uint32_t a6 = cpu->a[6];
+                    fprintf(stderr, "[READ_DATA #%d] ret=$%06X A6=$%06X", rd_count, r0, a6);
+                    for (int lvl = 0; lvl < 6 && a6 > 0x1000 && a6 < 0xFFFFFF; lvl++) {
+                        uint32_t caller_ret = cpu_read32(cpu, (a6 + 4) & 0xFFFFFF);
+                        uint32_t next_a6 = cpu_read32(cpu, a6);
+                        fprintf(stderr, " ← $%06X", caller_ret & 0xFFFFFF);
+                        if (next_a6 == a6) break;
+                        a6 = next_a6;
+                    }
+                    fprintf(stderr, "\n");
+                }
+            }
+        }
+
         /* VALID_AD spin probe: boot stalls in VALID_ADDR walking a
          * bogus parmcheck array. Log entry details for the first few
          * calls so we can identify the caller and why numcheck is huge. */

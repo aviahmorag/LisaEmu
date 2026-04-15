@@ -113,14 +113,50 @@ Something in that caller loops if READ_DATA returns error (likely a
 10738 or related boot-device read failure that our HLE partially
 handled but didn't fully resolve).
 
-Next-session task:
-1. Identify READ_DATA's caller in the spin: map the stack frame at
-   $08788C probe time to see what called READ_DATA (add a 2nd-level
-   probe on READ_DATA entry, dump the return-address chain).
-2. Check the error returned by READ_DATA. If it's a retry-forever
-   error from our 10738 HLE's partial handling, either make the HLE
-   report a terminating condition or skip that FS_INIT retry path
-   entirely.
+Diagnosis complete (this turn): READ_DATA probe logged the caller
+chain. It's always the same:
+```
+[READ_DATA] ret=$0AE0EA A6=$CBFC76
+   ← $0AE3C6 (SetObjPtr — map false-positive; real caller is lower)
+   ← $0AE45C (GetObjInvar — likewise)
+   ← $09B53E (Setup_Directory @ $09B522)
+   ← $09BC32 (Setup_IUInfo @ $09B7E6)
+   ← $0051DA (outer — INITSYS area)
+```
+
+**Setup_IUInfo → Setup_Directory → Build_Unit_Directory → GetObjVar
+→ READ_DATA**. Build_Unit_Directory (source-LOAD.TEXT:541) has:
+```pascal
+for i := 1 to nUnits do
+   begin
+      GetObjVar (obj_ptr, UnitLocVariant, obj_varblock);
+      if obj_ptr^.error <> 0 then Recover (4);
+      ...
+   end
+```
+GetObjVar reads one variant record from INTRINSIC.LIB per iteration.
+Our spin: 1000+ READ_DATA calls, all identical args. Either:
+(a) nUnits resolves to a huge number (another unresolved CONST),
+(b) GetObjVar's internal file-position isn't advancing — so each
+    iteration re-reads the same record forever (file-pos codegen
+    bug or ObjFile refnum mishandling),
+(c) The "Recover on error" isn't firing because obj_ptr^.error
+    stays 0 even though the read didn't advance.
+
+Real culprit is most likely (b): reading from a file whose
+fmark (file-position marker) never updates — the per-record read
+keeps returning the same bytes. Our source-compile boot doesn't
+have INTRINSIC.LIB populated via a real loader; our HLE is
+possibly returning "success with stale data."
+
+Next-session plan:
+1. Log obj_ptr^.error and actual read count after each READ_DATA.
+2. Check whether fmark/absbyte advances between calls (source
+   code is at fsui1.text:1744+).
+3. If the file doesn't actually exist in our FS image, short-circuit
+   Setup_IUInfo via HLE (it's only needed for dynamic code loading
+   from the intrinsic library; we may be able to skip it for the
+   boot path).
 
 ---
 
