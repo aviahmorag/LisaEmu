@@ -115,7 +115,15 @@ int main(int argc, char *argv[]) {
     if (strcmp(argv[1], "--headless") == 0) {
         headless = 1;
         argv++; argc--;
-        if (argc >= 4) { headless_frames = atoi(argv[3]); argc = 3; }
+        /* Optional trailing frame count. Post-shift, form is:
+         *   [--image <image> <frames>]  → argc==4, frames at argv[3]
+         *   [<Lisa_Source> <frames>]    → argc==3, frames at argv[2] */
+        if (argc >= 4 && strcmp(argv[1], "--image") == 0) {
+            headless_frames = atoi(argv[3]); argc = 3;
+        } else if (argc >= 3 && strcmp(argv[1], "--image") != 0) {
+            int n = atoi(argv[2]);
+            if (n > 0) { headless_frames = n; argc = 2; }
+        }
     }
 
     /* Check for --image flag: boot directly from a pre-built ProFile image */
