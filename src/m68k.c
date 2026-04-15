@@ -2988,6 +2988,41 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             cpu->pc = ret;
             continue;
         }
+        /* P40: zero-fill GETSPACE returns. Pascal code (CreateProcess →
+         * enqueue before ModifyProcess sets priority) reads the new
+         * PCB's priority field before it's initialized; garbage bytes
+         * from GETSPACE leftovers cause RQSCAN's BLE compare to spin.
+         * GETSPACE sig: function GETSPACE(amount: int2; b_area: absptr;
+         * var ordaddr: absptr): boolean. Stack at entry: retPC(4) +
+         * amount(2) + b_area(4) + ordaddr-ptr(4). We record the args
+         * at entry and, when control returns to retPC, zero `amount`
+         * bytes at *ordaddr (provided allocation succeeded).
+         * Single-slot state — GETSPACE is not re-entrant. */
+        {
+            static uint32_t gs_pending_ret = 0;
+            static uint32_t gs_pending_varptr = 0;
+            static uint32_t gs_pending_amount = 0;
+            static int gs_pending_gen = 0;
+            if (gs_pending_gen != g_emu_generation) {
+                gs_pending_ret = 0; gs_pending_varptr = 0;
+                gs_pending_amount = 0; gs_pending_gen = g_emu_generation;
+            }
+            if (cpu->pc == 0x00005FAA) {
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                gs_pending_ret    = cpu_read32(cpu, sp) & 0xFFFFFF;
+                gs_pending_amount = cpu_read16(cpu, sp + 4);
+                gs_pending_varptr = cpu_read32(cpu, sp + 10) & 0xFFFFFF;
+            } else if (gs_pending_ret && cpu->pc == gs_pending_ret) {
+                uint32_t allocated = cpu_read32(cpu, gs_pending_varptr) & 0xFFFFFF;
+                /* Only zero when allocation landed in RAM-like range. */
+                if (allocated >= 0x000400 && allocated + gs_pending_amount <= 0xFE0000
+                        && gs_pending_amount > 0 && gs_pending_amount < 0x10000) {
+                    for (uint32_t i = 0; i < gs_pending_amount; i++)
+                        cpu_write8(cpu, allocated + i, 0);
+                }
+                gs_pending_ret = 0;
+            }
+        }
         /* Track last-JSR/BSR/JMP source so we can identify the caller when
          * execution ends up in a garbage-code region. Captured before the
          * instruction executes, i.e. at the call-site PC. */
