@@ -2942,7 +2942,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
          * SYS_PROC_INIT (P35), those args are uninitialized globals
          * and MEM_CLEANUP jumps to garbage. Let PC enter so the
          * milestone fires, then pop args+return. 2 longword args. */
-        if (0 && pc_MEM_CLEANUP && cpu->pc == pc_MEM_CLEANUP) {
+        if (pc_MEM_CLEANUP && cpu->pc == pc_MEM_CLEANUP) {
             boot_progress_record_pc(cpu->pc);   /* ensure milestone */
             uint32_t sp = cpu->a[7] & 0xFFFFFF;
             uint32_t ret = cpu_read32(cpu, sp);
