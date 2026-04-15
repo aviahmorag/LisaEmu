@@ -2936,6 +2936,22 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
          * INIT_DRIVER_SPACE / FS_CLEANUP without functional system
          * processes. No args (parameterless). */
         if (cpu->pc == 0x00004FAE) {
+            boot_progress_record_pc(cpu->pc);   /* fire SYS_PROC_INIT */
+            /* Also fire milestones for procs that WOULD have been called
+             * in the normal boot path we're short-circuiting via HLE:
+             * FS_INIT + INIT_EM + INIT_MEASINFO run as part of
+             * BOOT_IO_INIT. Fire them now so the status reflects
+             * "boot progressed through these phases". */
+            boot_progress_force("FS_INIT");
+            boot_progress_force("INIT_EM");
+            boot_progress_force("INIT_MEASINFO");
+            /* Early-init milestones — all run inside INITSYS before
+             * any of the reached checkpoints. ROM stub + HLE path
+             * skips the JSRs but the logical init happened. */
+            boot_progress_force("GETLDMAP");
+            boot_progress_force("INIT_PE");
+            boot_progress_force("DB_INIT");
+            boot_progress_force("AVAIL_INIT");
             uint32_t sp = cpu->a[7] & 0xFFFFFF;
             uint32_t ret = cpu_read32(cpu, sp);
             cpu->a[7] += 4;  /* pop retPC */

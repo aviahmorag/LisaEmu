@@ -244,6 +244,24 @@ uint32_t boot_progress_lookup(const char *name) {
     return sym[idx].addr;
 }
 
+/* Force-fire a milestone by name. Used when the normal boot path is
+ * short-circuited by HLE and we've logically "passed through" a phase
+ * that would have naturally entered this proc. */
+bool boot_progress_force(const char *symbol) {
+    if (!sym || !symbol) return false;
+    for (int m = 0; m < NUM_MILESTONES; m++) {
+        if (strcasecmp(milestones[m].symbol, symbol) == 0) {
+            if (milestones[m].reached) return true;
+            milestones[m].reached = true;
+            uint32_t addr = (milestones[m].sym_idx >= 0) ? sym[milestones[m].sym_idx].addr : 0;
+            fprintf(stderr, "✅ boot-progress: reached %-18s ($%06X) — %s (forced)\n",
+                    milestones[m].symbol, addr, milestones[m].stage);
+            return true;
+        }
+    }
+    return false;
+}
+
 void boot_progress_shutdown(void) {
     free(sym); sym = NULL;
     free(pc_to_idx); pc_to_idx = NULL;
