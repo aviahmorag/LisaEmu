@@ -167,6 +167,17 @@ static cg_symbol_t *find_imported(codegen_t *cg, const char *name);
 static void register_proc_sig(codegen_t *cg, const char *name, ast_node_t *params[], int num_params);
 static cg_proc_sig_t *find_proc_sig(codegen_t *cg, const char *name);
 
+/* Non-primitive value param (record/string/array): P16 passes by reference
+ * as a 4-byte pointer. Caller must push @arg via LEA, not the arg value. */
+static inline bool ARG_BY_REF(cg_proc_sig_t *sig, int a) {
+    if (!sig || a >= sig->num_params) return false;
+    if (sig->param_is_var[a]) return false;
+    type_desc_t *t = sig->param_type[a];
+    if (!t) return false;
+    return t->kind == TK_RECORD || t->kind == TK_STRING || t->kind == TK_ARRAY;
+}
+
+
 /* Resolve a type from an AST type node */
 static type_desc_t *resolve_type(codegen_t *cg, ast_node_t *node) {
     if (!node) return find_type(cg, "integer");
@@ -1722,13 +1733,13 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
             {
 
             /* Push order: left-to-right for callee-clean (assembly),
-             * right-to-left for caller-clean (Pascal codegen).
-             * Use correct push size (MOVE.W vs MOVE.L) based on param type. */
+             * right-to-left for caller-clean (Pascal). */
             if (is_callee_clean) {
                 for (int i = 0; i < node->num_children; i++) {
                     bool is_var_arg = (sig && i < sig->num_params && sig->param_is_var[i]);
+                    bool by_ref = ARG_BY_REF(sig, i);
                     int psize = (sig && i < sig->num_params) ? sig->param_size[i] : 4;
-                    if (is_var_arg) {
+                    if (is_var_arg || by_ref) {
                         gen_lvalue_addr(cg, node->children[i]);
                         emit16(cg, 0x2F08);  /* MOVE.L A0,-(SP) */
                     } else if (psize <= 2) {
@@ -1742,8 +1753,9 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
             } else {
                 for (int i = node->num_children - 1; i >= 0; i--) {
                     bool is_var_arg = (sig && i < sig->num_params && sig->param_is_var[i]);
+                    bool by_ref = ARG_BY_REF(sig, i);
                     int psize = (sig && i < sig->num_params) ? sig->param_size[i] : 4;
-                    if (is_var_arg) {
+                    if (is_var_arg || by_ref) {
                         gen_lvalue_addr(cg, node->children[i]);
                         emit16(cg, 0x2F08);  /* MOVE.L A0,-(SP) */
                     } else if (psize <= 2) {
@@ -2105,37 +2117,39 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                 bool call_callee_clean = (call_sym && call_sym->is_external) ||
                                          (call_sig && call_sig->is_external);
 
-                /* Push arguments with correct sizes */
+                /* Push arguments with correct sizes.
+                 * Non-primitive value params (RECORD/STRING/ARRAY) are passed
+                 * by reference per P16 — push @arg, not the value. */
                 if (call_callee_clean) {
-                    /* Left-to-right for callee-clean (assembly) */
                     for (int a = 0; a < node->num_children; a++) {
                         bool is_var_arg = (call_sig && a < call_sig->num_params && call_sig->param_is_var[a]);
+                        bool by_ref = ARG_BY_REF(call_sig, a);
                         int psize = (call_sig && a < call_sig->num_params) ? call_sig->param_size[a] : 4;
-                        if (is_var_arg) {
+                        if (is_var_arg || by_ref) {
                             gen_lvalue_addr(cg, node->children[a]);
-                            emit16(cg, 0x2F08);  /* MOVE.L A0,-(SP) */
+                            emit16(cg, 0x2F08);
                         } else if (psize <= 2) {
                             gen_expression(cg, node->children[a]);
-                            emit16(cg, 0x3F00);  /* MOVE.W D0,-(SP) */
+                            emit16(cg, 0x3F00);
                         } else {
                             gen_expression(cg, node->children[a]);
-                            emit16(cg, 0x2F00);  /* MOVE.L D0,-(SP) */
+                            emit16(cg, 0x2F00);
                         }
                     }
                 } else {
-                    /* Right-to-left for caller-clean (Pascal) */
                     for (int a = node->num_children - 1; a >= 0; a--) {
                         bool is_var_arg = (call_sig && a < call_sig->num_params && call_sig->param_is_var[a]);
+                        bool by_ref = ARG_BY_REF(call_sig, a);
                         int psize = (call_sig && a < call_sig->num_params) ? call_sig->param_size[a] : 4;
-                        if (is_var_arg) {
+                        if (is_var_arg || by_ref) {
                             gen_lvalue_addr(cg, node->children[a]);
-                            emit16(cg, 0x2F08);  /* MOVE.L A0,-(SP) */
+                            emit16(cg, 0x2F08);
                         } else if (psize <= 2) {
                             gen_expression(cg, node->children[a]);
-                            emit16(cg, 0x3F00);  /* MOVE.W D0,-(SP) */
+                            emit16(cg, 0x3F00);
                         } else {
                             gen_expression(cg, node->children[a]);
-                            emit16(cg, 0x2F00);  /* MOVE.L D0,-(SP) */
+                            emit16(cg, 0x2F00);
                         }
                     }
                 }
@@ -2780,6 +2794,16 @@ static void gen_proc_or_func(codegen_t *cg, ast_node_t *node) {
         }
     }
 
+    /* Compiling a procedure BODY clears any prior EXTERNAL flag on this
+     * procedure's signature — the body exists, so callers should use the
+     * Pascal caller-clean convention for it. */
+    {
+        cg_proc_sig_t *own_sig = find_proc_sig(cg, node->name);
+        if (own_sig) own_sig->is_external = false;
+        cg_symbol_t *own_sym = find_global(cg, node->name);
+        if (own_sym) own_sym->is_external = false;
+    }
+
     /* Process local declarations (vars, consts, types) */
     for (int i = 0; i < node->num_children; i++) {
         ast_node_t *child = node->children[i];
@@ -3037,22 +3061,31 @@ static void register_proc_sig(codegen_t *cg, const char *name, ast_node_t *param
     }
 }
 
-/* Look up a procedure signature by name */
+/* Look up a procedure signature by name.
+ * Multiple entries may exist (e.g., an EXTERNAL declaration from one unit
+ * plus the body from another unit). Prefer the entry with is_external=false
+ * if any — the body is the authoritative definition. */
 static cg_proc_sig_t *find_proc_sig(codegen_t *cg, const char *name) {
+    cg_proc_sig_t *fallback = NULL;
     /* Search local signatures */
     if (cg->proc_sigs) {
         for (int i = 0; i < cg->num_proc_sigs; i++) {
-            if (strcasecmp(cg->proc_sigs[i].name, name) == 0)
-                return &cg->proc_sigs[i];
+            if (strcasecmp(cg->proc_sigs[i].name, name) == 0) {
+                if (!cg->proc_sigs[i].is_external) return &cg->proc_sigs[i];
+                if (!fallback) fallback = &cg->proc_sigs[i];
+            }
         }
     }
     /* Search imported signatures */
     if (cg->imported_proc_sigs) {
         for (int i = 0; i < cg->imported_proc_sigs_count; i++) {
-            if (strcasecmp(cg->imported_proc_sigs[i].name, name) == 0)
-                return &cg->imported_proc_sigs[i];
+            if (strcasecmp(cg->imported_proc_sigs[i].name, name) == 0) {
+                if (!cg->imported_proc_sigs[i].is_external) return &cg->imported_proc_sigs[i];
+                if (!fallback) fallback = &cg->imported_proc_sigs[i];
+            }
         }
     }
+    if (fallback) return fallback;
     return NULL;
 }
 
