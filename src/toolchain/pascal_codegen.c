@@ -2662,6 +2662,31 @@ static void process_var_decl(codegen_t *cg, ast_node_t *node, bool is_global) {
     /* Handle multiple names: "a,b,c" */
     char names[256];
     strncpy(names, node->name, sizeof(names) - 1);
+    /* P39 structural: PASCALDEFS-pinned globals. When a Pascal VAR name
+     * matches one of these names (case-insensitive), force its A5-relative
+     * offset to the PASCALDEFS-hardcoded value. This retires a whole class
+     * of tactical HLE bypasses (P32, P33 etc.) where Pascal-compiled global
+     * offsets disagree with asm code's hardcoded PASCALDEFS offsets. */
+    struct { const char *name; int offset; } pdefs_pins[] = {
+        /* Scheduler queue heads — asm PROCASM.TEXT addresses them
+         * directly as PFWD_REA(A5), PFWD_BLO(A5), etc. */
+        { "fwd_ReadyQ",  -1116 },   /* PFWD_REA */
+        { "bkwd_ReadyQ", -1120 },
+        { "fwd_BlockQ",  -1108 },   /* PFWD_BLO */
+        { "bkwd_BlockQ", -1112 },
+        /* Sysglobal pointer — asm uses B_SYSLOCAL_PTR(A5) at -24785 */
+        { "b_syslocal_ptr", -24785 },
+        /* System globals referenced from asm */
+        { "Invoke_sched", -24786 },
+        { "sct_ptr",      -24781 },
+        { "c_pcb_ptr",    -24617 },
+        { "sysA5",        -24613 },
+        { "port_cb_ptrs", -24609 },
+        { "size_sglobal", -24577 },
+        { "sg_free_pool_addr", -24575 },
+        { NULL, 0 }
+    };
+
     char *tok = strtok(names, ",");
     while (tok) {
         while (*tok == ' ') tok++;
@@ -2682,9 +2707,20 @@ static void process_var_decl(codegen_t *cg, ast_node_t *node, bool is_global) {
                     }
                 }
             }
+            /* Check PASCALDEFS-pinned list (P39 structural). Case-insensitive. */
+            int pinned_offset = 0;
+            for (int pi = 0; pdefs_pins[pi].name; pi++) {
+                if (str_eq_nocase(pdefs_pins[pi].name, tok)) {
+                    pinned_offset = pdefs_pins[pi].offset;
+                    break;
+                }
+            }
             cg_symbol_t *s = add_global_sym(cg, tok, type);
             if (s) {
-                if (existing_import && existing_import->offset != 0) {
+                if (pinned_offset != 0) {
+                    /* PASCALDEFS pin wins over natural offset */
+                    s->offset = pinned_offset;
+                } else if (existing_import && existing_import->offset != 0) {
                     /* Use the previously assigned offset */
                     s->offset = existing_import->offset;
                 } else {

@@ -2978,10 +2978,13 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
          * RQSCAN spins forever walking a bogus queue. Skip the queue
          * manipulation entirely — pop args + RTS.
          * Stack: retPC(4) + queue_byte(2 with A7 align) + pcb_ptr(4). */
-        if (cpu->pc == 0x000E0A64) {
+        /* DISABLED post-P39: PASCALDEFS pin of fwd_ReadyQ at -1116
+         * should let the asm RQSCAN walk terminate via INIT_PROCESS's
+         * sentinel. Re-enable if scheduler spins. */
+        if (0 && cpu->pc == 0x000E0A64) {
             uint32_t sp = cpu->a[7] & 0xFFFFFF;
             uint32_t ret = cpu_read32(cpu, sp);
-            cpu->a[7] += 10;  /* retPC + queue + pcb_ptr */
+            cpu->a[7] += 10;
             cpu->pc = ret;
             continue;
         }
