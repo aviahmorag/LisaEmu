@@ -142,12 +142,35 @@ Attempted bypass: HLE INTSON to pop args + RTS. Moved the spin
 elsewhere — caller kept re-JSRing INTSON in a tight loop (likely
 because something earlier in the flow needed real SR restoration).
 
-**Next session plan**: investigate MMU/segment layout. The
-supervisor stack's virt→phys mapping shouldn't land on code
-pages. Either the SSP is wrong at setup, or a segment's origin
-overlaps. Check `l_sysglobal`, stack segment allocation in
-startup, and whether the stk_info for the MemMgr process is
-initializing with a valid segment-relative stack.
+**P56 deeper trace** confirmed the layer:
+
+- At INTSON entry, bytes at $0DDDD2 are intact ($805F).
+- A JSR at PC=$00F182 with A7=$CAD5D2 writes retPC onto the stack.
+  The push target virt $CAD5CE → physical \$0DDDCE (computed from
+  MMU seg 101 SOR ≈ \$684 → phys base \$D0800, + offset \$0D5CE).
+- Subsequent exception frames (SR + PC) for the INTSON trap fall
+  into the same range, further corrupting nearby code.
+
+The OS programmed MMU seg 101 (the stack segment for the new
+MemMgr process) with SOR=\$684, mapping virt \$CAxxxx →
+phys \$D0800+. That physical range is already occupied by the
+linked code (\$0DDDC4=INTSON, \$0DDDD8=A5SETUP).
+
+Why: our linked Pascal binary is 2.25MB — using the full emulated
+RAM (LISA_RAM_SIZE) — leaving no physically-free pages for the
+OS to allocate fresh process stacks. The free-page tracker in
+POOL_INIT doesn't know about the code layout; it allocates what
+it thinks are free physical pages, and stack writes then clobber
+code bytes.
+
+**Next session plan**: reduce the compiled binary size OR expand
+emulator RAM. Real Lisa OS was much smaller than our 2.25MB
+compile — we include every source file we can find, including
+Apps/Libraries. Likely need to scope the compile set to just the
+OS kernel for a minimal boot. Alternatively, expand LISA_RAM_SIZE
+and the OS's `prom_memsize` so free-page allocator sees headroom
+above code. Either approach should retire this physical collision
+class for good.
 
 ### Earlier diagnosis (prior round, now resolved by P54): Build_Syslocal epilogue corrupts stack
 
