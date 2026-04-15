@@ -2896,7 +2896,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         static uint32_t pc_FS_CLEANUP, pc_PR_CLEANUP, pc_MEM_CLEANUP;
         static uint32_t pc_SYS_PROC_INIT, pc_excep_setup, pc_REG_OPEN_LIST;
         static uint32_t pc_QUEUE_PR, pc_GETSPACE, pc_Wait_sem, pc_MM_Setup;
-        static uint32_t pc_Make_SProcess, pc_Move_MemMgr;
+        static uint32_t pc_Make_SProcess, pc_Move_MemMgr, pc_unitio;
         static int hle_pc_gen = -1;
         if (hle_pc_gen != g_emu_generation) {
             pc_FS_CLEANUP    = boot_progress_lookup("FS_CLEANUP");
@@ -2911,6 +2911,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             pc_MM_Setup      = boot_progress_lookup("MM_Setup");
             pc_Make_SProcess = boot_progress_lookup("Make_SProcess");
             pc_Move_MemMgr   = boot_progress_lookup("MOVE_MEMMGR");
+            pc_unitio        = boot_progress_lookup("unitio");
             hle_pc_gen = g_emu_generation;
         }
         /* P37 HLE bypass: FS_CLEANUP (fsinit.text:136). Fires the
@@ -3003,6 +3004,32 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 cpu_write16(cpu, this_sem, (uint16_t)(cnt - 1));
             }
             cpu->a[7] += 4 + 4 + 2;  /* retPC + this_sem_ptr + control */
+            cpu->pc = ret;
+            continue;
+        }
+        /* P50 HLE bypass: unitio (OSUNITIO.TEXT:32). With P35 disabled so
+         * SYS_PROC_INIT runs naturally, control reaches a tight self-
+         * referential loop inside unitio around $0B0000 — symptom of
+         * unitio's frame being set up with LINK that saves a stale A6
+         * value equal to current A6, causing RTS to return to its own
+         * entry point. Downstream of the subrange-word codegen change,
+         * this may resolve with further codegen work, but for now the
+         * real body is a thin wrapper around lisaio and our disk I/O is
+         * HLE'd elsewhere, so unitio as a no-op is safe.
+         * Signature: (var errnum:int; devnum:int; bufadr:absptr;
+         *             numblocks:int4; blocknum:int4; var actual:int4;
+         *             mode:disk_io_type; op:ioop);
+         * Arg total: 4+2+4+4+4+4+2+2 = 26 bytes. */
+        if (pc_unitio && cpu->pc == pc_unitio) {
+            uint32_t sp = cpu->a[7] & 0xFFFFFF;
+            uint32_t ret      = cpu_read32(cpu, sp);
+            uint32_t errnum_p = cpu_read32(cpu, sp + 4);
+            uint32_t actual_p = cpu_read32(cpu, sp + 4 + 2 + 4 + 4 + 4);  /* offset to var actual */
+            if (errnum_p >= 0x400 && errnum_p < 0xFE0000)
+                cpu_write16(cpu, errnum_p, 0);
+            if (actual_p >= 0x400 && actual_p < 0xFE0000)
+                cpu_write32(cpu, actual_p, 0);
+            cpu->a[7] += 4 + 26;
             cpu->pc = ret;
             continue;
         }
