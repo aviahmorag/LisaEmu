@@ -6,6 +6,7 @@
  */
 
 #include "lisa.h"
+#include "boot_progress.h"
 #include "toolchain/toolchain_bridge.h"
 #include "toolchain/bootrom.h"
 #include <SDL.h>
@@ -179,6 +180,9 @@ int main(int argc, char *argv[]) {
         if (argc > 3) lisa_mount_floppy(&lisa, argv[3]);
     }
 
+    /* Load boot-progress symbol map (ignored if missing — e.g. --image mode) */
+    boot_progress_init("build/lisa_linked.map");
+
     if (headless) {
         lisa_reset(&lisa);
         for (int f = 0; f < headless_frames; f++) {
@@ -190,6 +194,7 @@ int main(int argc, char *argv[]) {
             }
         }
         printf("headless: ran %d frames cleanly\n", headless_frames);
+        boot_progress_report(stderr);
         return 0;
     }
 

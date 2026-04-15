@@ -16,6 +16,7 @@ SOURCES = $(SRCDIR)/m68k.c \
           $(SRCDIR)/profile.c \
           $(SRCDIR)/lisa.c \
           $(SRCDIR)/lisa_bridge.c \
+          $(SRCDIR)/boot_progress.c \
           $(SRCDIR)/main_sdl.c
 
 TOOL_SOURCES = $(TOOLDIR)/asm68k.c \

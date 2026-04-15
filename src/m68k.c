@@ -7,6 +7,7 @@
  */
 
 #include "m68k.h"
+#include "boot_progress.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2817,6 +2818,10 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         if (pc_ring_gen != g_emu_generation) { memset(pc_ring, 0, sizeof(pc_ring)); pc_ring_idx = 0; pc_ring_gen = g_emu_generation; }
         pc_ring[pc_ring_idx++ & 255] = cpu->pc;
         g_last_cpu_pc = cpu->pc;
+
+        /* Boot-progress instrumentation: record every PC so we can see
+         * which procedures have been entered. O(1) lookup, cheap. */
+        boot_progress_record_pc(cpu->pc);
 
         /* Jump-only ring: records (src_pc, dst_pc) pairs when PC changes
          * discontinuously (JSR, JMP, RTS, BRA, BSR with distance > 8). */

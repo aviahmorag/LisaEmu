@@ -70,7 +70,53 @@ make audit-linker       # Stage 4: Full pipeline + linker
 cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' build 2>&1 | grep -E "(error:|BUILD)"
 ```
 
-## Current Status (2026-04-15)
+## Current Status (2026-04-15 PM2)
+
+### Fix (P20): non-primitive value params + prefer Pascal body over external sig
+
+Two related codegen fixes that unblock MAKE_REGION → BLD_SEG → INSERTSDB
+in STARTUP:
+
+**ARG_BY_REF helper** (`src/toolchain/pascal_codegen.c`): P16 made
+`register_proc_sig` / `gen_proc_or_func` treat string/record/array value
+params as pass-by-reference (4-byte pointer frame slot). The caller side
+was never updated — it still evaluated the record as a value expression
+(first field into D0, pushed as 4-byte long with garbage upper word).
+Fix: detect non-VAR params of kind `TK_RECORD`/`TK_STRING`/`TK_ARRAY` at
+every call site and emit `LEA @arg; MOVE.L A0,-(SP)` (same as VAR args).
+Applied in both `AST_FUNC_CALL` and `AST_PROC_CALL`, callee-clean and
+caller-clean branches.
+
+**find_proc_sig prefers non-external sig**: When an EXTERNAL declaration
+in one unit registered a sig with `is_external=true`, and the Pascal body
+in another unit later registered a fresh sig for the same name, the
+APPEND-only `shared_proc_sigs` table kept both entries; `find_proc_sig`
+returned the first (external) match. Callers then treated the proc as
+assembly/callee-clean with left-to-right push, which mismatched the
+body's right-to-left Pascal frame. The VAR output param landed at the
+wrong offset — BLD_SEG wrote nil to address 0 instead of the caller's
+local. Fix: when multiple sigs exist, prefer the one with
+`is_external=false`; also clear `is_external` on own sig/sym when
+`gen_proc_or_func` emits a body.
+
+**Boot progress**:
+- Before P20: hung in INSERTSDB at `$0A38AA-$0A38D8`, IPL=4, because
+  `*c_sdb_ptr` was never populated.
+- After P20: MAKE_REGION → BLD_SEG correctly passes `@disca` by-ref
+  (per P16), pushes right-to-left, pops 24 bytes post-JSR (caller-clean).
+  INSERTSDB gets a valid sdb pointer. Boot advances.
+- **New blocker**: `SYSTEM_ERROR(10201)` (`e_hardsyscode`, "hardware
+  exception while in system code") from `ret=$071FD8`, which maps to
+  `hard_excep+594` (hard_excep at `$071D86`). So a real CPU hardware
+  exception (bus / address / illegal / etc.) is firing somewhere and
+  funneling into the runtime handler.
+
+Toolchain audit: **100% clean** (317/317 Pascal, 103/103 ASM, 8711
+symbols resolved, link OK). Output size delta vs P19: +12 bytes.
+
+---
+
+## Prior Status (2026-04-15 AM)
 
 ### Fix (P19): narrow RHS → wide longint/pointer stores now sign-extend
 

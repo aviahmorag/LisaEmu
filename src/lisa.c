@@ -4,6 +4,7 @@
  */
 
 #include "lisa.h"
+#include "boot_progress.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2846,6 +2847,13 @@ static bool hle_handle_system_error(lisa_t *lisa __attribute__((unused)), m68k_t
      * Stop the CPU to prevent infinite recursion. */
     fprintf(stderr, "SYSTEM_ERROR(%d): HALTING CPU\n", err_code);
     cpu->stopped = true;
+    /* Dump the boot-progress report once on first halt so we can see
+     * how far we got before failing. */
+    static bool reported_once = false;
+    if (!reported_once) {
+        reported_once = true;
+        boot_progress_report(stderr);
+    }
     return true;
 }
 
