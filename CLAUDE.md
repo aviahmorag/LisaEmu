@@ -70,7 +70,56 @@ make audit-linker       # Stage 4: Full pipeline + linker
 cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' build 2>&1 | grep -E "(error:|BUILD)"
 ```
 
-## Current Status (2026-04-15 PM17) — **24/27 (22 real + 2 bypass-fired)**
+## Current Status (2026-04-15 PM18) — **25/27 (23 real + 2 bypass-fired)**
+
+### Fix (P71+P72): unary-minus + IDENT_EXPR in CONST decls + subrange bounds
+
+Pascal parser builds `-1` as `AST_UNARY_OP(MINUS, INT_LITERAL(1))`
+and `min_ldsn..max_ldsn` with IDENT_EXPR bounds. Our codegen
+took children[0]->int_val directly, which is 0 for UNOP and
+IDENT_EXPR nodes. Result: every negative const and every
+ident-ref const/bound silently stored as 0.
+
+Concrete proof via P71 probe: `const sloc_ldsn = -1` was stored
+as 0; DS_OPEN called `LDSN_TO_MMU(0)` instead of `LDSN_TO_MMU(-1)`,
+picking MMU 104 instead of 105. Cascade through entire
+Make_SProcess chain.
+
+Fix (same pattern in both places — AST_CONST_DECL handler and
+AST_TYPE_SUBRANGE bound resolver):
+- `UNOP(MINUS/PLUS, INT_LITERAL)` → signed value
+- `IDENT_EXPR` pointing to prior CONST → reuse value
+- Fallback to int_val
+
+**Result: INIT_MEASINFO now fires legitimately (+1 real).**
+**Real count: 22 → 23.**
+
+Structural breadth: affects all ~71 negative consts + subrange
+bounds in Apple's OS source simultaneously. Many subtle bugs
+just silently corrected.
+
+### Diagnosis (P73+P74): BOOT_IO_INIT for-loop runs only 1 iteration
+
+Probed MAKE_NAME + MAKE_BUILTIN call counts and max PC reached
+in BOOT_IO_INIT:
+- MAKE_BUILTIN 2× (before loop) ✓
+- MAKE_NAME 1× (one iteration of case 1 or case 2 body)
+- Loop terminates after this single iteration
+- BOOT_IO_INIT reaches max PC \$005026 (its final RTS area) ✓
+
+So the for-loop EXITS cleanly but only one arm of case 1,2 runs.
+Our P66 multi-label case (AST_CASE_LABELS) should match both
+1 and 2; it seems only ONE of them actually dispatches. Either:
+- AST_CASE_LABELS codegen emits body reachable only from first
+  label's BEQ;
+- Selector (D3) gets corrupted between case iterations despite
+  the stack-save/restore;
+- `index` local variable gets overwritten by MAKE_NAME.
+
+Needs focused trace inside the case dispatcher code to find
+the exact failure. That's the next concrete session target.
+
+### Fix (P67): retired P36 MEM_CLEANUP bypass — +1 real milestone
 
 ### Exploration: Apple's actual artifacts vs ours
 
