@@ -2889,6 +2889,37 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         pc_ring[pc_ring_idx++ & 255] = cpu->pc;
         g_last_cpu_pc = cpu->pc;
 
+        /* P35 HLE bypass: SYS_PROC_INIT (STARTUP:2042). Creates the
+         * MemMgr and Root system processes. Each Make_SProcess call
+         * cascades through MM_Setup → init_proc_syslocal → crea_ecb,
+         * all of which fail because per-process syslocal areas
+         * aren't being initialized correctly (Pascal-vs-asm field
+         * offset class). Bypass entirely for now — boot may reach
+         * INIT_DRIVER_SPACE / FS_CLEANUP without functional system
+         * processes. No args (parameterless). */
+        if (cpu->pc == 0x00004FAE) {
+            uint32_t sp = cpu->a[7] & 0xFFFFFF;
+            uint32_t ret = cpu_read32(cpu, sp);
+            cpu->a[7] += 4;  /* pop retPC */
+            cpu->pc = ret;
+            continue;
+        }
+        /* P34 HLE bypass: excep_setup (EXCEPNR1.TEXT:232) when called
+         * with a wild b_sloc_ptr (top byte set → can't be valid RAM).
+         * MAKE_PROCESS for non-first processes appears to pass an
+         * uninitialized syslocal pointer; the inner GETSPACE then
+         * fails → SYSTEM_ERROR(10207). Let the first call (valid
+         * b_sloc_ptr from INIT_PROCESS) execute normally. */
+        if (cpu->pc == 0x00074B6A) {
+            uint32_t sp = cpu->a[7] & 0xFFFFFF;
+            uint32_t arg = cpu_read32(cpu, sp + 4);
+            if (arg & 0xFF000000) {
+                uint32_t ret = cpu_read32(cpu, sp);
+                cpu->a[7] += 4 + 4;  /* pop retPC + arg */
+                cpu->pc = ret;
+                continue;
+            }
+        }
         /* P33 HLE bypass: REG_OPEN_LIST (fsui1.text:1071). Walks
          * mounttable[device]^.openchain — same Pascal-vs-asm
          * sentinel-init class as QUEUE_PR. Set ecode^:=0 and return. */
