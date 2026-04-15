@@ -2889,6 +2889,33 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         pc_ring[pc_ring_idx++ & 255] = cpu->pc;
         g_last_cpu_pc = cpu->pc;
 
+        /* P33 HLE bypass: REG_OPEN_LIST (fsui1.text:1071). Walks
+         * mounttable[device]^.openchain — same Pascal-vs-asm
+         * sentinel-init class as QUEUE_PR. Set ecode^:=0 and return. */
+        if (cpu->pc == 0x00087862) {
+            uint32_t sp = cpu->a[7] & 0xFFFFFF;
+            uint32_t ret    = cpu_read32(cpu, sp);
+            uint32_t ecode_addr = cpu_read32(cpu, sp + 4);  /* VAR ecode */
+            cpu_write16(cpu, ecode_addr, 0);                /* success */
+            cpu->a[7] += 4 /*retPC*/ + 4 /*ecode*/ + 2 /*device*/ + 2 /*oldrefnum*/ + 2 /*newrefnum*/ + 2 /*newrntype*/;
+            cpu->pc = ret;
+            continue;
+        }
+        /* P32 HLE bypass: QUEUE_PR (PROCASM.TEXT). Pascal vs asm
+         * record-offset mismatch — fwd_ReadyQ at A5-1116 (PASCALDEFS
+         * hardcoded) is uninitialized because Pascal puts it at a
+         * different offset, and PCB priority field offset (PRIORITY=12
+         * per PASCALDEFS) doesn't match Pascal's PCB layout either.
+         * RQSCAN spins forever walking a bogus queue. Skip the queue
+         * manipulation entirely — pop args + RTS.
+         * Stack: retPC(4) + queue_byte(2 with A7 align) + pcb_ptr(4). */
+        if (cpu->pc == 0x000E0A64) {
+            uint32_t sp = cpu->a[7] & 0xFFFFFF;
+            uint32_t ret = cpu_read32(cpu, sp);
+            cpu->a[7] += 10;  /* retPC + queue + pcb_ptr */
+            cpu->pc = ret;
+            continue;
+        }
         /* Track last-JSR/BSR/JMP source so we can identify the caller when
          * execution ends up in a garbage-code region. Captured before the
          * instruction executes, i.e. at the call-site PC. */

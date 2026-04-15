@@ -70,7 +70,43 @@ make audit-linker       # Stage 4: Full pipeline + linker
 cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' build 2>&1 | grep -E "(error:|BUILD)"
 ```
 
-## Current Status (2026-04-15 PM7)
+## Current Status (2026-04-15 PM8)
+
+### Fix (P32): HLE bypass QUEUE_PR (Pascal-vs-asm offset mismatch)
+
+`PROCASM.TEXT` `QUEUE_PR` walks the Ready queue using PASCALDEFS-
+hardcoded offsets (`PFWD_REA = A5-1116`, `PRIORITY = 12` into
+PCB). Pascal puts `fwd_ReadyQ` at a different A5 offset than
+PASCALDEFS expects, so `INIT_PROCESS`'s store
+`fwd_ReadyQ := c_pcb_ptr` writes to the Pascal-compiled offset
+(not A5-1116). The asm reads A5-1116, sees zero, walks into vector
+table garbage. PCB priority field is similarly off-offset, so
+D1=$E2FF (garbage) makes the BLE.S RQSCAN loop spin forever.
+
+Bypass: at `QUEUE_PR` entry ($E0A64), pop retPC + 6 bytes of args
+(byte queue + longword pcb_ptr) and jump straight to retPC. Skip
+scheduling entirely.
+
+### Fix (P33): HLE bypass REG_OPEN_LIST (same chain-walk class)
+
+`fsui1.text:1071 REG_OPEN_LIST` walks `mounttable[device]^.openchain`
+— same uninitialized-sentinel pattern as QUEUE_PR. After P32
+unblocked QUEUE_PR, boot parked here. Bypass at $087862: write
+`ecode^ := 0`, pop retPC + 12 bytes of args, jump to retPC.
+
+These two bypasses unlocked downstream init — boot now reaches
+**SYSTEM_ERROR(10207) = e_excep_setup** at `ret=$074D84` inside
+`excep_setup` (EXCEPNR1.TEXT:232). One of the 4 `crea_ecb` calls
+(per-process exception channel allocation) is returning
+`errnum != no_error`, so the procedure jumps to label 8 and
+calls `system_error(e_excep_setup)`. Likely a syslocal-pool issue
+specific to process creation, OR another Pascal-record-vs-asm
+offset mismatch in the syslocal/ecb layout.
+
+Milestones still 16/27 (the bypasses don't visibly cross a
+checkpoint), but the **failure mode has changed** from a tight
+spin to a Pascal-level error — real progress past two structural
+blockers.
 
 ### Fix (P31): proc-sig type-pointer remap by name (was dangling)
 
