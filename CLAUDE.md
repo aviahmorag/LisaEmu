@@ -70,6 +70,42 @@ make audit-linker       # Stage 4: Full pipeline + linker
 cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' build 2>&1 | grep -E "(error:|BUILD)"
 ```
 
+## Current Status (2026-04-15 PM14) — **25/27 milestones**
+
+### Fix (P62): extended PASCALDEFS pin table — major milestone unlock
+
+Added the remaining 17 A5-relative equates from
+`source-PASCALDEFS.TEXT.unix.txt` to the pin table in
+`pascal_codegen.c:process_var_decl` (P39 had only 12 pins).
+Key addition: `mmrb_addr: -25691`. Without it Pascal stored
+mmrb_addr at its natural A5 offset; asm (INSERTSDB etc.) read
+via PASCALDEFS MMRB_ADDR=A5-25691, got zero, spun on nil
+chains.
+
+**Result: 20 → 25 milestones (all legitimate).** Boot reaches
+PR_CLEANUP cleanly via real code execution; the final halt at
+SYSTEM_ERROR(10201) ret=\$01E4F8 is inside hard_excep and
+occurs AFTER PR_CLEANUP fires (expected since
+ENTER_SCHEDULER's idle loop takes an exception when no user
+processes are runnable — Shell loading isn't yet in scope).
+
+Only 2 missing: FS_INIT (case-4 skipped in BOOT_IO_INIT's for
+loop — P63 diagnosis below), SHELL + WS_MAIN (user apps,
+require separate compile targets per P58).
+
+### Diagnosis (P63): FS_INIT case-4 not reached
+
+Probed case-4 helpers in BOOT_IO_INIT. Reached:
+MAKE_BUILTIN, MAKE_NAME (case 1 or 2), PARAMEMINIT,
+INIT_BOOT_CDS, CONFIG_DOWN, LD_DISABLE, CLOCK_INIT. NOT
+reached: MAKE_DISK_INFO, DISKSYNC, INTSON (in case-4
+context), SETNMIKEY, SETTOGGLEKEY, INITUID, SET_PREFERENCES,
+FS_INIT. So the for-loop `for index := 0 to 8` enters only
+early cases and exits before index=4. Suspected: Pascal
+case-statement codegen bug OR early exit via uncaught error
+in case 1/2. Needs focused codegen audit on `case ... of`
+dispatch table emit.
+
 ## Current Status (2026-04-15 PM13)
 
 ### Fix (P57-P60): real-disk-mapped compile architecture
