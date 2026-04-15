@@ -3033,6 +3033,76 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             cpu->pc = ret;
             continue;
         }
+        /* P69 HLE: MAKE_DATASEG — dormant (if 0 gated). Tried during
+         * P35 retirement attempt; providing a fake seg_ptr unlocked
+         * SYS_PROC_INIT body past FS_Setup but hit F-line trap deeper
+         * in the chain. Need proper disk-I/O backing, not just a
+         * stub seg_ptr. Keep for future reference. */
+        if (0)
+        /* Original HLE body: */
+        /* P69 HLE: MAKE_DATASEG — our disk-I/O + segment-allocator chain
+         * returns garbage seg_ptr ($FF9C0000) to callers because our
+         * compiled DS_OPEN chain doesn't have functional disk backing.
+         * Provide a minimal HLE that hands back a valid (fake but
+         * addressable) segment pointer so Make_SProcess's
+         * Build_Syslocal/Build_Stack flow can continue.
+         *
+         * Signature: (var errnum: int2; var segname: pathname;
+         *             mem_size, disc_size: int4; var refnum: int2;
+         *             var segptr: int4; ldsn: int2; dstype: int2)
+         * Stack layout (args 28 bytes + retPC):
+         *   [SP+4]=errnum ptr, [SP+8]=segname ptr,
+         *   [SP+12]=mem_size, [SP+16]=disc_size,
+         *   [SP+20]=refnum ptr, [SP+24]=segptr ptr,
+         *   [SP+28]=ldsn word, [SP+30]=dstype word.
+         *
+         * We reserve a growing region at $CE0000+ (syslocmmu base) as
+         * our "fake segment pool" — each MAKE_DATASEG call gets a
+         * mem_size-aligned slot. Zero-fill for predictability. */
+        {
+            static uint32_t pc_mds = 0;
+            static int pgen = -1;
+            if (pgen != g_emu_generation) {
+                pc_mds = boot_progress_lookup("MAKE_DATASEG");
+                pgen = g_emu_generation;
+            }
+            if (pc_mds && cpu->pc == pc_mds) {
+                static uint32_t fake_next = 0;
+                DBGSTATIC(int, fake_gen, 0);
+                if (fake_gen != g_emu_generation) {
+                    fake_next = 0xCE2000;  /* start after syslocal pool */
+                    fake_gen = g_emu_generation;
+                }
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                uint32_t ret       = cpu_read32(cpu, sp);
+                uint32_t errnum_p  = cpu_read32(cpu, sp + 4);
+                uint32_t mem_size  = cpu_read32(cpu, sp + 12);
+                uint32_t refnum_p  = cpu_read32(cpu, sp + 20);
+                uint32_t segptr_p  = cpu_read32(cpu, sp + 24);
+
+                /* Round up mem_size to 512-byte page. */
+                if (mem_size == 0) mem_size = 0x1000;
+                mem_size = (mem_size + 0x1FF) & ~0x1FF;
+
+                uint32_t seg = fake_next;
+                fake_next += mem_size + 0x1000;  /* +page spacing */
+
+                /* Zero the region. */
+                for (uint32_t i = 0; i < mem_size && seg + i < 0xE00000; i++)
+                    cpu_write8(cpu, seg + i, 0);
+
+                if (errnum_p >= 0x400 && errnum_p < 0xFE0000)
+                    cpu_write16(cpu, errnum_p, 0);
+                if (refnum_p >= 0x400 && refnum_p < 0xFE0000)
+                    cpu_write16(cpu, refnum_p, 1);  /* dummy valid refnum */
+                if (segptr_p >= 0x400 && segptr_p < 0xFE0000)
+                    cpu_write32(cpu, segptr_p, seg);
+
+                cpu->a[7] += 4 + 28;
+                cpu->pc = ret;
+                continue;
+            }
+        }
         if (pc_SYS_PROC_INIT && cpu->pc == pc_SYS_PROC_INIT) {
             boot_progress_record_pc(cpu->pc);  /* P45: ensure milestone fires even though body skipped */
             uint32_t sp = cpu->a[7] & 0xFFFFFF;
