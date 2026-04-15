@@ -279,9 +279,37 @@ propagated to the mmrb declaration context.
    — sentinel self-reference works, Find_it's walk terminates,
    the Find_it/REG_OPEN_LIST HLE bypasses can be removed.
 
+### Fix (P29): two-pass compile — types pre-pass
+
+Root cause of the whole chain-walk class: cross-unit type references.
+source-MMPRIM.TEXT's mmrb record uses `semaphore` from
+source-procprims.text, but our compiler was processing MMPRIM BEFORE
+procprims, so `semaphore` resolved to NULL (size -1). Each unknown
+field then occupied only 2 bytes, shifting every subsequent field's
+offset. `hd_sdscb_list` landed at offset 16 instead of real 30 —
+sentinel stores wrote to wrong slot, Find_it chain walks spun.
+
+Fix (src/toolchain/toolchain_bridge.c): a types-only pre-pass before
+the real Pascal-compile loop. Every .text file runs through the
+parser + resolve_type + shared-types export, with codegen / globals
+/ proc-sigs / linker skipped. By the time the real compile pass
+begins, shared_types is fully populated.
+
+Verified via debug dump (removed after confirm):
+- Before: `RECORD(size=292) hd_qioreq_list@0(sz=4) seg_wait_sem@4(sz=-1) ... hd_sdscb_list@16`
+- After:  `RECORD(size=312) hd_qioreq_list@0(sz=4) seg_wait_sem@4(sz=8) memmgr_sem@12(sz=8) ... hd_sdscb_list@30`
+
+Boot now fails at **SYSTEM_ERROR(10701) = stup_nospace** (GETSPACE
+failed) during BOOT_IO_INIT's builtin-device init loop — a real
+Pascal-level pool-allocator error, NOT a chain-walk spin. That
+confirms sentinels work and chain walks terminate. Next session
+needs to trace the GETSPACE bookkeeping.
+
+Audit: 100% clean (8711/8711 symbols, 382 modules, link OK).
+
 ### Session progress summary (2026-04-15 PM6)
 
-Milestones reached in this session (P23–P28):
+Milestones reached in this session (P23–P29):
 - P23: proc-local TYPE + array CONST bounds + WITH-field array
        element size (VEC-WRITE 30→0).
 - P24: ENTER_LOADER HLE.
