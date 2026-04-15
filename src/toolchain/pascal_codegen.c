@@ -2493,16 +2493,26 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                 emit16(cg, (uint16_t)(int16_t)(var ? var->offset : 0));
             }
 
-            /* Evaluate end value, save in D3 (size-aware) */
+            /* P75: evaluate end value and PUSH onto stack (not D3).
+             * Previously we kept end value in D3 across the body, but
+             * any proc call inside the body (or case statement) can
+             * clobber D3, causing the next iteration's CMP to use
+             * garbage and the loop to exit early. Push to stack; reload
+             * into D3 before each CMP; pop at loop exit. */
             int vsz = type_load_size(var ? var->type : NULL);
             gen_expression(cg, node->children[1]);
             if (vsz == 4)
-                emit16(cg, 0x2600);  /* MOVE.L D0,D3 */
+                emit16(cg, 0x2F00);  /* MOVE.L D0,-(SP) */
             else
-                emit16(cg, 0x3600);  /* MOVE.W D0,D3 */
+                emit16(cg, 0x3F00);  /* MOVE.W D0,-(SP) */
 
             /* Loop start */
             uint32_t loop_start = cg->code_size;
+
+            /* Reload end value into D3 from stack top. */
+            if (vsz == 4) emit16(cg, 0x262F);  /* MOVE.L 0(SP),D3 */
+            else          emit16(cg, 0x362F);  /* MOVE.W 0(SP),D3 */
+            emit16(cg, 0);
 
             /* Compare loop var to end (size-aware) */
             if (var) {
@@ -2550,6 +2560,9 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
 
             align_code(cg);
             patch16(cg, end_pos, (uint16_t)(cg->code_size - end_pos));
+            /* Pop the end value we pushed at loop entry. */
+            if (vsz == 2)      emit16(cg, 0x544F);  /* ADDQ.W #2,A7 */
+            else if (vsz == 4) emit16(cg, 0x588F);  /* ADDQ.L #4,A7 */
             break;
         }
 

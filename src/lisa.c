@@ -2863,6 +2863,20 @@ static bool hle_handle_system_error(lisa_t *lisa __attribute__((unused)), m68k_t
         cpu->cycles += 20;
         return true;
     }
+    /* P75: Error 10707 = stup_fsinit — filesystem init couldn't
+     * complete. Our disk has no real filesystem catalog, so FS_INIT
+     * legitimately fails. Suppress so BOOT_IO_INIT can continue
+     * past the case-4 body to subsequent cases and the post-loop
+     * flow (SYS_PROC_INIT bypass etc). */
+    if (err_code == 10707) {
+        fprintf(stderr, "HLE: Suppressing SYSTEM_ERROR(%d) — filesystem init handled\n",
+                err_code);
+        cpu->a[7] += 4;
+        cpu->a[7] += 2;
+        cpu->pc = ret_addr;
+        cpu->cycles += 20;
+        return true;
+    }
 
     /* SYSTEM_ERROR should halt — it never returns on a real Lisa.
      * Stop the CPU to prevent infinite recursion. */
