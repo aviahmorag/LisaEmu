@@ -114,6 +114,41 @@ area where an illegal \$FFFF word sits.
 
 Baseline (P35 enabled): 20/27 milestones, audit 100% clean.
 
+### Next blocker diagnosed (P55, not yet fixed): physical-RAM collision between code and supervisor stack
+
+With P54 + P35 off, boot now halts at SYSTEM_ERROR(10204) from
+an F-line trap at faultPC=$0DDDD8 (A5SETUP). Probing the INTSON
+body at runtime shows ~10 bytes of the procedure are literally
+overwritten with exception-frame bytes (`$271C $000D $DDD8
+$0700 $FFFF ...` — SR + PC + stack data):
+
+```
+Expected (from mover.text:243):
+$0DDDC4: 205F 40C0 C07C 2000 6604 805F 4E4F 805F 46C0 4ED0 (INTSON)
+$0DDDD8: 2878 xxxx 2A6D xxxx 4E75                         (A5SETUP)
+
+Observed at runtime:
+$0DDDC4: 205F 40C0 C07C 2000 6604 0000 271C 000D DDD8 0700
+$0DDDD8: FFFF 0000 0000 0700 00CA ...                    (← F-line)
+```
+
+Root cause: the supervisor stack's virtual address maps to a
+physical RAM page that shares physical RAM with the code segment
+containing INTSON/A5SETUP. Each exception push clobbers the code
+bytes. Same class as the P30 fix (where we grew `l_sysglobal` to
+avoid stack/globals collision).
+
+Attempted bypass: HLE INTSON to pop args + RTS. Moved the spin
+elsewhere — caller kept re-JSRing INTSON in a tight loop (likely
+because something earlier in the flow needed real SR restoration).
+
+**Next session plan**: investigate MMU/segment layout. The
+supervisor stack's virt→phys mapping shouldn't land on code
+pages. Either the SSP is wrong at setup, or a segment's origin
+overlaps. Check `l_sysglobal`, stack segment allocation in
+startup, and whether the stk_info for the MemMgr process is
+initializing with a valid segment-relative stack.
+
 ### Earlier diagnosis (prior round, now resolved by P54): Build_Syslocal epilogue corrupts stack
 
 Structural `P48` (subrange-word) + dynamic HLE lookup (`P42`)
