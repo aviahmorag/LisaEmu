@@ -157,7 +157,21 @@ static bool is_kernel_module(const char *path) {
 static type_desc_t shared_types[MAX_SHARED_TYPES];
 static int num_shared_types = 0;
 
+/* When `types_only_pass` is true, parse the file and export its TYPE/CONST
+ * decls to the shared tables so subsequent files can resolve cross-unit
+ * named types (e.g. `semaphore` from source-procprims.text.unix.txt
+ * referenced by source-MMPRIM.TEXT's mmrb record). Doesn't emit code
+ * or push to the linker. Fixes the compile-order issue where a file
+ * using another unit's types compiles BEFORE that unit, producing
+ * records whose field types have `size=-1` (NULL type ptr), leading
+ * to wrong overall record size and miscompiled sentinel stores. */
+static bool compile_pascal_file_impl(const char *path, linker_t *lk, bool types_only_pass);
+
 static bool compile_pascal_file(const char *path, linker_t *lk) {
+    return compile_pascal_file_impl(path, lk, false);
+}
+
+static bool compile_pascal_file_impl(const char *path, linker_t *lk, bool types_only_pass) {
     char *source = read_file(path);
     if (!source) return false;
 
@@ -228,12 +242,15 @@ static bool compile_pascal_file(const char *path, linker_t *lk) {
 
     codegen_generate(cg, ast);
 
-    if (is_startup) {
+    if (is_startup && !types_only_pass) {
         fprintf(stderr, "STARTUP CODEGEN: %u bytes code, %d globals, %d relocs\n",
                 cg->code_size, cg->num_globals, cg->num_relocs);
     }
 
-    /* Export this file's globals to the shared table for cross-unit access */
+    /* Export this file's globals to the shared table for cross-unit access.
+     * Skip on the types-only pass — second-pass real compile does the
+     * export and we don't want duplicates. */
+    if (!types_only_pass)
     for (int i = 0; i < cg->num_globals && num_shared_globals < MAX_SHARED_GLOBALS; i++) {
         if (!cg->globals[i].is_external && !cg->globals[i].is_forward) {
             shared_globals[num_shared_globals++] = cg->globals[i];
@@ -241,12 +258,15 @@ static bool compile_pascal_file(const char *path, linker_t *lk) {
     }
 
     /* Export this file's types to the shared table for cross-unit type casts.
-     * We must export ALL types (including anonymous ones like inline array types)
-     * because globals and named types may reference them via pointers
-     * (element_type, base_type, fields[].type, set_base). After copying,
-     * we remap all internal pointers from the old cg->types[] addresses
-     * to the new shared_types[] addresses so they survive codegen_free(). */
+     * On the types-only pre-pass, this is where the whole scheme pays off.
+     * On the real (second) pass, types for this file are already in
+     * shared_types from the pre-pass — re-exporting would duplicate them
+     * and find_type's first-match could pick up the new copy that still
+     * has stale NULL pointers from AST nodes destined for reparse. So
+     * only export on the pre-pass; the second pass uses the pre-pass's
+     * fully-resolved types by reference. */
     int types_base = num_shared_types;  /* index where this file's types start */
+    if (!types_only_pass) goto skip_type_export;
     {
         /* Phase 1: copy all types */
         for (int i = 0; i < cg->num_types && num_shared_types < MAX_SHARED_TYPES; i++) {
@@ -280,10 +300,12 @@ static bool compile_pascal_file(const char *path, linker_t *lk) {
         #undef IN_CG_TYPES
         #undef REMAP_TYPE_PTR
     }
+skip_type_export:;
 
     /* Export this file's procedure signatures to the shared table.
-     * Remap param_type pointers from cg->types[] to shared_types[]. */
-    if (cg->proc_sigs) {
+     * Skip on types-only pass — re-exporting on second pass would
+     * duplicate entries. */
+    if (cg->proc_sigs && !types_only_pass) {
         for (int i = 0; i < cg->num_proc_sigs && num_shared_proc_sigs < MAX_SHARED_PROC_SIGS; i++) {
             cg_proc_sig_t *sig = &shared_proc_sigs[num_shared_proc_sigs++];
             *sig = cg->proc_sigs[i];
@@ -301,7 +323,7 @@ static bool compile_pascal_file(const char *path, linker_t *lk) {
     }
 
     bool ok = true;
-    if (cg->code_size > 0) {
+    if (cg->code_size > 0 && !types_only_pass) {
         ok = linker_load_codegen(lk, path,
                                   cg->code, cg->code_size,
                                   cg->globals, cg->num_globals,
@@ -508,6 +530,27 @@ build_result_t toolchain_build(const char *source_dir,
             break;
         }
     }
+
+    /* Phase 0: types-only pre-pass. Without this, units that reference
+     * types declared in later-compiled units (e.g. source-MMPRIM.TEXT's
+     * mmrb field `seg_wait_sem: semaphore` — semaphore is in
+     * source-procprims.text which compiles later) produce records
+     * whose field types are NULL. Record layout degrades: each unknown
+     * field occupies only 2 bytes, so hd_sdscb_list's offset is 14
+     * bytes short of the real layout and all its sentinel-init stores
+     * land in wrong slots. By pre-running every Pascal file in
+     * types-only mode, shared_types is fully populated before the
+     * real code-emit pass. */
+    for (int i = 0; i < num_files; i++) {
+        if (files[i].is_assembly) continue;
+        if (i == startup_idx) continue;
+        compile_pascal_file_impl(files[i].path, lk, true);
+    }
+    if (startup_idx >= 0) {
+        compile_pascal_file_impl(files[startup_idx].path, lk, true);
+    }
+    fprintf(stderr, "Types-only pre-pass complete: %d shared types, %d shared globals (constants)\n",
+            num_shared_types, num_shared_globals);
 
     /* Phase 1: Compile Pascal files — STARTUP last */
     int pascal_count = 0, pascal_ok = 0, pascal_fail = 0;
