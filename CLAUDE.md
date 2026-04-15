@@ -202,9 +202,23 @@ computation.
   `with c_mmrb^ do ... with head_sdb do ... memchain.fwd_link :=
   @memchain.fwd_link` silently stored to address 0 with wrong
   width; head_sdb stayed all zeros; INSERTSDB spun. Fix: fall
-  back to with_lookup_field in all three paths. Boot now advances
-  past first INSERTSDB walk; more width bugs remain in
-  MAKE_FREE/INSERTSDB.
+  back to with_lookup_field in all three paths.
+- P14: ptr.field^.subfield width/offset resolution. P_ENQUEUE
+  (MM0.TEXT:207) `newlink.fwd_link^.bkwd_link := @newlink`
+  compiled to MOVE.W (2-byte) stores instead of MOVE.L. Fix:
+  extend expr_size + gen_lvalue_addr's AST_FIELD_ACCESS handling
+  to recursively resolve the base type when children[0] is
+  AST_DEREF whose pointer is itself an AST_FIELD_ACCESS.
+- P15: Pascal variant records — parser previously kept only the
+  largest variant arm, dropping fields from smaller arms (e.g.
+  `freechain` in codesdb's `free` arm). Fix: emit ALL variant
+  fields bracketed by `__variant_begin__` / `__variant_arm__` /
+  `__variant_end__` sentinels; type builder resets offset at
+  each arm boundary so arms overlap (proper Pascal semantics).
+
+Boot now passes MM_INIT head_sdb init + first INSERTSDB walk.
+New blocker: SYSTEM_ERROR(10701) from GET_BOOTSPACE's GETFREE
+call (STARTUP.TEXT:1171) — free chain or CONFIG_DOWN flow.
 - Memory layout: himem = b_dbscreen, bothimem = lomem.
 
 **Key progress (2026-04-12):**
