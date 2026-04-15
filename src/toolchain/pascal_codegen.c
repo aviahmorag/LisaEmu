@@ -1258,6 +1258,86 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
             int opsz = expr_size(cg, node);
             bool use_long = (opsz == 4);
 
+            /* Pascal string equality: `s = 'literal'` or `s1 = s2` where
+             * at least one side is a string literal (or a known TK_STRING
+             * operand > 4 bytes). Without this the codegen below treats
+             * string fields as 2-byte scalars and emits CMP.L vs a pointer
+             * to the literal — never equal, so tests like
+             * `configinfo[i]^.devname = 'BITBKT'` always return false. */
+            if ((node->op == TOK_EQ || node->op == TOK_NE)) {
+                ast_node_t *lhs_n = node->children[0];
+                ast_node_t *rhs_n = node->children[1];
+                /* Either side being a STRING_LITERAL is a strong signal:
+                 * Pascal only allows `=`/`<>` against a string literal when
+                 * the other side is also a string. expr_size's heuristic
+                 * (size > 4) misses many cases where the field type didn't
+                 * resolve (e.g. `configinfo[i]^.devname`'s AST path with
+                 * array-access-inside-deref), so use "has a string literal"
+                 * as the trigger. */
+                bool l_is_str = (lhs_n->type == AST_STRING_LITERAL) ||
+                                (expr_size(cg, lhs_n) > 4);
+                bool r_is_str = (rhs_n->type == AST_STRING_LITERAL) ||
+                                (expr_size(cg, rhs_n) > 4);
+                if (l_is_str || r_is_str) {
+                    /* Load LHS address into A0; RHS address into A1.
+                     * For STRING_LITERAL, gen_expression returns a pointer
+                     * in D0. For an lvalue (field/var/array), use
+                     * gen_lvalue_addr to get an address in A0. */
+                    if (lhs_n->type == AST_STRING_LITERAL) {
+                        gen_expression(cg, lhs_n);
+                        emit16(cg, 0x2040);  /* MOVEA.L D0,A0 */
+                    } else {
+                        gen_lvalue_addr(cg, lhs_n);
+                    }
+                    emit16(cg, 0x2F08);  /* MOVE.L A0,-(SP)  save LHS ptr */
+                    if (rhs_n->type == AST_STRING_LITERAL) {
+                        gen_expression(cg, rhs_n);
+                        emit16(cg, 0x2240);  /* MOVEA.L D0,A1 */
+                    } else {
+                        gen_lvalue_addr(cg, rhs_n);
+                        emit16(cg, 0x2248);  /* MOVEA.L A0,A1 */
+                    }
+                    emit16(cg, 0x205F);  /* MOVEA.L (SP)+,A0  restore LHS */
+                    /* Inline byte-compare:
+                     *     MOVE.B (A0)+,D2       ; lhs length
+                     *     MOVE.B (A1)+,D1       ; rhs length
+                     *     CMP.B  D1,D2
+                     *     BNE    .ne            ; lengths differ → not equal
+                     *     TST.B  D2
+                     *     BEQ    .eq            ; both empty
+                     * .loop:
+                     *     CMP.B  (A0)+,(A1)+
+                     *     BNE    .ne
+                     *     SUBQ.B #1,D2
+                     *     BNE    .loop
+                     * .eq: MOVEQ #1,D0 ; BRA .done
+                     * .ne: MOVEQ #0,D0
+                     * .done:
+                     * For TOK_NE, EOR #1,D0 at the end. */
+                    emit16(cg, 0x1418);  /* MOVE.B (A0)+,D2 */
+                    emit16(cg, 0x1219);  /* MOVE.B (A1)+,D1 */
+                    emit16(cg, 0xB401);  /* CMP.B D1,D2 */
+                    emit16(cg, 0x660E);  /* BNE.S +14  → .ne */
+                    emit16(cg, 0x4A02);  /* TST.B D2 */
+                    emit16(cg, 0x670A);  /* BEQ.S +10  → .eq */
+                    /* .loop: */
+                    emit16(cg, 0xB308);  /* CMPM.B (A0)+,(A1)+ */
+                    emit16(cg, 0x6606);  /* BNE.S +6 → .ne */
+                    emit16(cg, 0x5302);  /* SUBQ.B #1,D2 */
+                    emit16(cg, 0x66F8);  /* BNE.S -8 → .loop */
+                    /* .eq: */
+                    emit16(cg, 0x7001);  /* MOVEQ #1,D0 */
+                    emit16(cg, 0x6002);  /* BRA.S +2  → .done */
+                    /* .ne: */
+                    emit16(cg, 0x7000);  /* MOVEQ #0,D0 */
+                    /* .done */
+                    if (node->op == TOK_NE) {
+                        emit16(cg, 0x0A40); emit16(cg, 0x0001);  /* EORI.W #1,D0 */
+                    }
+                    break;
+                }
+            }
+
             gen_expression(cg, node->children[0]);
             /* If using 32-bit ops but left operand is 16-bit, sign-extend.
              * MOVE.W ea,D0 only sets D0[15:0]; the stale upper word corrupts
