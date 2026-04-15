@@ -70,7 +70,61 @@ make audit-linker       # Stage 4: Full pipeline + linker
 cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' build 2>&1 | grep -E "(error:|BUILD)"
 ```
 
-## Current Status (2026-04-15 PM8)
+## Current Status (2026-04-15 PM9)
+
+### Fix (P39): PASCALDEFS-pin globals to hardcoded A5 offsets — structural foundation
+
+Root-cause class retired (for globals): Pascal's natural A5-relative
+placement for globals didn't match `source-PASCALDEFS.TEXT`
+hardcoded offsets used by asm (e.g. `PFWD_REA .EQU -1116`). Added an
+explicit pin table in `process_var_decl` (pascal_codegen.c):
+
+```c
+{ "fwd_ReadyQ",     -1116 },  /* PFWD_REA */
+{ "bkwd_ReadyQ",    -1120 },
+{ "fwd_BlockQ",     -1108 },  /* PFWD_BLO */
+{ "bkwd_BlockQ",    -1112 },
+{ "b_syslocal_ptr", -24785 },
+{ "Invoke_sched",   -24786 },
+{ "sct_ptr",        -24781 },
+{ "c_pcb_ptr",      -24617 },
+{ "sysA5",          -24613 },
+{ "port_cb_ptrs",   -24609 },
+{ "size_sglobal",   -24577 },
+{ "sg_free_pool_addr", -24575 },
+```
+
+**Verified**: runtime check at `QUEUE_PR` entry shows
+`PFWD_REA(A5-1116)` now contains `$00CCB512` (valid sysglobal
+pointer) vs `$00000000` pre-P39. INIT_PROCESS's
+`fwd_ReadyQ := c_pcb_ptr` lands at the asm-expected slot.
+
+**Follow-on needed**: the QUEUE_PR spin isn't fully retired yet.
+With P35 bypass off, RQSCAN now terminates the queue-walk
+structurally (chain self-references correctly) but still loops
+because the NEW PCB's priority field at offset 12 reads `$E2FF`
+instead of `$00FA` — PCB field layout matches PASCALDEFS
+(`PRIORITY=12`) per PCB-LAYOUT dump, but the VALUE at runtime is
+wrong. Root cause pending: either `priValue` push-width bug in
+the MAKE_SPROCESS caller, or a later write corrupts byte 12.
+
+Boot: 19/27 milestones (unchanged), parked at
+`SYSTEM_ERROR(10201)` after PR_CLEANUP. P32 QUEUE_PR bypass
+disabled (`if(0)`) since current path (via P35 bypass) doesn't
+exercise it.
+
+### HLE bypass stack (tactical, to be retired by structural work)
+
+Active bypasses gating further progress:
+- **P33** (`REG_OPEN_LIST` $087862): mounttable chain walk.
+- **P34** (`excep_setup` $074B6A): when called with wild `b_sloc_ptr`.
+- **P35** (`SYS_PROC_INIT` $004FAE): full system-process creation.
+- **P36** (`MEM_CLEANUP` $0AC4CC): fires milestone 19, bypasses body.
+- **P37** (`FS_CLEANUP` $082E12): fires milestone 18, bypasses body.
+- **P38** (`PR_CLEANUP` $00518A): fires milestone 20, bypasses body.
+
+Inactive (superseded by P39):
+- **P32** (`QUEUE_PR` $0E0A64): disabled.
 
 ### Fix (P32): HLE bypass QUEUE_PR (Pascal-vs-asm offset mismatch)
 
