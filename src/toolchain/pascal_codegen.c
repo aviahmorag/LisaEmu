@@ -1916,6 +1916,13 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                         (wrt->fields[fld].type->kind == TK_POINTER ||
                          (wrt->fields[fld].type->kind == TK_LONGINT && fsz < 4)))
                         fsz = rhs_sz;
+                    /* Widen narrow RHS to match a longint/pointer field so the
+                     * upper 16 bits of D0 aren't stale scratch. Mirrors ORD4. */
+                    if (fsz == 4 && rhs_sz < 4 && wrt->fields[fld].type &&
+                        (wrt->fields[fld].type->kind == TK_LONGINT ||
+                         wrt->fields[fld].type->kind == TK_POINTER)) {
+                        emit16(cg, 0x48C0);  /* EXT.L D0 */
+                    }
                     if (fsz == 4) {
                         emit16(cg, 0x2F00);  /* MOVE.L D0,-(SP) save RHS */
                     } else {
@@ -1947,6 +1954,13 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                         (sym->type->kind == TK_POINTER ||
                          (sym->type->kind == TK_LONGINT && sz < 4)))
                         sz = rhs_sz;
+                    /* Narrow RHS → wide longint/pointer LHS: sign-extend to
+                     * prevent stale upper word. */
+                    if (sz == 4 && rhs_sz < 4 && sym->type &&
+                        (sym->type->kind == TK_LONGINT ||
+                         sym->type->kind == TK_POINTER)) {
+                        emit16(cg, 0x48C0);  /* EXT.L D0 */
+                    }
                     int depth = find_local_depth(cg, lhs->name);
                     if (depth > 0) {
                         emit16(cg, 0x2200);  /* MOVE.L D0,D1 — save value */
@@ -1971,6 +1985,12 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                         (sym->type->kind == TK_POINTER ||
                          (sym->type->kind == TK_LONGINT && sz < 4)))
                         sz = rhs_sz;
+                    /* Narrow RHS → wide longint/pointer LHS: sign-extend. */
+                    if (sz == 4 && rhs_sz < 4 && sym->type &&
+                        (sym->type->kind == TK_LONGINT ||
+                         sym->type->kind == TK_POINTER)) {
+                        emit16(cg, 0x48C0);  /* EXT.L D0 */
+                    }
                     if (depth > 0) {
                         /* Outer scope: save D0, get frame, write via A0 */
                         emit16(cg, 0x2200);  /* MOVE.L D0,D1 — save value */
@@ -1995,6 +2015,12 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                         (sym->type->kind == TK_POINTER ||
                          (sym->type->kind == TK_LONGINT && sz < 4)))
                         sz = rhs_sz;
+                    /* Narrow RHS → wide longint/pointer global: sign-extend. */
+                    if (sz == 4 && rhs_sz < 4 && sym->type &&
+                        (sym->type->kind == TK_LONGINT ||
+                         sym->type->kind == TK_POINTER)) {
+                        emit16(cg, 0x48C0);  /* EXT.L D0 */
+                    }
                     if (sz == 4) emit16(cg, 0x2B40);
                     else if (sz == 1) emit16(cg, 0x1B40);
                     else emit16(cg, 0x3B40);  /* MOVE.W D0,offset(A5) */
@@ -2006,6 +2032,13 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                  * so no unconditional widening — that overwrites adjacent fields. */
                 int sz = expr_size(cg, lhs);
                 if (sz > 4) sz = 4;
+                /* Narrow RHS → wide longint/pointer target via field/array:
+                 * the element type drives sz, so when sz=4 but rhs_sz<4 and
+                 * the load was MOVE.W, the upper word of D0 is stale. EXT.L
+                 * sign-extends to a proper 32-bit value. */
+                if (sz == 4 && rhs_sz < 4) {
+                    emit16(cg, 0x48C0);  /* EXT.L D0 */
+                }
                 if (sz == 4) {
                     emit16(cg, 0x2F00);  /* MOVE.L D0,-(SP) */
                     gen_lvalue_addr(cg, lhs);

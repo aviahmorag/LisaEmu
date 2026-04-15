@@ -72,6 +72,35 @@ cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' bui
 
 ## Current Status (2026-04-15)
 
+### Fix (P19): narrow RHS → wide longint/pointer stores now sign-extend
+
+When Pascal compiles `count := pages` where `count : longint` and
+`pages : integer`, our codegen emitted `MOVE.W pages → D0` then
+`MOVE.L D0 → count` — but D0's upper 16 bits were stale scratch from
+the previous operation. Result: `count = (pages << 16) | garbage`.
+In LD_READSEQ this produced `count = 65739` for `pages = 1`, causing
+the loader HLE to attempt a 32MB disk read and corrupt the TRAP
+handler frame, crashing the emulator.
+
+Fix: emit `EXT.L D0` (sign-extend 16→32) immediately before any
+MOVE.L store when:
+- The LHS type is `TK_LONGINT` or `TK_POINTER`,
+- Store width is 4, but RHS expression width is < 4.
+
+Applied symmetrically in four assignment paths (pascal_codegen.c,
+AST_ASSIGN case):
+1. WITH-field stores (~L1920)
+2. VAR-param writes (~L1960)
+3. Local / non-global writes (~L1990)
+4. Global-var writes (~L2010)
+5. Complex LHS (array/field/deref) writes (~L2025)
+
+Boot now passes PASCALINIT, reaches a new blocker: tight loop inside
+**INSERTSDB at `$0A38AA-$0A38D8`** with IPL=4. INSERTSDB is being
+called from a much later code path than the earlier P13 MM_INIT
+case — likely another list-walk over an uninitialized field. Next
+session to diagnose.
+
 ### Fix (P18): LOADER TRAP HLE uses MMU-translated reads/writes
 
 Pre-fix, the loader-trap port handler (src/lisa.c:815) indexed
