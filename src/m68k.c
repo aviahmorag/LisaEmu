@@ -2860,7 +2860,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             /* Log entry/exit of MM_INIT and GETSPACE calls within it,
              * to see whether mmrb_addr gets written. */
             DBGSTATIC(int, mminit_state, 0); /* 0=before, 1=inside */
-            if (cpu->pc == 0xA7056 && mminit_state == 0) {
+            if (cpu->pc == 0xA71E0 && mminit_state == 0) {
                 mminit_state = 1;
                 fprintf(stderr, "=== ENTER MM_INIT @ $A69F2, mmrb_addr sysglobal value = ?\n");
                 /* dump the global mmrb_addr location — we need to know where it lives.
@@ -2919,7 +2919,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             }
 
             DBGSTATIC(int, gs_count, 0);
-            if (cpu->pc == 0x5CE6 && mminit_state == 1 && gs_count < 4) {
+            if (cpu->pc == 0x5CEA && mminit_state == 1 && gs_count < 4) {
                 gs_count++;
                 /* GETSPACE signature: function GETSPACE(size: longint; ptrsysg: absptr; var addr: longint): boolean;
                  * params pushed right-to-left: var addr (4 bytes, ADDRESS), ptrsysg (4), size (4), return slot (2 or 4).
@@ -2931,9 +2931,21 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 for (int off = 4; off <= 20; off += 2)
                     fprintf(stderr, "    SP+%2d = $%08X\n", off, cpu_read32(cpu, sp + off));
             }
+            /* Dump P_ENQUEUE ($A1B00) prologue on first call */
+            DBGSTATIC(int, penq_dumped, 0);
+            if (cpu->pc == 0xA1C82 && !penq_dumped) {
+                penq_dumped = 1;
+                fprintf(stderr, "=== P_ENQUEUE bytes at $A1B00-$A1B5F:");
+                for (int b = 0; b < 96; b += 2) {
+                    if (b % 32 == 0) fprintf(stderr, "\n   $%06X: ", 0xA1B00 + b);
+                    fprintf(stderr, " %04X", cpu_read16(cpu, 0xA1B00 + b));
+                }
+                fprintf(stderr, "\n");
+            }
+
             /* Dump head_sdb sentinels at $CCA020 on first INSERTSDB entry */
             DBGSTATIC(int, sentinel_dumped, 0);
-            if (cpu->pc == 0xA1D5C && !sentinel_dumped) {
+            if (cpu->pc == 0xA1EE6 && !sentinel_dumped) {
                 sentinel_dumped = 1;
                 fprintf(stderr, "=== head_sdb sentinels at $CCA020 (should be self-refs):\n");
                 for (int off = 0; off < 40; off += 4) {
@@ -2944,7 +2956,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
 
             /* Dump the first 32 bytes of INSERTSDB ($A17A0) on first entry */
             DBGSTATIC(int, insertsdb_dumped, 0);
-            if (cpu->pc == 0xA1D5C && !insertsdb_dumped) {
+            if (cpu->pc == 0xA1EE6 && !insertsdb_dumped) {
                 insertsdb_dumped = 1;
                 fprintf(stderr, "=== INSERTSDB prologue bytes at $A17A0-$A17BF:");
                 for (int b = 0; b < 32; b += 2)

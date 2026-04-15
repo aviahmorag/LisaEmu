@@ -195,6 +195,16 @@ computation.
 - P12: true/false/nil inside WITH blocks — the WITH fallthrough
   handler emitted MOVE.W #0 instead of checking for built-in
   constants. Every `x := true` inside a WITH block stored false.
+- P13: WITH-field bases in nested WITH blocks. Three paths in
+  pascal_codegen.c (AST_WITH type resolution, expr_size
+  FIELD_ACCESS, gen_lvalue_addr FIELD_ACCESS) didn't resolve
+  identifiers that are fields of an outer WITH record. MM_INIT's
+  `with c_mmrb^ do ... with head_sdb do ... memchain.fwd_link :=
+  @memchain.fwd_link` silently stored to address 0 with wrong
+  width; head_sdb stayed all zeros; INSERTSDB spun. Fix: fall
+  back to with_lookup_field in all three paths. Boot now advances
+  past first INSERTSDB walk; more width bugs remain in
+  MAKE_FREE/INSERTSDB.
 - Memory layout: himem = b_dbscreen, bothimem = lomem.
 
 **Key progress (2026-04-12):**

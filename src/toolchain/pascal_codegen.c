@@ -618,6 +618,47 @@ static int expr_size(codegen_t *cg, ast_node_t *node) {
                         ptr_sym->type->base_type) {
                         rt = ptr_sym->type->base_type;
                         if (rt->kind == TK_POINTER && rt->base_type) rt = rt->base_type;
+                    } else if (!ptr_sym && cg->with_depth > 0) {
+                        /* WITH field whose value is a pointer: p^.f */
+                        type_desc_t *wrt = NULL;
+                        int fld = with_lookup_field(cg, ptr_node->name, &wrt, NULL);
+                        if (fld >= 0 && wrt) {
+                            type_desc_t *ft = wrt->fields[fld].type;
+                            if (ft && ft->kind == TK_POINTER && ft->base_type)
+                                rt = ft->base_type;
+                        }
+                    }
+                } else if (ptr_node && ptr_node->type == AST_FIELD_ACCESS) {
+                    /* `rec.field^.subfield` — resolve rec.field's type.
+                     * rec.field has pointer type ptr_p; dereferenced yields p;
+                     * .subfield lookup needs p. */
+                    ast_node_t *fa = ptr_node;
+                    type_desc_t *base = NULL;
+                    if (fa->children[0] && fa->children[0]->type == AST_IDENT_EXPR) {
+                        cg_symbol_t *bs = find_symbol_any(cg, fa->children[0]->name);
+                        if (bs && bs->type) {
+                            base = bs->type;
+                            if (base->kind == TK_POINTER && base->base_type)
+                                base = base->base_type;
+                        } else if (!bs && cg->with_depth > 0) {
+                            type_desc_t *wrt = NULL;
+                            int wfld = with_lookup_field(cg, fa->children[0]->name, &wrt, NULL);
+                            if (wfld >= 0 && wrt) {
+                                base = wrt->fields[wfld].type;
+                                if (base && base->kind == TK_POINTER && base->base_type)
+                                    base = base->base_type;
+                            }
+                        }
+                    }
+                    if (base && base->kind == TK_RECORD) {
+                        for (int i = 0; i < base->num_fields; i++) {
+                            if (str_eq_nocase(base->fields[i].name, fa->name)) {
+                                type_desc_t *ft = base->fields[i].type;
+                                if (ft && ft->kind == TK_POINTER && ft->base_type)
+                                    rt = ft->base_type;
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -867,16 +908,60 @@ static void gen_lvalue_addr(codegen_t *cg, ast_node_t *node) {
         } else if (node->children[0]->type == AST_DEREF) {
             /* p^.field — the deref child has the pointer variable */
             ast_node_t *ptr_node = node->children[0]->children[0];
+            type_desc_t *rec_type = NULL;
             if (ptr_node && ptr_node->type == AST_IDENT_EXPR) {
                 cg_symbol_t *ptr_sym = find_symbol_any(cg, ptr_node->name);
                 if (ptr_sym && ptr_sym->type && ptr_sym->type->kind == TK_POINTER &&
                     ptr_sym->type->base_type && ptr_sym->type->base_type->kind == TK_RECORD) {
-                    type_desc_t *rt = ptr_sym->type->base_type;
-                    for (int fi = 0; fi < rt->num_fields; fi++) {
-                        if (str_eq_nocase(rt->fields[fi].name, node->name)) {
-                            field_off = rt->fields[fi].offset;
+                    rec_type = ptr_sym->type->base_type;
+                } else if (!ptr_sym && cg->with_depth > 0) {
+                    /* WITH field whose type is a pointer to a record */
+                    type_desc_t *wrt = NULL;
+                    int wfld = with_lookup_field(cg, ptr_node->name, &wrt, NULL);
+                    if (wfld >= 0 && wrt) {
+                        type_desc_t *ft = wrt->fields[wfld].type;
+                        if (ft && ft->kind == TK_POINTER && ft->base_type &&
+                            ft->base_type->kind == TK_RECORD)
+                            rec_type = ft->base_type;
+                    }
+                }
+            } else if (ptr_node && ptr_node->type == AST_FIELD_ACCESS) {
+                /* rec.field^.subfield — resolve rec.field's pointer type. */
+                ast_node_t *fa = ptr_node;
+                type_desc_t *base = NULL;
+                if (fa->children[0] && fa->children[0]->type == AST_IDENT_EXPR) {
+                    cg_symbol_t *bs = find_symbol_any(cg, fa->children[0]->name);
+                    if (bs && bs->type) {
+                        base = bs->type;
+                        if (base->kind == TK_POINTER && base->base_type)
+                            base = base->base_type;
+                    } else if (!bs && cg->with_depth > 0) {
+                        type_desc_t *wrt = NULL;
+                        int wfld = with_lookup_field(cg, fa->children[0]->name, &wrt, NULL);
+                        if (wfld >= 0 && wrt) {
+                            base = wrt->fields[wfld].type;
+                            if (base && base->kind == TK_POINTER && base->base_type)
+                                base = base->base_type;
+                        }
+                    }
+                }
+                if (base && base->kind == TK_RECORD) {
+                    for (int i = 0; i < base->num_fields; i++) {
+                        if (str_eq_nocase(base->fields[i].name, fa->name)) {
+                            type_desc_t *ft = base->fields[i].type;
+                            if (ft && ft->kind == TK_POINTER && ft->base_type &&
+                                ft->base_type->kind == TK_RECORD)
+                                rec_type = ft->base_type;
                             break;
                         }
+                    }
+                }
+            }
+            if (rec_type) {
+                for (int fi = 0; fi < rec_type->num_fields; fi++) {
+                    if (str_eq_nocase(rec_type->fields[fi].name, node->name)) {
+                        field_off = rec_type->fields[fi].offset;
+                        break;
                     }
                 }
             }
