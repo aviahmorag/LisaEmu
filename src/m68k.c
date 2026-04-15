@@ -2819,6 +2819,37 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         pc_ring[pc_ring_idx++ & 255] = cpu->pc;
         g_last_cpu_pc = cpu->pc;
 
+        /* Track last-JSR/BSR/JMP source so we can identify the caller when
+         * execution ends up in a garbage-code region. Captured before the
+         * instruction executes, i.e. at the call-site PC. */
+        static uint32_t last_jsr_pc[8];  /* ring of last 8 call-site PCs */
+        static uint32_t last_jsr_target[8];
+        static int last_jsr_idx = 0;
+        static int last_jsr_gen = 0;
+        if (last_jsr_gen != g_emu_generation) {
+            memset(last_jsr_pc, 0, sizeof(last_jsr_pc));
+            memset(last_jsr_target, 0, sizeof(last_jsr_target));
+            last_jsr_idx = 0; last_jsr_gen = g_emu_generation;
+        }
+        {
+            uint16_t op_peek = cpu_read16(cpu, cpu->pc);
+            /* 4EB9 xxxxxxxx = JSR abs.L ; 4EB8 xxxx = JSR abs.W
+             * 61xx = BSR.S/W ; 4E90..4E97 = JSR (An) */
+            if (op_peek == 0x4EB9) {
+                last_jsr_target[last_jsr_idx & 7] = cpu_read32(cpu, cpu->pc + 2);
+                last_jsr_pc[last_jsr_idx++ & 7] = cpu->pc;
+            } else if ((op_peek & 0xFF00) == 0x6100) {
+                int8_t disp8 = (int8_t)(op_peek & 0xFF);
+                uint32_t tgt = (disp8 == 0) ? cpu->pc + 2 + (int16_t)cpu_read16(cpu, cpu->pc + 2)
+                                             : cpu->pc + 2 + disp8;
+                last_jsr_target[last_jsr_idx & 7] = tgt;
+                last_jsr_pc[last_jsr_idx++ & 7] = cpu->pc;
+            } else if ((op_peek & 0xFFF8) == 0x4E90) {
+                last_jsr_target[last_jsr_idx & 7] = cpu->a[op_peek & 7];
+                last_jsr_pc[last_jsr_idx++ & 7] = cpu->pc;
+            }
+        }
+
         /* Boot-progress instrumentation: record every PC so we can see
          * which procedures have been entered. O(1) lookup, cheap. */
         boot_progress_record_pc(cpu->pc);
@@ -3386,6 +3417,13 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 for (uint32_t a = 0x25F0; a < 0x2620; a += 2)
                     fprintf(stderr, " %04X", cpu_read16(cpu, a));
                 fprintf(stderr, "\n");
+                fprintf(stderr, "    Last 8 JSR/BSR/JMP(An) (oldest→newest):\n");
+                for (int ji = 0; ji < 8; ji++) {
+                    int slot = (last_jsr_idx + ji) & 7;
+                    if (last_jsr_pc[slot])
+                        fprintf(stderr, "      call@$%06X → target=$%08X\n",
+                                last_jsr_pc[slot], last_jsr_target[slot]);
+                }
             }
         }
         /* Detect PC in unmapped RAM ($200000-$FBFFFF) — past 2MB, before I/O */
