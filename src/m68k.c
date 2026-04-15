@@ -2896,7 +2896,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         static uint32_t pc_FS_CLEANUP, pc_PR_CLEANUP, pc_MEM_CLEANUP;
         static uint32_t pc_SYS_PROC_INIT, pc_excep_setup, pc_REG_OPEN_LIST;
         static uint32_t pc_QUEUE_PR, pc_GETSPACE, pc_Wait_sem, pc_MM_Setup;
-        static uint32_t pc_Make_SProcess;
+        static uint32_t pc_Make_SProcess, pc_Move_MemMgr;
         static int hle_pc_gen = -1;
         if (hle_pc_gen != g_emu_generation) {
             pc_FS_CLEANUP    = boot_progress_lookup("FS_CLEANUP");
@@ -2910,6 +2910,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             pc_Wait_sem      = boot_progress_lookup("Wait_sem");
             pc_MM_Setup      = boot_progress_lookup("MM_Setup");
             pc_Make_SProcess = boot_progress_lookup("Make_SProcess");
+            pc_Move_MemMgr   = boot_progress_lookup("MOVE_MEMMGR");
             hle_pc_gen = g_emu_generation;
         }
         /* P37 HLE bypass: FS_CLEANUP (fsinit.text:136). Fires the

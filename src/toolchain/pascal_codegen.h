@@ -201,6 +201,13 @@ typedef struct {
     int num_labels;
     struct { int label; uint32_t patch_offset; } pending_gotos[128];
     int num_pending_gotos;
+
+    /* P48: nesting depth of PACKED record/array construction. When > 0,
+     * 0..255 subrange fields pack to 1 byte; otherwise they default to
+     * word-sized to match Lisa Pascal's real layout (needed so asm
+     * code reading PRIORITY(A1) as CMP.W sees positive word values for
+     * priorities 128..255). */
+    int in_packed;
 } codegen_t;
 
 /* Public API */

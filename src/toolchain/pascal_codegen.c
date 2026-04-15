@@ -226,7 +226,7 @@ static type_desc_t *resolve_type(codegen_t *cg, ast_node_t *node) {
                     }
                 }
                 int range = t->range_high - t->range_low;
-                if (range <= 255) t->size = 1;
+                if (cg->in_packed && range <= 255) t->size = 1;
                 else if (range <= 65535) t->size = 2;
                 else t->size = 4;
             }
@@ -345,8 +345,12 @@ static type_desc_t *resolve_type(codegen_t *cg, ast_node_t *node) {
         }
 
         case AST_TYPE_PACKED:
-            if (node->num_children > 0)
-                return resolve_type(cg, node->children[0]);
+            if (node->num_children > 0) {
+                cg->in_packed++;
+                type_desc_t *pt = resolve_type(cg, node->children[0]);
+                cg->in_packed--;
+                return pt;
+            }
             return find_type(cg, "integer");
 
         case AST_TYPE_ENUM: {
