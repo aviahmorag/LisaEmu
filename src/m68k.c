@@ -2924,6 +2924,36 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
          * which procedures have been entered. O(1) lookup, cheap. */
         boot_progress_record_pc(cpu->pc);
 
+        /* HLE: bypass ENTER_LOADER. The real proc is a supervisor/user
+         * mode-switch bridge that calls loader_link at $204. Our
+         * source-compiled boot has no real loader (the ROM stub at
+         * $FE0600 just scribbles a VIA port and RTSes) and the proc's
+         * MOVEM save/restore span a mode transition that expects save-
+         * to-SSP vs restore-from-USP to match — they don't when LDR_CALL
+         * is invoked from supervisor-mode system code (e.g. during
+         * BOOT_IO_INIT), and A2 comes back as 0. Simplest safe bypass:
+         * at ENTER_LOADER entry, pop retaddr + 8 bytes of args (same
+         * net effect as a successful call with error=0 — LDR_CALL
+         * writes error:=0 before calling us, so leaving it as-is is
+         * fine) and RTS. */
+        {
+            extern uint32_t boot_progress_lookup(const char *name);
+            static uint32_t enter_loader_addr = 0;
+            static int el_probed = 0;
+            if (!el_probed) { el_probed = 1; enter_loader_addr = boot_progress_lookup("ENTER_LOADER"); }
+            if (enter_loader_addr && cpu->pc == enter_loader_addr) {
+                uint32_t retaddr = cpu_read32(cpu, cpu->a[7]);
+                cpu->a[7] += 12;  /* pop retaddr (4) + ldr_a5 (4) + params ptr (4) */
+                cpu->pc = retaddr;
+                cpu->cycles += 20;
+                DBGSTATIC(int, el_count, 0);
+                if (el_count++ < 3)
+                    fprintf(stderr, "[HLE-ENTER_LOADER #%d] bypassed, return to $%06X\n",
+                            el_count, retaddr);
+                continue;
+            }
+        }
+
         /* Jump-only ring: records (src_pc, dst_pc) pairs when PC changes
          * discontinuously (JSR, JMP, RTS, BRA, BSR with distance > 8). */
         static struct { uint32_t src, dst; } jmp_ring[128];

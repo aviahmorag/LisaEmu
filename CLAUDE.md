@@ -156,15 +156,46 @@ If codegen pushes `ldr_a5` as a 2-byte integer instead of 4-byte
 longint (or swaps argument order, or forgets the VAR params pointer
 form), enter_loader's `move.l (SP)+,a2` pops garbage.
 
-Next session task:
-1. Disassemble the call site in the generated code for SOURCE-CD
-   around the ENTER_LOADER call. Confirm stack layout matches:
-     push @params (4 bytes), push ldr_a5 (4 bytes), JSR (pushes 4).
-2. If mismatch, fix in pascal_codegen.c's call-site argument emit
-   (either `AST_PROC_CALL` VAR-param handling or longint literal
-   push sizing).
-3. Re-run: VEC-WRITE should stay at 0; milestone should advance
-   past BOOT_IO_INIT toward FS_INIT.
+### Fix (P24): HLE bypass for ENTER_LOADER
+
+Disassembled the LDR_CALL call site at `$0675B6..$0675C8` — the
+Pascal caller IS pushing args correctly (MOVE.L A0,-(SP) for params
+ptr then MOVE.L D0,-(SP) for ldr_a5, then JSR, 12 bytes total).
+ENTER_LOADER itself pops 12 correctly. So the bug is NOT in the
+call-site codegen.
+
+Root cause is mode-switch: ENTER_LOADER pushes save with MOVEM to
+whichever A7 is active at entry (SSP if caller was supervisor), but
+later does `move #$700,sr` which transitions to user mode — causing
+A7 to swap from SSP to USP before the restore MOVEM. The restore
+pops from USP (unrelated data) so A2 = 0. This is fine when
+LDR_CALL is called from user mode (as real Lisa OS does), but
+BOOT_IO_INIT invokes it from supervisor, breaking the assumption.
+
+The simplest safe bypass: HLE the ENTER_LOADER entry. Since our
+source-compiled boot has no real loader (the `loader_link` at $204
+points to a near-no-op ROM stub at $FE0600), the "call the loader"
+semantics are already empty. HLE pops retaddr + 8 bytes of args and
+RTS — LDR_CALL already sets `params.error := 0` before calling us,
+so leaving that unchanged is semantically a successful loader call.
+
+Code (src/m68k.c, in the main execute loop): checks
+`cpu->pc == boot_progress_lookup("ENTER_LOADER")` each instruction
+and bypasses if matched. Lookup is cached after first probe.
+
+Boot progress: now passes BOOT_IO_INIT and hits
+**SYSTEM_ERROR(10758) at ret=$004280** inside MAKE_BUILTIN
+(near-builtin-driver construction inside I/O subsystem init).
+10738 × 2 fires first (boot device "find_boot" / "load_boot") and
+is suppressed by an existing HLE. 10758 is NOT in the named error
+constants in SOURCE-CD.TEXT — likely a runtime-computed error code
+(e.g. from driver_init returning a specific code).
+
+Next session: locate the proc enclosing PC=$004280 (MAKE_BUILTIN
+$004244..$004284) — disassemble to find what value is passed to
+SYSTEM_ERROR there. Candidates: a GETSPACE failure, a driver table
+lookup failure, or a driver-init error code propagated from a
+builtin driver init proc.
 
 ---
 
