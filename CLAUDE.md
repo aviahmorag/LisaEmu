@@ -86,12 +86,59 @@ Boot reaches PASCALINIT → INITSYS → GETLDMAP → REG_TO_MAPPED →
 POOL_INIT → MM_INIT. Runs 2000+ frames cleanly, no SYSTEM_ERROR,
 then hangs in a tight loop at **$0A17BC-$0A17F6 with IPL=7**.
 
-**Corrected diagnosis (2026-04-15):** the hang is NOT the scheduler
-and NOT a MODEMA hardware poll (despite the PC landing inside the
-MODEMA segment, which just contains Pascal runtime math helpers
-that got linked there). One-shot trace (src/m68k.c, fires once
-when PC enters $A17BC-$A17F6) confirmed the call chain matches
-STARTUP.TEXT line 392-396 (`AVAIL_INIT`):
+**ROOT CAUSE IDENTIFIED (2026-04-15):** codegen bug — `MM_INIT`'s
+self-referential sentinel writes inside a nested `with head_sdb do`
+block never emit store instructions. The hang is `INSERTSDB`
+walking an uninitialized list.
+
+**Symbol resolution** (now emitted as `build/lisa_linked.map`):
+- $A17A0 = `INSERTSDB`  (the stuck loop)
+- $A18E6 = `MAKE_FREE`  (caller; STARTUP:416)
+- $A6F3A = `BLDPGLEN`   (earlier STARTUP:405-406 calls)
+- $A69F2 = `MM_INIT`    (called from AVAIL_INIT:359)
+
+**Evidence chain:**
+1. STARTUP main body → AVAIL_INIT → MM_INIT → GETSPACE.
+2. GETSPACE correctly writes `mmrb_addr = $CCA00A` to **A5-1268**.
+3. INSERTSDB correctly reads `mmrb_addr` from **A5-1268** →
+   c_mmrb = $CCA00A (valid sysglobal pointer). Our lisa.c diag
+   label "A5-1264" is off by 4 bytes; the global really lives at
+   -1268. (Low priority cleanup.)
+4. `head_sdb` lives at c_mmrb + $16 = **$CCA020**.
+5. **Memory at $CCA020..$CCA044 is ALL ZEROS** → sentinels never
+   written. MM4.TEXT:237-248 has:
+   ```pascal
+   with head_sdb do begin
+     memchain.fwd_link := @memchain.fwd_link;
+     memchain.bkwd_link := @memchain.fwd_link;
+     freechain.fwd_link := @freechain.fwd_link;
+     freechain.bkwd_link := @freechain.fwd_link;
+     ...
+   ```
+   Those four self-referential address-of-field stores are silently
+   dropped by codegen. Result: INSERTSDB reads fwd_link=0, walks to
+   address 0, reads SSP/garbage, loop never terminates.
+
+**Related bugs already fixed in this family:** P4 (WITH field
+offsets), P12 (WITH true/false). This is a new WITH-block case:
+nested `with outer^.field do` + assignment of form
+`innerfield.ptr := @innerfield.ptr` (address-of a field of the
+WITH variable, written back to that same field). Likely the
+codegen path for `@X` inside a WITH loses the WITH base and emits
+store to a wrong (or zero) address — need to inspect
+pascal_codegen.c's WITH+address-of path.
+
+**Next:** fix the codegen. Read MM4.TEXT:237 compilation. Then
+either (a) add a WITH-nested address-of case in pascal_codegen.c
+mirroring P12's fallthrough, or (b) as a surgical fix, add a
+codegen-emitted prologue to MM_INIT that pokes the sentinels via
+inline pointer arithmetic if the source pattern is hard to match.
+Option (a) is the real fix; (b) is a backstop.
+
+---
+
+Call chain confirmed via one-shot trace at $A17BC-$A17F6 in
+src/m68k.c:
 
 ```
 STARTUP $0008C0 → PMMAKE $0A6F3A (×2 calls)

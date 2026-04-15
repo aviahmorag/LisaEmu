@@ -652,6 +652,33 @@ build_result_t toolchain_build(const char *source_dir,
                 fclose(rf);
                 fprintf(stderr, "Linked raw: %s (%u bytes)\n", raw_path, link_size);
             }
+
+            /* Sorted symbol map alongside the raw binary */
+            char map_path[512];
+            snprintf(map_path, sizeof(map_path), "%s/lisa_linked.map", output_dir);
+            FILE *mf = fopen(map_path, "w");
+            if (mf) {
+                int *order = (int*)malloc(sizeof(int) * lk->num_symbols);
+                int n = 0;
+                for (int i = 0; i < lk->num_symbols; i++)
+                    if (lk->symbols[i].type == LSYM_ENTRY) order[n++] = i;
+                for (int i = 1; i < n; i++) {
+                    int key = order[i];
+                    uint32_t kv = lk->symbols[key].value;
+                    int j = i - 1;
+                    while (j >= 0 && lk->symbols[order[j]].value > kv) {
+                        order[j+1] = order[j]; j--;
+                    }
+                    order[j+1] = key;
+                }
+                for (int i = 0; i < n; i++)
+                    fprintf(mf, "$%06X  %s\n",
+                            lk->symbols[order[i]].value,
+                            lk->symbols[order[i]].name);
+                fclose(mf);
+                free(order);
+                fprintf(stderr, "Symbol map: %s (%d entries)\n", map_path, n);
+            }
         }
 
         /* Dump bytes around $B14 (where compiled code crashes with Illegal) */

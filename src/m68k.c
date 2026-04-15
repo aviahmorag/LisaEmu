@@ -2835,6 +2835,120 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         }
         prev_pc_for_jmp = cpu->pc;
 
+        /* Trace each JSR $A17A0 call (from $A1996) — log the pushed
+         * longint parameter + caller-frame locals so we can see what
+         * pointer is being passed and where it came from. */
+        {
+            DBGSTATIC(int, jsr_a17a0_count, 0);
+            if (cpu->pc == 0xA1996 && jsr_a17a0_count < 6) {
+                jsr_a17a0_count++;
+                /* At this point SP points at the pushed parameter (MOVE.L D0,-(SP) at $A1994
+                 * just executed). The top-of-stack 4 bytes are the param. */
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                uint32_t param = cpu_read32(cpu, sp);
+                uint32_t local_m4 = cpu_read32(cpu, (cpu->a[6] & 0xFFFFFF) - 4);
+                uint32_t local_m8 = cpu_read32(cpu, (cpu->a[6] & 0xFFFFFF) - 8);
+                uint32_t arg_p8   = cpu_read32(cpu, (cpu->a[6] & 0xFFFFFF) + 8);
+                uint32_t arg_p12  = cpu_read32(cpu, (cpu->a[6] & 0xFFFFFF) + 12);
+                fprintf(stderr, "=== JSR $A17A0 call #%d at $A1996 ===\n", jsr_a17a0_count);
+                fprintf(stderr, "  param-on-stack = $%08X\n", param);
+                fprintf(stderr, "  caller frame A6=$%08X: -4=$%08X  -8=$%08X  +8=$%08X  +12=$%08X\n",
+                        cpu->a[6], local_m4, local_m8, arg_p8, arg_p12);
+                fprintf(stderr, "  D0=$%08X D1=$%08X D2=$%08X D3=$%08X D7=$%08X A0=$%08X A5=$%08X\n",
+                        cpu->d[0], cpu->d[1], cpu->d[2], cpu->d[3], cpu->d[7], cpu->a[0], cpu->a[5]);
+            }
+            /* Log entry/exit of MM_INIT and GETSPACE calls within it,
+             * to see whether mmrb_addr gets written. */
+            DBGSTATIC(int, mminit_state, 0); /* 0=before, 1=inside */
+            if (cpu->pc == 0xA69F2 && mminit_state == 0) {
+                mminit_state = 1;
+                fprintf(stderr, "=== ENTER MM_INIT @ $A69F2, mmrb_addr sysglobal value = ?\n");
+                /* dump the global mmrb_addr location — we need to know where it lives.
+                 * A5-relative offset from lisa.c:2451 is -1264. So addr = A5 - 1264. */
+                uint32_t ga = (cpu->a[5] & 0xFFFFFF) - 1264;
+                uint32_t gv = cpu_read32(cpu, ga);
+                fprintf(stderr, "    mmrb_addr at logical $%06X = $%08X (A5=$%08X)\n", ga, gv, cpu->a[5]);
+            }
+            /* Log each JSR to GETSPACE while in MM_INIT */
+            DBGSTATIC(int, gs_count, 0);
+            if (cpu->pc == 0x5CC6 && mminit_state == 1 && gs_count < 4) {
+                gs_count++;
+                /* GETSPACE signature: function GETSPACE(size: longint; ptrsysg: absptr; var addr: longint): boolean;
+                 * params pushed right-to-left: var addr (4 bytes, ADDRESS), ptrsysg (4), size (4), return slot (2 or 4).
+                 * After JSR pushes return PC, frame has: [SP]=retPC, [SP+4]=var-addr-ptr, [SP+8]=ptrsysg, [SP+12]=size. */
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                uint32_t ret_pc = cpu_read32(cpu, sp);
+                /* Probe several word offsets to catch the var parameter. */
+                fprintf(stderr, "=== GETSPACE call #%d  ret=$%06X  SP=$%06X\n", gs_count, ret_pc, sp);
+                for (int off = 4; off <= 20; off += 2)
+                    fprintf(stderr, "    SP+%2d = $%08X\n", off, cpu_read32(cpu, sp + off));
+            }
+            /* Dump head_sdb sentinels at $CCA020 on first INSERTSDB entry */
+            DBGSTATIC(int, sentinel_dumped, 0);
+            if (cpu->pc == 0xA17A0 && !sentinel_dumped) {
+                sentinel_dumped = 1;
+                fprintf(stderr, "=== head_sdb sentinels at $CCA020 (should be self-refs):\n");
+                for (int off = 0; off < 40; off += 4) {
+                    uint32_t a = 0xCCA020 + off;
+                    fprintf(stderr, "    $%06X = $%08X\n", a, cpu_read32(cpu, a));
+                }
+            }
+
+            /* Dump the first 32 bytes of INSERTSDB ($A17A0) on first entry */
+            DBGSTATIC(int, insertsdb_dumped, 0);
+            if (cpu->pc == 0xA17A0 && !insertsdb_dumped) {
+                insertsdb_dumped = 1;
+                fprintf(stderr, "=== INSERTSDB prologue bytes at $A17A0-$A17BF:");
+                for (int b = 0; b < 32; b += 2)
+                    fprintf(stderr, " %04X", cpu_read16(cpu, 0xA17A0 + b));
+                fprintf(stderr, "\n");
+                /* And MAKE_FREE (\$A18E6) prologue */
+                fprintf(stderr, "=== MAKE_FREE prologue bytes at $A18E6-$A1905:");
+                for (int b = 0; b < 32; b += 2)
+                    fprintf(stderr, " %04X", cpu_read16(cpu, 0xA18E6 + b));
+                fprintf(stderr, "\n");
+                /* And MM_INIT prologue — to see where @mmrb_addr is computed */
+                fprintf(stderr, "=== MM_INIT prologue bytes at $A69F2-$A6A11:");
+                for (int b = 0; b < 32; b += 2)
+                    fprintf(stderr, " %04X", cpu_read16(cpu, 0xA69F2 + b));
+                fprintf(stderr, "\n");
+            }
+
+            /* After GETSPACE call #1 returns, dump memory around expected mmrb_addr location */
+            DBGSTATIC(int, gs1_dumped, 0);
+            if (cpu->pc == 0x0A6A10 && gs_count >= 1 && !gs1_dumped) {
+                gs1_dumped = 1;
+                uint32_t a5 = cpu->a[5] & 0xFFFFFF;
+                fprintf(stderr, "=== After GETSPACE#1 return  A5=$%06X, D0=$%08X (return value)\n", a5, cpu->d[0]);
+                for (int off = -1280; off <= -1240; off += 4) {
+                    uint32_t addr = a5 + off;
+                    uint32_t v = cpu_read32(cpu, addr);
+                    fprintf(stderr, "    A5%+5d ($%06X) = $%08X\n", off, addr, v);
+                }
+            }
+            /* On exit of MM_INIT (RTS, approximately): report final mmrb_addr. Just sample periodically. */
+            DBGSTATIC(int, mminit_done, 0);
+            if (mminit_state == 1 && !mminit_done && cpu->pc == 0x09A8) {
+                /* hack: any PC back in STARTUP $900-$A00 range likely means MM_INIT has returned */
+                mminit_done = 1;
+                uint32_t ga = (cpu->a[5] & 0xFFFFFF) - 1264;
+                uint32_t gv = cpu_read32(cpu, ga);
+                fprintf(stderr, "=== MM_INIT RETURNED (heuristic), mmrb_addr = $%08X\n", gv);
+            }
+
+            /* Also log ENTRY to $A18E6 — to see what was passed to the outer helper */
+            DBGSTATIC(int, jsr_a18e6_count, 0);
+            if (cpu->pc == 0xA18E6 && jsr_a18e6_count < 6) {
+                jsr_a18e6_count++;
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                /* Stack at entry: [SP]=return PC (4 bytes), [SP+4]=pushed word param. */
+                uint32_t ret_pc = cpu_read32(cpu, sp);
+                uint16_t arg_w = cpu_read16(cpu, sp + 4);
+                fprintf(stderr, "=== ENTER $A18E6 call #%d  return=$%06X  word-arg=$%04X  D0=$%08X D3=$%08X ===\n",
+                        jsr_a18e6_count, ret_pc, arg_w, cpu->d[0], cpu->d[3]);
+            }
+        }
+
         /* One-shot caller trace for the MODEMA poll hang at $A17BC-$A17F6.
          * Dumps the last 64 PCs so we can see which init routine entered
          * here, plus the enclosing JSR targets. */

@@ -889,6 +889,36 @@ bool linker_write_binary(linker_t *lk, const char *filename) {
     fwrite(lk->output, 1, lk->output_size, f);
     fclose(f);
 
+    /* Also write a sorted symbol map: build/<filename>.map */
+    char mapname[512];
+    snprintf(mapname, sizeof(mapname), "%s.map", filename);
+    FILE *mf = fopen(mapname, "w");
+    if (mf) {
+        int *order = (int*)malloc(sizeof(int) * lk->num_symbols);
+        int n = 0;
+        for (int i = 0; i < lk->num_symbols; i++) {
+            if (lk->symbols[i].type == LSYM_ENTRY) order[n++] = i;
+        }
+        /* sort by value ascending */
+        for (int i = 1; i < n; i++) {
+            int key = order[i];
+            uint32_t kv = lk->symbols[key].value;
+            int j = i - 1;
+            while (j >= 0 && lk->symbols[order[j]].value > kv) {
+                order[j+1] = order[j]; j--;
+            }
+            order[j+1] = key;
+        }
+        for (int i = 0; i < n; i++) {
+            fprintf(mf, "$%06X  %s\n",
+                    lk->symbols[order[i]].value,
+                    lk->symbols[order[i]].name);
+        }
+        fclose(mf);
+        free(order);
+        printf("Symbol map: %s (%d entries)\n", mapname, n);
+    }
+
     printf("Linked: %s (%u bytes, %d modules, %d symbols)\n",
            filename, lk->output_size, lk->num_modules, lk->num_symbols);
     return true;
