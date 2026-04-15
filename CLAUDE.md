@@ -72,6 +72,52 @@ cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' bui
 
 ## Current Status (2026-04-15 PM7)
 
+### Fix (P31): proc-sig type-pointer remap by name (was dangling)
+
+`toolchain_bridge.c`'s proc-sig export tried to remap each
+`sig->param_type[j]` from a `cg->types`-relative pointer to a
+`shared_types`-relative one via `&shared_types[types_base + idx]`.
+That worked on the **types-only pre-pass** (when types ARE copied
+to shared_types), but on the **real pass** types were intentionally
+NOT re-copied (P29 design — `goto skip_type_export`), so
+`types_base` still pointed at the END of all pre-pass types and
+the remap landed in **uninitialized shared_types slots**.
+
+The dangling pointers caused proc sigs to report `size=0 kind=0
+name=""` for primitive params like `int2`/`int4`/`absptr`. The
+RECONST path in `gen_proc_or_func` then fell into its `else psz=4`
+branch — silently treating every unresolved `int2` as a 4-byte
+slot.
+
+Worst offender: BLD_SEG's frame layout. With `newsize: int2`
+inflated to 4 bytes, every subsequent param shifted by 2. Caller
+MAKE_REGION pushed `newsize` correctly as 2 bytes, so callee read
+`var c_sdb_ptr` arg from the WRONG stack offset → got garbage
+($FFE20000), dereferenced into unmapped seg 113 → got garbage
+$2F0041EE → did `MOVE.W 0,(garbage+8)` which masked to physical
+$41F6, **overwriting OS code in MAKE_BUILTIN**. The corrupted
+bytes decoded into an F-line trap → SYSTEM_ERROR(10204).
+
+Two coordinated fixes:
+1. **toolchain_bridge.c**: remap `sig->param_type[j]` by NAME
+   lookup in `shared_types`. Stable across passes. Anonymous
+   types get `NULL` (RECONST falls back to integer).
+2. **pascal_codegen.c** RECONST: prefer `sig->param_size[j]`
+   (set authoritatively at register_proc_sig time when types
+   were fully resolved) over recomputing psz from `ptype->size`.
+   Belt-and-suspenders against future type-ptr issues.
+
+Result:
+- Boot reaches **SYS_PROC_INIT** (16/27, was 15/27).
+- No more SYSTEM_ERROR halts in 5000-frame run.
+- No more BLD_SEG-driven OS-code corruption.
+- Toolchain audit: 8711/8711 symbols, 100% clean (stage 4).
+
+Boot is now spinning past SYS_PROC_INIT but hasn't hit
+INIT_DRIVER_SPACE yet. Next session: trace where it's parked
+(probably another HLE-bypassable spin or a downstream
+codegen issue).
+
 ### Fix (P30): bump l_sysglobal $6000→$7000 (stack/globals no longer collide)
 
 With our Pascal codegen producing sysglobal globals totaling ~24906

@@ -304,20 +304,40 @@ skip_type_export:;
 
     /* Export this file's procedure signatures to the shared table.
      * Skip on types-only pass — re-exporting on second pass would
-     * duplicate entries. */
+     * duplicate entries.
+     *
+     * P30-followup: remap sig->param_type pointers from cg->types into
+     * shared_types BY NAME. Previously we used `types_base + idx`, but
+     * on the real (second) pass types aren't re-copied (skip_type_export
+     * above), so types_base points past valid shared_types entries and
+     * the remap lands in uninitialized slots — causing proc sigs to
+     * report size=0 kind=0 for int2/int4/etc., which defaults param
+     * sizes to 4 bytes in RECONST. Name-based lookup is stable across
+     * passes. */
     if (cg->proc_sigs && !types_only_pass) {
         for (int i = 0; i < cg->num_proc_sigs && num_shared_proc_sigs < MAX_SHARED_PROC_SIGS; i++) {
             cg_proc_sig_t *sig = &shared_proc_sigs[num_shared_proc_sigs++];
             *sig = cg->proc_sigs[i];
             for (int j = 0; j < sig->num_params; j++) {
-                if (sig->param_type[j]) {
-                    type_desc_t *pt = sig->param_type[j];
-                    if (pt >= &cg->types[0] && pt < &cg->types[cg->num_types]) {
-                        ptrdiff_t idx = pt - cg->types;
-                        sig->param_type[j] = &shared_types[types_base + idx];
+                type_desc_t *pt = sig->param_type[j];
+                if (pt && pt >= &cg->types[0] && pt < &cg->types[cg->num_types] && pt->name[0]) {
+                    /* Look up the same type by name in shared_types */
+                    type_desc_t *found = NULL;
+                    for (int k = 0; k < num_shared_types; k++) {
+                        if (strcasecmp(shared_types[k].name, pt->name) == 0) {
+                            found = &shared_types[k];
+                            break;
+                        }
                     }
-                    /* If already in shared_types (imported), leave as-is */
+                    if (found) sig->param_type[j] = found;
+                    /* If not found by name (anonymous type), clear so RECONST's
+                     * name-lookup fallback doesn't hit a dangling pointer. */
+                    else sig->param_type[j] = NULL;
+                } else if (pt && pt >= &cg->types[0] && pt < &cg->types[cg->num_types]) {
+                    /* Anonymous type (no name) — can't remap safely, clear. */
+                    sig->param_type[j] = NULL;
                 }
+                /* If already in shared_types (imported), leave as-is */
             }
         }
     }

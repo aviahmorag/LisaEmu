@@ -2884,17 +2884,17 @@ static void gen_proc_or_func(codegen_t *cg, ast_node_t *node) {
                 cg_symbol_t *s = add_local(cg, sig->param_name[j], ptype, true, sig->param_is_var[j]);
                 if (s) {
                     s->offset = param_offset;
+                    /* Prefer sig->param_size[j] (set correctly at
+                     * register_proc_sig time when types were fully
+                     * resolved). Fall back to ptype-derived calc. */
                     int psz;
-                    if (sig->param_is_var[j]) psz = 4;
+                    if (sig->param_size[j] == 2 || sig->param_size[j] == 4) {
+                        psz = sig->param_size[j];
+                    } else if (sig->param_is_var[j]) psz = 4;
                     else if (!ptype) psz = 2;
                     else if (ptype->size == 4) psz = 4;
                     else if (ptype->size == 1 || ptype->size == 2) psz = 2;
                     else psz = 4;
-                    if (strcasestr(cg->current_file, "SYSG1") &&
-                        strcasestr(node->name, "POOL_INIT"))
-                        fprintf(stderr, "    param '%s' offset=%d sz=%d type=%s\n",
-                                sig->param_name[j], param_offset, psz,
-                                ptype ? ptype->name : "NULL");
                     param_offset += psz;
                     if (param_offset % 2) param_offset++;
                 }
