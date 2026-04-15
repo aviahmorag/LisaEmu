@@ -72,6 +72,19 @@ static inline void push16(m68k_t *cpu, uint16_t val) {
 static inline void push32(m68k_t *cpu, uint32_t val) {
     cpu->a[7] -= 4;
     cpu_write32(cpu, cpu->a[7], val);
+    /* Probe: catch any 32-bit push with non-zero high byte onto the
+     * supervisor stack. Such values become bogus PCs on the Lisa's
+     * 24-bit bus when popped by RTS/RTE. */
+    if ((val & 0xFF000000) && cpu->a[7] >= 0xCB0000 && cpu->a[7] < 0xD00000) {
+        extern int g_emu_generation;
+        static int hip_count = 0;
+        static int hip_gen = -1;
+        if (hip_gen != g_emu_generation) { hip_count = 0; hip_gen = g_emu_generation; }
+        if (hip_count++ < 16) {
+            fprintf(stderr, "PUSH-HIPC[%d]: PC=$%08X pushed $%08X to SSP=$%08X\n",
+                    hip_count, cpu->pc, val, cpu->a[7]);
+        }
+    }
 }
 
 static inline uint16_t pop16(m68k_t *cpu) {
@@ -83,6 +96,16 @@ static inline uint16_t pop16(m68k_t *cpu) {
 static inline uint32_t pop32(m68k_t *cpu) {
     uint32_t val = cpu_read32(cpu, cpu->a[7]);
     cpu->a[7] += 4;
+    if ((val & 0xFF000000)) {
+        extern int g_emu_generation;
+        static int pop_count = 0;
+        static int pop_gen = -1;
+        if (pop_gen != g_emu_generation) { pop_count = 0; pop_gen = g_emu_generation; }
+        if (pop_count++ < 16) {
+            fprintf(stderr, "POP-HIPC[%d]: PC=$%08X popped $%08X from SSP=$%08X\n",
+                    pop_count, cpu->pc, val, cpu->a[7] - 4);
+        }
+    }
     return val;
 }
 
@@ -584,6 +607,20 @@ static void take_exception(m68k_t *cpu, int vector) {
     uint16_t old_sr = cpu->sr;
     set_supervisor(cpu, true);
     cpu->sr &= ~SR_TRACE;
+
+    /* Trap-frame probe: log the PC we're pushing for vectors 37/39
+     * (post-SYSTEM_ERROR(10201) crash hunt — a bogus $615262DC return
+     * address ends up on the stack; want to see whether a trap entry
+     * is the culprit). Also log when the pushed PC has a non-zero
+     * high byte — those are always wrong on the Lisa (24-bit bus). */
+    if (vector == 37 || vector == 39 || (cpu->pc & 0xFF000000)) {
+        DBGSTATIC(int, tf_count, 0);
+        if (tf_count++ < 32) {
+            fprintf(stderr,
+                "TRAP-FRAME[v%d #%d]: push PC=$%08X SR=$%04X  SSP_before=$%08X  A6=$%08X\n",
+                vector, tf_count, cpu->pc, old_sr, cpu->a[7], cpu->a[6]);
+        }
+    }
 
     /* Push PC and SR */
     push32(cpu, cpu->pc);
@@ -2831,6 +2868,24 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         static int pc_ring_idx = 0;
         static int pc_ring_gen = 0;
         if (pc_ring_gen != g_emu_generation) { memset(pc_ring, 0, sizeof(pc_ring)); pc_ring_idx = 0; pc_ring_gen = g_emu_generation; }
+        /* High-byte PC trip: fire once when PC first leaves the 24-bit
+         * range. Dump the PC ring (previous instruction(s)) to identify
+         * the transition point. */
+        {
+            static int hip_fired = 0;
+            static int hip_fired_gen = -1;
+            if (hip_fired_gen != g_emu_generation) { hip_fired = 0; hip_fired_gen = g_emu_generation; }
+            if (!hip_fired && (cpu->pc & 0xFF000000)) {
+                hip_fired = 1;
+                fprintf(stderr, "HIPC-TRIP: PC=$%08X (prev-ring, newest first):\n", cpu->pc);
+                for (int k = 0; k < 16; k++) {
+                    int idx = (pc_ring_idx - 1 - k + 256) & 0xFF;
+                    fprintf(stderr, "  [-%d] PC=$%08X\n", k+1, pc_ring[idx]);
+                }
+                fprintf(stderr, "  A0=$%08X A1=$%08X A5=$%08X A6=$%08X A7=$%08X SR=$%04X\n",
+                        cpu->a[0], cpu->a[1], cpu->a[5], cpu->a[6], cpu->a[7], cpu->sr);
+            }
+        }
         pc_ring[pc_ring_idx++ & 255] = cpu->pc;
         g_last_cpu_pc = cpu->pc;
 

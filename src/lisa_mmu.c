@@ -266,6 +266,25 @@ void lisa_mem_write8(lisa_mem_t *mem, uint32_t addr, uint8_t val) {
                     (*cnt)++;
                 }
             }
+            /* Vector-table watchpoint: catch writes into $00-$FF after
+             * boot-ROM init completes. The OS re-writes many vectors
+             * during INIT_TRAPV; we only care about writes where the
+             * resulting byte has a non-zero high bit in a context that
+             * would form a corrupt PC on read (tracked: byte values that
+             * end up as the MSB of a longword in range [0x8..0xFC]). */
+            {
+                extern uint32_t g_last_cpu_pc;
+            if (phys < 0x100 && g_last_cpu_pc > 0x100 && (phys & 3) == 0 && val != 0) {
+                static int vtw_count = 0;
+                static int vtw_gen = -1;
+                extern int g_emu_generation;
+                if (vtw_gen != g_emu_generation) { vtw_count = 0; vtw_gen = g_emu_generation; }
+                if (vtw_count++ < 32) {
+                    fprintf(stderr, "VEC-WRITE[%d]: PC=$%06X addr=$%06X val=$%02X (msb of vec%d)\n",
+                            vtw_count, g_last_cpu_pc, phys, val, (int)(phys / 4));
+                }
+            }
+            }
             /* Watchpoint: $002600..$00260F code region is overwritten during
              * boot — causing SYSTEM_ERROR(10201). Log every write. */
             if (phys >= 0x2600 && phys < 0x2610) {

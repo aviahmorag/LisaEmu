@@ -98,26 +98,72 @@ PC=$000094, lands at `$615262A8` (garbage), A7 gets zeroed, PC hot
 pages show `$006D00 / $006E00 / $0A0600` — all in I/O init territory.
 Vectors taken before the crash: v39 (TRAP) × 3, v37 (TRAP) × 2.
 
-PC-trail decoded via linker map:
-- `$011CF0..$011DA4` = **TransPoint** (scheduler context-switch primitive)
-- `$011DD4..$011E24` = **AbortProcess** epilogue (UNLK, RTS)
-- After AbortProcess's RTS the CPU lands at `$615262DC` — a 32-bit
-  garbage address popped from the stack. The VEC-HIST shows v39 (TRAP)
-  × 3 and v37 (TRAP) × 2 immediately prior, so the corrupted return
-  address was pushed during one of those trap entries.
+PC-trail decoded via linker map + targeted probes this session:
 
-So the real question: **which trap handler pushed a 32-bit return
-address with high half $6152 onto the supervisor stack?** This isn't
-an MMU bug — it's an exception-frame layout mismatch. Likely candidates:
-- `crea_ecb` or similar chain in INIT_EC pushes something wrong.
-- A TRAP #5 (syscall) entry computes a bogus return PC and the RTE
-  pops wrong.
-- One of our HLE handlers returns a register value instead of a PC.
+1. **HIPC-TRIP probe** (PC-first-leaves-24-bit) fires at $615262A8,
+   which comes from **vector-4 handler read at $10** (illegal-instr
+   vector). That means vector 4 was corrupted.
 
-Next-session task: (a) instrument `take_exception` to log pushed PC
-for vectors 37/39 when the PC is non-canonical (high byte != 0);
-(b) log the source of the bogus $615262DC — scan for it being
-written to the stack or to A0 prior to AbortProcess's RTS.
+2. **VEC-WRITE probe** (writes into $00-$FF from post-boot code)
+   catches the corrupter: a 17-iteration unrolled loop at
+   `$004192, $0041B6, $0041EE, $004226, $00425E, $004296, ...`
+   (56-byte stride), each doing `MOVE.W D0,(A0)` where A0=vector
+   MSB-position and D0's low word has a non-zero high byte:
+   ```
+   PC=$004192 val=$4E (msb of vec0..17)   ← good initial pass
+   PC=$0041B6 val=$5F (msb of vec0)
+   PC=$0041EE val=$64 (msb of vec1)
+   PC=$004226 val=$6A (msb of vec2)
+   PC=$004296 val=$61 (msb of vec4)   ← the one that kills us
+   ```
+
+3. **Per-iteration code pattern** (each 56-byte block starts with):
+   ```
+   30 80         MOVE.W D0,(A0)       ; stores prev D0 low word
+   41 ED <d16>   LEA d16(A5),A0       ; A0 := A5+offset
+   20 08         MOVE.L A0,D0         ; D0 := A0 (32-bit)
+   3F 00         MOVE.W D0,-(SP)      ; push low word
+   41 F9 <long>  LEA abs.L,A0         ; placeholder (zeros)
+   70 0x         MOVEQ #x,D0
+   32 00         MOVE.W D0,D1
+   C2 FC 00 02   MULU.W #2,D1
+   D1 C1         ADDA.L D1,A0
+   30 1F         MOVE.W (A7)+,D0     ; pop low word (→ next iter store)
+   ```
+
+4. Root cause: **A5 has a stale/wrong value during INIT_JTDRIVER**
+   (proc at $004124 — the jump-table driver installer). `LEA d16(A5),A0`
+   then `MOVE.W D0,(A0)` relies on A5 pointing to the sysjt/sysglobal
+   base. If A5 were the correct Pascal globals base (e.g. $CCA000), the
+   computed address would go to sysglobal, not $0010 (vec 4 MSB).
+   Instead the value written is $6152, which is `LEA $2AC(A5),A0` with
+   A5 ≈ $5EA6 (A5 uninitialized or holding something else).
+
+   BUT — observed behavior says the probe-caught `addr` is $10 (vec 4),
+   NOT $6152. So A0 points to vec 4 while D0's low word IS $6152 (low
+   16 of some LEA $d16(A5) from an earlier iteration). That's consistent
+   with an off-by-one between the LEA-computed A0 (for next iter's
+   store) and what actually gets stored (prev iter's computed address).
+   Either way: A5 was wrong; the 17-step unrolled loop is installing
+   garbage handler addresses into the vector table.
+
+Next-session task:
+- Disassemble the proc entry for the enclosing function (likely
+  INIT_JTDRIVER at $004124 — map calls it out, though surrounded by
+  collided Office-System symbols). Find where A5 is set up at entry.
+  Is there a missing `LINK A5,#...` or a wrong MOVEM setup?
+- Compare against Lisa_Source source for INIT_JTDRIVER / INIT_SYSJT /
+  whichever proc walks a vector-installation table during BOOT_IO_INIT.
+- The fact that vec 4's MSB write fires from PC=$004296 and is the
+  very vector that becomes the crash PC when illegal-instr fires
+  confirms this is THE corruption path — fixing A5 here should
+  unblock the next stage.
+
+Probes to keep in place (all committed this session):
+- `HIPC-TRIP` in m68k_execute (first PC with high byte → dump ring).
+- `PUSH-HIPC` / `POP-HIPC` in push32/pop32.
+- `TRAP-FRAME` in take_exception for vectors 37/39.
+- `VEC-WRITE` in lisa_mem_write8 (writes to $00-$FF, MSB positions).
 
 ---
 
