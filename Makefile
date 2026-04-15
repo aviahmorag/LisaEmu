@@ -27,6 +27,7 @@ TOOL_SOURCES = $(TOOLDIR)/asm68k.c \
                $(TOOLDIR)/diskimage.c \
                $(TOOLDIR)/bootrom.c \
                $(TOOLDIR)/toolchain_fileset.c \
+               $(TOOLDIR)/compile_targets.c \
                $(TOOLDIR)/toolchain_bridge.c
 
 OBJECTS = $(patsubst $(SRCDIR)/%.c,$(BUILDDIR)/%.o,$(SOURCES))

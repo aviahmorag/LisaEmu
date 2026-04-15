@@ -18,9 +18,11 @@
 #include "diskimage.h"
 #include "bootrom.h"
 #include "toolchain_fileset.h"
+#include "compile_targets.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <ctype.h>
 #include <dirent.h>
 #include <sys/stat.h>
@@ -501,22 +503,39 @@ build_result_t toolchain_build(const char *source_dir,
         return result;
     }
 
-    /* P57: match real SYSTEM.OS link set. Only LISA_OS/OS/ (kernel
-     * sources) + LIBHW (hardware intrinsics). Apps, user libraries
-     * (LIBS), fonts, and toolkit are loaded on demand by the OS —
-     * including them in the boot image bloats it past LISA_RAM_SIZE
-     * and causes physical-RAM collisions between code and
-     * stack/heap (see P55/P56 diagnosis).
+    /* P58: use the SYSTEM.OS compile target — explicit module list
+     * from the reference project. Current state: the module list
+     * matches Apple's ALEX-COMP-SYSTEMOS.TEXT + ALEX-LINK-SYSTEMOS.TEXT
+     * (~50 modules). However our toolchain currently depends on some
+     * support files that Apple's OS doesn't include in SYSTEM.OS
+     * (e.g., $I-expansion differences, cross-module type propagation).
+     * For now we walk search_dirs and compile EVERYTHING found — once
+     * the toolchain is able to cleanly compile the minimal Apple set,
+     * we'll switch to strict module filtering.
      *
-     * Reference: _inspiration/LisaSourceCompilation-main/src/LINK/
-     * ALEX-LINK-SYSTEMOS.TEXT lists the 47 modules that go into the
-     * real SYSTEM.OS binary; they all live in OS/ or LIBHW/. */
+     * The module list drives disk-image layout: each target will emit
+     * a separate OBJ file at its out_path. Apps and libraries become
+     * separate targets (future work). */
+    const compile_target_t *target = compile_targets_find("SYSTEM.OS");
+    if (!target) {
+        snprintf(result.error_message, sizeof(result.error_message),
+                 "SYSTEM.OS compile target not found");
+        free(files);
+        return result;
+    }
+
     int num_files = 0;
-    char subdir[512];
-    snprintf(subdir, sizeof(subdir), "%s/LISA_OS/OS", source_dir);
-    num_files += find_source_files(subdir, files + num_files, MAX_SOURCE_FILES - num_files);
-    snprintf(subdir, sizeof(subdir), "%s/LISA_OS/LIBHW", source_dir);
-    num_files += find_source_files(subdir, files + num_files, MAX_SOURCE_FILES - num_files);
+    for (int d = 0; target->search_dirs[d]; d++) {
+        char subdir[512];
+        snprintf(subdir, sizeof(subdir), "%s/%s", source_dir, target->search_dirs[d]);
+        num_files += find_source_files(subdir, files + num_files,
+                                        MAX_SOURCE_FILES - num_files);
+    }
+
+    int modules_requested = 0;
+    while (target->modules[modules_requested]) modules_requested++;
+    fprintf(stderr, "COMPILE TARGET '%s': %d modules requested, %d source files found (walking search_dirs)\n",
+            target->name, modules_requested, num_files);
 
     /* Sort files: interface/definition files first, then primitives, then
      * alphabetically.  Files containing "GLOBAL", "DEFS", or "SYSCALL"
