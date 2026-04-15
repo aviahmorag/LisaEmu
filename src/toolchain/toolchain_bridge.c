@@ -115,6 +115,108 @@ static int find_source_files(const char *dir, source_file_t *files, int max_file
     return count;
 }
 
+/* Scan a Pascal/asm file for $I include directives (either
+ * `{$I name}` or `{$Iname}` / `(*$Iname*)` forms). Fills `out` with
+ * the included filenames' basenames (in uppercase, without
+ * extension) up to max_out entries. Returns count. */
+static int scan_file_for_includes(const char *path, char out[][64], int max_out) {
+    int n = 0;
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    char line[1024];
+    while (fgets(line, sizeof(line), f) && n < max_out) {
+        for (const char *p = line; *p; p++) {
+            /* Match `{$I` or `(*$I` (not followed by 'F' of IFC). */
+            if (p[0] != '$' || (p[1] != 'I' && p[1] != 'i')) continue;
+            /* Check for preceding '{' or '(*' */
+            bool good_prefix = false;
+            if (p > line && p[-1] == '{') good_prefix = true;
+            if (p >= line + 2 && p[-1] == '*' && p[-2] == '(') good_prefix = true;
+            if (!good_prefix) continue;
+            /* Exclude $IFC */
+            if ((p[2] == 'F' || p[2] == 'f') && (p[3] == 'C' || p[3] == 'c')) continue;
+            /* Parse the include filename (can be with or without space after $I). */
+            const char *q = p + 2;
+            while (*q == ' ' || *q == '\t') q++;
+            char inc[256]; int pi = 0;
+            while (*q && *q != '}' && *q != '*' && *q != ' ' && pi < 255) {
+                inc[pi++] = *q++;
+            }
+            inc[pi] = '\0';
+            if (!inc[0]) continue;
+            /* Strip leading dir prefix (e.g. "source/MM1.text" → "MM1.text"). */
+            const char *slash = strrchr(inc, '/');
+            const char *colon = strrchr(inc, ':');
+            const char *sep = slash ? slash : colon;
+            const char *base_inc = sep ? sep + 1 : inc;
+            /* Strip extension. */
+            char bare[64];
+            size_t blen = strlen(base_inc);
+            if (blen >= sizeof(bare)) blen = sizeof(bare) - 1;
+            memcpy(bare, base_inc, blen);
+            bare[blen] = '\0';
+            char *dot = strchr(bare, '.');
+            if (dot) *dot = '\0';
+            /* Uppercase for comparison. */
+            for (char *c = bare; *c; c++) *c = toupper((unsigned char)*c);
+            if (!bare[0]) continue;
+            strncpy(out[n], bare, 63);
+            out[n][63] = '\0';
+            n++;
+            if (n >= max_out) break;
+        }
+    }
+    fclose(f);
+    return n;
+}
+
+/* Build a set of basenames (uppercase, no extension) that are
+ * $I-included by OTHER files in the list. These should be skipped
+ * from standalone compilation to avoid double-emission. */
+static int build_included_set(const source_file_t *files, int num_files,
+                              char included[][64], int max_included) {
+    int n = 0;
+    char tmp[32][64];
+    for (int i = 0; i < num_files; i++) {
+        int m = scan_file_for_includes(files[i].path, tmp, 32);
+        for (int j = 0; j < m && n < max_included; j++) {
+            /* Dedupe. */
+            bool dup = false;
+            for (int k = 0; k < n; k++) {
+                if (strcmp(included[k], tmp[j]) == 0) { dup = true; break; }
+            }
+            if (!dup) {
+                strncpy(included[n], tmp[j], 63);
+                included[n][63] = '\0';
+                n++;
+            }
+        }
+    }
+    return n;
+}
+
+/* Check if a file's basename matches any entry in the "included" set. */
+static bool file_is_included(const char *path, char included[][64], int n_included) {
+    const char *slash = strrchr(path, '/');
+    const char *base = slash ? slash + 1 : path;
+    /* Extract bare basename — strip "source-" prefix and ".TEXT..." extension. */
+    char bare[64];
+    strncpy(bare, base, sizeof(bare) - 1);
+    bare[sizeof(bare) - 1] = '\0';
+    /* Skip "source-" prefix. */
+    char *b = bare;
+    if (strncasecmp(b, "source-", 7) == 0) b += 7;
+    /* Strip first '.' */
+    char *dot = strchr(b, '.');
+    if (dot) *dot = '\0';
+    /* Uppercase. */
+    for (char *c = b; *c; c++) *c = toupper((unsigned char)*c);
+    for (int i = 0; i < n_included; i++) {
+        if (strcmp(b, included[i]) == 0) return true;
+    }
+    return false;
+}
+
 /* ========================================================================
  * Compilation
  * ======================================================================== */
@@ -572,12 +674,24 @@ build_result_t toolchain_build(const char *source_dir,
         fprintf(stderr, "COMPILE TARGET '%s' [STRICT]: %d modules, %d files matched (from %d candidates)\n",
                 target->name, modules_requested, num_files, num_cand);
     } else {
+        /* P60: skip files that are $I-included by other files on the
+         * list. Otherwise they'd be compiled twice (once standalone,
+         * once inline via $I-expansion in the parent), causing symbol
+         * duplication / placement drift. */
+        static char included_set[256][64];
+        int n_included = build_included_set(candidates, num_cand,
+                                             included_set, 256);
+        int skipped = 0;
         for (int c = 0; c < num_cand; c++) {
+            if (file_is_included(candidates[c].path, included_set, n_included)) {
+                skipped++;
+                continue;
+            }
             if (num_files < MAX_SOURCE_FILES)
                 files[num_files++] = candidates[c];
         }
-        fprintf(stderr, "COMPILE TARGET '%s' [LOOSE]: %d modules requested, %d source files (full walk)\n",
-                target->name, modules_requested, num_files);
+        fprintf(stderr, "COMPILE TARGET '%s' [LOOSE]: %d modules requested, %d source files (%d skipped as $I-included)\n",
+                target->name, modules_requested, num_files, skipped);
     }
     free(candidates);
 

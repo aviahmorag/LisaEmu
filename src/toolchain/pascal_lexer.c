@@ -439,9 +439,13 @@ static bool lexer_handle_directive(lexer_t *lex, const char *dir) {
         return true;
     }
 
-    /* $I filename — include file */
-    if ((dir[1] == 'I' || dir[1] == 'i') &&
-        (dir[2] == ' ' || dir[2] == '\t')) {
+    /* $I filename — include file. Accept both `{$I name}` (space)
+     * and `{$Iname}` / `(*$Iname*)` (no space, used in MM0.TEXT
+     * and other units). Exclude $IFC (conditional compile). */
+    bool is_i = (dir[1] == 'I' || dir[1] == 'i');
+    bool is_ifc = is_i && (dir[2] == 'F' || dir[2] == 'f') &&
+                  (dir[3] == 'C' || dir[3] == 'c');
+    if (is_i && !is_ifc) {
         if (lexer_is_active(lex)) {
             const char *p = dir + 2;
             while (*p == ' ' || *p == '\t') p++;
