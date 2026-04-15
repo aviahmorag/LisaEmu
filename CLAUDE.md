@@ -70,7 +70,61 @@ make audit-linker       # Stage 4: Full pipeline + linker
 cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' build 2>&1 | grep -E "(error:|BUILD)"
 ```
 
-## Current Status (2026-04-15 PM5)
+## Current Status (2026-04-15 PM6)
+
+### Fix (P25): Pascal string equality byte-compare
+
+`s = 'literal'` and `s <> 'literal'` now emit an inline byte-compare
+(length check + CMPM.B loop) instead of scalar CMP.L. Triggered when
+either operand is `AST_STRING_LITERAL` (expr_size heuristic alone
+misses field-access-through-deref-of-array-access type resolution,
+so the literal itself is the trigger). TOK_NE flips via EORI.W #1.
+
+Result: `configinfo[i]^.devname = 'BITBKT'` in FIND_EMPTYSLOT now
+works. MAKE_BUILTIN succeeds. SYSTEM_ERROR(10758) cleared. Milestone
+count 15 → 16 (gains INIT_PROCESS). Toolchain audit 100% clean.
+
+Also in this session:
+- Xcode build unblocked: `lisaOS/lisaOS/Emulator/boot_progress.{c,h}`
+  added as symlinks (per project convention — NOT copies).
+- headless frames CLI arg fixed: `./build/lisaemu --headless
+  Lisa_Source 5000` now respects the frame count (was frozen at 600).
+
+### New blocker: READ_DATA loop calling VALID_AD repeatedly
+
+Boot no longer crashes — the 600-frame window completed cleanly with
+only the two expected 10738 HLE-suppressed errors. But past
+BOOT_IO_INIT, execution enters a **READ_DATA loop** that never
+advances to FS_INIT.
+
+Probe added at `VALID_AD` entry in `src/m68k.c` (kept in the tree):
+```
+[VALID_AD #1..#1000] caller=$08788C arr=$CBFBF0 numcheck=3 errnum@$CB00D3
+```
+Every call comes from the same JSR site inside READ_DATA ($087818)
+at return addr $08788C, with same args (3 parms to check, stable
+parmcheck address). Over 5000 frames, VALID_AD was called 1000+
+times — so READ_DATA is being re-invoked repeatedly by its caller,
+not spinning internally.
+
+READ_DATA (source-fsui1.text:1686) is the filesystem read primitive.
+It's called by FS_INIT and friends during filesystem startup.
+Something in that caller loops if READ_DATA returns error (likely a
+10738 or related boot-device read failure that our HLE partially
+handled but didn't fully resolve).
+
+Next-session task:
+1. Identify READ_DATA's caller in the spin: map the stack frame at
+   $08788C probe time to see what called READ_DATA (add a 2nd-level
+   probe on READ_DATA entry, dump the return-address chain).
+2. Check the error returned by READ_DATA. If it's a retry-forever
+   error from our 10738 HLE's partial handling, either make the HLE
+   report a terminating condition or skip that FS_INIT retry path
+   entirely.
+
+---
+
+## Prior Status (2026-04-15 PM5)
 
 ### Fix (P23): proc-local TYPE registration + WITH/array codegen
 

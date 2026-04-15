@@ -2924,6 +2924,32 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
          * which procedures have been entered. O(1) lookup, cheap. */
         boot_progress_record_pc(cpu->pc);
 
+        /* VALID_AD spin probe: boot stalls in VALID_ADDR walking a
+         * bogus parmcheck array. Log entry details for the first few
+         * calls so we can identify the caller and why numcheck is huge. */
+        {
+            extern uint32_t boot_progress_lookup(const char *name);
+            static uint32_t valid_ad_addr = 0;
+            static int va_probed = 0;
+            if (!va_probed) { va_probed = 1; valid_ad_addr = boot_progress_lookup("VALID_AD"); }
+            if (valid_ad_addr && cpu->pc == valid_ad_addr) {
+                DBGSTATIC(int, va_count, 0);
+                va_count++;
+                if (va_count < 8 || va_count == 100 || va_count == 1000 || va_count == 10000) {
+                    /* Stack frame at entry: return addr, then pcheck
+                     * (4 bytes), errnum (4 bytes, VAR ptr). RTN offset = 12. */
+                    uint32_t sp = cpu->a[7];
+                    uint32_t retaddr = cpu_read32(cpu, sp);
+                    uint32_t arr = cpu_read32(cpu, sp + 4);
+                    uint32_t errnum = cpu_read32(cpu, sp + 8);
+                    uint16_t numcheck = cpu_read16(cpu, arr);
+                    fprintf(stderr,
+                        "[VALID_AD #%d] caller=$%06X arr=$%06X numcheck=%d errnum@$%06X\n",
+                        va_count, retaddr, arr, numcheck, errnum);
+                }
+            }
+        }
+
         /* HLE: bypass ENTER_LOADER. The real proc is a supervisor/user
          * mode-switch bridge that calls loader_link at $204. Our
          * source-compiled boot has no real loader (the ROM stub at
