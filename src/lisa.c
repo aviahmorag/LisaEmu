@@ -837,19 +837,23 @@ static void io_write_cb(uint32_t offset, uint8_t val) {
              *   offset 26: wordvalue (2 bytes)
              *   offset 28: bytevalue (1 byte + pad)
              *   offset 30: path (ld_filename = pascal string) */
+            /* fake_parms comes in as a LOGICAL (MMU-translated) address —
+             * the caller lives in user-mode code with the MMU enabled, so
+             * it passes a virtual pointer. Route all reads through
+             * lisa_mem_read{8,16,32} which handle the translation. */
             uint32_t pa = loader_parms_addr;
-            if (pa + 30 >= LISA_RAM_SIZE) {
-                fprintf(stderr, "LOADER TRAP: invalid parms addr $%08X\n", pa);
-                return;
-            }
+            /* Probe the first and last byte we'll touch (offset +30 for the
+             * Pascal string length) to catch obviously bogus pointers. We
+             * don't need an exact bound check here — the MMU will pass
+             * unmapped segments through and the emulator will flag the
+             * resulting out-of-range physical address. */
+            (void)lisa_mem_read8(&lisa->mem, pa);
+            (void)lisa_mem_read8(&lisa->mem, pa + 30);
 
-            uint16_t opcode = (lisa->mem.ram[pa+2] << 8) | lisa->mem.ram[pa+3];
-            uint32_t addr   = (lisa->mem.ram[pa+4] << 24) | (lisa->mem.ram[pa+5] << 16) |
-                              (lisa->mem.ram[pa+6] << 8) | lisa->mem.ram[pa+7];
-            uint32_t blok   = (lisa->mem.ram[pa+12] << 24) | (lisa->mem.ram[pa+13] << 16) |
-                              (lisa->mem.ram[pa+14] << 8) | lisa->mem.ram[pa+15];
-            uint32_t count  = (lisa->mem.ram[pa+16] << 24) | (lisa->mem.ram[pa+17] << 16) |
-                              (lisa->mem.ram[pa+18] << 8) | lisa->mem.ram[pa+19];
+            uint16_t opcode = lisa_mem_read16(&lisa->mem, pa + 2);
+            uint32_t addr   = lisa_mem_read32(&lisa->mem, pa + 4);
+            uint32_t blok   = lisa_mem_read32(&lisa->mem, pa + 12);
+            uint32_t count  = lisa_mem_read32(&lisa->mem, pa + 16);
 
             fprintf(stderr, "LOADER TRAP: opcode=%u addr=$%08X blok=%u count=%u\n",
                     opcode, addr, (unsigned)blok, (unsigned)count);
@@ -857,19 +861,17 @@ static void io_write_cb(uint32_t offset, uint8_t val) {
             switch (opcode) {
                 case 0: { /* call_open — open a file on boot disk */
                     /* Extract Pascal string from path field at offset 30 */
-                    int path_len = lisa->mem.ram[pa+30];
+                    int path_len = lisa_mem_read8(&lisa->mem, pa + 30);
                     if (path_len > 32) path_len = 32;
                     char path_str[64];
                     for (int i = 0; i < path_len; i++)
-                        path_str[i] = lisa->mem.ram[pa+31+i];
+                        path_str[i] = lisa_mem_read8(&lisa->mem, pa + 31 + i);
                     path_str[path_len] = '\0';
 
                     bool ok = ldr_open_file(lisa, path_str);
                     /* result at offset 20 (Pascal boolean = 2 bytes) */
-                    lisa->mem.ram[pa+20] = 0;
-                    lisa->mem.ram[pa+21] = ok ? 1 : 0;
-                    lisa->mem.ram[pa+0] = 0;
-                    lisa->mem.ram[pa+1] = 0;
+                    lisa_mem_write16(&lisa->mem, pa + 20, ok ? 0x0001 : 0x0000);
+                    lisa_mem_write16(&lisa->mem, pa + 0, 0);
                     fprintf(stderr, "LOADER: call_open '%s' → %s\n",
                             path_str, ok ? "OK" : "FAIL");
                     break;
@@ -877,43 +879,34 @@ static void io_write_cb(uint32_t offset, uint8_t val) {
 
                 case 1: { /* call_fill — position to byte offset in file */
                     bool ok = ldr_fillbuf(lisa, (int32_t)addr);
-                    lisa->mem.ram[pa+0] = 0;
-                    lisa->mem.ram[pa+1] = ok ? 0 : 0xFF;
+                    lisa_mem_write16(&lisa->mem, pa + 0, ok ? 0x0000 : 0x00FF);
                     break;
                 }
 
                 case 2: { /* call_byte — read next byte from file */
                     uint8_t b = ldr_getbyte(lisa);
-                    lisa->mem.ram[pa+28] = b; /* bytevalue at offset 28 */
-                    lisa->mem.ram[pa+0] = 0;
-                    lisa->mem.ram[pa+1] = 0;
+                    lisa_mem_write8(&lisa->mem, pa + 28, b); /* bytevalue */
+                    lisa_mem_write16(&lisa->mem, pa + 0, 0);
                     break;
                 }
 
                 case 3: { /* call_word — read next word from file */
                     int16_t w = ldr_getword(lisa);
-                    lisa->mem.ram[pa+26] = (w >> 8) & 0xFF; /* wordvalue at offset 26 */
-                    lisa->mem.ram[pa+27] = w & 0xFF;
-                    lisa->mem.ram[pa+0] = 0;
-                    lisa->mem.ram[pa+1] = 0;
+                    lisa_mem_write16(&lisa->mem, pa + 26, (uint16_t)w);
+                    lisa_mem_write16(&lisa->mem, pa + 0, 0);
                     break;
                 }
 
                 case 4: { /* call_long — read next longint from file */
                     int32_t l = ldr_getlong(lisa);
-                    lisa->mem.ram[pa+22] = (l >> 24) & 0xFF; /* longvalue at offset 22 */
-                    lisa->mem.ram[pa+23] = (l >> 16) & 0xFF;
-                    lisa->mem.ram[pa+24] = (l >> 8) & 0xFF;
-                    lisa->mem.ram[pa+25] = l & 0xFF;
-                    lisa->mem.ram[pa+0] = 0;
-                    lisa->mem.ram[pa+1] = 0;
+                    lisa_mem_write32(&lisa->mem, pa + 22, (uint32_t)l);
+                    lisa_mem_write16(&lisa->mem, pa + 0, 0);
                     break;
                 }
 
                 case 5: { /* call_move — move bytes from file to memory */
                     ldr_movemultiple(lisa, (int32_t)count, addr);
-                    lisa->mem.ram[pa+0] = 0;
-                    lisa->mem.ram[pa+1] = 0;
+                    lisa_mem_write16(&lisa->mem, pa + 0, 0);
                     fprintf(stderr, "LOADER: call_move %u bytes → $%08X\n",
                             (unsigned)count, addr);
                     break;
@@ -944,29 +937,25 @@ static void io_write_cb(uint32_t offset, uint8_t val) {
                             }
                         }
                         /* Fill header/tag data */
-                        uint32_t hdr_addr = (lisa->mem.ram[pa+8] << 24) | (lisa->mem.ram[pa+9] << 16) |
-                                            (lisa->mem.ram[pa+10] << 8) | lisa->mem.ram[pa+11];
+                        uint32_t hdr_addr = lisa_mem_read32(&lisa->mem, pa + 8);
                         if (hdr_addr > 0 && hdr_addr + PROFILE_TAG_SIZE <= LISA_RAM_SIZE) {
                             size_t tag_offset = (size_t)(block0 + blok) * PROFILE_BLOCK_SIZE;
                             if (tag_offset + PROFILE_TAG_SIZE <= lisa->profile.data_size)
                                 memcpy(&lisa->mem.ram[hdr_addr],
                                        lisa->profile.data + tag_offset, PROFILE_TAG_SIZE);
                         }
-                        lisa->mem.ram[pa+0] = 0;
-                        lisa->mem.ram[pa+1] = 0;
+                        lisa_mem_write16(&lisa->mem, pa + 0, 0);
                         fprintf(stderr, "LOADER: call_read %u blocks @%u (abs %u) → $%08X\n",
                                 (unsigned)count, (unsigned)blok, (unsigned)(block0+blok), addr);
                     } else {
-                        lisa->mem.ram[pa+0] = 0xFF;
-                        lisa->mem.ram[pa+1] = 0xFF;
+                        lisa_mem_write16(&lisa->mem, pa + 0, 0xFFFF);
                         fprintf(stderr, "LOADER: call_read FAIL — no disk\n");
                     }
                     break;
 
                 default:
                     fprintf(stderr, "LOADER: unknown opcode %u\n", opcode);
-                    lisa->mem.ram[pa+0] = 0xFF;
-                    lisa->mem.ram[pa+1] = 0xFF;
+                    lisa_mem_write16(&lisa->mem, pa + 0, 0xFFFF);
                     break;
             }
             loader_parms_addr = 0;

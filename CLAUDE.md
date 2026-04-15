@@ -72,7 +72,29 @@ cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' bui
 
 ## Current Status (2026-04-15)
 
-### Latest fix (P17): `goto` / numeric-label support (was silently dropped)
+### Fix (P18): LOADER TRAP HLE uses MMU-translated reads/writes
+
+Pre-fix, the loader-trap port handler (src/lisa.c:815) indexed
+`lisa->mem.ram[pa+N]` directly, treating the fake_parms pointer as a
+physical offset. That worked only while the MMU was disabled
+(pre-boot). After the MMU comes up, Pascal OS passes a **logical**
+fake_parms pointer (e.g. `$CBFDC8`), which is well above the 2.25 MB
+physical RAM — so the old code rejected the call as "invalid parms
+addr" and the TRAP handler's RTE chain crashed into the vector table.
+
+Fix: route all fake_parms reads/writes through
+`lisa_mem_read{8,16,32}` / `lisa_mem_write{8,16,32}`, which handle
+MMU translation transparently. Removed the now-wrong physical-RAM
+bound check.
+
+**New failure** (not yet fixed): the HLE now decodes the trap, but
+one call comes through with `opcode=6 count=65739` — an obviously
+garbage block count. Suggests either the fake_parms struct layout
+differs post-Pascal-OS, or we're re-entering the trap handler when
+we shouldn't. Next session to diagnose — may need to gate the
+LOADER HLE on the CPU still being in boot-ROM code range.
+
+### Fix (P17): `goto` / numeric-label support (was silently dropped)
 
 Parser created `AST_GOTO` nodes but no `AST_LABEL_DECL`; label prefixes
 like `9:` were consumed and the following statement parsed as if the
