@@ -70,7 +70,31 @@ make audit-linker       # Stage 4: Full pipeline + linker
 cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' build 2>&1 | grep -E "(error:|BUILD)"
 ```
 
-## Current Status (2026-04-15 PM2)
+## Current Status (2026-04-15 PM3)
+
+### Diagnosis (P21 in progress): SYSTEM_ERROR(10201) at hard_excep+594
+
+Added a targeted PC-probe in `src/m68k.c` that fires when PC=$002600 (the
+only hard-exception vector 4 site per VEC-FIRST log). Dump shows:
+
+```
+$25F0: 3F00            MOVE.W D0,-(SP)
+$25F2: 41ED FB2C       LEA -1236(A5),A0
+$25F6: D0FC 0258       ADDA.W #$258,A0
+$25FA: 203C 0000 0080  MOVE.L #$80,D0
+$2600: 00CC A04E 00CC A482 0013 FFEC 00ED 952C   ← raw DATA, illegal as code
+$2610: 2008 3F00 41ED FB2C 203C 0000 0081 3200   ← code resumes, next iter #$81
+```
+
+Execution falls straight through $25FA → $2600 (no branch). The 16 bytes
+at $2600..$260F look like an inline relocation table (sysglobal
+addresses $00CCA04E / $00CCA482, plus two offsets). Hypothesis: codegen
+either (a) emitted a data table mid-stream without a BRA over it, or
+(b) dropped the JSR at $2600 between the arg-prep and the next loop
+iteration at $2610. Need to identify which Pascal proc compiled here
+(MMU segmentation makes the raw map lookup unreliable — $2600 has
+multiple segment symbols). Boot progress markers reach INIT_SCTAB
+(15/27), so the proc is between that and INIT_MEASINFO.
 
 ### Fix (P20): non-primitive value params + prefer Pascal body over external sig
 

@@ -3349,6 +3349,45 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                         cpu_read8(cpu, 0x2E), cpu_read8(cpu, 0x2F));
             }
         }
+        /* Detect PC in suspicious low RAM ($400..$5000) — above vector table,
+         * below the normal Pascal-code start. PC=$002600 fired during boot and
+         * funneled into hard_excep → SYSTEM_ERROR(10201). Dump ring, regs,
+         * stack to find the JSR/JMP that landed us here. */
+        {
+            DBGSTATIC(int, lowpc_trace_count, 0);
+            uint32_t masked = cpu->pc & 0xFFFFFF;
+            if (masked == 0x002600 && lowpc_trace_count < 3) {
+                lowpc_trace_count++;
+                fprintf(stderr, "\n!!! PC IN LOW RAM (#%d): PC=$%06X op=$%04X SP=$%08X SR=$%04X\n",
+                        lowpc_trace_count, cpu->pc, cpu_read16(cpu, cpu->pc),
+                        cpu->a[7], cpu->sr);
+                fprintf(stderr, "    Last 30 PCs (oldest→newest):\n");
+                for (int ri = 30; ri > 0; ri--) {
+                    uint32_t rpc = pc_ring[(pc_ring_idx - ri) & 255];
+                    uint16_t rop = cpu_read16(cpu, rpc);
+                    fprintf(stderr, "      PC=$%06X op=$%04X", rpc, rop);
+                    if (rop == 0x4E75) fprintf(stderr, "  RTS");
+                    else if (rop == 0x4E73) fprintf(stderr, "  RTE");
+                    else if ((rop & 0xFFC0) == 0x4EC0) fprintf(stderr, "  JMP");
+                    else if ((rop & 0xFFC0) == 0x4E80) fprintf(stderr, "  JSR");
+                    else if ((rop & 0xFF00) == 0x6000) fprintf(stderr, "  BRA");
+                    else if ((rop & 0xFF00) == 0x6100) fprintf(stderr, "  BSR");
+                    fprintf(stderr, "\n");
+                }
+                fprintf(stderr, "    Regs: D0=$%08X D1=$%08X A0=$%08X A1=$%08X\n",
+                        cpu->d[0], cpu->d[1], cpu->a[0], cpu->a[1]);
+                fprintf(stderr, "          A5=$%08X A6=$%08X A7=$%08X\n",
+                        cpu->a[5], cpu->a[6], cpu->a[7]);
+                fprintf(stderr, "    Stack (8 longs from SP):");
+                for (int si = 0; si < 8; si++)
+                    fprintf(stderr, " $%08X", cpu_read32(cpu, (cpu->a[7] + si*4) & 0xFFFFFF));
+                fprintf(stderr, "\n");
+                fprintf(stderr, "    Bytes @$25F0..$2620:");
+                for (uint32_t a = 0x25F0; a < 0x2620; a += 2)
+                    fprintf(stderr, " %04X", cpu_read16(cpu, a));
+                fprintf(stderr, "\n");
+            }
+        }
         /* Detect PC in unmapped RAM ($200000-$FBFFFF) — past 2MB, before I/O */
         {
             DBGSTATIC(int, unmapped_trace_count, 0);
