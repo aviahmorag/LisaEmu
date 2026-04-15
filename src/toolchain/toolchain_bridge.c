@@ -501,12 +501,21 @@ build_result_t toolchain_build(const char *source_dir,
         return result;
     }
 
-    /* Only compile OS kernel and system libraries (LISA_OS/).
-     * Apps (APPS/) and Toolkit (Lisa_Toolkit/) are loaded on demand —
-     * the kernel must fit in 1MB RAM. */
+    /* P57: match real SYSTEM.OS link set. Only LISA_OS/OS/ (kernel
+     * sources) + LIBHW (hardware intrinsics). Apps, user libraries
+     * (LIBS), fonts, and toolkit are loaded on demand by the OS —
+     * including them in the boot image bloats it past LISA_RAM_SIZE
+     * and causes physical-RAM collisions between code and
+     * stack/heap (see P55/P56 diagnosis).
+     *
+     * Reference: _inspiration/LisaSourceCompilation-main/src/LINK/
+     * ALEX-LINK-SYSTEMOS.TEXT lists the 47 modules that go into the
+     * real SYSTEM.OS binary; they all live in OS/ or LIBHW/. */
     int num_files = 0;
     char subdir[512];
-    snprintf(subdir, sizeof(subdir), "%s/LISA_OS", source_dir);
+    snprintf(subdir, sizeof(subdir), "%s/LISA_OS/OS", source_dir);
+    num_files += find_source_files(subdir, files + num_files, MAX_SOURCE_FILES - num_files);
+    snprintf(subdir, sizeof(subdir), "%s/LISA_OS/LIBHW", source_dir);
     num_files += find_source_files(subdir, files + num_files, MAX_SOURCE_FILES - num_files);
 
     /* Sort files: interface/definition files first, then primitives, then
