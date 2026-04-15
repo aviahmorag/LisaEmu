@@ -712,10 +712,29 @@ static ast_node_t *parse_type(parser_t *p) {
                 advance(p);
             match(p, TOK_OF);
 
-            /* Track the largest variant arm to use for sizing.
-             * We'll collect fields from the first variant arm that has fields. */
-            int best_arm_field_count = 0;
-            ast_node_t *best_arm_fields[64];
+            /* Emit a sentinel marker before the variant fields so the type
+             * builder knows the variant region starts here (and can lay out
+             * arms with overlapping offsets). */
+            ast_node_t *vbeg = ast_new(AST_FIELD, p->lex.line);
+            strncpy(vbeg->name, "__variant_begin__", sizeof(vbeg->name) - 1);
+            ast_add_child(n, vbeg);
+
+            /* Collect fields from ALL variant arms and add them to the
+             * record. Different arms overlap in memory at the same starting
+             * offset (the "variant offset" = sum of fixed fields). Type
+             * descriptors downstream don't model overlap, but the codegen
+             * needs to find every variant field by name — otherwise code
+             * like `with rec do begin freechain.fwd_link := ... end`
+             * silently drops stores when `freechain` is in a smaller arm.
+             * Correct Pascal layout sets the overlap offset per arm; our
+             * compromise is to mark variant fields with a flag so the
+             * offset-assignment pass can reset them to the variant offset.
+             * For now we just emit them all and rely on the first arm
+             * providing the most relevant layout. */
+            ast_node_t *all_variant_fields[256];
+            int num_variant_fields = 0;
+            int arm_start_indices[64]; /* index in all_variant_fields where each arm begins */
+            int num_arms = 0;
 
             while (!check(p, TOK_END) && !check(p, TOK_EOF) && !BAILED(p)) {
                 /* Skip variant labels: const [, const]... : */
@@ -725,9 +744,8 @@ static ast_node_t *parse_type(parser_t *p) {
 
                 /* Variant arm fields in parentheses: (field1: type1; ...) */
                 if (match(p, TOK_LPAREN)) {
-                    int arm_field_count = 0;
-                    ast_node_t *arm_fields[64];
-
+                    if (num_arms < 64)
+                        arm_start_indices[num_arms++] = num_variant_fields;
                     while (!check(p, TOK_RPAREN) && !check(p, TOK_CASE) &&
                            !check(p, TOK_END) && !check(p, TOK_EOF) && !BAILED(p)) {
                         /* Parse field: name[, name] : type */
@@ -745,30 +763,38 @@ static ast_node_t *parse_type(parser_t *p) {
                             if (match(p, TOK_COLON)) {
                                 ast_add_child(field, parse_type(p));
                             }
-                            if (arm_field_count < 64)
-                                arm_fields[arm_field_count++] = field;
+                            if (num_variant_fields < 256)
+                                all_variant_fields[num_variant_fields++] = field;
                             match(p, TOK_SEMICOLON);
                         } else {
                             advance(p); /* skip unexpected tokens */
                         }
                     }
                     match(p, TOK_RPAREN);
-
-                    /* Keep the arm with the most fields (heuristic for largest) */
-                    if (arm_field_count > best_arm_field_count) {
-                        best_arm_field_count = arm_field_count;
-                        for (int fi = 0; fi < arm_field_count; fi++)
-                            best_arm_fields[fi] = arm_fields[fi];
-                    }
                 } else {
                     /* No parentheses — skip to next variant or END */
                 }
                 match(p, TOK_SEMICOLON);
             }
 
-            /* Add the largest variant arm's fields to the record */
-            for (int fi = 0; fi < best_arm_field_count; fi++)
-                ast_add_child(n, best_arm_fields[fi]);
+            /* Add variant-arm fields, with __variant_arm__ sentinels
+             * between arms so the type builder can reset offset to the
+             * variant start at each arm boundary (proper Pascal variant
+             * record layout — arms overlap in memory). */
+            for (int ai = 0; ai < num_arms; ai++) {
+                int arm_begin = arm_start_indices[ai];
+                int arm_end = (ai + 1 < num_arms) ? arm_start_indices[ai + 1] : num_variant_fields;
+                if (ai > 0) {
+                    ast_node_t *vsep = ast_new(AST_FIELD, p->lex.line);
+                    strncpy(vsep->name, "__variant_arm__", sizeof(vsep->name) - 1);
+                    ast_add_child(n, vsep);
+                }
+                for (int fi = arm_begin; fi < arm_end; fi++)
+                    ast_add_child(n, all_variant_fields[fi]);
+            }
+            ast_node_t *vend = ast_new(AST_FIELD, p->lex.line);
+            strncpy(vend->name, "__variant_end__", sizeof(vend->name) - 1);
+            ast_add_child(n, vend);
         }
         expect(p, TOK_END);
         return n;

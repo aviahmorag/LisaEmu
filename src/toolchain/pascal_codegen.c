@@ -280,21 +280,39 @@ static type_desc_t *resolve_type(codegen_t *cg, ast_node_t *node) {
         case AST_TYPE_RECORD: {
             type_desc_t *t = add_type(cg, "", TK_RECORD, 0);
             int offset = 0;
+            int variant_start = -1;   /* offset where variants begin; -1 = not yet */
+            int variant_max_end = 0;  /* max end offset across all variant arms */
             for (int i = 0; i < node->num_children; i++) {
                 ast_node_t *field = node->children[i];
-                if (field->type == AST_FIELD && field->num_children > 0) {
-                    type_desc_t *ft = resolve_type(cg, field->children[0]);
-                    int fs = ft ? ft->size : 2;
-                    /* Word-align fields */
-                    if (fs >= 2 && (offset % 2)) offset++;
-                    if (t->num_fields < 64) {
-                        strncpy(t->fields[t->num_fields].name, field->name, 63);
-                        t->fields[t->num_fields].offset = offset;
-                        t->fields[t->num_fields].type = ft;
-                        t->num_fields++;
+                if (field->type != AST_FIELD) continue;
+                /* Variant-region sentinels inserted by the parser */
+                if (field->num_children == 0) {
+                    if (str_eq_nocase(field->name, "__variant_begin__")) {
+                        if (offset % 2) offset++;
+                        variant_start = offset;
+                        variant_max_end = offset;
+                    } else if (str_eq_nocase(field->name, "__variant_arm__")) {
+                        /* Track the end of the previous arm, reset to variant start */
+                        if (offset > variant_max_end) variant_max_end = offset;
+                        offset = variant_start;
+                    } else if (str_eq_nocase(field->name, "__variant_end__")) {
+                        if (offset > variant_max_end) variant_max_end = offset;
+                        offset = variant_max_end;
+                        variant_start = -1;
                     }
-                    offset += fs;
+                    continue;
                 }
+                type_desc_t *ft = resolve_type(cg, field->children[0]);
+                int fs = ft ? ft->size : 2;
+                /* Word-align fields */
+                if (fs >= 2 && (offset % 2)) offset++;
+                if (t->num_fields < 64) {
+                    strncpy(t->fields[t->num_fields].name, field->name, 63);
+                    t->fields[t->num_fields].offset = offset;
+                    t->fields[t->num_fields].type = ft;
+                    t->num_fields++;
+                }
+                offset += fs;
             }
             if (offset % 2) offset++; /* Pad to word boundary */
             t->size = offset;
