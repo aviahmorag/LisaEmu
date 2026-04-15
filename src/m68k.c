@@ -2924,6 +2924,35 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
          * which procedures have been entered. O(1) lookup, cheap. */
         boot_progress_record_pc(cpu->pc);
 
+        /* HLE: bypass Setup_IUInfo. Our source-compile boot doesn't
+         * have INTRINSIC.LIB populated via a real loader, so
+         * Build_Unit_Directory's `for i := 1 to nUnits do GetObjVar(..)`
+         * spins forever reading stale bytes from an empty/unseeded
+         * intrinsic library file. Setup_IUInfo is only needed for
+         * dynamic code loading (IU trap handler, shared-segment dir);
+         * the boot path to FS_INIT / system processes doesn't strictly
+         * require it. Bypassing it is the same strategy as the
+         * ENTER_LOADER HLE (P24) and lets boot advance.
+         *
+         * Setup_IUInfo takes no Pascal args, so HLE = pop retaddr, RTS. */
+        {
+            extern uint32_t boot_progress_lookup(const char *name);
+            static uint32_t setup_iuinfo_addr = 0;
+            static int si_probed = 0;
+            if (!si_probed) { si_probed = 1; setup_iuinfo_addr = boot_progress_lookup("Setup_IUInfo"); }
+            if (setup_iuinfo_addr && cpu->pc == setup_iuinfo_addr) {
+                uint32_t retaddr = cpu_read32(cpu, cpu->a[7]);
+                cpu->a[7] += 4;
+                cpu->pc = retaddr;
+                cpu->cycles += 20;
+                DBGSTATIC(int, si_count, 0);
+                if (si_count++ < 3)
+                    fprintf(stderr, "[HLE-Setup_IUInfo #%d] bypassed, return to $%06X\n",
+                            si_count, retaddr);
+                continue;
+            }
+        }
+
         /* READ_DATA caller probe: locate the outer proc that keeps
          * re-invoking READ_DATA during FS_INIT, and log its return
          * chain so we can find the retry loop. */

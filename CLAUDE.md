@@ -149,14 +149,38 @@ keeps returning the same bytes. Our source-compile boot doesn't
 have INTRINSIC.LIB populated via a real loader; our HLE is
 possibly returning "success with stale data."
 
+### Fix (P26): HLE bypass for Setup_IUInfo
+
+Took the short-circuit path (option 3 from the diagnosis). Setup_IUInfo
+takes no Pascal args, so the HLE is trivial: pop retaddr, RTS. Boot
+escapes the READ_DATA spin.
+
+New immediate blocker: **SYSTEM_ERROR(10201) at ret=$0739AC** (inside
+`hard_excep`) from illegal-instr at PC=$08658A with opcode=$00CC.
+The linked binary at $08658A contains $3400 (MOVE.W D0,D2) — a legal
+instruction. So either:
+- Runtime code overwrite (like the pre-P23 seg-85 alias bug — probably
+  a different segment this time). Not yet confirmed.
+- Or CPU took a wild jump to $08658A with a stale relocation byte in
+  memory there after some other proc wrote data. $00CC is the MSB of
+  \$00CCxxxx (sysglobal pointer), suggesting the classic "data stored
+  mid-code region" pattern we've seen before.
+
+Proc around $08658A: between `REG_OPEN_LIST` ($0864BE) and `GOPEN`
+($0867F0). Likely more FS init (file registration / open) — the same
+region that was failing pre-Setup_IUInfo bypass.
+
 Next-session plan:
-1. Log obj_ptr^.error and actual read count after each READ_DATA.
-2. Check whether fmark/absbyte advances between calls (source
-   code is at fsui1.text:1744+).
-3. If the file doesn't actually exist in our FS image, short-circuit
-   Setup_IUInfo via HLE (it's only needed for dynamic code loading
-   from the intrinsic library; we may be able to skip it for the
-   boot path).
+1. Compare $08658A bytes in `build/lisa_linked.bin` (static) vs
+   runtime read — confirm overwrite hypothesis with a watchpoint on
+   phys address (or translated address — depends on segment).
+2. If overwrite: trace who wrote there. The prior seg-85 MMU bug
+   pattern suggests another segment's SOR is 0 for a non-vector area
+   and a legit P_ENQUEUE / MAKE_FREE write is aliasing. MMU-W probe
+   is already in place — look for seg 67 (or whatever segment maps
+   $086xxx) writes with SOR=0.
+3. If no overwrite: check if the last JSR/RTS target is PC=$08658A
+   by design but the instruction is in a segment that's not loaded.
 
 ---
 
