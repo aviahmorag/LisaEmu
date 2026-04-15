@@ -83,20 +83,45 @@ After `G` at Lisabug prompt, reaches OS LOADER → **SYSTEM ERROR 10100**
 
 Toolchain: 317 Pascal + 103 ASM files → linked binary → disk image.
 Boot reaches PASCALINIT → INITSYS → GETLDMAP → REG_TO_MAPPED →
-POOL_INIT → MM_INIT. Passes ALL of INITSYS initialization, then
-hangs in a tight poll at **$0A17BC-$0A17F6 with IPL=7** (all
-interrupts masked). Runs 2000+ frames cleanly, no SYSTEM_ERROR.
-**Important correction (2026-04-15):** prior handoffs labeled this
-"scheduler idle loop" — it is NOT. The segment map places $A17BC
-inside `SOURCE-MODEMA.TEXT.unix.txt` ($0A067C-$0A303F). The loop
-reads memory via A0=$B9F608 in 8-byte strides (likely FINDBIT or
-a serial buffer scan). The real scheduler binary is at
-$0B81E2-$0B8BBD. Boot hangs **before** reaching the scheduler
-proper, inside a device-init poll that spins against unemulated
-serial/SCC hardware.
-Next: identify which caller enters MODEMA during boot (PC ring
-trace from the last JSR before $A17BC) and decide whether to HLE
-the SCC poll or short-circuit the modem driver init.
+POOL_INIT → MM_INIT. Runs 2000+ frames cleanly, no SYSTEM_ERROR,
+then hangs in a tight loop at **$0A17BC-$0A17F6 with IPL=7**.
+
+**Corrected diagnosis (2026-04-15):** the hang is NOT the scheduler
+and NOT a MODEMA hardware poll (despite the PC landing inside the
+MODEMA segment, which just contains Pascal runtime math helpers
+that got linked there). One-shot trace (src/m68k.c, fires once
+when PC enters $A17BC-$A17F6) confirmed the call chain matches
+STARTUP.TEXT line 392-396 (`AVAIL_INIT`):
+
+```
+STARTUP $0008C0 → PMMAKE $0A6F3A (×2 calls)
+STARTUP $000934↔$000928 (×30) — small loop
+STARTUP $000950↔$00095E (×30) — 32-bit DIVIDE-by-subtraction:
+                                 adjust_index := membase div maxmmusize
+STARTUP $000962 → MODEMA-seg $0A18E6 — JSR to multiply helper
+                                       (i-realmemmmu)*maxmmusize
+MODEMA-seg $0A1996 → $0A17A0 — nested JSR (stuck here)
+```
+
+The `$A17A0` loop walks memory at A0=$B9F608 in 8-byte strides,
+reading word and comparing against D2. iospacemmu=126 → $FC0000
+(not $B9F608), so it's NOT an I/O poll. $B9F608 = seg 92 offset
+$1F608 — looks like garbage/uninitialized, not a real data
+structure. Suspect: the SETMMU inline code inside the multiply
+helper is walking a corrupt MMU descriptor list.
+
+Also suspicious: `sg_free_pool_addr = $A0000000` (non-canonical).
+
+Inspiration projects: `_inspiration/lisaem-master/src/lisa/` has
+full Z8530 SCC, VIA, COPS, floppy emulation — worth mining if we
+later need SCC. Not needed for this bug.
+
+Next: (a) add a trace at the START of AVAIL_INIT to confirm the
+procedure identity; (b) log the actual parameters passed into
+$A17A0 (the stuck sub) — specifically the pointer at -4(A6) of
+$A18E6's frame, which becomes A0=$B9F608; (c) find where that
+pointer originates, likely a miscompiled MMU-descriptor-base
+computation.
 
 **Key progress (2026-04-13):**
 - P6: Boolean size (1→2 bytes) — Lisa Pascal stores booleans as words.
