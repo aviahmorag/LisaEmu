@@ -2625,7 +2625,13 @@ static void gen_proc_or_func(codegen_t *cg, ast_node_t *node) {
                 cg_symbol_t *s = add_local(cg, param->name, ptype, true, is_var);
                 if (s) {
                     s->offset = param_offset;
-                    param_offset += is_var ? 4 : (ptype ? ptype->size : 2);
+                    int psz;
+                    if (is_var) psz = 4;
+                    else if (!ptype) psz = 2;
+                    else if (ptype->size == 4) psz = 4;
+                    else if (ptype->size == 1 || ptype->size == 2) psz = 2;
+                    else psz = 4;  /* strings/records/arrays by ref (match register_proc_sig) */
+                    param_offset += psz;
                     if (param_offset % 2) param_offset++;
                 }
             }
@@ -2647,7 +2653,12 @@ static void gen_proc_or_func(codegen_t *cg, ast_node_t *node) {
                 cg_symbol_t *s = add_local(cg, sig->param_name[j], ptype, true, sig->param_is_var[j]);
                 if (s) {
                     s->offset = param_offset;
-                    int psz = sig->param_is_var[j] ? 4 : (ptype ? ptype->size : 2);
+                    int psz;
+                    if (sig->param_is_var[j]) psz = 4;
+                    else if (!ptype) psz = 2;
+                    else if (ptype->size == 4) psz = 4;
+                    else if (ptype->size == 1 || ptype->size == 2) psz = 2;
+                    else psz = 4;
                     if (strcasestr(cg->current_file, "SYSG1") &&
                         strcasestr(node->name, "POOL_INIT"))
                         fprintf(stderr, "    param '%s' offset=%d sz=%d type=%s\n",
@@ -2911,11 +2922,17 @@ static void register_proc_sig(codegen_t *cg, const char *name, ast_node_t *param
         sig->param_type[i] = ptype;
         if (sig->param_is_var[i]) {
             sig->param_size[i] = 4;  /* VAR params are always pointers */
+        } else if (!ptype) {
+            sig->param_size[i] = 2;  /* unresolved — fallback to word */
+        } else if (ptype->size == 4) {
+            sig->param_size[i] = 4;  /* longint, pointer, real */
+        } else if (ptype->size == 1 || ptype->size == 2) {
+            sig->param_size[i] = 2;  /* byte/char/int/bool/enum all push as word */
         } else {
-            if (ptype && ptype->size == 4)
-                sig->param_size[i] = 4;  /* longint, pointer, etc. */
-            else
-                sig->param_size[i] = 2;  /* integer, enum, boolean, etc. */
+            /* String, record, array value params: Apple Pascal passes by
+             * reference (4-byte pointer to the data). Frame layout below
+             * must match this — non-primitive value params occupy 4 bytes. */
+            sig->param_size[i] = 4;
         }
     }
 }

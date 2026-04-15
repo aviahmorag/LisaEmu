@@ -70,7 +70,42 @@ make audit-linker       # Stage 4: Full pipeline + linker
 cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' build 2>&1 | grep -E "(error:|BUILD)"
 ```
 
-## Current Status (2026-04-13)
+## Current Status (2026-04-15)
+
+### Latest fix (P16): string/record value param push/frame mismatch
+
+`crea_ecb(errnum, sys_terminate, @term_def_hdl, ecb_ptr, b_sloc_ptr)` in
+EXCEP_SETUP was passing `b_sloc_ptr = $104C00CE` (upper-word stale,
+lower word = high byte of syslocal base) because string-value params
+(`excep_name : t_ex_name = string[16]`) were being **pushed as MOVE.W
+(2 bytes)** while the callee's frame layout **reserved the full 17+
+bytes for the string**. The stack was misaligned by 15 bytes;
+b_sloc_ptr's read at offset 38(A6) actually picked up adjacent garbage.
+
+Root cause — two matching places in `pascal_codegen.c`:
+1. `register_proc_sig`: fallback `param_size = 2` for any type whose
+   `ptype->size != 4` — strings (17), records, and arrays all got 2.
+2. `gen_proc_or_func` (both forward-decl reconstruction and direct
+   param lists): frame offset incremented by `ptype->size`, so the
+   callee expected strings to occupy their real byte size.
+
+Fix: treat any non-primitive value param (size not in {1,2,4}) as
+**pass-by-reference** (4-byte pointer). Caller LEAs the string into
+D0 (already done), pushes MOVE.L; callee frame reserves 4 bytes.
+Works with our existing LENGTH/COPY intrinsics which already expect
+a string pointer in D0/A0.
+
+Result: `b_area` to GETSPACE now correctly $00CE0000. EXCEP_SETUP's
+4 crea_ecb calls all reach GETSPACE with valid args. SYSTEM_ERROR(10207)
+still fires but from a different downstream cause (likely errnum
+propagation or enqueue write — next session).
+
+Symbol count: 8527 → 8711. Toolchain audit still 100% clean (317/317
+Pascal, 103/103 ASM, link OK, 0 unresolved).
+
+---
+
+## Prior Status (2026-04-13)
 
 ### Prebuilt image (`prebuilt/los_compilation_base.image`)
 
