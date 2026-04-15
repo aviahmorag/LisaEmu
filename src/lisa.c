@@ -2863,16 +2863,40 @@ static bool hle_handle_system_error(lisa_t *lisa __attribute__((unused)), m68k_t
         cpu->cycles += 20;
         return true;
     }
-    /* P75: Error 10707 = stup_fsinit — filesystem init couldn't
-     * complete. Our disk has no real filesystem catalog, so FS_INIT
-     * legitimately fails. Suppress so BOOT_IO_INIT can continue
-     * past the case-4 body to subsequent cases and the post-loop
-     * flow (SYS_PROC_INIT bypass etc). */
+    /* P76: Error 10707 = stup_fsinit. With P75's for-loop fix unlocked
+     * FS_INIT naturally; its body runs FS_MASTER_INIT (fails, no real
+     * disk) → SYSTEM_ERROR(10707) → suppress → return to repeat-loop
+     * → loop check `until error=0` fails → infinite loop. Fix by
+     * exiting the enclosing procedure directly: pop the full stack up
+     * through FS_INIT's frame and RTS back to its caller. */
     if (err_code == 10707) {
-        fprintf(stderr, "HLE: Suppressing SYSTEM_ERROR(%d) — filesystem init handled\n",
+        fprintf(stderr, "HLE: Suppressing SYSTEM_ERROR(%d) — unwind to FS_INIT caller\n",
                 err_code);
-        cpu->a[7] += 4;
-        cpu->a[7] += 2;
+        /* Walk back up to find the frame where FS_INIT was called.
+         * We pop retPC + err arg + repeatedly unwind A6 link chain
+         * until we find a return address outside FS_INIT. FS_INIT is
+         * at $0026F4..~$0027D0 per linker map; its caller return is
+         * in BOOT_IO_INIT. */
+        uint32_t fs_init_pc = 0x0026F4;
+        uint32_t fs_init_end = 0x002800;
+        cpu->a[7] += 4 + 2;  /* pop SYSTEM_ERROR retPC + err */
+        /* Unwind A6 chain until saved retPC is outside FS_INIT. */
+        for (int i = 0; i < 8; i++) {
+            uint32_t a6 = cpu->a[6] & 0xFFFFFF;
+            if (a6 < 0x400 || a6 >= 0xFE0000) break;
+            uint32_t saved_a6 = lisa_mem_read32(&lisa->mem, a6);
+            uint32_t saved_ret = lisa_mem_read32(&lisa->mem, a6 + 4);
+            if (saved_ret < fs_init_pc || saved_ret >= fs_init_end) {
+                /* Outside FS_INIT — this is the caller frame. Unwind. */
+                cpu->a[7] = (cpu->a[7] & 0xFF000000) | ((a6 + 8) & 0xFFFFFF);
+                cpu->a[6] = saved_a6;
+                cpu->pc = saved_ret;
+                cpu->cycles += 40;
+                return true;
+            }
+            cpu->a[6] = saved_a6;
+        }
+        /* Fallback: plain SYSTEM_ERROR suppress */
         cpu->pc = ret_addr;
         cpu->cycles += 20;
         return true;
