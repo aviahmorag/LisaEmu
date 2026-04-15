@@ -2633,29 +2633,66 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
         }
 
         case AST_CASE: {
-            /* Evaluate selector into D0, save in D3 (size-aware) */
+            /* P66: Evaluate selector into D0 and PUSH onto stack. Case
+             * bodies may call procs that clobber D3 (our prior scratch
+             * register), which broke dispatch for later arms — e.g.
+             * case 1,2's MAKE_NAME call corrupted D3 so CMP for case 4
+             * compared against a stale register. Safer: keep selector
+             * on stack, reload into D3 before each CMP. */
             int csz = expr_size(cg, node->children[0]);
             gen_expression(cg, node->children[0]);
             if (csz == 4)
-                emit16(cg, 0x2600);  /* MOVE.L D0,D3 */
+                emit16(cg, 0x2F00);  /* MOVE.L D0,-(SP) */
             else
-                emit16(cg, 0x3600);  /* MOVE.W D0,D3 */
+                emit16(cg, 0x3F00);  /* MOVE.W D0,-(SP) */
 
             uint32_t end_fixups[128];
             int num_fixups = 0;
 
-            /* Case branches: pairs of (label, statement) starting at child[1] */
+            /* Case branches: pairs of (label_or_labels_group, statement)
+             * starting at child[1]. Single-label arm: child = expr.
+             * Multi-label arm: child = AST_CASE_LABELS with N label
+             * children; emit one BEQ per label to the shared body. */
             int ci = 1;
             while (ci + 1 < node->num_children) {
-                /* Evaluate label into D0 */
-                gen_expression(cg, node->children[ci]);
-                if (csz == 4)
-                    emit16(cg, 0xB083);  /* CMP.L D3,D0 */
-                else
-                    emit16(cg, 0xB043);  /* CMP.W D3,D0 */
-                emit16(cg, 0x6600);  /* BNE.W next_case */
-                uint32_t next_pos = cg->code_size;
-                emit16(cg, 0);
+                ast_node_t *label_node = node->children[ci];
+                uint32_t body_pos = 0;
+                uint32_t skip_fixups[16]; int num_skips = 0;
+
+                if (label_node->type == AST_CASE_LABELS) {
+                    uint32_t beq_positions[16]; int num_beqs = 0;
+                    for (int li = 0; li < label_node->num_children; li++) {
+                        gen_expression(cg, label_node->children[li]);
+                        /* Reload selector from stack top into D3. */
+                        if (csz == 4) emit16(cg, 0x262F);  /* MOVE.L 0(SP),D3 */
+                        else          emit16(cg, 0x362F);  /* MOVE.W 0(SP),D3 */
+                        emit16(cg, 0);
+                        if (csz == 4) emit16(cg, 0xB083);  /* CMP.L D3,D0 */
+                        else          emit16(cg, 0xB043);  /* CMP.W D3,D0 */
+                        emit16(cg, 0x6700);  /* BEQ.W body */
+                        if (num_beqs < 16) beq_positions[num_beqs++] = cg->code_size;
+                        emit16(cg, 0);
+                    }
+                    emit16(cg, 0x6000);  /* BRA.W past_body */
+                    if (num_skips < 16) skip_fixups[num_skips++] = cg->code_size;
+                    emit16(cg, 0);
+                    align_code(cg);
+                    body_pos = cg->code_size;
+                    for (int bi = 0; bi < num_beqs; bi++) {
+                        patch16(cg, beq_positions[bi],
+                                (uint16_t)(body_pos - beq_positions[bi]));
+                    }
+                } else {
+                    gen_expression(cg, label_node);
+                    if (csz == 4) emit16(cg, 0x262F);
+                    else          emit16(cg, 0x362F);
+                    emit16(cg, 0);
+                    if (csz == 4) emit16(cg, 0xB083);
+                    else          emit16(cg, 0xB043);
+                    emit16(cg, 0x6600);  /* BNE.W next_case */
+                    if (num_skips < 16) skip_fixups[num_skips++] = cg->code_size;
+                    emit16(cg, 0);
+                }
 
                 /* Case body */
                 gen_statement(cg, node->children[ci + 1]);
@@ -2666,11 +2703,14 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                 if (num_fixups < 128) end_fixups[num_fixups++] = cg->code_size;
                 emit16(cg, 0);
 
-                /* Patch BNE to skip to here */
+                /* Patch the "skip body" branches to land here. */
                 align_code(cg);
-                patch16(cg, next_pos, (uint16_t)(cg->code_size - next_pos));
-
+                for (int si = 0; si < num_skips; si++) {
+                    patch16(cg, skip_fixups[si],
+                            (uint16_t)(cg->code_size - skip_fixups[si]));
+                }
                 ci += 2;
+                (void)body_pos;
             }
 
             /* OTHERWISE: any remaining odd children */
@@ -2684,6 +2724,9 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
             for (int j = 0; j < num_fixups; j++) {
                 patch16(cg, end_fixups[j], (uint16_t)(cg->code_size - end_fixups[j]));
             }
+            /* Pop the selector we pushed at case entry. */
+            if (csz == 2)      emit16(cg, 0x544F);  /* ADDQ.W #2,A7 */
+            else if (csz == 4) emit16(cg, 0x588F);  /* ADDQ.L #4,A7 */
             break;
         }
 

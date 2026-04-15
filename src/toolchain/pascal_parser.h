@@ -73,6 +73,7 @@ typedef enum {
     AST_REPEAT,
     AST_FOR,
     AST_CASE,
+    AST_CASE_LABELS,  /* P66: group of comma-separated case labels sharing one body */
     AST_WITH,
     AST_GOTO,
     AST_EMPTY,

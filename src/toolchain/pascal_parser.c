@@ -88,6 +88,7 @@ const char *ast_type_name(ast_type_t type) {
         case AST_REPEAT: return "REPEAT";
         case AST_FOR: return "FOR";
         case AST_CASE: return "CASE";
+        case AST_CASE_LABELS: return "CASE_LABELS";
         case AST_WITH: return "WITH";
         case AST_GOTO: return "GOTO";
         case AST_EMPTY: return "EMPTY";
@@ -556,15 +557,27 @@ static ast_node_t *parse_statement(parser_t *p) {
                 match(p, TOK_SEMICOLON);
                 continue;
             }
-            /* case label(s) : statement */
-            ast_node_t *label_node = parse_expression(p);
-            while (match(p, TOK_COMMA)) {
-                parse_expression(p); /* additional labels */
+            /* case label(s) : statement
+             * Multiple comma-separated labels share one body. Wrap them
+             * in an AST_CASE_LABELS node so codegen can emit one body
+             * reached via multiple comparisons (avoids body-dup bugs). */
+            ast_node_t *first_label = parse_expression(p);
+            if (check(p, TOK_COMMA)) {
+                ast_node_t *labels_group = ast_new(AST_CASE_LABELS, p->lex.line);
+                ast_add_child(labels_group, first_label);
+                while (match(p, TOK_COMMA)) {
+                    ast_add_child(labels_group, parse_expression(p));
+                }
+                if (!expect(p, TOK_COLON)) { synchronize(p); continue; }
+                ast_node_t *stmt = parse_statement(p);
+                ast_add_child(n, labels_group);
+                ast_add_child(n, stmt);
+            } else {
+                if (!expect(p, TOK_COLON)) { synchronize(p); continue; }
+                ast_node_t *stmt = parse_statement(p);
+                ast_add_child(n, first_label);
+                ast_add_child(n, stmt);
             }
-            if (!expect(p, TOK_COLON)) { synchronize(p); continue; }
-            ast_node_t *stmt = parse_statement(p);
-            ast_add_child(n, label_node);
-            ast_add_child(n, stmt);
             match(p, TOK_SEMICOLON);
         }
         if (match(p, TOK_OTHERWISE)) {
