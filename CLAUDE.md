@@ -170,17 +170,54 @@ Proc around $08658A: between `REG_OPEN_LIST` ($0864BE) and `GOPEN`
 ($0867F0). Likely more FS init (file registration / open) — the same
 region that was failing pre-Setup_IUInfo bypass.
 
+### Fix (P27): drop writes to unmapped segments (no more wrap-alias)
+
+WATCH-$8658A probe confirmed the hypothesis: Pascal runtime at
+PC=$0DE7FE/$0DE7C2 writes to logical $E0658A (seg 112). Seg 112's
+`changed==0` so mmu_translate passed it through unchanged, then
+`phys %= LISA_RAM_SIZE` wrapped $E0658A → $08658A — writing sysglobal-
+pointer bytes ($00 $CC $A5 $12, $34 $00 $70 $00) over legitimate OS
+code at $08658A..$08658D. Next fetch hit opcode $00CC → illegal
+instruction → SYSTEM_ERROR(10201).
+
+Fix in `src/lisa_mmu.c` (both `lisa_mem_write8` RAM paths): when
+both the logical addr AND the post-translate phys are above
+LISA_RAM_SIZE ($240000), the segment is unconfigured — drop the
+write instead of wrapping. Read path still falls through (returns
+arbitrary memory but can't corrupt state). New `UNMAPPED-WRITE`
+probe logs the first 16 drops for visibility.
+
+This is a general backstop — the same wrap bug was the root cause
+of pre-P22 seg-85 code corruption (fixed narrowly at the MMU-
+programming HLE level). P27 adds a generic safety net: any
+segment that was never configured by the OS can't silently corrupt
+physical code.
+
+Result:
+- WATCH-$8658A fires 4 times (before being dropped), no more
+  overwrite at $08658A.
+- SYSTEM_ERROR(10201) cleared. Boot runs 5000 frames cleanly
+  without halting.
+- Boot now spins in `Find_it` ($06E06E) — a lookup routine that
+  apparently calls itself repeatedly looking for something that
+  isn't there. Next downstream blocker.
+
+Audit: toolchain 100% clean (8711/8711 symbols, 382 modules,
+link OK, output 2297054 bytes).
+
 Next-session plan:
-1. Compare $08658A bytes in `build/lisa_linked.bin` (static) vs
-   runtime read — confirm overwrite hypothesis with a watchpoint on
-   phys address (or translated address — depends on segment).
-2. If overwrite: trace who wrote there. The prior seg-85 MMU bug
-   pattern suggests another segment's SOR is 0 for a non-vector area
-   and a legit P_ENQUEUE / MAKE_FREE write is aliasing. MMU-W probe
-   is already in place — look for seg 67 (or whatever segment maps
-   $086xxx) writes with SOR=0.
-3. If no overwrite: check if the last JSR/RTS target is PC=$08658A
-   by design but the instruction is in a segment that's not loaded.
+1. Identify the proc that calls Find_it in a loop. Likely FS_INIT
+   or a driver-registration sub-proc searching for a device/file
+   that doesn't exist in our source-built image.
+2. Potential fix classes: (a) HLE-short the caller if the search
+   is for INTRINSIC.LIB-related records or boot-device state that
+   our emulator doesn't populate; (b) ensure our image's FS has
+   the needed stub records; (c) patch the search to bail after
+   exhausting the (empty) list rather than looping.
+3. Optional: figure out who SHOULD be configuring seg 112 and
+   whether we can populate it at boot-image-build time. The
+   dropped writes ARE legitimate intent — they're just going
+   somewhere that doesn't exist in our memory layout.
 
 ---
 

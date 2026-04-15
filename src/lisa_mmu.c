@@ -248,6 +248,26 @@ void lisa_mem_write8(lisa_mem_t *mem, uint32_t addr, uint8_t val) {
                     mem->io_write(phys - LISA_IO_BASE, val);
                 break;
             }
+            /* Unmapped-segment safety (write path only): if the logical
+             * address was above physical RAM AND the resulting phys is
+             * also out of range, the segment is unconfigured. Wrapping
+             * with `%= LISA_RAM_SIZE` would alias onto code (caught
+             * pre-P23 as seg-85 → phys $002600, now post-P26 as seg-112
+             * → phys $08658A). Drop the write. */
+            if (addr >= LISA_RAM_SIZE && phys >= LISA_RAM_SIZE) {
+                extern uint32_t g_last_cpu_pc;
+                static int unmap_count = 0;
+                static int unmap_gen = -1;
+                extern int g_emu_generation;
+                if (unmap_gen != g_emu_generation) { unmap_count = 0; unmap_gen = g_emu_generation; }
+                if (unmap_count++ < 16) {
+                    int seg = (addr >> 17) & 0x7F;
+                    fprintf(stderr,
+                        "UNMAPPED-WRITE[%d]: PC=$%06X log=$%06X phys=$%06X val=$%02X (seg=%d) dropped\n",
+                        unmap_count, g_last_cpu_pc, addr, phys, val, seg);
+                }
+                break;
+            }
             /* Lisa hardware wraps RAM addresses at the physical memory boundary */
             phys %= LISA_RAM_SIZE;
             /* FB-WRITE watchpoint: log writes into both framebuffer pages
@@ -307,6 +327,27 @@ void lisa_mem_write8(lisa_mem_t *mem, uint32_t addr, uint8_t val) {
                         fprintf(stderr, "  current_context=%d mmu_enabled=%d setup_mode=%d\n",
                                 mem->current_context, mem->mmu_enabled, mem->setup_mode);
                     }
+                }
+            }
+            /* $08658A watchpoint: post-P26 illegal-instr at this PC
+             * with opcode $00CC, while linked binary has $3400 — code
+             * overwrite, same class as the pre-P23 $2600 one. Log
+             * writes to this range to find the aliasing caller. */
+            if (phys >= 0x86580 && phys < 0x86590) {
+                extern uint32_t g_last_cpu_pc;
+                static int w86_count = 0;
+                static int w86_gen = -1;
+                extern int g_emu_generation;
+                if (w86_gen != g_emu_generation) { w86_count = 0; w86_gen = g_emu_generation; }
+                if (w86_count++ < 32) {
+                    int seg = (addr >> 17) & 0x7F;
+                    int ctx = mem->current_context;
+                    if (ctx >= MMU_NUM_CONTEXTS) ctx = 0;
+                    mmu_segment_t *s = &mem->segments[ctx][seg];
+                    fprintf(stderr, "WATCH-$8658A [%d]: PC=$%06X log=$%06X phys=$%06X val=$%02X "
+                            "(seg=%d ctx=%d sor=$%03X slr=$%03X)\n",
+                            w86_count, g_last_cpu_pc, addr, phys, val,
+                            seg, ctx, s->sor, s->slr);
                 }
             }
             mem->ram[phys] = val;
