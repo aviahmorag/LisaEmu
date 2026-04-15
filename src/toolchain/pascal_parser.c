@@ -469,11 +469,17 @@ static ast_node_t *parse_statement(parser_t *p) {
         /* Look ahead to see if this is a label */
         token_t saved = CUR(p);
         lexer_t saved_lex = p->lex;
+        int label_num = (int)CUR(p).int_val;
         advance(p);
         if (check(p, TOK_COLON)) {
             advance(p); /* consume colon */
-            /* Label prefix — now parse the actual statement */
-            return parse_statement(p);
+            /* Emit an AST_LABEL_DECL node carrying the label number, followed
+             * by the labeled statement as its child. Codegen records the
+             * label's emission address and patches pending forward-GOTOs. */
+            ast_node_t *lbl = ast_new(AST_LABEL_DECL, p->lex.line);
+            lbl->int_val = label_num;
+            ast_add_child(lbl, parse_statement(p));
+            return lbl;
         }
         /* Not a label — restore and fall through to expression parsing */
         p->lex = saved_lex;

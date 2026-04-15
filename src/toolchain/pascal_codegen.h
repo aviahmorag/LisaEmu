@@ -192,6 +192,15 @@ typedef struct {
         ast_node_t  *record_expr;   /* AST node for the record expression */
     } with_stack[16];
     int with_depth;
+
+    /* Per-procedure label map: numeric labels declared inside the current
+     * procedure body. Reset by gen_proc_or_func at procedure entry.
+     * `pending_gotos` stores forward-reference GOTOs that need patching
+     * when the matching label is emitted (or at procedure end if unresolved). */
+    struct { int label; uint32_t code_offset; } labels[128];
+    int num_labels;
+    struct { int label; uint32_t patch_offset; } pending_gotos[128];
+    int num_pending_gotos;
 } codegen_t;
 
 /* Public API */

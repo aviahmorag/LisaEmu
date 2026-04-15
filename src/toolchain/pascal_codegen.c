@@ -2137,6 +2137,69 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
             gen_expression(cg, node);
             break;
 
+        case AST_LABEL_DECL: {
+            /* Record label's code offset, patch any pending forward GOTOs,
+             * then emit the labeled statement. */
+            int lbl = (int)node->int_val;
+            if (cg->num_labels < 128) {
+                cg->labels[cg->num_labels].label = lbl;
+                cg->labels[cg->num_labels].code_offset = cg->code_size;
+                cg->num_labels++;
+            }
+            /* Patch any pending forward BRA.W's targeting this label.
+             * BRA.W displacement = (target - branch_instr_addr - 2), where
+             * the 16-bit offset slot lives at patch_offset (2 bytes after
+             * the opcode). So displacement is (target - (patch_offset - 2) - 2)
+             * = target - patch_offset. */
+            for (int g = 0; g < cg->num_pending_gotos; g++) {
+                if (cg->pending_gotos[g].label == lbl) {
+                    uint32_t patch = cg->pending_gotos[g].patch_offset;
+                    int32_t disp = (int32_t)cg->code_size - (int32_t)patch;
+                    if (disp > 32767 || disp < -32768) {
+                        /* Out of BRA.W range — not expected for normal Pascal
+                         * procedures; emit an error and proceed. */
+                        fprintf(stderr, "GOTO: label %d out of BRA.W range (disp=%d) in %s\n",
+                                lbl, disp, cg->current_file);
+                    }
+                    cg->code[patch]     = (disp >> 8) & 0xFF;
+                    cg->code[patch + 1] = disp & 0xFF;
+                    cg->pending_gotos[g] = cg->pending_gotos[--cg->num_pending_gotos];
+                    g--;
+                }
+            }
+            if (node->num_children > 0)
+                gen_statement(cg, node->children[0]);
+            break;
+        }
+
+        case AST_GOTO: {
+            int lbl = (int)node->int_val;
+            uint32_t target = 0xFFFFFFFF;
+            for (int i = 0; i < cg->num_labels; i++) {
+                if (cg->labels[i].label == lbl) { target = cg->labels[i].code_offset; break; }
+            }
+            emit16(cg, 0x6000);  /* BRA.W */
+            uint32_t patch = cg->code_size;
+            emit16(cg, 0);       /* 16-bit displacement placeholder */
+            if (target != 0xFFFFFFFF) {
+                int32_t disp = (int32_t)target - (int32_t)patch;
+                if (disp > 32767 || disp < -32768) {
+                    fprintf(stderr, "GOTO: label %d back-branch out of range (disp=%d) in %s\n",
+                            lbl, disp, cg->current_file);
+                }
+                cg->code[patch]     = (disp >> 8) & 0xFF;
+                cg->code[patch + 1] = disp & 0xFF;
+            } else {
+                /* Forward reference — queue for patching */
+                if (cg->num_pending_gotos < 128) {
+                    cg->pending_gotos[cg->num_pending_gotos].label = lbl;
+                    cg->pending_gotos[cg->num_pending_gotos].patch_offset = patch;
+                    cg->num_pending_gotos++;
+                }
+            }
+            break;
+        }
+
         case AST_IF: {
             gen_expression(cg, node->children[0]);
             emit16(cg, 0x4A40);  /* TST.W D0 */
@@ -2610,6 +2673,10 @@ static void gen_proc_or_func(codegen_t *cg, ast_node_t *node) {
     if (entry) entry->offset = (int)cg->code_size;
 
     push_scope(cg);
+
+    /* Reset per-procedure label state */
+    cg->num_labels = 0;
+    cg->num_pending_gotos = 0;
 
     /* Process parameters */
     int param_offset = 8; /* After saved A6 and return address */

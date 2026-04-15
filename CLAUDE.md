@@ -72,7 +72,32 @@ cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' bui
 
 ## Current Status (2026-04-15)
 
-### Latest fix (P16): string/record value param push/frame mismatch
+### Latest fix (P17): `goto` / numeric-label support (was silently dropped)
+
+Parser created `AST_GOTO` nodes but no `AST_LABEL_DECL`; label prefixes
+like `9:` were consumed and the following statement parsed as if the
+label never existed. Codegen had no handler for either. Consequence:
+`goto N` emitted **zero bytes** and control fell through straight into
+the labeled statement. In EXCEP_SETUP this meant `goto 9` (skip-past-
+error-handler) was silently dropped — every crea_ecb chain fell through
+into `system_error(e_excep_setup)` unconditionally.
+
+Fix:
+- **Parser**: on `<int>:` prefix, emit `AST_LABEL_DECL(int_val=N)` with
+  the following statement as child (not just drop the label).
+- **Codegen**: per-procedure label map + pending-GOTO patch list reset
+  at each procedure entry. GOTOs emit `BRA.W` (6000 + 16-bit disp).
+  Backward targets emit disp inline; forward targets queue for patching
+  when `AST_LABEL_DECL` is reached. BRA.W's ±32KB range is ample for
+  intra-procedure jumps in Lisa OS.
+
+Result: boot now passes EXCEP_SETUP cleanly, reaches GETSPACE #25 at
+a brand-new call site (`$0A2194` in a later procedure). New failure is
+further downstream — wild PC jumps to non-canonical addresses
+(`$57C2EC48`, `$60AA0094`, `$6A6C0000`) suggesting a pointer corruption
+or uninitialized vector; next session to diagnose.
+
+### Fix (P16): string/record value param push/frame mismatch
 
 `crea_ecb(errnum, sys_terminate, @term_def_hdl, ecb_ptr, b_sloc_ptr)` in
 EXCEP_SETUP was passing `b_sloc_ptr = $104C00CE` (upper-word stale,
