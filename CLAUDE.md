@@ -70,7 +70,100 @@ make audit-linker       # Stage 4: Full pipeline + linker
 cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' build 2>&1 | grep -E "(error:|BUILD)"
 ```
 
-## Current Status (2026-04-15 PM9)
+## Current Status (2026-04-15 PM10)
+
+### Fix (P42): dynamic HLE address lookup via `boot_progress_lookup`
+
+Every HLE bypass in `src/m68k.c` previously hardcoded its target PC
+(`cpu->pc == 0x00082E12` for FS_CLEANUP, etc.). Any codegen change
+that widened emitted code shifted the linker map and silently broke
+these bypasses — several iterations this session were wasted
+chasing "regressions" that were actually stale PC constants.
+
+Fix: cache lookups once per `g_emu_generation` using symbol names:
+
+```c
+static uint32_t pc_FS_CLEANUP, pc_PR_CLEANUP, pc_MEM_CLEANUP,
+                pc_SYS_PROC_INIT, pc_excep_setup, pc_REG_OPEN_LIST,
+                pc_QUEUE_PR, pc_GETSPACE;
+if (hle_pc_gen != g_emu_generation) {
+    pc_FS_CLEANUP = boot_progress_lookup("FS_CLEANUP");
+    // …
+}
+if (pc_FS_CLEANUP && cpu->pc == pc_FS_CLEANUP) { …bypass… }
+```
+
+Future codegen experiments can adjust instruction widths without
+retuning address constants. No runtime behavior change — still
+19/27 milestones, audit 100% clean (8711/8711).
+
+### Fix (P40): zero-fill GETSPACE returns (calloc semantics)
+
+Belt-and-suspenders fix: on GETSPACE return, memset the allocated
+block to zero before control resumes. Didn't retire the P32/P35
+bypasses — the RQSCAN spin has a deeper codegen root cause (see
+below) — but eliminates a whole class of "uninitialized field
+reads garbage" bugs.
+
+### Diagnosis (this session, not yet fixed): RQSCAN spin root cause
+
+With P35 disabled so SYS_PROC_INIT runs naturally, Make_SProcess
+→ CreateProcess → Wait_sem reaches this code (procprims:791):
+
+```pascal
+if priority < semPriority then    { semPriority = 226, priority = 255 }
+  begin
+    priority := semPriority;
+    Queue_Process (pcb_ptr, Ready);
+  end
+```
+
+`255 < 226` should be FALSE under both signed AND unsigned
+interpretation, but our Pascal codegen takes the TRUE branch.
+
+**Root cause**: Pascal `priority : 0..255` is a 1-byte subrange.
+Codegen emits `MOVE.B (A0),D0` to read it — 68000 MOVE.B only
+writes D0[7:0], leaving D0[31:8] *stale from prior scratch*. If
+an earlier op left $FF in D0[15:8], the CMP.W against #226 sees
+$FFFF (signed -1) vs $00E2 — `-1 < 226` is TRUE, branch taken.
+
+Wait_sem then writes `priority := $E2` via MOVE.B (byte 12 of PCB,
+leaving byte 13 = norm_pri = $FF untouched), giving word @ offset
+12 = `$E2FF`. QUEUE_PR's `MOVE PRIORITY(A1),D1` reads this as
+signed word = $FFFFE2FF = -7425, and RQSCAN's `CMP/BLE.S` loops
+forever because no chained PCB's priority is lower.
+
+**Why Apple's build doesn't hit this**: Apple's Lisa Pascal lays
+out `0..255` subrange FIELDS as 2-byte word-sized in unpacked
+records (confirmed by PASCALDEFS `DOMAIN .EQU 17` — only works if
+priority + norm_pri together occupy offsets 12-15 as 2x word
+rather than our 12,13 as 2x byte). With word-sized fields, the
+value 226 = $00E2 is positive signed, CMP.W works, RQSCAN
+terminates.
+
+**Fix options (not yet applied — each has a trap)**:
+
+1. **Subrange default size → 2 bytes + track PACKED** (structural).
+   Tried this session; regressed boot because packed records
+   (SMT entries, seg_bitmap) need tight packing. Needs an
+   `in_packed` counter on the codegen context so `AST_TYPE_PACKED`
+   propagates into nested subrange resolution. Most correct fix.
+
+2. **Zero-extend MOVE.B loads** (narrow). Emit `ANDI.W #$FF,D0`
+   after each byte-sized field read. Tried this session; fixes
+   the Wait_sem comparison, but ONLY works if HLE addresses are
+   dynamic (P42, now done). Even with that, the WORD-read in
+   asm RQSCAN still reads bytes 12+13 together — need norm_pri
+   byte to stay zero OR ensure priority < 128 always. Apple's
+   priority design assumes word layout, so zero-extend alone
+   isn't enough.
+
+3. **HLE Wait_sem** (tactical). Skip the priority-raise path.
+   Fragile — the WORD-compare bug will re-emerge elsewhere.
+
+Best path forward: option 1 with proper PACKED tracking. Blast
+radius in Lisa_Source is small — only 2 packed `0..255` field uses
+(SMT.limit in MMPRIM and LOADER).
 
 ### Fix (P39): PASCALDEFS-pin globals to hardcoded A5 offsets — structural foundation
 
