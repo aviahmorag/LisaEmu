@@ -1604,7 +1604,18 @@ void lisa_reset(lisa_t *lisa) {
         uint32_t b_sysjt     = smt_base + l_smt;
         uint32_t l_sysjt     = 0x1000;    /* 4KB jump table */
         uint32_t b_sysglobal = b_sysjt + l_sysjt;
-        uint32_t l_sysglobal = 0x6000;    /* 24KB sysglobal */
+        /* 28KB sysglobal. Apple's layout is 24KB ($6000), but our Pascal
+         * codegen produces globals totaling ~24906 bytes — 330 bytes over
+         * Apple's hardcoded PASCALDEFS offsets. With l_sysglobal=$6000,
+         * A5 ends up at $CC5FFC and A5-relative offsets beyond $5FFC
+         * cross into logical segment 101 (the supervisor-stack segment),
+         * so Pascal globals share physical memory with the stack —
+         * `sg_free_pool_addr` at A5-24906 = logical $CBFEB2 gets
+         * overwritten by supervisor stack pushes.
+         *
+         * Bumping to $7000 pushes A5 to $CC6FFC so all compiled globals
+         * fit within segment 102, with a healthy margin. */
+        uint32_t l_sysglobal = 0x7000;
         uint32_t b_superstack = b_sysglobal + l_sysglobal;
         uint32_t l_superstack = 0x4000;   /* 16KB supervisor stack */
         uint32_t b_sgheap    = b_superstack + l_superstack;

@@ -70,7 +70,40 @@ make audit-linker       # Stage 4: Full pipeline + linker
 cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' build 2>&1 | grep -E "(error:|BUILD)"
 ```
 
-## Current Status (2026-04-15 PM6)
+## Current Status (2026-04-15 PM7)
+
+### Fix (P30): bump l_sysglobal $6000→$7000 (stack/globals no longer collide)
+
+With our Pascal codegen producing sysglobal globals totaling ~24906
+bytes (330 bytes over Apple's PASCALDEFS hardcoded `SG_FREE_POOL_ADDR
+.EQU -24575`), A5 at $CC5FFC meant `@sg_free_pool_addr = A5-24906 =
+$CBFEB2`. That address is in logical segment 101 — the same segment
+the supervisor stack maps to — so stack pushes were overwriting the
+pool header pointer. Between GETSPACE call #27 and #28, the pointer
+changed from $CCA000 → $6629F2 (stack garbage), and #28's free-list
+walk crashed into `SYSTEM_ERROR(10701)`.
+
+Fix (`src/lisa.c`): grew `l_sysglobal` from $6000 to $7000 (24KB →
+28KB). A5 now resolves to $CC6FFC, and all A5-negative global
+accesses stay within segment 102. `@sg_free_pool_addr` at
+logical $CC0EB2 — inside sysglobal physical memory, insulated from
+the supervisor stack in seg 101.
+
+POOL_INIT self-corrects: it computes `size_sglobal := l_sysglob -
+(b_sysglobal_ptr - 24575 - mb_sysglob)`, so increasing l_sysglob
+just gives the free pool more headroom (the overhead already
+accounts for our inflated record size).
+
+**New blocker**: `SYSTEM_ERROR(10204) = e_flinesyscode` (F-line
+trap in system code) at `ret=$0DB5EE` (inside hard_excep/fline
+handler). Some routine past MAKE_BUILTIN is hitting an illegal
+`$Fxxx` opcode. Next session: trace the PC at the F-line trap via
+the existing HIPC-TRIP / VEC-FIRST probes to find which
+procedure contains the miscompiled opcode.
+
+Toolchain audit: Stage-4 linker **8711/8711 symbols, 100% clean.**
+(Stage-2 codegen shows 89.8% but that's toolkit/QuickDraw refs
+outside the OS kernel build — not a regression.)
 
 ### Fix (P25): Pascal string equality byte-compare
 

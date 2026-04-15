@@ -3176,22 +3176,28 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
              *   function GETSPACE(amount: int2; b_area: absptr; var ordaddr: absptr): boolean
              * Stack after JSR: retPC(4) | amount(2) | b_area(4) | ordaddr-ptr(4). */
             DBGSTATIC(int, gs_all_count, 0);
-            if (cpu->pc == 0x5CEA && gs_all_count < 25) {
+            if (cpu->pc == 0x5FAA && gs_all_count < 40) {
                 gs_all_count++;
                 uint32_t sp = cpu->a[7] & 0xFFFFFF;
                 uint32_t ret_pc = cpu_read32(cpu, sp);
                 uint16_t amount = cpu_read16(cpu, sp + 4);
                 uint32_t b_area = cpu_read32(cpu, sp + 6);
                 uint32_t varptr = cpu_read32(cpu, sp + 10);
-                fprintf(stderr, "GETSPACE #%d  ret=$%06X  amount=$%X (%d)  b_area=$%08X  var=$%08X\n",
-                        gs_all_count, ret_pc, amount, amount, b_area, varptr);
-                /* Dump the 16 bytes before the JSR — the argument-push sequence */
-                if (ret_pc >= 0x400 && gs_all_count <= 4) {
-                    fprintf(stderr, "    bytes preceding JSR (ret-20..ret-2):");
-                    for (int b = -20; b < 0; b += 2)
-                        fprintf(stderr, " %04X", cpu_read16(cpu, ret_pc + b));
-                    fprintf(stderr, "\n");
-                }
+                /* GETSPACE internally: if b_area == b_sysglobal_ptr, adj := b_area - 24575.
+                 * b_sysglobal_ptr is odd (ends in $EB1 or similar); syslocal b_area is even.
+                 * Treat any odd b_area as sysglobal and subtract 24575. */
+                uint32_t adj = (b_area & 1) ? (b_area - 24575) : b_area;
+                uint32_t pool_hdr_ptr = cpu_read32(cpu, adj);
+                uint32_t h0 = cpu_read32(cpu, pool_hdr_ptr);
+                uint32_t h4 = cpu_read32(cpu, pool_hdr_ptr + 4);
+                uint32_t h8 = cpu_read32(cpu, pool_hdr_ptr + 8);
+                uint16_t firstfree = cpu_read16(cpu, pool_hdr_ptr);
+                uint16_t poolsize = cpu_read16(cpu, pool_hdr_ptr + 2);
+                uint16_t freecount = cpu_read16(cpu, pool_hdr_ptr + 4);
+                fprintf(stderr, "GETSPACE #%d ret=$%06X amt=%d b_area=$%08X var=$%08X A5=$%08X A7=$%08X adj=$%06X hdr=$%06X [ff=$%04X sz=$%04X fc=$%04X] %08X %08X %08X\n",
+                        gs_all_count, ret_pc, amount, b_area, varptr,
+                        cpu->a[5], cpu->a[7], adj & 0xFFFFFF,
+                        pool_hdr_ptr & 0xFFFFFF, firstfree, poolsize, freecount, h0, h4, h8);
             }
 
             DBGSTATIC(int, gs_count, 0);
