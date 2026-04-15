@@ -70,7 +70,47 @@ make audit-linker       # Stage 4: Full pipeline + linker
 cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' build 2>&1 | grep -E "(error:|BUILD)"
 ```
 
-## Current Status (2026-04-15 PM12)
+## Current Status (2026-04-15 PM13)
+
+### Fix (P57-P60): real-disk-mapped compile architecture
+
+Mirrored Apple's actual SYSTEM.OS build structure per the
+`_inspiration/LisaSourceCompilation-main/src/LINK/` reference:
+
+- **P57** — scoped compile to `LISA_OS/OS` + `LIBHW` (was the full
+  `LISA_OS/` tree). Cut binary from 2.25MB to ~0.75MB, symbol
+  count 8711 → 2246. The 2.25MB binary was consuming all
+  LISA_RAM_SIZE, leaving no physical RAM for process stacks — the
+  root cause of the P55/P56 MMU collision class.
+- **P58** — `compile_targets.h/c`: typed registry with `name`,
+  `out_path`, module list, search dirs. SYSTEM.OS target defined
+  with the 50 modules from Apple's ALEX-COMP-SYSTEMOS.TEXT +
+  ALEX-LINK-SYSTEMOS.TEXT. Scaffolding for future targets
+  (SYS1LIB, SYS2LIB, LIBQD, LIBTK, LIBPL, LIBOS, apps).
+- **P59** — `LISAEMU_STRICT_MODULES=1` env var: when set, strictly
+  filter the 50-module list; otherwise walk search_dirs.
+- **P60** — Two paired fixes unlocking the strict scope:
+  1. Lexer now accepts `{$Iname}` (no space between $I and
+     filename) — Apple's preferred form in MM0.TEXT:
+     `(*$Isource/MM1.TEXT*)`. Excludes $IFC carefully.
+  2. Toolchain pre-scans files for $I directives and builds an
+     "included-by-another" set. Those files are skipped from
+     standalone compile so they don't get double-emitted.
+     Result: 25 of 121 files auto-skipped (MM1-4, DS2-3,
+     PMMAKE/PMCNTRL/PMTERM/PMSPROCS, LD*).
+  3. Fixed `cdCONFIG` filter rule to allow CDCONFIGASM through
+     (Apple's SYSTEM.OS link includes the asm helper but not the
+     Pascal cdCONFIG program).
+
+**Current milestone counts:**
+- Loose mode (default): **20/27** — baseline preserved.
+- Strict mode (env var): **14/27** — closer to Apple's real scope,
+  still short because some cross-module dependencies Apple's
+  toolchain resolved (type propagation, implicit linkage) aren't
+  yet fully handled by ours. Milestones present: PASCALINIT,
+  INITSYS, GETLDMAP, REG_TO_MAPPED, INIT_PE, POOL_INIT,
+  INIT_TRAPV, DB_INIT, AVAIL_INIT, MM_INIT, MAKE_REGION, BLD_SEG,
+  MAKE_FREE, INSERTSDB. Spins in INSERTSDB at \$039AE2.
 
 ### Fix (P54): codegen EXT.L skip when RHS contains a FUNC_CALL
 

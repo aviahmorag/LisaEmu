@@ -119,7 +119,10 @@ bool tc_should_skip_file(const char *name) {
     if (strcasestr(name, "GDATALIST") != NULL) return true;
     if (strcasestr(name, "cdchar") != NULL) return true;
     if (strcasestr(name, "nwshell") != NULL) return true;
-    if (strcasestr(name, "cdCONFIG") != NULL) return true;
+    /* Skip the cdCONFIG program (standalone app) but keep CDCONFIGASM
+     * (assembly helper used by SYSTEM.OS per Apple's real link). */
+    if (strcasestr(name, "cdCONFIG") != NULL &&
+        strcasestr(name, "CDCONFIGASM") == NULL) return true;
     if (strcasestr(name, "TKALERT") != NULL) return true;
 
     return false;
