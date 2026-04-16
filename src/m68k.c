@@ -3468,6 +3468,21 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 }
             }
         }
+        /* P80g: trace Make_SProcess calls */
+        {
+            static uint32_t pc_msp = 0;
+            static int msp_probed = 0;
+            if (!msp_probed) {
+                msp_probed = 1;
+                pc_msp = boot_progress_lookup("Make_SPr");
+                if (!pc_msp) pc_msp = boot_progress_lookup("Make_SProcess");
+            }
+            if (cpu->pc == pc_msp) {
+                DBGSTATIC(int, msp_count, 0);
+                fprintf(stderr, "[Make_SProcess #%d] A6=$%06X A7=$%06X\n",
+                        ++msp_count, cpu->a[6] & 0xFFFFFF, cpu->a[7] & 0xFFFFFF);
+            }
+        }
         /* P80g: bypass CreateProcess. The process creation code has deep
          * record field offset corruption that causes A6 to become $FD800000
          * during Build_Syslocal/Build_Stack. For now, skip the entire
@@ -3559,22 +3574,17 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                     fprintf(stderr, "%04X ", cpu_read16(cpu, (sp + j) & 0xFFFFFF));
                 fprintf(stderr, "\n");
             }
-            if (discsize > 0) {
-                uint32_t errnum_ptr = cpu_read32(cpu, (sp + 4) & 0xFFFFFF) & 0xFFFFFF;
-                if (errnum_ptr >= 0x1000)
-                    cpu_write16(cpu, errnum_ptr, 134);
-                uint32_t ret = cpu_read32(cpu, sp);
-                cpu->a[7] += 4;  /* pop ret only — caller does ADDA.W #$1A,SP */
-                cpu->pc = ret;
-                fprintf(stderr, "[HLE-MAKE_SYSDATASEG] bypassed discsize=%d → error 134\n", discsize);
-                continue;
-            }
+            /* P80g: treat ALL MAKE_SYSDATASEG calls as resident (discsize=0).
+             * Previously, discsize>0 returned error 134 to trigger a resident
+             * retry. But the retry fails because exit(Make_SProcess) from
+             * the nested Recover doesn't properly write errnum to the VAR
+             * param. Just allocate as resident regardless of discsize. */
             /* P80f: bypass disc_size=0 (resident) calls too.
              * DS_OPEN fails because the FS isn't functional.
              * For memory-resident segments, allocate via GETSPACE and
              * program the MMU directly. Set errnum=0, refnum=0,
              * segptr=allocated address. */
-            if (discsize == 0) {
+            {   /* P80g: handle ALL discsize values as resident */
                 int32_t memsize = (int32_t)cpu_read32(cpu, (sp + 12) & 0xFFFFFF);
                 uint32_t errnum_ptr = cpu_read32(cpu, (sp + 4) & 0xFFFFFF) & 0xFFFFFF;
                 uint32_t segptr_ptr = cpu_read32(cpu, (sp + 24) & 0xFFFFFF) & 0xFFFFFF;

@@ -1951,9 +1951,17 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                 break;
             }
 
-            /* EXIT: return from current procedure */
+            /* EXIT: return from named procedure.
+             * P80g: exit(proc_name) from a nested procedure must unwind
+             * A6 to the target procedure's frame BEFORE UNLK/RTS.
+             * Otherwise UNLK uses the nested proc's frame, exiting the
+             * wrong function. Same static-link chain as non-local goto. */
             if (str_eq_nocase(fn, "EXIT")) {
-                /* If EXIT has an argument (procedure name), ignore it */
+                if (cg->scope_depth > 1) {
+                    /* Nested proc: restore A6 to enclosing scope */
+                    for (int d = cg->scope_depth - 1; d >= 1; d--)
+                        emit16(cg, 0x2C56);  /* MOVEA.L (A6),A6 */
+                }
                 emit16(cg, 0x4E5E);  /* UNLK A6 */
                 emit16(cg, 0x4E75);  /* RTS */
                 break;
