@@ -70,30 +70,76 @@ make audit-linker       # Stage 4: Full pipeline + linker
 cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' build 2>&1 | grep -E "(error:|BUILD)"
 ```
 
-## Current Status (2026-04-16) — **27/27 reported (23 real + 4 bypass-fired)**
+## Current Status (2026-04-16 PM3) — **27/27 reported (23 real + 4 bypass-fired)**
 
-All OS-kernel boot checkpoints reached at HEAD `ded554c`. Build
+All OS-kernel boot checkpoints reached at HEAD `c062456`. Build
 and audit green. Working tree clean.
 
 ### Real milestones (23): PASCALINIT through FS_INIT + SYS_PROC_INIT entry
 
-All reached by actual Pascal/asm code execution. Includes P75's
-for-loop fix (FS_INIT) and P76's FS_INIT error unwind.
+All reached by actual Pascal/asm code execution.
 
 ### Bypass-fired milestones (4):
 
-- **SYS_PROC_INIT** (P35 at `src/m68k.c:3040`): entry PC reached, body skipped. When P35 is disabled, Make_SProcess runs through to QUEUE_PR ($06CD5E) before spinning on the RQSCAN byte-subrange priority-compare issue. The old MAKE_DATASEG/$FF9C0000 blocker is GONE — P62/P65/P71/P72 codegen fixes resolved it.
-- **FS_CLEANUP** (P37 at `src/m68k.c:2920`): body spins in FIND_REFNCB_ENTRY — blocked by SYS_PROC_INIT body not running.
-- **MEM_CLEANUP** (P36 at `src/m68k.c:2945`): body spins in ADDTO_MMLIST — SRB lists not set up.
-- **PR_CLEANUP** (P38 at `src/m68k.c:2933`): idle scheduler loop — needs Shell loaded.
+- **SYS_PROC_INIT** (P35): entry PC reached, body skipped. When
+  P35 is disabled, filesystem code corrupts vector table during
+  process creation → F-line trap → SYSTEM_ERROR(10204). The old
+  MAKE_DATASEG blocker is gone (P62/P65/P71/P72 fixed it). The
+  new blocker is code corruption from pointer arithmetic bugs in
+  filesystem/process primitives code paths.
+- **FS_CLEANUP** (P37): body spins in FIND_REFNCB_ENTRY.
+- **MEM_CLEANUP** (P36): body spins in ADDTO_MMLIST.
+- **PR_CLEANUP** (P38): idle scheduler loop — needs Shell.
 
-### Next blocker: byte-subrange PCB field layout
+### Next blocker: SYS_PROC_INIT F-line trap
 
-When P35 is disabled, QUEUE_PR spins because `priority : 0..255`
-is compiled as 1-byte field. Apple's Pascal uses 2-byte word fields
-in unpacked records. Fix: add `in_packed` context to codegen so
-unpacked subrange fields default to word size. See NEXT_SESSION.md
-for detailed steps.
+When P35 is disabled, the boot reaches SYS_PROC_INIT → Make_SProcess
+but crashes from F-line trap (SYSTEM_ERROR 10204) at ret=$067B96.
+Root cause: filesystem code around SplitPathname ($02BC9C) writes
+to the CPU vector table (addr $00 and $CC), corrupting exception
+handlers. This is a pointer arithmetic or field offset bug in the
+FS init code path.
+
+P78's Signal_sem HLE guard prevents the separate RQSCAN spin
+issue (bogus PCB pointers from semaphore wait_queue). P77's
+RELSPACE guard prevents the seglock sentinel spin. But the primary
+crash is from FS code before either guard triggers.
+
+### Fix (P77): generalized EXT.L skip for pointer/longint arithmetic
+
+Added `rhs_has_wide_operand()` that scans AST for any 32-bit
+sub-expression (pointer, longint, addr-of, func_call). When found,
+skip EXT.L D0 sign-extension that would destroy upper 16 bits.
+Applied to all 7 EXT.L emission sites. Root cause: `ptr + SIZEOF(x)`
+loaded the pointer as MOVE.L, added SIZEOF as ADD.W (preserving
+upper word), then EXT.L killed it.
+
+### Fix (P78): Signal_sem + RELSPACE safety guards
+
+- Signal_sem HLE: if sem_count >= 0, bypass body (no waiters).
+  If wait_queue outside sysglobal range, skip waiter path.
+- RELSPACE guard: skip when ordaddr == b_area (freeing pool base).
+
+### Roadmap to fully bootable Lisa desktop
+
+**Current: Kernel 90% complete, full desktop ~25-30%**
+
+| Layer | Status | What's needed |
+|-------|--------|---------------|
+| OS Kernel (SYSTEM.OS) | 90% — 27/27 checkpoints | Fix SYS_PROC_INIT body |
+| System Libraries (SYS1LIB, SYS2LIB) | 0% | New compile targets + linking |
+| Graphics (LIBQD, LIBTK) | 0% | New compile targets |
+| Drivers (SYSTEM.LLD, CD_*) | 0% | 13 new binaries |
+| Shell (APDM = Desktop Manager) | 0% | Separate compile target |
+| Apps (LisaWrite, LisaCalc, etc.) | 0% | 14 app targets |
+| Intrinsic library loading | 0% | Dynamic linking support |
+| Lisa filesystem (MDDF, catalog) | 0% | Disk image infrastructure |
+| Boot ROM / bootloaders | Partial | BT_Profile, BT_Sony |
+
+Full source code is available for ALL components. The toolchain
+(parser 100%, assembler 100%, linker working) can handle additional
+targets — the remaining work is systematic: define 26+ compile
+targets, fix per-target codegen issues, build the disk layout.
 
 ### Fix (P71+P72): unary-minus + IDENT_EXPR in CONST decls + subrange bounds
 
