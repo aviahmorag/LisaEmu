@@ -351,12 +351,26 @@ static bool compile_pascal_file_impl(const char *path, linker_t *lk, bool types_
                 cg->code_size, cg->num_globals, cg->num_relocs);
     }
 
-    /* Export this file's globals to the shared table for cross-unit access.
-     * Skip on the types-only pass — second-pass real compile does the
-     * export and we don't want duplicates. */
-    if (!types_only_pass)
+    /* Export this file's globals (including CONSTs) to the shared table.
+     * P79: CONSTs must also be exported during the types-only pre-pass so
+     * that record types with string[CONST_NAME] fields (e.g. DCB.name using
+     * string[max_ename]) resolve correctly. Without this, max_ename isn't
+     * found during pre-pass record resolution, string[max_ename] falls back
+     * to string[255], and DCB is 344 bytes instead of ~120.
+     * On the real pass, only export non-duplicates (check by name). */
     for (int i = 0; i < cg->num_globals && num_shared_globals < MAX_SHARED_GLOBALS; i++) {
         if (!cg->globals[i].is_external && !cg->globals[i].is_forward) {
+            /* On real pass, skip if already exported from pre-pass */
+            if (!types_only_pass) {
+                bool dup = false;
+                for (int j = 0; j < num_shared_globals; j++) {
+                    if (strcasecmp(shared_globals[j].name, cg->globals[i].name) == 0) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (dup) continue;
+            }
             shared_globals[num_shared_globals++] = cg->globals[i];
         }
     }

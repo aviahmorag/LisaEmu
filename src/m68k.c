@@ -3090,6 +3090,9 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         if (pc_SYS_PROC_INIT && cpu->pc == pc_SYS_PROC_INIT && !g_vec_guard_active) {
             g_vec_guard_active = 1;
         }
+        /* P35: SYS_PROC_INIT bypass — still needed because FS code path
+         * requires functional filesystem backing we don't have yet.
+         * P79 fixed record layouts but process creation needs real Make_File. */
         if (pc_SYS_PROC_INIT && cpu->pc == pc_SYS_PROC_INIT) {
             boot_progress_record_pc(cpu->pc);  /* P45: ensure milestone fires even though body skipped */
             uint32_t sp = cpu->a[7] & 0xFFFFFF;
@@ -3165,17 +3168,16 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             static uint32_t pc_parse_pathname = 0;
             if (dp_gen == g_emu_generation && !pc_parse_pathname)
                 pc_parse_pathname = boot_progress_lookup("parse_pathname");
+            /* P79-diag: trace parse_pathname bypass */
             if (pc_parse_pathname && cpu->pc == pc_parse_pathname) {
                 uint32_t sp = cpu->a[7] & 0xFFFFFF;
                 uint32_t ret = cpu_read32(cpu, sp);
-                /* parse_pathname has complex params — just pop retPC and args.
-                 * It's callee-clean Pascal. Check stack size from LINK frame. */
-                /* parse_pathname(var ecode: integer; var path: pathname;
-                 *    var NamePart: pathname; var DirPath: pathname;
-                 *    var havePrefix: boolean; var volume: e_name)
-                 * 6 VAR params = 24 bytes */
-                uint32_t ecode_ptr = cpu_read32(cpu, sp + 24);
-                cpu_write16(cpu, ecode_ptr & 0xFFFFFF, 0);
+                /* parse_pathname: 6 VAR params = 24 bytes, callee-clean */
+                uint32_t ecode_ptr = cpu_read32(cpu, sp + 24) & 0xFFFFFF;
+                /* P79: validate pointer before writing — ecode_ptr can be
+                 * garbage ($000000) when caller's record layouts were wrong */
+                if (ecode_ptr >= 0x1000 && ecode_ptr < 0x240000)
+                    cpu_write16(cpu, ecode_ptr, 0);
                 cpu->a[7] += 4 + 24;
                 cpu->pc = ret;
                 DBGSTATIC(int, pp_count, 0);
@@ -3189,10 +3191,13 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 /* 5 VAR params, right-to-left push (Pascal convention):
                  * SP+4: volPath_ptr(4), SP+8: parID_ptr(4), SP+12: device_ptr(4),
                  * SP+16: path_ptr(4), SP+20: ecode_ptr(4) */
-                uint32_t ecode_ptr = cpu_read32(cpu, sp + 20);
-                uint32_t device_ptr = cpu_read32(cpu, sp + 12);
-                cpu_write16(cpu, ecode_ptr & 0xFFFFFF, 0);    /* ecode = 0 */
-                cpu_write16(cpu, device_ptr & 0xFFFFFF, 0);   /* device = 0 (bootdev) */
+                uint32_t ecode_ptr = cpu_read32(cpu, sp + 20) & 0xFFFFFF;
+                uint32_t device_ptr = cpu_read32(cpu, sp + 12) & 0xFFFFFF;
+                /* P79: validate pointers before writing */
+                if (ecode_ptr >= 0x1000 && ecode_ptr < 0x240000)
+                    cpu_write16(cpu, ecode_ptr, 0);    /* ecode = 0 */
+                if (device_ptr >= 0x1000 && device_ptr < 0x240000)
+                    cpu_write16(cpu, device_ptr, 0);   /* device = 0 (bootdev) */
                 cpu->a[7] += 4 + 20;  /* retPC + 5 VAR params */
                 cpu->pc = ret;
                 DBGSTATIC(int, dp_count, 0);
@@ -3218,8 +3223,10 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             uint32_t ret = cpu_read32(cpu, sp);
             /* ecode_ptr is the deepest arg (pushed first, leftmost param).
              * Stack layout: retPC, label_size(2), path_ptr(4), ecode_ptr(4) */
-            uint32_t ecode_ptr = cpu_read32(cpu, sp + 10);
-            cpu_write16(cpu, ecode_ptr & 0xFFFFFF, 0);  /* ecode = 0 = success */
+            uint32_t ecode_ptr = cpu_read32(cpu, sp + 10) & 0xFFFFFF;
+            /* P79: validate pointer before writing */
+            if (ecode_ptr >= 0x1000 && ecode_ptr < 0x240000)
+                cpu_write16(cpu, ecode_ptr, 0);  /* ecode = 0 = success */
             cpu->a[7] += 4 + 2 + 4 + 4;  /* pop retPC + all args */
             cpu->pc = ret;
             DBGSTATIC(int, mf_count, 0);
@@ -3255,7 +3262,9 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                  * Check wait_queue (offset 4) — if it's outside sysglobal/
                  * syslocal range, it's garbage. Skip the waiter path. */
                 uint32_t wait_q = cpu_read32(cpu, (sem_ptr + 4) & 0xFFFFFF);
-                if (wait_q && (wait_q < 0xCA0000 || wait_q > 0xD40000)) {
+                /* P79: also treat wait_q==0 (NULL) as bogus — sem_count<0
+                 * with NULL wait_queue means corrupt semaphore state */
+                if (!wait_q || wait_q < 0xCA0000 || wait_q > 0xD40000) {
                     DBGSTATIC(int, ss_skip, 0);
                     if (ss_skip++ < 5)
                         fprintf(stderr, "[P78-SS] Signal_sem: sem_count=%d wait_queue=$%08X (bogus) — skipping waiter path\n",

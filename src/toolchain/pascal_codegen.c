@@ -143,7 +143,13 @@ static type_desc_t *add_type(codegen_t *cg, const char *name, type_kind_t kind, 
 
 static void init_builtin_types(codegen_t *cg) {
     add_type(cg, "integer", TK_INTEGER, 2);
-    add_type(cg, "int1", TK_BYTE, 1);
+    add_type(cg, "int1", TK_INTEGER, 2);  /* P79: Lisa Pascal stores int1 (-128..127)
+                                           * as word-sized in unpacked records. The
+                                           * TYPE decl `int1 = -128..127` in DRIVERDEFS
+                                           * produces a 2-byte subrange; asm code reads
+                                           * these fields with MOVE.W. Was TK_BYTE/1
+                                           * which shifted every field after int1 in
+                                           * devrec, reqblk, etc. */
     add_type(cg, "int2", TK_INTEGER, 2);
     add_type(cg, "int4", TK_LONGINT, 4);
     add_type(cg, "longint", TK_LONGINT, 4);
@@ -336,6 +342,12 @@ static type_desc_t *resolve_type(codegen_t *cg, ast_node_t *node) {
                 }
                 type_desc_t *ft = resolve_type(cg, field->children[0]);
                 int fs = ft ? ft->size : 2;
+                /* P79: In Lisa Pascal unpacked records, string fields are
+                 * padded to even length. string[32] = 33 bytes → 34. Without
+                 * this, all fields after an odd-length string are shifted by
+                 * 1 byte, breaking devrec.devname (string[32]) and every
+                 * field after it. */
+                if (ft && ft->kind == TK_STRING && (fs % 2)) fs++;
                 /* Word-align fields */
                 if (fs >= 2 && (offset % 2)) offset++;
                 if (t->num_fields < 64) {
