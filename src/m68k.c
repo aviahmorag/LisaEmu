@@ -3449,10 +3449,15 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             if (pc_recover && cpu->pc == pc_recover) {
                 uint32_t sp = cpu->a[7] & 0xFFFFFF;
                 int16_t error = (int16_t)cpu_read16(cpu, sp + 4); /* error param before LINK */
+                /* Also read the actual errnum from MAKE_DATASEG's VAR param */
+                uint32_t a6 = cpu->a[6] & 0xFFFFFF; /* RECOVER's A6 = MAKE_DATASEG's frame */
+                uint32_t mds_a6 = cpu_read32(cpu, a6) & 0xFFFFFF; /* follow static link to parent */
+                uint32_t errnum_ptr = cpu_read32(cpu, mds_a6 + 8) & 0xFFFFFF; /* MAKE_DATASEG param at A6+8 */
+                int16_t real_errnum = (errnum_ptr >= 0x1000) ? (int16_t)cpu_read16(cpu, errnum_ptr) : -9999;
                 DBGSTATIC(int, rec_count, 0);
                 if (rec_count++ < 5) {
-                    fprintf(stderr, "[MAKE_DATASEG-RECOVER #%d] error=%d ret=$%06X\n",
-                            rec_count, error, cpu_read32(cpu, sp) & 0xFFFFFF);
+                    fprintf(stderr, "[MAKE_DATASEG-RECOVER #%d] error=%d errnum=%d ret=$%06X\n",
+                            rec_count, error, real_errnum, cpu_read32(cpu, sp) & 0xFFFFFF);
                     /* Walk A6 chain for context */
                     uint32_t fp = cpu->a[6] & 0xFFFFFF;
                     for (int i = 0; i < 4 && fp > 0x400 && fp < 0xFFFFFF; i++) {
@@ -3513,13 +3518,51 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             }
             if (discsize > 0) {
                 uint32_t errnum_ptr = cpu_read32(cpu, (sp + 4) & 0xFFFFFF) & 0xFFFFFF;
-                if (errnum_ptr >= 0x1000 && errnum_ptr < 0x240000)
+                if (errnum_ptr >= 0x1000)
                     cpu_write16(cpu, errnum_ptr, 134);
                 uint32_t ret = cpu_read32(cpu, sp);
-                /* Total args: ldsn(2)+segptr(4)+refnum(4)+discsize(4)+memsize(4)+progname(4)+errnum(4)=26 */
-                cpu->a[7] += 4 + 26;  /* ret + args */
+                cpu->a[7] += 4 + 26;
                 cpu->pc = ret;
-                fprintf(stderr, "[HLE-MAKE_SYSDATASEG] bypassed discsize=%d, returning error 134\n", discsize);
+                fprintf(stderr, "[HLE-MAKE_SYSDATASEG] bypassed discsize=%d → error 134\n", discsize);
+                continue;
+            }
+            /* P80f: bypass disc_size=0 (resident) calls too.
+             * DS_OPEN fails because the FS isn't functional.
+             * For memory-resident segments, allocate via GETSPACE and
+             * program the MMU directly. Set errnum=0, refnum=0,
+             * segptr=allocated address. */
+            if (discsize == 0) {
+                int32_t memsize = (int32_t)cpu_read32(cpu, (sp + 12) & 0xFFFFFF);
+                uint32_t errnum_ptr = cpu_read32(cpu, (sp + 4) & 0xFFFFFF) & 0xFFFFFF;
+                uint32_t segptr_ptr = cpu_read32(cpu, (sp + 24) & 0xFFFFFF) & 0xFFFFFF;
+                uint32_t refnum_ptr = cpu_read32(cpu, (sp + 20) & 0xFFFFFF) & 0xFFFFFF;
+                int16_t ldsn = (int16_t)cpu_read16(cpu, (sp + 28) & 0xFFFFFF);
+                /* P80f: for resident segments, allocate from the sgheap area
+                 * which is already MMU-mapped. The sgheap starts after the
+                 * sysglobal pool. Use a bump allocator within the mapped range.
+                 * The sgheap is mapped in segment 102 ($CC0000-$CDFFFF). */
+                static uint32_t hle_seg_bump = 0xCCC000;  /* well above pool at $CCB000 */
+                static int hle_seg_gen = -1;
+                extern int g_emu_generation;
+                if (hle_seg_gen != g_emu_generation) {
+                    hle_seg_bump = 0xCCC000;
+                    hle_seg_gen = g_emu_generation;
+                }
+                uint32_t seg_ptr = hle_seg_bump;
+                int alloc_size = (memsize > 0) ? memsize : 4096;  /* min 4KB */
+                hle_seg_bump += (alloc_size + 0x1FF) & ~0x1FF;
+                /* Zero-fill the allocated area */
+                for (int j = 0; j < alloc_size; j++)
+                    cpu_write8(cpu, (seg_ptr + j) & 0xFFFFFF, 0);
+                /* Write results */
+                if (errnum_ptr >= 0x1000) cpu_write16(cpu, errnum_ptr, 0);
+                if (segptr_ptr >= 0x1000) cpu_write32(cpu, segptr_ptr, seg_ptr);
+                if (refnum_ptr >= 0x1000) cpu_write16(cpu, refnum_ptr, 100 + ldsn);
+                fprintf(stderr, "[HLE-MAKE_SYSDATASEG] resident: memsize=%d ldsn=%d → seg_ptr=$%06X\n",
+                        alloc_size, ldsn, seg_ptr);
+                uint32_t ret = cpu_read32(cpu, sp);
+                cpu->a[7] += 4 + 26;
+                cpu->pc = ret;
                 continue;
             }
         }
