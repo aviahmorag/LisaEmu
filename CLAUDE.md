@@ -70,13 +70,12 @@ make audit-linker       # Stage 4: Full pipeline + linker
 cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' build 2>&1 | grep -E "(error:|BUILD)"
 ```
 
-## Current Status (2026-04-16) — 25/27 milestones, kernel boot COMPLETE
+## Current Status (2026-04-16) — 26/27 milestones, kernel boot COMPLETE
 
-Build green. The entire kernel boot sequence completes: INIT through
-PR_CLEANUP (scheduler idle loop). 25/27 milestones green. Only
-INIT_MEASINFO (cosmetic) and SHELL (next layer) remain.
+Build green. 26/27 kernel milestones: INIT through PR_CLEANUP.
+Only SHELL (next layer — requires multi-target build) remains.
 
-### P80 session fixes (13 structural codegen + HLE fixes)
+### P80 session fixes (16 structural codegen + HLE fixes)
 
 1. **8-char significant identifiers** (P80): Lisa Pascal identifiers significant to 8 chars.
 2. **SYS_PROC_INIT bypass disabled** (P80): P35 bypass removed.
@@ -91,6 +90,9 @@ INIT_MEASINFO (cosmetic) and SHELL (next layer) remain.
 11. **Non-local goto A6 restore** (P80e): Nested proc gotos follow static link chain.
 12. **Boolean NOT for function calls** (P80e): Parameterless functions use boolean NOT.
 13. **CHK_LDSN_FREE bypass** (P80e): System LDSNs bypass "in use" check.
+14. **Generalized record repair** (P80f): auto-detect/replace corrupt records at all field access points.
+15. **Enum/const priority** (P80f): enum registration checks imported_globals before overwriting CONSTs.
+16. **MAKE_SYSDATASEG HLE** (P80f): resident segment bypass — allocates from sgheap, skips DS_OPEN.
 
 ### P79 session fixes (6 structural codegen improvements)
 
@@ -101,13 +103,13 @@ INIT_MEASINFO (cosmetic) and SHELL (next layer) remain.
 5. **Byte-subrange sizing** (P79f): range<=255 → natural size=1. Record fields widen to 2.
 6. **Record-field array stride** (P79f): resolve element type for FIELD_ACCESS array bases.
 
-### Next blocker: MAKE_DATASEG DS_OPEN failure
+### Next: CreateProcess/FinishCreate hard exception
 
-Make_SProcess creates processes but MAKE_DATASEG fails during DS_OPEN
-with garbage error -18032 (suspected record field offset corruption in
-segment management structures). CHK_LDSN_FREE is bypassed for system
-LDSNs. The non-local goto and boolean NOT fixes are structural
-improvements that may also help other code paths.
+MAKE_SYSDATASEG now succeeds (HLE bypass for resident segments). But
+CreateProcess/FinishCreate hits SYSTEM_ERROR(10201) when initializing
+the new process's PCB/stack. This is unwound to continue boot.
+The next step toward actual process dispatch is fixing this init code
+or HLE-bypassing CreateProcess itself.
 
 ### Roadmap to fully bootable Lisa desktop
 
