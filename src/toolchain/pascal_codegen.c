@@ -691,7 +691,12 @@ static void gen_ptr_expression(codegen_t *cg, ast_node_t *node) {
 
 /* Check if an identifier is a field of an active WITH record.
  * Returns the field index and sets *out_type to the record type,
- * or returns -1 if not found. Searches from innermost WITH outward. */
+ * or returns -1 if not found. Searches from innermost WITH outward.
+ *
+ * P80c: if the found record type has all field offsets = 0 (a known
+ * corruption issue where the full-pass local type gets zeroed), try
+ * to find the same record in imported_types which has correct offsets
+ * from the pre-pass fixup. */
 static int with_lookup_field(codegen_t *cg, const char *name,
                              type_desc_t **out_type, int *out_with_idx) {
     for (int w = cg->with_depth - 1; w >= 0; w--) {
@@ -699,19 +704,35 @@ static int with_lookup_field(codegen_t *cg, const char *name,
         if (!rt || rt->kind != TK_RECORD) continue;
         for (int fi = 0; fi < rt->num_fields; fi++) {
             if (str_eq_nocase(rt->fields[fi].name, name)) {
+                /* P80c: detect and repair corrupt record types.
+                 * A record with >1 field where ALL offsets are 0 is corrupt. */
+                if (fi > 0 && rt->fields[fi].offset == 0 && rt->num_fields > 1) {
+                    int all_zero = 1;
+                    for (int fj = 1; fj < rt->num_fields; fj++)
+                        if (rt->fields[fj].offset != 0) { all_zero = 0; break; }
+                    if (all_zero && cg->imported_types) {
+                        /* Search imported types for a matching record */
+                        for (int it = 0; it < cg->imported_types_count; it++) {
+                            type_desc_t *imp = &cg->imported_types[it];
+                            if (imp->kind != TK_RECORD || imp->num_fields != rt->num_fields) continue;
+                            if (!str_eq_nocase(imp->name, rt->name)) continue;
+                            /* Verify imported version has non-zero offsets */
+                            if (imp->num_fields > 1 && imp->fields[1].offset > 0) {
+                                /* Replace the corrupt type with the imported one */
+                                fprintf(stderr, "  [P80c-FIX] repaired '%s' field '%s' offset %d→%d\n",
+                                        rt->name, name, 0, imp->fields[fi > 0 ? fi : 1].offset);
+                                rt = imp;
+                                cg->with_stack[w].record_type = rt;
+                                /* Re-find the field in the corrected type */
+                                for (fi = 0; fi < rt->num_fields; fi++)
+                                    if (str_eq_nocase(rt->fields[fi].name, name)) break;
+                                break;
+                            }
+                        }
+                    }
+                }
                 if (out_type) *out_type = rt;
                 if (out_with_idx) *out_with_idx = w;
-                /* P80c debug: trace WITH lookups for freepool fields */
-                if (str_eq_nocase(name, "firstfree") && rt->fields[fi].offset == 0) {
-                    fprintf(stderr, "  [WITH-LOOKUP-BUG] '%s' → rt=%p '%s' offset=0! FULL DUMP:\n",
-                            name, (void*)rt, rt->name[0] ? rt->name : "(anon)");
-                    for (int fj = 0; fj < rt->num_fields; fj++)
-                        fprintf(stderr, "    field[%d] '%s' @%d sz=%d kind=%d type=%p type_name='%s'\n",
-                                fj, rt->fields[fj].name, rt->fields[fj].offset,
-                                rt->fields[fj].type ? rt->fields[fj].type->size : -1,
-                                rt->fields[fj].type ? rt->fields[fj].type->kind : -1,
-                                (void*)rt->fields[fj].type, rt->fields[fj].type_name);
-                }
                 return fi;
             }
         }
@@ -3434,14 +3455,51 @@ static void gen_proc_or_func(codegen_t *cg, ast_node_t *node) {
                         strncpy(alias->name, saved_name, sizeof(alias->name) - 1);
                     }
                 } else {
-                    /* If stub already exists with this name, overwrite in place. */
+                    /* If stub already exists with this name, overwrite in place.
+                     * P80c: if the existing type is an IMPORTED record with valid
+                     * offsets (from the pre-pass fixup), DON'T overwrite it — the
+                     * local resolve_type may produce a copy with zeroed offsets
+                     * due to the struct copy corruption bug. Instead, just discard
+                     * the locally resolved type and keep the imported one. */
                     type_desc_t *existing = find_type(cg, child->name);
                     if (existing && existing != t) {
+                        /* Check: is this an imported record with valid offsets? */
+                        bool imported_ok = false;
+                        if (cg->imported_types && existing->kind == TK_RECORD &&
+                            existing->num_fields > 1 && existing->fields[1].offset > 0) {
+                            /* Check if 'existing' is in the imported_types array */
+                            if (existing >= cg->imported_types &&
+                                existing < cg->imported_types + cg->imported_types_count)
+                                imported_ok = true;
+                        }
+                        if (!imported_ok) {
                         char saved_name[64];
                         strncpy(saved_name, child->name, sizeof(saved_name) - 1);
                         saved_name[63] = '\0';
                         *existing = *t;
                         strncpy(existing->name, saved_name, sizeof(existing->name) - 1);
+                        /* P80c: verify record field offsets after struct copy.
+                         * The *existing = *t copy sometimes produces zeroed offsets
+                         * (suspected memory corruption from large type arrays).
+                         * Recompute offsets from field sizes as a safety net. */
+                        if (existing->kind == TK_RECORD && existing->num_fields > 1 &&
+                            existing->fields[1].offset == 0) {
+                            int off = 0;
+                            for (int fi = 0; fi < existing->num_fields; fi++) {
+                                int fs = existing->fields[fi].type ? existing->fields[fi].type->size : 2;
+                                if (existing->fields[fi].type && existing->fields[fi].type->kind == TK_STRING && (fs % 2)) fs++;
+                                if (fs == 1 && existing->fields[fi].type &&
+                                    (existing->fields[fi].type->kind == TK_BYTE || existing->fields[fi].type->kind == TK_CHAR ||
+                                     existing->fields[fi].type->kind == TK_SUBRANGE))
+                                    fs = 2;
+                                if (fs >= 2 && (off % 2)) off++;
+                                existing->fields[fi].offset = off;
+                                off += fs;
+                            }
+                            if (off % 2) off++;
+                            existing->size = off;
+                        }
+                        } /* end if (!imported_ok) */
                     } else {
                         strncpy(t->name, child->name, sizeof(t->name) - 1);
                     }

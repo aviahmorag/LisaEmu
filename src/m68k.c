@@ -3087,21 +3087,52 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
          * P71's unary-minus CONST evaluation which made LDSN_TO_MMU
          * receive the correct ldsn value so DS_OPEN computes the right
          * seg_ptr via real MMU_Base. */
-        /* P80c: trace INIT_FREEPOOL to verify pool setup */
+        /* P80c: trace INIT_FREEPOOL and fix broken pool headers.
+         * Due to a record field offset corruption bug, INIT_FREEPOOL's
+         * compiled code writes firstfree (int4) at offset 0 instead of
+         * offset 2, overwriting pool_size with $00000008. Fix: after
+         * INIT_FREEPOOL returns, check if pool_size=0 and repair. */
         {
             static uint32_t pc_ifp = 0;
             static int ifp_probed = 0;
+            static uint32_t pending_fp_ptr = 0;
+            static int16_t pending_fp_size = 0;
+            static uint32_t pending_ret = 0;
             if (!ifp_probed) { ifp_probed = 1; pc_ifp = boot_progress_lookup("INIT_FREEPOOL"); }
+            /* On INIT_FREEPOOL entry: save parameters */
             if (pc_ifp && cpu->pc == pc_ifp) {
                 uint32_t sp = cpu->a[7] & 0xFFFFFF;
-                /* After JSR: SP+4=fp_ptr(4), SP+8=fp_size(2) (after LINK: A6+8, A6+12) */
-                uint32_t fp_ptr = cpu_read32(cpu, (sp + 4) & 0xFFFFFF);
-                int16_t fp_size = (int16_t)cpu_read16(cpu, (sp + 8) & 0xFFFFFF);
+                pending_fp_ptr = cpu_read32(cpu, (sp + 4) & 0xFFFFFF);
+                pending_fp_size = (int16_t)cpu_read16(cpu, (sp + 8) & 0xFFFFFF);
+                pending_ret = cpu_read32(cpu, sp) & 0xFFFFFF;
                 DBGSTATIC(int, ifp_count, 0);
                 if (ifp_count++ < 5)
                     fprintf(stderr, "[INIT_FREEPOOL #%d] fp_ptr=$%08X fp_size=%d ($%04X) ret=$%06X\n",
-                            ifp_count, fp_ptr, fp_size, (uint16_t)fp_size,
-                            cpu_read32(cpu, sp) & 0xFFFFFF);
+                            ifp_count, pending_fp_ptr, pending_fp_size,
+                            (uint16_t)pending_fp_size, pending_ret);
+            }
+            /* After return: check and fix pool header */
+            if (pending_ret && cpu->pc == pending_ret && pending_fp_ptr) {
+                uint32_t pool = pending_fp_ptr & 0xFFFFFF;
+                int16_t pool_size = (int16_t)cpu_read16(cpu, pool);
+                int expected_pool_size = (pending_fp_size - 8) / 2;
+                if (pool_size != expected_pool_size && expected_pool_size > 0) {
+                    fprintf(stderr, "[P80c-HLE] INIT_FREEPOOL pool header corrupt at $%06X: "
+                            "pool_size=%d (expected %d). Repairing.\n",
+                            pool, pool_size, expected_pool_size);
+                    /* hdr_freepool layout: pool_size(2) + firstfree(4) + freecount(2) = 8 bytes.
+                     * The bug writes firstfree at offset 0, producing:
+                     * +0: $0000 $0008 instead of +0: $xxxx +2: $0000 $0008.
+                     * Fix: write correct values at correct offsets. */
+                    cpu_write16(cpu, pool, (uint16_t)expected_pool_size);     /* pool_size at +0 */
+                    cpu_write32(cpu, pool + 2, 8);                            /* firstfree at +2 */
+                    cpu_write16(cpu, pool + 6, (uint16_t)expected_pool_size); /* freecount at +6 */
+                    /* Also fix the first free entry (at +8): size=pool_size, next=0(stopper) */
+                    cpu_write16(cpu, pool + 8, (uint16_t)expected_pool_size); /* ent.size */
+                    cpu_write32(cpu, pool + 10, 0);                           /* ent.next = stopper */
+                }
+                pending_ret = 0;
+                pending_fp_ptr = 0;
             }
         }
         /* P80b: trace GETSPACE calls to diagnose pool exhaustion.
