@@ -776,19 +776,63 @@ build_result_t toolchain_build(const char *source_dir,
     if (startup_idx >= 0) {
         compile_pascal_file_impl(files[startup_idx].path, lk, true);
     }
-    /* P79-diag: check key record sizes after pre-pass */
-    for (int ti = 0; ti < num_shared_types; ti++) {
-        type_desc_t *t = &shared_types[ti];
-        if (t->kind == TK_RECORD && t->num_fields > 0 &&
-            (strcasecmp(t->name, "addrdisc") == 0 ||
-             strcasecmp(t->name, "discaddr") == 0 ||
-             strcasecmp(t->name, "Tsdbtype") == 0 ||
-             strcasecmp(t->name, "segHandle") == 0)) {
-            fprintf(stderr, "  [TYPE] %s: size=%d fields=%d\n", t->name, t->size, t->num_fields);
-            for (int f = 0; f < t->num_fields; f++)
-                fprintf(stderr, "    @%d %s sz=%d\n", t->fields[f].offset, t->fields[f].name,
-                        t->fields[f].type ? t->fields[f].type->size : -1);
+    /* P80b: after the pre-pass, all types are in shared_types but record
+     * field sizes may be wrong — types compiled early couldn't resolve
+     * types defined later (e.g., MMRB's semaphore fields defaulted to
+     * size 2 because the semaphore type wasn't defined yet).
+     * Fix: re-resolve field types by name and recompute record layouts. */
+    {
+        int fixups = 0;
+        for (int ti = 0; ti < num_shared_types; ti++) {
+            type_desc_t *t = &shared_types[ti];
+            if (t->kind != TK_RECORD || t->num_fields == 0) continue;
+            int needs_fixup = 0;
+            for (int fi = 0; fi < t->num_fields; fi++) {
+                if (!t->fields[fi].type && t->fields[fi].type_name[0]) {
+                    /* Re-resolve by stored type name */
+                    /* Look up type by name in shared_types (8-char significant) */
+                    type_desc_t *resolved = NULL;
+                    for (int si = 0; si < num_shared_types; si++) {
+                        const char *a = shared_types[si].name;
+                        const char *b = t->fields[fi].type_name;
+                        int n = 0;
+                        while (*a && *b) {
+                            if (toupper((unsigned char)*a) != toupper((unsigned char)*b)) break;
+                            a++; b++; if (++n >= 8) break;
+                        }
+                        if (n >= 8 || *a == *b) { resolved = &shared_types[si]; break; }
+                    }
+                    if (resolved) {
+                        t->fields[fi].type = resolved;
+                        needs_fixup = 1;
+                    }
+                }
+            }
+            if (!needs_fixup) continue;
+            /* Recompute field offsets with correct sizes */
+            int offset = 0;
+            for (int fi = 0; fi < t->num_fields; fi++) {
+                int fs = t->fields[fi].type ? t->fields[fi].type->size : 2;
+                /* P79: string padding */
+                if (t->fields[fi].type && t->fields[fi].type->kind == TK_STRING && (fs % 2)) fs++;
+                /* P79f: byte-scalar widening in unpacked records */
+                if (fs == 1 && t->fields[fi].type &&
+                    (t->fields[fi].type->kind == TK_BYTE || t->fields[fi].type->kind == TK_CHAR ||
+                     t->fields[fi].type->kind == TK_SUBRANGE))
+                    fs = 2;
+                /* Word-align fields >= 2 bytes */
+                if (fs >= 2 && (offset % 2)) offset++;
+                t->fields[fi].offset = offset;
+                offset += fs;
+            }
+            if (offset % 2) offset++;
+            if (offset != t->size) {
+                fixups++;
+                t->size = offset;
+            }
         }
+        if (fixups > 0)
+            fprintf(stderr, "Pre-pass fixup: recomputed %d record layouts with resolved types\n", fixups);
     }
     fprintf(stderr, "Types-only pre-pass complete: %d shared types, %d shared globals (constants)\n",
             num_shared_types, num_shared_globals);

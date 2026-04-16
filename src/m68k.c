@@ -3103,6 +3103,46 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             fprintf(stderr, "  mmrb_addr         (A5-25691):  $%08X\n", cpu_read32(cpu, (a5 - 25691) & 0xFFFFFF));
             fprintf(stderr, "  sctab             (A5-25661):  $%08X\n", cpu_read32(cpu, (a5 - 25661) & 0xFFFFFF));
             fprintf(stderr, "  invoke_sched      (A5-24786):  $%02X\n", cpu_read8(cpu, (a5 - 24786) & 0xFFFFFF));
+            /* P80b: dump MMRB structure to diagnose sds_sem corruption */
+            uint32_t mmrb = cpu_read32(cpu, (a5 - 25691) & 0xFFFFFF);
+            if (mmrb >= 0xCC0000 && mmrb < 0xCE0000) {
+                fprintf(stderr, "  MMRB @$%06X hex dump (80 bytes):\n", mmrb);
+                for (int row = 0; row < 80; row += 16) {
+                    fprintf(stderr, "    +$%02X:", row);
+                    for (int col = 0; col < 16 && row + col < 80; col += 2)
+                        fprintf(stderr, " %04X", cpu_read16(cpu, (mmrb + row + col) & 0xFFFFFF));
+                    fprintf(stderr, "\n");
+                }
+                /* Decode expected MMRB fields:
+                 * +0:  hd_qioreq_list (linkage: fwd:int2 + bkwd:int2 = 4)
+                 * +4:  seg_wait_sem (semaphore: count:int2 + owner:int2 + wait_q:4 = 8)
+                 * +12: memmgr_sem (semaphore: 8)
+                 * +20: memmgr_busyF (boolean: 1-2)
+                 * +22: clr_mmbusy (boolean: 1-2)
+                 * +24: numbRelSegs (int2: 2)
+                 * +26: req_pcb_ptr (ptr_pcb: 4)
+                 * +30: hd_sdscb_list (linkage: 4)
+                 * +34: sds_sem (semaphore: count:int2 + owner:int2 + wait_q:4 = 8)
+                 */
+                fprintf(stderr, "  Decoded (assuming Apple layout):\n");
+                fprintf(stderr, "    hd_qioreq_list:  fwd=$%04X bkwd=$%04X\n",
+                        cpu_read16(cpu, mmrb), cpu_read16(cpu, mmrb + 2));
+                fprintf(stderr, "    seg_wait_sem:    count=%d owner=$%04X wait_q=$%08X\n",
+                        (int16_t)cpu_read16(cpu, mmrb + 4),
+                        cpu_read16(cpu, mmrb + 6), cpu_read32(cpu, mmrb + 8));
+                fprintf(stderr, "    memmgr_sem:      count=%d owner=$%04X wait_q=$%08X\n",
+                        (int16_t)cpu_read16(cpu, mmrb + 12),
+                        cpu_read16(cpu, mmrb + 14), cpu_read32(cpu, mmrb + 16));
+                fprintf(stderr, "    memmgr_busyF:    $%02X  clr_mmbusy: $%02X\n",
+                        cpu_read8(cpu, mmrb + 20), cpu_read8(cpu, mmrb + 21));
+                fprintf(stderr, "    numbRelSegs:     %d  req_pcb_ptr: $%08X\n",
+                        (int16_t)cpu_read16(cpu, mmrb + 22), cpu_read32(cpu, mmrb + 24));
+                fprintf(stderr, "    hd_sdscb_list:   fwd=$%04X bkwd=$%04X\n",
+                        cpu_read16(cpu, mmrb + 28), cpu_read16(cpu, mmrb + 30));
+                fprintf(stderr, "    sds_sem@+34:     count=%d owner=$%04X wait_q=$%08X\n",
+                        (int16_t)cpu_read16(cpu, mmrb + 34),
+                        cpu_read16(cpu, mmrb + 36), cpu_read32(cpu, mmrb + 38));
+            }
         }
         /* P80: VEC-GUARD PC trace removed — binary layout shifts on recompile.
          * Use generic VEC-GUARD dump in lisa_mmu.c instead. */
@@ -3315,9 +3355,18 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                  * with NULL wait_queue means corrupt semaphore state */
                 if (!wait_q || wait_q < 0xCA0000 || wait_q > 0xD40000) {
                     DBGSTATIC(int, ss_skip, 0);
-                    if (ss_skip++ < 5)
-                        fprintf(stderr, "[P78-SS] Signal_sem: sem_count=%d wait_queue=$%08X (bogus) — skipping waiter path\n",
-                                sem_count, wait_q);
+                    if (ss_skip++ < 5) {
+                        uint32_t ret = cpu_read32(cpu, sp);
+                        fprintf(stderr, "[P78-SS] Signal_sem: sem_ptr=$%08X sem_count=%d wait_queue=$%08X (bogus) ret=$%06X\n",
+                                sem_ptr, sem_count, wait_q, ret & 0xFFFFFF);
+                        /* Dump A6 chain to identify caller */
+                        uint32_t fp = cpu->a[6] & 0xFFFFFF;
+                        for (int i = 0; i < 6 && fp > 0x400 && fp < 0xFFFFFF; i++) {
+                            uint32_t r = cpu_read32(cpu, fp + 4);
+                            fprintf(stderr, "  frame[%d]: A6=$%06X ret=$%06X\n", i, fp, r & 0xFFFFFF);
+                            fp = cpu_read32(cpu, fp) & 0xFFFFFF;
+                        }
+                    }
                     cpu_write16(cpu, sem_ptr & 0xFFFFFF, (uint16_t)(sem_count + 1));
                     cpu_write16(cpu, (sem_ptr + 2) & 0xFFFFFF, 0);
                     uint32_t ret = cpu_read32(cpu, sp);

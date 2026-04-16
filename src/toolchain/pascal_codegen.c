@@ -372,6 +372,13 @@ static type_desc_t *resolve_type(codegen_t *cg, ast_node_t *node) {
                 if (fs >= 2 && (offset % 2)) offset++;
                 if (t->num_fields < 64) {
                     strncpy(t->fields[t->num_fields].name, field->name, 63);
+                    t->fields[t->num_fields].name[63] = '\0';
+                    /* Store original type name for post-prepass re-resolution */
+                    t->fields[t->num_fields].type_name[0] = '\0';
+                    if (field->children[0] && field->children[0]->name)
+                        strncpy(t->fields[t->num_fields].type_name,
+                                field->children[0]->name, 63);
+                    t->fields[t->num_fields].type_name[63] = '\0';
                     t->fields[t->num_fields].offset = offset;
                     t->fields[t->num_fields].type = ft;
                     t->num_fields++;
@@ -380,6 +387,18 @@ static type_desc_t *resolve_type(codegen_t *cg, ast_node_t *node) {
             }
             if (offset % 2) offset++; /* Pad to word boundary */
             t->size = offset;
+            /* P80b: debug print for MMRB and similar large records */
+            if (t->num_fields >= 8) {
+                for (int fi = 0; fi < t->num_fields; fi++) {
+                    if (str_eq_nocase(t->fields[fi].name, "sds_sem")) {
+                        fprintf(stderr, "  [TYPE] mmrb-like: size=%d fields=%d\n", t->size, t->num_fields);
+                        for (int fj = 0; fj < t->num_fields; fj++)
+                            fprintf(stderr, "    @%d %s sz=%d\n", t->fields[fj].offset,
+                                    t->fields[fj].name, t->fields[fj].type ? t->fields[fj].type->size : -1);
+                        break;
+                    }
+                }
+            }
             return t;
         }
 
