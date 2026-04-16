@@ -432,7 +432,14 @@ skip_type_export:;
      * report size=0 kind=0 for int2/int4/etc., which defaults param
      * sizes to 4 bytes in RECONST. Name-based lookup is stable across
      * passes. */
-    if (cg->proc_sigs && !types_only_pass) {
+    /* P79c: Export proc sigs on BOTH passes. During the types-only pre-pass,
+     * this ensures that cross-unit calls in later-compiled units can find
+     * the non-external body sig (via find_proc_sig's preference logic).
+     * Without this, DS2.TEXT→BLD_SEG only sees the EXTERNAL sig from
+     * MMPRIM (DS2 compiles before MM0), making is_callee_clean=true and
+     * pushing args in the wrong direction. On the real pass, skip sigs
+     * that were already exported from the pre-pass by name check. */
+    if (cg->proc_sigs) {
         for (int i = 0; i < cg->num_proc_sigs && num_shared_proc_sigs < MAX_SHARED_PROC_SIGS; i++) {
             cg_proc_sig_t *sig = &shared_proc_sigs[num_shared_proc_sigs++];
             *sig = cg->proc_sigs[i];
