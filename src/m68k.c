@@ -3512,14 +3512,83 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 if (!pc_mp) pc_mp = 0x04EF12;  /* from map */
                 if (!pc_fc) pc_fc = 0x04E3CA;  /* from map */
             }
-            if (pc_cp && (cpu->pc == pc_cp || cpu->pc == pc_mp || cpu->pc == pc_fc)) {
-                DBGSTATIC(int, cp_count, 0);
-                if (cp_count++ < 10) {
-                    const char *fn = (cpu->pc == pc_cp) ? "CreateProcess" :
-                                     (cpu->pc == pc_mp) ? "ModifyProcess" : "FinishCreate";
-                    fprintf(stderr, "[HLE-%s #%d] bypassed\n", fn, cp_count);
-                }
+            if (pc_cp && cpu->pc == pc_cp) {
+                /* P80h: HLE CreateProcess — initialize minimum PCB fields.
+                 * Stack: ret(4), pcb_ptr(4), sloc_addr(4), stk_addr(4),
+                 * stk_info_addr(4), jt_ptr(4), unit_list_addr(4),
+                 * start_PC(4), evnt_chn(2) — 30 bytes of args */
                 uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                uint32_t pcb = cpu_read32(cpu, (sp + 4) & 0xFFFFFF) & 0xFFFFFF;
+                uint32_t sloc_addr = cpu_read32(cpu, (sp + 8) & 0xFFFFFF) & 0xFFFFFF;
+                uint32_t stk_addr = cpu_read32(cpu, (sp + 12) & 0xFFFFFF) & 0xFFFFFF;
+                uint32_t start_pc_val = cpu_read32(cpu, (sp + 28) & 0xFFFFFF);
+                /* Read sloc_handle.seg_ptr and stk_handle.seg_ptr/seg_size.
+                 * segHandle: seg_size(4), disk_size(4), seg_refnum(2), seg_ptr(4) */
+                uint32_t sloc_seg_ptr = cpu_read32(cpu, (sloc_addr + 10) & 0xFFFFFF);
+                uint32_t stk_seg_ptr = cpu_read32(cpu, (stk_addr + 10) & 0xFFFFFF);
+                uint32_t stk_seg_size = cpu_read32(cpu, (stk_addr) & 0xFFFFFF);
+                /* Read sysA5 from SGLOBAL @$200 */
+                uint32_t sys_a5 = cpu_read32(cpu, 0x200);
+                DBGSTATIC(int, cp_count, 0);
+                cp_count++;
+                fprintf(stderr, "[HLE-CreateProcess #%d] pcb=$%06X sloc=$%06X stk=$%06X "
+                        "stk_size=%d start_PC=$%06X\n",
+                        cp_count, pcb, sloc_seg_ptr, stk_seg_ptr,
+                        stk_seg_size, start_pc_val & 0xFFFFFF);
+                /* Dump stack for debugging */
+                fprintf(stderr, "  Stack:");
+                for (int j = 4; j <= 34; j += 2)
+                    fprintf(stderr, " %04X", cpu_read16(cpu, (sp + j) & 0xFFFFFF));
+                fprintf(stderr, "\n");
+                /* Initialize PCB fields at estimated offsets.
+                 * PCB layout: next_schedPtr(4), prev_schedPtr(4), semwait_queue(4),
+                 * priority(2), norm_pri(2), blk_state(2), domain(2), sems_owned(2) */
+                if (pcb >= 0xCC0000 && pcb < 0xCE0000) {
+                    /* priority from Make_SProcess (250 MemMgr, 230 Root) */
+                    static int pri_vals[] = {250, 230, 200, 200};
+                    int pri = pri_vals[(cp_count-1) < 4 ? (cp_count-1) : 3];
+                    cpu_write16(cpu, pcb + 12, (uint16_t)pri);   /* priority */
+                    cpu_write16(cpu, pcb + 14, (uint16_t)pri);   /* norm_pri */
+                    cpu_write16(cpu, pcb + 16, 0);               /* blk_state = empty */
+                    cpu_write16(cpu, pcb + 18, 0);               /* domain = 0 */
+                }
+                uint32_t ret = cpu_read32(cpu, sp);
+                cpu->a[7] += 4;
+                cpu->pc = ret;
+                continue;
+            }
+            if (pc_cp && cpu->pc == pc_mp) {
+                /* ModifyProcess: just bypass */
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                uint32_t ret = cpu_read32(cpu, sp);
+                cpu->a[7] += 4;
+                cpu->pc = ret;
+                continue;
+            }
+            if (pc_cp && cpu->pc == pc_fc) {
+                /* P80h: HLE FinishCreate — queue process in ready list.
+                 * FinishCreate(pcb: ptr_PCB; stk: segHandle; sloc: segHandle; obj: ObjHandle)
+                 * Push order L→R: obj(4), sloc_addr(4), stk_addr(4), pcb(4)
+                 * After JSR: SP+4=pcb, SP+8=stk_addr, SP+12=sloc_addr, SP+16=obj */
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                uint32_t pcb = cpu_read32(cpu, (sp + 4) & 0xFFFFFF) & 0xFFFFFF;
+                DBGSTATIC(int, fc_count, 0);
+                fc_count++;
+                fprintf(stderr, "[HLE-FinishCreate #%d] pcb=$%06X → queuing\n",
+                        fc_count, pcb);
+                /* Insert into fwd_ReadyQ. The ReadyQ is at A5-1116 (PFWD_REA
+                 * from PASCALDEFS). It's a relptr (int2) linked list. */
+                uint32_t a5 = cpu->a[5] & 0xFFFFFF;
+                uint32_t b_sysglobal = cpu_read32(cpu, 0x200);
+                /* Queue_Process inserts by priority. For simplicity, just
+                 * set the process as the first in the ready queue. */
+                int16_t old_fwd = (int16_t)cpu_read16(cpu, (a5 - 1116) & 0xFFFFFF);
+                /* fwd_ReadyQ is a relptr (relative to b_sysglobal_ptr) */
+                int16_t new_rp = (int16_t)(pcb - b_sysglobal);
+                /* PCB.next_schedPtr = old fwd_ReadyQ (as relptr) */
+                cpu_write32(cpu, pcb, old_fwd ? (b_sysglobal + old_fwd) : 0);
+                /* fwd_ReadyQ = new process */
+                cpu_write16(cpu, (a5 - 1116) & 0xFFFFFF, (uint16_t)new_rp);
                 uint32_t ret = cpu_read32(cpu, sp);
                 cpu->a[7] += 4;
                 cpu->pc = ret;
