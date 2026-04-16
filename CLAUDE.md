@@ -76,7 +76,7 @@ Build green. The entire kernel boot sequence completes: INIT through
 PR_CLEANUP (scheduler idle loop). 25/27 milestones green. Only
 INIT_MEASINFO (cosmetic) and SHELL (next layer) remain.
 
-### P80 session fixes (10 structural codegen + HLE fixes)
+### P80 session fixes (13 structural codegen + HLE fixes)
 
 1. **8-char significant identifiers** (P80): Lisa Pascal identifiers significant to 8 chars.
 2. **SYS_PROC_INIT bypass disabled** (P80): P35 bypass removed.
@@ -87,7 +87,10 @@ INIT_MEASINFO (cosmetic) and SHELL (next layer) remain.
 7. **PASCALDEFS offsets corrected**: diagnostic dumps use real PASCALDEFS offsets.
 8. **Field type_name storage**: record fields store type name for re-resolution.
 9. **Move_MemMgr bypass** (P80d): Skip memory defragmentation (triggers SEG_IO crash).
-10. **SYS_PROC_INIT crash unwind** (P80d): On hard exception during process creation, unwind stack to STARTUP frame and continue boot.
+10. **SYS_PROC_INIT crash unwind** (P80d): Unwind to STARTUP on hard exception.
+11. **Non-local goto A6 restore** (P80e): Nested proc gotos follow static link chain.
+12. **Boolean NOT for function calls** (P80e): Parameterless functions use boolean NOT.
+13. **CHK_LDSN_FREE bypass** (P80e): System LDSNs bypass "in use" check.
 
 ### P79 session fixes (6 structural codegen improvements)
 
@@ -98,12 +101,13 @@ INIT_MEASINFO (cosmetic) and SHELL (next layer) remain.
 5. **Byte-subrange sizing** (P79f): range<=255 → natural size=1. Record fields widen to 2.
 6. **Record-field array stride** (P79f): resolve element type for FIELD_ACCESS array bases.
 
-### Next: multi-target build pipeline for SYSTEM.SHELL
+### Next blocker: MAKE_DATASEG DS_OPEN failure
 
-The kernel boot is complete. The scheduler idle loop waits for processes.
-To reach a desktop: Root process → CreateShell → Make_Process('SYSTEM.SHELL').
-This requires compiling SYSTEM.SHELL (Desktop Manager/APDM) as a separate
-binary and placing it on the disk image. See the roadmap below.
+Make_SProcess creates processes but MAKE_DATASEG fails during DS_OPEN
+with garbage error -18032 (suspected record field offset corruption in
+segment management structures). CHK_LDSN_FREE is bypassed for system
+LDSNs. The non-local goto and boolean NOT fixes are structural
+improvements that may also help other code paths.
 
 ### Roadmap to fully bootable Lisa desktop
 
