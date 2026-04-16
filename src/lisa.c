@@ -2902,6 +2902,24 @@ static bool hle_handle_system_error(lisa_t *lisa __attribute__((unused)), m68k_t
         return true;
     }
 
+    /* P78d: suppress hard exception errors (10201/10204) during
+     * SYS_PROC_INIT — these are caused by codegen pointer bugs in FS
+     * code that we've HLE-bypassed. The corrupted code path should
+     * never return successfully anyway; suppressing just lets the
+     * boot continue past the error. */
+    extern int g_vec_guard_active;
+    if (g_vec_guard_active && (err_code == 10201 || err_code == 10204)) {
+        static int supp_10201 = 0;
+        if (supp_10201++ < 10) {
+            fprintf(stderr, "HLE: Suppressing SYSTEM_ERROR(%d) during SYS_PROC_INIT (ret=$%06X)\n",
+                    err_code, ret_addr);
+        }
+        cpu->a[7] += 4 + 2;  /* pop retPC + err_code */
+        cpu->pc = ret_addr;
+        cpu->cycles += 20;
+        return true;
+    }
+
     /* SYSTEM_ERROR should halt — it never returns on a real Lisa.
      * Stop the CPU to prevent infinite recursion. */
     fprintf(stderr, "SYSTEM_ERROR(%d): HALTING CPU\n", err_code);

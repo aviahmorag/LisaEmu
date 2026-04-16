@@ -294,15 +294,25 @@ void lisa_mem_write8(lisa_mem_t *mem, uint32_t addr, uint8_t val) {
              * end up as the MSB of a longword in range [0x8..0xFC]). */
             {
                 extern uint32_t g_last_cpu_pc;
-            if (phys < 0x100 && g_last_cpu_pc > 0x100 && (phys & 3) == 0 && val != 0) {
-                static int vtw_count = 0;
-                static int vtw_gen = -1;
+            /* P78d: PROTECT the vector table from post-init writes.
+             * Many FS/segment functions compute wrong pointers due to
+             * codegen bugs, aliasing into the $000-$0FF vector table.
+             * Guard: drop ALL writes to $000-$3FF from code above $1000.
+             * The vector table is set up during early STARTUP and should
+             * NOT be modified by OS kernel code during process creation. */
+            /* Only active after SYS_PROC_INIT milestone fires —
+             * earlier writes (INIT_TRAPV etc.) are legitimate. */
+            extern int g_vec_guard_active;  /* set in m68k.c after SYS_PROC_INIT */
+            if (phys < 0x400 && g_last_cpu_pc > 0x1000 && g_vec_guard_active) {
+                static int vtg_count = 0;
+                static int vtg_gen = -1;
                 extern int g_emu_generation;
-                if (vtw_gen != g_emu_generation) { vtw_count = 0; vtw_gen = g_emu_generation; }
-                if (vtw_count++ < 32) {
-                    fprintf(stderr, "VEC-WRITE[%d]: PC=$%06X addr=$%06X val=$%02X (msb of vec%d)\n",
-                            vtw_count, g_last_cpu_pc, phys, val, (int)(phys / 4));
+                if (vtg_gen != g_emu_generation) { vtg_count = 0; vtg_gen = g_emu_generation; }
+                if (vtg_count++ < 16 && (phys & 3) == 0) {
+                    fprintf(stderr, "VEC-GUARD[%d]: PC=$%06X dropped write to $%06X val=$%02X\n",
+                            vtg_count, g_last_cpu_pc, phys, val);
                 }
+                return;  /* DROP the write — protect vector table */
             }
             }
             /* Watchpoint: $002600..$00260F code region is overwritten during

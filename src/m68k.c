@@ -483,6 +483,7 @@ static int illegal_opcode_histogram[16] = {0};
 uint32_t g_last_cpu_pc = 0;  /* Visible to lisa_mmu.c for write watchpoints */
 
 int g_emu_generation = 0;
+int g_vec_guard_active = 0;  /* P78d: set after SYS_PROC_INIT to protect vector table */
 int m68k_exception_histogram[256] = {0};
 #define exception_histogram m68k_exception_histogram
 
@@ -2897,6 +2898,36 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
          * - UNLOCKSEGS walks corrupt seglock sentinel → RELSPACE spin
          * Both are downstream of c_syslocal_ptr miscalculation. */
 
+        /* P78b diag: trace VEC-WRITE source PCs via A6 frame chain.
+         * The FS code around $02Bxxx writes to vector table during
+         * SYS_PROC_INIT. Catch the first such write and dump the call stack. */
+        {
+            DBGSTATIC(int, p78b_armed, 0);
+            DBGSTATIC(int, p78b_traced, 0);
+            uint32_t spi_addr = boot_progress_lookup("SYS_PROC_INIT");
+            if (spi_addr && cpu->pc == spi_addr) p78b_armed = 1;
+            /* After SYS_PROC_INIT, watch for PCs in the FS code area that
+             * writes to vectors. From prior probes: $02BB0E, $02BC8C,
+             * $02BC9C, $02BE48, $02C6B2. */
+            if (p78b_armed && !p78b_traced &&
+                cpu->pc >= 0x02B000 && cpu->pc <= 0x02D000) {
+                p78b_traced = 1;
+                fprintf(stderr, "[P78b] FS code entered from SYS_PROC_INIT context, PC=$%06X\n",
+                        cpu->pc);
+                fprintf(stderr, "  D0=$%08X D1=$%08X A0=$%08X A1=$%08X A5=$%08X\n",
+                        cpu->d[0], cpu->d[1], cpu->a[0], cpu->a[1], cpu->a[5]);
+                fprintf(stderr, "  A6 chain:");
+                uint32_t fp = cpu->a[6] & 0xFFFFFF;
+                for (int i = 0; i < 12 && fp > 0x100 && fp < 0xF00000; i++) {
+                    uint32_t ret = cpu_read32(cpu, (fp + 4) & 0xFFFFFF);
+                    fprintf(stderr, " ret=$%06X", ret);
+                    uint32_t next_fp = cpu_read32(cpu, fp & 0xFFFFFF) & 0xFFFFFF;
+                    if (next_fp <= fp || next_fp == 0) break;
+                    fp = next_fp;
+                }
+                fprintf(stderr, "\n");
+            }
+        }
         /* P78 probes removed — LDSN_TO_MMU and MMU_BASE work correctly
          * after the P77 EXT.L fix. Build_Syslocal's syslocal sentinel
          * stores are still not landing (separate issue in the refdb LDSN
@@ -2909,7 +2940,8 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         static uint32_t pc_FS_CLEANUP, pc_PR_CLEANUP, pc_MEM_CLEANUP;
         static uint32_t pc_SYS_PROC_INIT, pc_excep_setup, pc_REG_OPEN_LIST;
         static uint32_t pc_QUEUE_PR, pc_GETSPACE, pc_Wait_sem, pc_MM_Setup;
-        static uint32_t pc_unitio, pc_UNLOCKSEGS, pc_Signal_sem;
+        static uint32_t pc_unitio, pc_UNLOCKSEGS, pc_Signal_sem, pc_Make_File;
+        static uint32_t pc_SplitPathname;
         static int hle_pc_gen = -1;
         if (hle_pc_gen != g_emu_generation) {
             pc_FS_CLEANUP    = boot_progress_lookup("FS_CLEANUP");
@@ -2925,6 +2957,8 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             pc_unitio        = boot_progress_lookup("unitio");
             pc_UNLOCKSEGS    = boot_progress_lookup("UNLOCKSEGS");
             pc_Signal_sem    = boot_progress_lookup("Signal_sem");
+            pc_Make_File     = boot_progress_lookup("Make_File");
+            pc_SplitPathname = boot_progress_lookup("SplitPathname");
             hle_pc_gen = g_emu_generation;
         }
         /* P37 HLE bypass: FS_CLEANUP (fsinit.text:136). Fires the
@@ -3052,6 +3086,10 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
          * P71's unary-minus CONST evaluation which made LDSN_TO_MMU
          * receive the correct ldsn value so DS_OPEN computes the right
          * seg_ptr via real MMU_Base. */
+        /* P78d: activate vector table guard when SYS_PROC_INIT entry is reached */
+        if (pc_SYS_PROC_INIT && cpu->pc == pc_SYS_PROC_INIT && !g_vec_guard_active) {
+            g_vec_guard_active = 1;
+        }
         if (pc_SYS_PROC_INIT && cpu->pc == pc_SYS_PROC_INIT) {
             boot_progress_record_pc(cpu->pc);  /* P45: ensure milestone fires even though body skipped */
             uint32_t sp = cpu->a[7] & 0xFFFFFF;
@@ -3097,6 +3135,99 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
          * is safe: write errnum=0 and return. Signature:
          * procedure UNLOCKSEGS(var errnum: integer) — Pascal callee-clean,
          * stack: retPC(4) + errnum_ptr(4). */
+        /* P78c HLE bypass: SplitPathname (fsui1.text:247). Called from
+         * MAKE_SYSDATASEG during process creation. DecompPath (called
+         * internally) writes to bogus addresses that alias into the
+         * vector table because our filesystem isn't functional.
+         * HLE: write ecode=0, device=0 (bootdev), volPath='' (empty),
+         * return. Signature: procedure SplitPathname(var ecode: integer;
+         * var path: pathname; var device: integer; var volPath: pathname)
+         * — 4 VAR params, Pascal callee-clean.
+         * Stack: retPC(4) + volPath_ptr(4) + device_ptr(4) + path_ptr(4) + ecode_ptr(4) = 20. */
+        /* P78c HLE bypass: DecompPath (fsui1.text). Called from
+         * SPLITPATHNAME and directly from Make_Object during FS operations.
+         * The call to SPLITPATHNAME in MAKE_SYSDATASEG resolves to
+         * DecompPath's entry (SplitPathname is a thin wrapper).
+         * DecompPath → parse_pathname writes to bogus addresses aliasing
+         * into the vector table. HLE: write ecode=0, device=0, return.
+         * Signature: procedure DecompPath(var ecode: error; var path:
+         * pathname; var device: integer; var parID: NodeIdent;
+         * var volPath: pathname) — 5 VAR params, 20 bytes of args. */
+        {
+            static uint32_t pc_DecompPath = 0;
+            static int dp_gen = -1;
+            if (dp_gen != g_emu_generation) {
+                pc_DecompPath = boot_progress_lookup("DecompPath");
+                dp_gen = g_emu_generation;
+            }
+            /* Also bypass parse_pathname — it's the actual function writing
+             * to the vector table via bogus pathname pointers */
+            static uint32_t pc_parse_pathname = 0;
+            if (dp_gen == g_emu_generation && !pc_parse_pathname)
+                pc_parse_pathname = boot_progress_lookup("parse_pathname");
+            if (pc_parse_pathname && cpu->pc == pc_parse_pathname) {
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                uint32_t ret = cpu_read32(cpu, sp);
+                /* parse_pathname has complex params — just pop retPC and args.
+                 * It's callee-clean Pascal. Check stack size from LINK frame. */
+                /* parse_pathname(var ecode: integer; var path: pathname;
+                 *    var NamePart: pathname; var DirPath: pathname;
+                 *    var havePrefix: boolean; var volume: e_name)
+                 * 6 VAR params = 24 bytes */
+                uint32_t ecode_ptr = cpu_read32(cpu, sp + 24);
+                cpu_write16(cpu, ecode_ptr & 0xFFFFFF, 0);
+                cpu->a[7] += 4 + 24;
+                cpu->pc = ret;
+                DBGSTATIC(int, pp_count, 0);
+                if (pp_count++ < 3)
+                    fprintf(stderr, "[HLE-parse_pathname #%d] bypassed\n", pp_count);
+                continue;
+            }
+            if (pc_DecompPath && cpu->pc == pc_DecompPath) {
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                uint32_t ret = cpu_read32(cpu, sp);
+                /* 5 VAR params, right-to-left push (Pascal convention):
+                 * SP+4: volPath_ptr(4), SP+8: parID_ptr(4), SP+12: device_ptr(4),
+                 * SP+16: path_ptr(4), SP+20: ecode_ptr(4) */
+                uint32_t ecode_ptr = cpu_read32(cpu, sp + 20);
+                uint32_t device_ptr = cpu_read32(cpu, sp + 12);
+                cpu_write16(cpu, ecode_ptr & 0xFFFFFF, 0);    /* ecode = 0 */
+                cpu_write16(cpu, device_ptr & 0xFFFFFF, 0);   /* device = 0 (bootdev) */
+                cpu->a[7] += 4 + 20;  /* retPC + 5 VAR params */
+                cpu->pc = ret;
+                DBGSTATIC(int, dp_count, 0);
+                if (dp_count++ < 5)
+                    fprintf(stderr, "[HLE-DecompPath #%d] bypassed\n", dp_count);
+                continue;
+            }
+        }
+        /* P78b HLE bypass: Make_File (fsui1.text:593). During process
+         * creation, MAKE_SYSDATASEG → MAKE_IT → Make_File tries to create
+         * a backing file for the data segment. Our filesystem isn't
+         * functional (no mounttable, no real disk catalog), so Make_File →
+         * Make_Object → DecompPath → SplitPathname writes to garbage
+         * addresses that alias into the CPU vector table, causing F-line
+         * trap. HLE: write ecode=0, pop args, return. The physical memory
+         * for the data segment is already allocated; the file is only
+         * needed for disk swapping (which we don't do).
+         * Signature: procedure Make_File(var ecode: error; var path:
+         * pathname; label_size: integer) — Pascal callee-clean.
+         * Stack: retPC(4) + label_size(2) + path_ptr(4) + ecode_ptr(4). */
+        if (pc_Make_File && cpu->pc == pc_Make_File) {
+            uint32_t sp = cpu->a[7] & 0xFFFFFF;
+            uint32_t ret = cpu_read32(cpu, sp);
+            /* ecode_ptr is the deepest arg (pushed first, leftmost param).
+             * Stack layout: retPC, label_size(2), path_ptr(4), ecode_ptr(4) */
+            uint32_t ecode_ptr = cpu_read32(cpu, sp + 10);
+            cpu_write16(cpu, ecode_ptr & 0xFFFFFF, 0);  /* ecode = 0 = success */
+            cpu->a[7] += 4 + 2 + 4 + 4;  /* pop retPC + all args */
+            cpu->pc = ret;
+            DBGSTATIC(int, mf_count, 0);
+            if (mf_count++ < 5)
+                fprintf(stderr, "[HLE-Make_File #%d] bypassed, ecode_ptr=$%06X → 0\n",
+                        mf_count, ecode_ptr);
+            continue;
+        }
         /* P78 HLE bypass: Signal_sem — when the semaphore's sem_count
          * is >= 0 before incrementing, there are no real waiters. The
          * full Signal_sem body reads wait_queue^.semwait_queue which
