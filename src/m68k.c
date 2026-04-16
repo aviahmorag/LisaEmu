@@ -3143,7 +3143,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             int16_t size = (int16_t)cpu_read16(cpu, (sp + 4) & 0xFFFFFF);
             uint32_t b_area = cpu_read32(cpu, (sp + 6) & 0xFFFFFF);
             DBGSTATIC(int, gs_count, 0);
-            if (gs_count++ < 30) {
+            if (gs_count++ < 60) {
                 fprintf(stderr, "[GETSPACE #%d] size=%d b_area=$%08X ret=$%06X\n",
                         gs_count, size, b_area, cpu_read32(cpu, sp) & 0xFFFFFF);
                 /* Dump sg_free_pool area (first 32 bytes) */
@@ -3346,21 +3346,63 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
          *   var refnum: int2; var segptr: absptr; ldsn: int2)
          * Stack: retPC(4) + ldsn(2) + segptr_ptr(4) + refnum_ptr(4) +
          *   discsize(4) + memsize(4) + progname_ptr(4) + errnum_ptr(4) = 30 */
+        /* P80d: bypass Move_MemMgr. This function moves the MemMgr process
+         * to the end of memory to reduce fragmentation. The move involves
+         * complex segment operations (SEG_IO, SWAP_SEG, BLD_SEG) that
+         * crash due to a frame pointer corruption during the move.
+         * Skipping the move is safe — it's a boot-time optimization. */
+        {
+            static uint32_t pc_mmove = 0;
+            static int mmove_probed = 0;
+            if (!mmove_probed) {
+                mmove_probed = 1;
+                pc_mmove = boot_progress_lookup("MOVE_MEMMGR");
+                if (!pc_mmove) pc_mmove = boot_progress_lookup("Move_MemMgr");
+                if (!pc_mmove) pc_mmove = boot_progress_lookup("Move_Mem");
+                fprintf(stderr, "  DEBUG: MOVE_MEMMGR lookup → $%06X\n", pc_mmove);
+            }
+            if (pc_mmove && cpu->pc == pc_mmove) {
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                uint32_t ret = cpu_read32(cpu, sp);
+                cpu->a[7] += 4;
+                cpu->pc = ret;
+                fprintf(stderr, "[HLE-Move_MemMgr] bypassed\n");
+                continue;
+            }
+        }
         /* P79 HLE: MAKE_SYSDATASEG — bypass non-resident (discsize>0)
          * calls, returning error 134 to trigger STARTUP's resident retry.
          * Currently both calls are discsize=0 (resident), so this doesn't
          * fire. Kept for when the calling code is fixed to pass discsize>0. */
         if (pc_MAKE_SYSDATASEG && cpu->pc == pc_MAKE_SYSDATASEG) {
             uint32_t sp = cpu->a[7] & 0xFFFFFF;
-            /* errnum@SP+4, progname@SP+8, memsize@SP+12, discsize@SP+16 */
+            /* Stack layout verified from compiled code:
+             * errnum_ptr(4), progname_ptr(4), memsize(4), discsize(4),
+             * refnum_ptr(4), segptr_ptr(4), ldsn(2) — left to right push.
+             * After JSR: SP+4=errnum_ptr, SP+8=progname_ptr, SP+12=memsize,
+             * SP+16=discsize, SP+20=refnum_ptr, SP+24=segptr_ptr, SP+28=ldsn(2) */
             int32_t discsize = (int32_t)cpu_read32(cpu, (sp + 16) & 0xFFFFFF);
+            DBGSTATIC(int, msd_count, 0);
+            if (msd_count++ < 5) {
+                fprintf(stderr, "[MAKE_SYSDATASEG #%d] discsize=%d memsize=%d ldsn=%d\n",
+                        msd_count, discsize,
+                        (int32_t)cpu_read32(cpu, (sp + 12) & 0xFFFFFF),
+                        (int16_t)cpu_read16(cpu, (sp + 28) & 0xFFFFFF));
+                /* Dump stack for debugging */
+                fprintf(stderr, "  Stack: ");
+                for (int j = 4; j <= 30; j += 2)
+                    fprintf(stderr, "%04X ", cpu_read16(cpu, (sp + j) & 0xFFFFFF));
+                fprintf(stderr, "\n");
+            }
             if (discsize > 0) {
                 uint32_t errnum_ptr = cpu_read32(cpu, (sp + 4) & 0xFFFFFF) & 0xFFFFFF;
                 if (errnum_ptr >= 0x1000 && errnum_ptr < 0x240000)
                     cpu_write16(cpu, errnum_ptr, 134);
                 uint32_t ret = cpu_read32(cpu, sp);
-                cpu->a[7] += 30;
+                /* Total args: ldsn(2)+segptr(4)+refnum(4)+discsize(4)+memsize(4)+progname(4)+errnum(4)=26 */
+                cpu->a[7] += 4 + 26;  /* ret + args */
                 cpu->pc = ret;
+                fprintf(stderr, "[HLE-MAKE_SYSDATASEG] bypassed discsize=%d, returning error 134\n", discsize);
                 continue;
             }
         }

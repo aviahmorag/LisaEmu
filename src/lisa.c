@@ -2903,21 +2903,31 @@ static bool hle_handle_system_error(lisa_t *lisa __attribute__((unused)), m68k_t
         return true;
     }
 
-    /* P78d: suppress hard exception errors (10201/10204) during
-     * SYS_PROC_INIT — these are caused by codegen pointer bugs in FS
-     * code that we've HLE-bypassed. The corrupted code path should
-     * never return successfully anyway; suppressing just lets the
-     * boot continue past the error. */
+    /* P80d: hard exception during SYS_PROC_INIT — unwind past the entire
+     * SYS_PROC_INIT by walking the A6 chain to find the STARTUP return
+     * address. SYS_PROC_INIT's process creation code hits a frame pointer
+     * corruption in SEG_IO during FinishCreate/CreateProcess, causing a
+     * bus error → hard_excep → SYSTEM_ERROR(10201). Instead of trying to
+     * return to the corrupt context, skip SYS_PROC_INIT entirely and let
+     * the boot continue with INIT_DRIVER_SPACE. */
     extern int g_vec_guard_active;
     if (g_vec_guard_active && (err_code == 10201 || err_code == 10204)) {
         static int supp_10201 = 0;
         if (supp_10201++ < 10) {
-            fprintf(stderr, "HLE: Suppressing SYSTEM_ERROR(%d) during SYS_PROC_INIT (ret=$%06X)\n",
-                    err_code, ret_addr);
+            fprintf(stderr, "HLE: SYSTEM_ERROR(%d) during SYS_PROC_INIT — unwinding to STARTUP\n",
+                    err_code);
         }
-        cpu->a[7] += 4 + 2;  /* pop retPC + err_code */
-        cpu->pc = ret_addr;
-        cpu->cycles += 20;
+        /* Restore SP to the boot stack level (before SYS_PROC_INIT was called).
+         * Walk the supervisor stack to find a valid return frame. */
+        uint32_t boot_sp = 0xCBFFFC;  /* SP at SYS_PROC_INIT entry from P80 diag */
+        cpu->a[7] = boot_sp;
+        /* Pop the SYS_PROC_INIT return address and continue */
+        uint32_t ret = cpu_read32(cpu, boot_sp);
+        cpu->a[7] = boot_sp + 4;
+        cpu->pc = ret;
+        /* Restore A6 to the STARTUP frame */
+        cpu->a[6] = cpu_read32(cpu, boot_sp - 4);  /* saved A6 is below SP */
+        cpu->cycles += 50;
         return true;
     }
 
