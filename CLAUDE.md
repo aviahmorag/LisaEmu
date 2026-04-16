@@ -70,46 +70,55 @@ make audit-linker       # Stage 4: Full pipeline + linker
 cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' build 2>&1 | grep -E "(error:|BUILD)"
 ```
 
-## Current Status (2026-04-16) — 26/27 milestones, kernel boot COMPLETE
+## Current Status (2026-04-16) — 25/27 milestones, both processes created
 
-Build green. 26/27 kernel milestones: INIT through PR_CLEANUP.
-Only SHELL (next layer — requires multi-target build) remains.
+Build green. Full kernel boot INIT→PR_CLEANUP. Both MemMgr and Root
+processes created via HLE bypass chain. Scheduler runs in idle loop
+(processes not yet in ready queue — need PCB initialization).
 
-### P80 session fixes (16 structural codegen + HLE fixes)
+### P80 session fixes (20+ structural codegen + HLE fixes)
 
-1. **8-char significant identifiers** (P80): Lisa Pascal identifiers significant to 8 chars.
-2. **SYS_PROC_INIT bypass disabled** (P80): P35 bypass removed.
-3. **DecompPath/parse_pathname bypasses disabled** (P80a): FS functions run natively.
-4. **Iterative pre-pass record fixup** (P80b): 27 records corrected after types-only pre-pass.
-5. **Imported type preservation** (P80c): Full-pass type declarations preserve imported records.
-6. **INIT_FREEPOOL HLE repair** (P80c): Runtime pool header validation.
-7. **PASCALDEFS offsets corrected**: diagnostic dumps use real PASCALDEFS offsets.
-8. **Field type_name storage**: record fields store type name for re-resolution.
-9. **Move_MemMgr bypass** (P80d): Skip memory defragmentation (triggers SEG_IO crash).
-10. **SYS_PROC_INIT crash unwind** (P80d): Unwind to STARTUP on hard exception.
-11. **Non-local goto A6 restore** (P80e): Nested proc gotos follow static link chain.
-12. **Boolean NOT for function calls** (P80e): Parameterless functions use boolean NOT.
-13. **CHK_LDSN_FREE bypass** (P80e): System LDSNs bypass "in use" check.
-14. **Generalized record repair** (P80f): auto-detect/replace corrupt records at all field access points.
-15. **Enum/const priority** (P80f): enum registration checks imported_globals before overwriting CONSTs.
-16. **MAKE_SYSDATASEG HLE** (P80f): resident segment bypass — allocates from sgheap, skips DS_OPEN.
+**Structural codegen:**
+1. **8-char significant identifiers** (P80): Lisa Pascal truncation rule
+2. **Iterative pre-pass record fixup** (P80b): 27 records corrected
+3. **Imported type preservation** (P80c): prevents full-pass offset corruption
+4. **Non-local goto A6 restore** (P80e): follows static link chain
+5. **Non-local exit() A6 restore** (P80g): same fix for exit(proc) calls
+6. **Boolean NOT for function calls** (P80e): TST/SEQ instead of NOT.W
+7. **Enum/const priority** (P80f): enum ordinals don't overwrite CONSTs
+8. **Generalized record repair** (P80f): auto-detect/replace corrupt records
+9. **Anonymous record repair** (P80f): match by first field name
+10. **find_type imported preference** (P80g): prefer imported records with valid offsets
+11. **Post-creation record repair** (P80g): copy offsets from imported at resolve_type
+
+**HLE mechanisms:**
+12. **MAKE_SYSDATASEG bypass** (P80f/g): all segment creation as resident
+13. **CreateProcess/ModifyProcess/FinishCreate bypass** (P80g)
+14. **CHK_LDSN_FREE bypass** (P80e): system LDSNs allowed
+15. **Move_MemMgr bypass** (P80d)
+16. **INIT_FREEPOOL pool repair** (P80c)
+17. **SYS_PROC_INIT crash unwind** (P80d)
 
 ### P79 session fixes (6 structural codegen improvements)
 
-1. **Record layouts** (P79): string word-padding, CONST pre-pass export.
-2. **Push direction** (P79c): `is_callee_clean` prefers sig's is_external over symbol's.
-3. **Proc sig pre-pass** (P79d): proc sigs exported during types pre-pass.
-4. **Enum constants** (P79e): AST_TYPE_ENUM registers ordinal values.
-5. **Byte-subrange sizing** (P79f): range<=255 → natural size=1. Record fields widen to 2.
-6. **Record-field array stride** (P79f): resolve element type for FIELD_ACCESS array bases.
+1. **Record layouts** (P79): string word-padding, CONST pre-pass export
+2. **Push direction** (P79c): prefer sig's is_external
+3. **Proc sig pre-pass** (P79d): export during types pre-pass
+4. **Enum constants** (P79e): register ordinal values
+5. **Byte-subrange sizing** (P79f): range<=255 → size=1
+6. **Record-field array stride** (P79f): resolve element type for field arrays
 
-### Next: CreateProcess/FinishCreate hard exception
+### Next: process dispatch (PCB initialization)
 
-MAKE_SYSDATASEG now succeeds (HLE bypass for resident segments). But
-CreateProcess/FinishCreate hits SYSTEM_ERROR(10201) when initializing
-the new process's PCB/stack. This is unwound to continue boot.
-The next step toward actual process dispatch is fixing this init code
-or HLE-bypassing CreateProcess itself.
+Both MemMgr and Root are allocated but their PCBs are uninitialized
+(CreateProcess bypassed). The scheduler needs:
+- PCB.priority set (250 for MemMgr, 230 for Root)
+- PCB.blk_state = empty set (ready)
+- Environment save area in syslocal (A5, PC, A6, A7, SR)
+- Process queued via Queue_Process → fwd_ReadyQ
+
+Either fix CreateProcess codegen (root cause: dangling type pointers
+from *existing = *t struct copy) or build HLE PCB + Queue_Process.
 
 ### Roadmap to fully bootable Lisa desktop
 

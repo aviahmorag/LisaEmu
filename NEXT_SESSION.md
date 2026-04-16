@@ -1,65 +1,52 @@
 # LisaEmu — Next Session Handoff (2026-04-16)
 
-## Session: 17 structural codegen fixes (P80–P80f) — 26/27 milestones
+## Session: 20+ codegen fixes, BOTH processes created
 
-### Key fixes:
-1. **8-char significant identifiers** (P80)
-2. **27 record layouts** via iterative pre-pass fixup (P80b)  
-3. **Imported type preservation** — prevents full-pass offset corruption (P80c)
-4. **Non-local goto A6 restore** — follows static link chain (P80e)
-5. **Boolean NOT for functions** — SYS_CALLED fix (P80e)
-6. **Enum/const priority** — enum ordinals don't overwrite CONST values (P80f)
-7. **Anonymous record repair** — matches by first field name (P80f)
-8. **MAKE_SYSDATASEG HLE** — resident segment bypass (P80f)
+### Key discoveries:
+1. **8-char identifiers**, **27 record layouts**, **non-local goto/exit A6 restore**
+2. **Boolean NOT for functions**, **enum/const priority**, **record repair generalization**
+3. **MAKE_SYSDATASEG stack pop fix** (double-pop corrupted second call)
+4. **exit(proc) non-local unwind** (same as goto — follows static link chain)
+5. **Root cause identified**: *existing = *t struct copy creates dangling type pointers
 
-### Result: 26/27 milestones, full kernel boot INIT→PR_CLEANUP
+### Result: 25/27 milestones, both processes created via HLE chain:
+- MAKE_SYSDATASEG: 4 segments allocated (syslocal+stack × 2 processes)
+- CreateProcess/ModifyProcess/FinishCreate: bypassed (6 calls total)
+- Move_MemMgr: bypassed
+- Scheduler runs in idle loop (Pause instruction)
 
-## Current blocker: CreateProcess hard exception
+## Current state: processes not dispatchable
 
-### Symptom
-Make_SProcess → Get_Resources → [MAKE_SYSDATASEG HLE bypass succeeds] →
-CreateProcess → A6 corrupted to $FD800000 → crash to vector table →
-SYSTEM_ERROR(10201).
+Both MemMgr and Root are "created" (memory allocated) but PCBs are
+uninitialized. The scheduler scans fwd_ReadyQ which is empty.
 
-### Analysis
-CreateProcess initializes the new process's PCB, stack frame, and
-syslocal structures. The allocated segments are at $CCC000 (syslocal)
-and $CCCC00 (stack) — both in mapped sysglobal segment 102.
+## Next priorities
 
-The crash has A6=$FD800000 — frame pointer completely out of range.
-This happens because CreateProcess's compiled code contains WITH blocks
-that access the new process's syslocal and stack structures. If any
-record type used in those WITH blocks has corrupt field offsets, the
-code writes to wrong addresses, corrupting the stack frame.
+### 1. HLE PCB initialization + Queue_Process
+Minimum to make processes dispatchable:
+- Set PCB.priority (250 MemMgr, 230 Root)
+- Set PCB.blk_state = 0 (empty set = ready)
+- Set PCB.proctype = sys
+- Set up syslocal env_save_area (A5=sysA5, PC=start_PC, SR=0, etc.)
+- Insert PCB into fwd_ReadyQ
 
-### Error sequence
-1. MAKE_SYSDATASEG HLE bypass: memsize=3072 (syslocal), 4096 (stack)
-2. CreateProcess starts initializing process structures
-3. A6 gets corrupted during a WITH block in process init code
-4. Code crashes to vector table → SYSTEM_ERROR(10201)
-5. Unwound past SYS_PROC_INIT → boot continues cleanly
+The PCB address is from GETSPACE #41/#42. The syslocal/stack addresses
+are from MAKE_SYSDATASEG HLE ($CCC000, $CCCC00, $CCDE00, $CCEA00).
 
-### Next steps
+### 2. Fix root cause: type pointer dangling
+The *existing = *t struct copy in type-decl processing copies type
+pointers from cg->types (freed after compilation) into shared_types.
+These become dangling pointers when cg is reused. The proper fix:
+after the copy, remap ALL internal type pointers (field types, base
+types) from cg->types to shared_types, like the REMAP_TYPE_PTR logic
+in the pre-pass export code. This would eliminate ALL record offset
+corruption and allow CreateProcess to run natively.
 
-#### 1. Identify which record in CreateProcess is corrupt
-CreateProcess uses: PCB, syslocal, init_stack, segHandle, stkInfo_rec.
-Add type debug prints to find which record has all-zero offsets in the
-local type table. Then ensure repair_corrupt_record catches it.
-
-#### 2. Root-cause the offset corruption
-The `*existing = *t` struct copy in type-decl processing zeroes field
-offsets for SOME records but not others. Need to understand WHY some
-copies corrupt and others don't. Possible: the source type `t` was
-already corrupt when copied (created by a resolve_type that used a
-corrupt imported type as a field type).
-
-#### 3. Alternative: HLE CreateProcess
-If the codegen fix is too deep, bypass CreateProcess entirely with an
-HLE that sets up a minimal PCB, stack frame, and process state. The
-PCB is already allocated by GETSPACE. The syslocal and stack are at
-known addresses from the MAKE_SYSDATASEG HLE.
+### 3. Multi-target build pipeline
+Once processes dispatch, Root calls CreateShell → Make_Process('SYSTEM.SHELL').
+This requires SYSTEM.SHELL compiled from source and placed on disk image.
 
 ## Quick reference
 - Build: `make`
 - Run: `rm -f build/lisa_profile.image && ./build/lisaemu --headless Lisa_Source 5000`
-- Commit: `2ebac61` (26/27, kernel boot complete, process creation WIP)
+- Commit: `d7be85e` (25/27, both processes created)
