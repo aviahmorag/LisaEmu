@@ -70,7 +70,30 @@ make audit-linker       # Stage 4: Full pipeline + linker
 cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' build 2>&1 | grep -E "(error:|BUILD)"
 ```
 
-## Current Status (2026-04-15 PM18) — **25/27 (23 real + 2 bypass-fired)**
+## Current Status (2026-04-16) — **27/27 reported (23 real + 4 bypass-fired)**
+
+All OS-kernel boot checkpoints reached at HEAD `ded554c`. Build
+and audit green. Working tree clean.
+
+### Real milestones (23): PASCALINIT through FS_INIT + SYS_PROC_INIT entry
+
+All reached by actual Pascal/asm code execution. Includes P75's
+for-loop fix (FS_INIT) and P76's FS_INIT error unwind.
+
+### Bypass-fired milestones (4):
+
+- **SYS_PROC_INIT** (P35 at `src/m68k.c:3040`): entry PC reached, body skipped. When P35 is disabled, Make_SProcess runs through to QUEUE_PR ($06CD5E) before spinning on the RQSCAN byte-subrange priority-compare issue. The old MAKE_DATASEG/$FF9C0000 blocker is GONE — P62/P65/P71/P72 codegen fixes resolved it.
+- **FS_CLEANUP** (P37 at `src/m68k.c:2920`): body spins in FIND_REFNCB_ENTRY — blocked by SYS_PROC_INIT body not running.
+- **MEM_CLEANUP** (P36 at `src/m68k.c:2945`): body spins in ADDTO_MMLIST — SRB lists not set up.
+- **PR_CLEANUP** (P38 at `src/m68k.c:2933`): idle scheduler loop — needs Shell loaded.
+
+### Next blocker: byte-subrange PCB field layout
+
+When P35 is disabled, QUEUE_PR spins because `priority : 0..255`
+is compiled as 1-byte field. Apple's Pascal uses 2-byte word fields
+in unpacked records. Fix: add `in_packed` context to codegen so
+unpacked subrange fields default to word size. See NEXT_SESSION.md
+for detailed steps.
 
 ### Fix (P71+P72): unary-minus + IDENT_EXPR in CONST decls + subrange bounds
 
