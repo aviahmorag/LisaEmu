@@ -143,13 +143,13 @@ static type_desc_t *add_type(codegen_t *cg, const char *name, type_kind_t kind, 
 
 static void init_builtin_types(codegen_t *cg) {
     add_type(cg, "integer", TK_INTEGER, 2);
-    add_type(cg, "int1", TK_INTEGER, 2);  /* P79: Lisa Pascal stores int1 (-128..127)
-                                           * as word-sized in unpacked records. The
-                                           * TYPE decl `int1 = -128..127` in DRIVERDEFS
-                                           * produces a 2-byte subrange; asm code reads
-                                           * these fields with MOVE.W. Was TK_BYTE/1
-                                           * which shifted every field after int1 in
-                                           * devrec, reqblk, etc. */
+    add_type(cg, "int1", TK_BYTE, 1);     /* P79f: int1 is naturally 1 byte.
+                                           * Widening to 2 bytes for unpacked record
+                                           * fields is done in the record resolver. The
+                                           * P79 fix of TK_INTEGER/2 was too broad —
+                                           * it doubled array[1..150] of int1 elements,
+                                           * causing sc_par_no in sc_table to overflow
+                                           * into b_syslocal_ptr (SCTAB2 corruption). */
     add_type(cg, "int2", TK_INTEGER, 2);
     add_type(cg, "int4", TK_LONGINT, 4);
     add_type(cg, "longint", TK_LONGINT, 4);
@@ -246,7 +246,13 @@ static type_desc_t *resolve_type(codegen_t *cg, ast_node_t *node) {
                     else t->range_high = val;
                 }
                 int range = t->range_high - t->range_low;
-                if (cg->in_packed && range <= 255) t->size = 1;
+                /* P79f: byte-sized subranges (range<=255) get natural size=1.
+                 * In unpacked record fields, the record resolver widens to 2.
+                 * In arrays, elements stay at 1 byte (matching Apple's layout:
+                 * sc_par_no: array[1..150] of int1 = 150 bytes, not 300).
+                 * Previously only packed context gave size=1; unpacked always
+                 * gave 2, making array elements double-sized. */
+                if (range <= 255) t->size = 1;
                 else if (range <= 65535) t->size = 2;
                 else t->size = 4;
             }
@@ -345,11 +351,16 @@ static type_desc_t *resolve_type(codegen_t *cg, ast_node_t *node) {
                 type_desc_t *ft = resolve_type(cg, field->children[0]);
                 int fs = ft ? ft->size : 2;
                 /* P79: In Lisa Pascal unpacked records, string fields are
-                 * padded to even length. string[32] = 33 bytes → 34. Without
-                 * this, all fields after an odd-length string are shifted by
-                 * 1 byte, breaking devrec.devname (string[32]) and every
-                 * field after it. */
+                 * padded to even length. string[32] = 33 bytes → 34. */
                 if (ft && ft->kind == TK_STRING && (fs % 2)) fs++;
+                /* P79f: In Lisa Pascal unpacked records, byte-sized scalar
+                 * fields (int1, char, byte) are widened to word size (2 bytes).
+                 * Asm code reads these with MOVE.W (e.g., PRIORITY(A1) in PCB).
+                 * Only widen scalars, not records/arrays/strings. */
+                if (fs == 1 && ft && !cg->in_packed &&
+                    (ft->kind == TK_BYTE || ft->kind == TK_CHAR ||
+                     ft->kind == TK_SUBRANGE))
+                    fs = 2;
                 /* Word-align fields */
                 if (fs >= 2 && (offset % 2)) offset++;
                 if (t->num_fields < 64) {
@@ -983,7 +994,33 @@ static void gen_lvalue_addr(codegen_t *cg, ast_node_t *node) {
             /* Resolve element size from the array type */
             int elem_size = 2;  /* default word */
             int array_low = 0;
-            if (node->children[0]->type == AST_IDENT_EXPR) {
+            if (node->children[0]->type == AST_FIELD_ACCESS &&
+                node->children[0]->num_children > 0) {
+                /* P79f: array access on a record field (e.g. sctab.sc_par_no[i]).
+                 * Resolve the record's field type to get the array element size.
+                 * Without this, elem_size defaults to 2, making byte-array
+                 * strides double (sc_par_no overflows into b_syslocal_ptr). */
+                ast_node_t *base_node = node->children[0]->children[0];
+                cg_symbol_t *rec_sym = NULL;
+                if (base_node && base_node->type == AST_IDENT_EXPR)
+                    rec_sym = find_symbol_any(cg, base_node->name);
+                type_desc_t *rec_type = (rec_sym && rec_sym->type) ? rec_sym->type : NULL;
+                if (rec_type && rec_type->kind == TK_POINTER && rec_type->base_type)
+                    rec_type = rec_type->base_type;
+                if (rec_type && rec_type->kind == TK_RECORD && node->children[0]->name[0]) {
+                    for (int f = 0; f < rec_type->num_fields; f++) {
+                        if (str_eq_nocase(rec_type->fields[f].name, node->children[0]->name)) {
+                            type_desc_t *ft = rec_type->fields[f].type;
+                            if (ft && ft->kind == TK_ARRAY) {
+                                array_low = ft->array_low;
+                                if (ft->element_type)
+                                    elem_size = type_size(ft->element_type);
+                            }
+                            break;
+                        }
+                    }
+                }
+            } else if (node->children[0]->type == AST_IDENT_EXPR) {
                 cg_symbol_t *arr_sym = find_symbol_any(cg, node->children[0]->name);
                 type_desc_t *at = (arr_sym && arr_sym->type) ? arr_sym->type : NULL;
                 if (!at && cg->with_depth > 0) {

@@ -3091,15 +3091,12 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         if (pc_SYS_PROC_INIT && cpu->pc == pc_SYS_PROC_INIT && !g_vec_guard_active) {
             g_vec_guard_active = 1;
         }
-        /* (P79e probes removed — enum constant fix verified) */
+        /* (P79f probes removed — b_syslocal_ptr corruption traced to SCTAB2 overflow, fixed) */
         /* P35: SYS_PROC_INIT bypass. Both MAKE_SYSDATASEG calls are
          * resident (discsize=0, memory-only), so the FS isn't the issue.
          * The crash comes from BLD_SEG/Signal_sem with NULL pointers in
          * the process creation chain (CreateProcess → Build_Syslocal).
          * Root cause needs investigation in the process creation code. */
-        /* P35: SYS_PROC_INIT bypass. P79e fixed enum constants, eliminating
-         * GetFCB/ENQUEUE NULL. DS_OPEN body still writes through NULL in
-         * BIND_DATASEG path. Further investigation needed. */
         if (pc_SYS_PROC_INIT && cpu->pc == pc_SYS_PROC_INIT) {
             boot_progress_record_pc(cpu->pc);  /* P45: ensure milestone fires even though body skipped */
             uint32_t sp = cpu->a[7] & 0xFFFFFF;
@@ -3280,7 +3277,9 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         if (pc_Signal_sem && cpu->pc == pc_Signal_sem) {
             uint32_t sp = cpu->a[7] & 0xFFFFFF;
             uint32_t sem_ptr = cpu_read32(cpu, sp + 4);
-            if (sem_ptr) {
+            /* P79e: validate sem_ptr — bogus values like $000012 (in vector
+             * table area) mean the caller passed garbage. Skip entirely. */
+            if (sem_ptr && sem_ptr >= 0x1000 && sem_ptr < 0x240000) {
                 int16_t sem_count = (int16_t)cpu_read16(cpu, sem_ptr & 0xFFFFFF);
                 if (sem_count >= 0) {
                     /* No waiters — just increment and return */
@@ -3310,6 +3309,12 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                     cpu->pc = ret;
                     continue;
                 }
+            } else if (sem_ptr) {
+                /* sem_ptr is in vector table area — bogus, just return */
+                uint32_t ret = cpu_read32(cpu, sp);
+                cpu->a[7] += 8;
+                cpu->pc = ret;
+                continue;
             }
         }
         /* P77 HLE: guard RELSPACE against freeing pool base itself.
