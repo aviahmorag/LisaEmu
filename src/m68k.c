@@ -3392,6 +3392,69 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             }
             wp_prev_a6 = a6;
         }
+        /* P80e: bypass CHK_LDSN_FREE for negative (system) LDSNs.
+         * System LDSNs (-1=syslocal, -2=stack) are ABSOLUTE segment IDs
+         * shared between processes. CHK_LDSN_FREE rejects them as "in use"
+         * because the boot process already bound them. On a real Lisa, each
+         * process has its own MMU domain with separate LDSN bindings.
+         * HLE: return e_ldsnfree (=1) for ldsn < 0. */
+        {
+            static uint32_t pc_clf = 0;
+            static int clf_probed = 0;
+            if (!clf_probed) {
+                clf_probed = 1;
+                pc_clf = boot_progress_lookup("CHK_LDSN_FREE");
+                if (!pc_clf) pc_clf = boot_progress_lookup("CHK_LDSN");
+                if (pc_clf) fprintf(stderr, "  DEBUG: CHK_LDSN_FREE at $%06X\n", pc_clf);
+                else fprintf(stderr, "  DEBUG: CHK_LDSN_FREE NOT FOUND\n");
+            }
+            if (pc_clf && (cpu->pc == pc_clf || cpu->pc == 0x01834A)) {
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                /* CHK_LDSN_FREE(var errnum: int2; ldsn: int2; numb: int2)
+                 * Compiled pushes: numb(2), ldsn(2), errnum_ptr(4)
+                 * After JSR: SP+4=errnum_ptr(4), SP+8=ldsn(2), SP+10=numb(2) */
+                int16_t ldsn = (int16_t)cpu_read16(cpu, (sp + 8) & 0xFFFFFF);
+                int16_t numb = (int16_t)cpu_read16(cpu, (sp + 10) & 0xFFFFFF);
+                DBGSTATIC(int, clf_all, 0);
+                if (clf_all++ < 10)
+                    fprintf(stderr, "[CHK_LDSN_FREE #%d] ldsn=%d numb=%d\n", clf_all, ldsn, numb);
+                if (ldsn < 0) {
+                    uint32_t errnum_ptr = cpu_read32(cpu, (sp + 4) & 0xFFFFFF) & 0xFFFFFF;
+                    if (errnum_ptr >= 0x1000 && errnum_ptr < 0x240000)
+                        cpu_write16(cpu, errnum_ptr, 1);  /* e_ldsnfree = 1 */
+                    uint32_t ret = cpu_read32(cpu, sp);
+                    cpu->a[7] += 4;  /* pop return address only — caller's ADDQ.L #8 cleans args */
+                    cpu->pc = ret;
+                    DBGSTATIC(int, clf_count, 0);
+                    if (clf_count++ < 5)
+                        fprintf(stderr, "[HLE-CHK_LDSN_FREE] ldsn=%d → e_ldsnfree (bypassed)\n", ldsn);
+                    continue;
+                }
+            }
+        }
+        /* P80e: trace MAKE_DATASEG RECOVER to find failure cause */
+        {
+            static uint32_t pc_recover = 0;
+            static int rec_probed = 0;
+            if (!rec_probed) { rec_probed = 1; pc_recover = boot_progress_lookup("RECOVER"); }
+            /* RECOVER is at $01AF16. Its first param is error: int2 at A6+8 (after LINK) */
+            if (pc_recover && cpu->pc == pc_recover) {
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                int16_t error = (int16_t)cpu_read16(cpu, sp + 4); /* error param before LINK */
+                DBGSTATIC(int, rec_count, 0);
+                if (rec_count++ < 5) {
+                    fprintf(stderr, "[MAKE_DATASEG-RECOVER #%d] error=%d ret=$%06X\n",
+                            rec_count, error, cpu_read32(cpu, sp) & 0xFFFFFF);
+                    /* Walk A6 chain for context */
+                    uint32_t fp = cpu->a[6] & 0xFFFFFF;
+                    for (int i = 0; i < 4 && fp > 0x400 && fp < 0xFFFFFF; i++) {
+                        uint32_t r = cpu_read32(cpu, fp + 4) & 0xFFFFFF;
+                        fprintf(stderr, "  frame[%d]: A6=$%06X ret=$%06X\n", i, fp, r);
+                        fp = cpu_read32(cpu, fp) & 0xFFFFFF;
+                    }
+                }
+            }
+        }
         /* P80d: bypass Move_MemMgr. This function moves the MemMgr process
          * to the end of memory to reduce fragmentation. The move involves
          * complex segment operations (SEG_IO, SWAP_SEG, BLD_SEG) that

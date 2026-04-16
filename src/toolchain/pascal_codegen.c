@@ -1494,6 +1494,15 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                     cg_symbol_t *sym = find_symbol_any(cg, child->name);
                     if (sym && sym->type && sym->type->kind == TK_BOOLEAN)
                         is_boolean = true;
+                    /* P80e: parameterless function calls parsed as identifiers.
+                     * If the identifier is a known function (via proc sig),
+                     * treat as boolean — Pascal's NOT is boolean for functions.
+                     * Fixes: `not SYS_CALLED` where SYS_CALLED is an external
+                     * function whose return type was hidden by (* *) comments. */
+                    if (!is_boolean && child->name[0]) {
+                        cg_proc_sig_t *sig = find_proc_sig(cg, child->name);
+                        if (sig) is_boolean = true;
+                    }
                 }
                 if (is_boolean) {
                     emit16(cg, 0x4A40);  /* TST.W D0 */
