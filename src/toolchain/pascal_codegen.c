@@ -356,6 +356,22 @@ static type_desc_t *resolve_type(codegen_t *cg, ast_node_t *node) {
                     continue;
                 }
                 type_desc_t *ft = resolve_type(cg, field->children[0]);
+                /* P80c: if resolve_type failed (field type not yet defined),
+                 * try imported_types as fallback. Without this, record fields
+                 * with types defined in later units get size 2 (default), and
+                 * the record layout is wrong — e.g., hdr_freepool's firstfree
+                 * (int4) gets size 2 instead of 4 when int4/longint isn't yet
+                 * in the local type table. */
+                if (!ft && field->children[0] && field->children[0]->name[0] &&
+                    cg->imported_types) {
+                    const char *tname = field->children[0]->name;
+                    for (int it = 0; it < cg->imported_types_count; it++) {
+                        if (str_eq_nocase(cg->imported_types[it].name, tname)) {
+                            ft = &cg->imported_types[it];
+                            break;
+                        }
+                    }
+                }
                 int fs = ft ? ft->size : 2;
                 /* P79: In Lisa Pascal unpacked records, string fields are
                  * padded to even length. string[32] = 33 bytes → 34. */
@@ -373,23 +389,35 @@ static type_desc_t *resolve_type(codegen_t *cg, ast_node_t *node) {
                 if (t->num_fields < 64) {
                     strncpy(t->fields[t->num_fields].name, field->name, 63);
                     t->fields[t->num_fields].name[63] = '\0';
-                    /* Store original type name for post-prepass re-resolution */
                     t->fields[t->num_fields].type_name[0] = '\0';
-                    if (field->children[0] && field->children[0]->name)
+                    if (field->children[0] && field->children[0]->name[0])
                         strncpy(t->fields[t->num_fields].type_name,
-                                field->children[0]->name, 63);
-                    t->fields[t->num_fields].type_name[63] = '\0';
+                                field->children[0]->name, 11);
+                    t->fields[t->num_fields].type_name[11] = '\0';
                     t->fields[t->num_fields].offset = offset;
                     t->fields[t->num_fields].type = ft;
+                    /* P80c trace: record layout for freepool fields */
+                    if (str_eq_nocase(field->name, "firstfree"))
+                        fprintf(stderr, "  [RECORD-LAYOUT] '%s' field '%s' offset=%d fs=%d\n",
+                                t->name[0] ? t->name : "(anon)", field->name, offset, fs);
                     t->num_fields++;
                 }
                 offset += fs;
             }
             if (offset % 2) offset++; /* Pad to word boundary */
             t->size = offset;
-            /* P80b: debug print for MMRB and similar large records */
-            if (t->num_fields >= 8) {
+            /* P80b/c: debug print for records with key field names */
+            if (t->num_fields >= 2) {
                 for (int fi = 0; fi < t->num_fields; fi++) {
+                    if (str_eq_nocase(t->fields[fi].name, "firstfree")) {
+                        fprintf(stderr, "  [TYPE] %s (hdr_freepool-like): size=%d fields=%d\n",
+                                t->name[0] ? t->name : "(anon)", t->size, t->num_fields);
+                        for (int fj = 0; fj < t->num_fields; fj++)
+                            fprintf(stderr, "    @%d %s sz=%d kind=%d\n", t->fields[fj].offset,
+                                    t->fields[fj].name, t->fields[fj].type ? t->fields[fj].type->size : -1,
+                                    t->fields[fj].type ? t->fields[fj].type->kind : -1);
+                        break;
+                    }
                     if (str_eq_nocase(t->fields[fi].name, "sds_sem")) {
                         fprintf(stderr, "  [TYPE] mmrb-like: size=%d fields=%d\n", t->size, t->num_fields);
                         for (int fj = 0; fj < t->num_fields; fj++)
@@ -673,6 +701,17 @@ static int with_lookup_field(codegen_t *cg, const char *name,
             if (str_eq_nocase(rt->fields[fi].name, name)) {
                 if (out_type) *out_type = rt;
                 if (out_with_idx) *out_with_idx = w;
+                /* P80c debug: trace WITH lookups for freepool fields */
+                if (str_eq_nocase(name, "firstfree") && rt->fields[fi].offset == 0) {
+                    fprintf(stderr, "  [WITH-LOOKUP-BUG] '%s' → rt=%p '%s' offset=0! FULL DUMP:\n",
+                            name, (void*)rt, rt->name[0] ? rt->name : "(anon)");
+                    for (int fj = 0; fj < rt->num_fields; fj++)
+                        fprintf(stderr, "    field[%d] '%s' @%d sz=%d kind=%d type=%p type_name='%s'\n",
+                                fj, rt->fields[fj].name, rt->fields[fj].offset,
+                                rt->fields[fj].type ? rt->fields[fj].type->size : -1,
+                                rt->fields[fj].type ? rt->fields[fj].type->kind : -1,
+                                (void*)rt->fields[fj].type, rt->fields[fj].type_name);
+                }
                 return fi;
             }
         }

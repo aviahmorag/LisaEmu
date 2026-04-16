@@ -3087,6 +3087,23 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
          * P71's unary-minus CONST evaluation which made LDSN_TO_MMU
          * receive the correct ldsn value so DS_OPEN computes the right
          * seg_ptr via real MMU_Base. */
+        /* P80c: trace INIT_FREEPOOL to verify pool setup */
+        {
+            static uint32_t pc_ifp = 0;
+            static int ifp_probed = 0;
+            if (!ifp_probed) { ifp_probed = 1; pc_ifp = boot_progress_lookup("INIT_FREEPOOL"); }
+            if (pc_ifp && cpu->pc == pc_ifp) {
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                /* After JSR: SP+4=fp_ptr(4), SP+8=fp_size(2) (after LINK: A6+8, A6+12) */
+                uint32_t fp_ptr = cpu_read32(cpu, (sp + 4) & 0xFFFFFF);
+                int16_t fp_size = (int16_t)cpu_read16(cpu, (sp + 8) & 0xFFFFFF);
+                DBGSTATIC(int, ifp_count, 0);
+                if (ifp_count++ < 5)
+                    fprintf(stderr, "[INIT_FREEPOOL #%d] fp_ptr=$%08X fp_size=%d ($%04X) ret=$%06X\n",
+                            ifp_count, fp_ptr, fp_size, (uint16_t)fp_size,
+                            cpu_read32(cpu, sp) & 0xFFFFFF);
+            }
+        }
         /* P80b: trace GETSPACE calls to diagnose pool exhaustion.
          * Codegen pushes: ord_ptr (4), b_area (4), size (2) — left-to-right.
          * After JSR: SP+0=ret(4), SP+4=size(2), SP+6=b_area(4), SP+10=ord_ptr(4) */

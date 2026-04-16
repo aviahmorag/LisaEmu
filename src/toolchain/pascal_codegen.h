@@ -64,7 +64,7 @@ typedef struct type_desc {
     /* For records */
     struct {
         char name[64];
-        char type_name[64];  /* Original type name for re-resolution */
+        char type_name[12];  /* Original type name for re-resolution (8-char significant) */
         int offset;
         struct type_desc *type;
     } fields[64];
