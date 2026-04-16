@@ -549,6 +549,7 @@ static cg_symbol_t *add_global_sym(codegen_t *cg, const char *name, type_desc_t 
 static void gen_expression(codegen_t *cg, ast_node_t *node);
 static void gen_statement(codegen_t *cg, ast_node_t *node);
 static void gen_lvalue_addr(codegen_t *cg, ast_node_t *node);
+static int expr_size(codegen_t *cg, ast_node_t *node);
 
 /* Generate an expression whose result will be used as a pointer (32-bit).
  * Calls gen_expression then retroactively patches any 16-bit MOVE to D0
@@ -640,6 +641,55 @@ static int type_load_size(type_desc_t *t) {
     if (t->kind == TK_LONGINT) return 4;
     if (t->kind == TK_PROC || t->kind == TK_FUNC) return 4; /* procedure/function pointers */
     return t->size > 0 ? t->size : 2;
+}
+
+/* P77: Check whether an RHS expression has any sub-expression that produces
+ * a 32-bit value (longint, pointer, address-of, func_call). When this is
+ * true, the D0 register already contains a valid 32-bit result after
+ * gen_expression, and emitting EXT.L would DESTROY the upper 16 bits.
+ * This generalizes P54's FUNC_CALL-only check. */
+static bool rhs_has_wide_operand(codegen_t *cg, ast_node_t *node) {
+    if (!node) return false;
+    switch (node->type) {
+        case AST_FUNC_CALL:
+        case AST_ADDR_OF:
+        case AST_STRING_LITERAL:
+            return true;
+        case AST_INT_LITERAL:
+            return (node->int_val < -32768 || node->int_val > 32767);
+        case AST_IDENT_EXPR: {
+            cg_symbol_t *sym = find_symbol_any(cg, node->name);
+            if (sym && sym->type &&
+                (sym->type->kind == TK_POINTER || sym->type->kind == TK_LONGINT))
+                return true;
+            if (sym && sym->is_const) {
+                int cv = sym->offset;
+                return (cv < -32768 || cv > 32767);
+            }
+            if (cg->with_depth > 0) {
+                type_desc_t *wrt = NULL;
+                int fld = with_lookup_field(cg, node->name, &wrt, NULL);
+                if (fld >= 0 && wrt && wrt->fields[fld].type &&
+                    (wrt->fields[fld].type->kind == TK_POINTER ||
+                     wrt->fields[fld].type->kind == TK_LONGINT))
+                    return true;
+            }
+            return false;
+        }
+        case AST_BINARY_OP:
+            return (node->num_children >= 2 &&
+                    (rhs_has_wide_operand(cg, node->children[0]) ||
+                     rhs_has_wide_operand(cg, node->children[1])));
+        case AST_UNARY_OP:
+            return (node->num_children >= 1 &&
+                    rhs_has_wide_operand(cg, node->children[0]));
+        case AST_FIELD_ACCESS:
+        case AST_DEREF:
+        case AST_ARRAY_ACCESS:
+            return (expr_size(cg, node) >= 4);
+        default:
+            return false;
+    }
 }
 
 /* Determine the byte size of an expression's result type.
@@ -1397,7 +1447,7 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
              * properly-sized results in D0. EXT.L would zero the upper word
              * of a 32-bit return value like MMU_BASE → $CC0000 → $0000. */
             if (use_long && expr_size(cg, node->children[0]) <= 2 &&
-                node->children[0]->type != AST_FUNC_CALL)
+                !rhs_has_wide_operand(cg, node->children[0]))
                 emit16(cg, 0x48C0);  /* EXT.L D0 */
             /* Save left result for later.
              * If the right operand is complex (binary op, function call,
@@ -1416,7 +1466,7 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                 gen_expression(cg, rhs);
                 /* Same for right operand */
                 if (use_long && expr_size(cg, rhs) <= 2 &&
-                    rhs->type != AST_FUNC_CALL)
+                    !rhs_has_wide_operand(cg, rhs))
                     emit16(cg, 0x48C0);  /* EXT.L D0 */
                 /* D0 = right, restore left from D2 or stack */
                 emit16(cg, use_long ? 0x2200 : 0x3200);  /* MOVE.L/W D0,D1 (right → D1) */
@@ -2085,7 +2135,8 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                      * upper 16 bits of D0 aren't stale scratch. Mirrors ORD4. */
                     if (fsz == 4 && rhs_sz < 4 && wrt->fields[fld].type &&
                         (wrt->fields[fld].type->kind == TK_LONGINT ||
-                         wrt->fields[fld].type->kind == TK_POINTER)) {
+                         wrt->fields[fld].type->kind == TK_POINTER) &&
+                        !rhs_has_wide_operand(cg, node->children[1])) {
                         emit16(cg, 0x48C0);  /* EXT.L D0 */
                     }
                     if (fsz == 4) {
@@ -2120,10 +2171,11 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                          (sym->type->kind == TK_LONGINT && sz < 4)))
                         sz = rhs_sz;
                     /* Narrow RHS → wide longint/pointer LHS: sign-extend to
-                     * prevent stale upper word. */
+                     * prevent stale upper word. P77: skip if RHS already 32-bit. */
                     if (sz == 4 && rhs_sz < 4 && sym->type &&
                         (sym->type->kind == TK_LONGINT ||
-                         sym->type->kind == TK_POINTER)) {
+                         sym->type->kind == TK_POINTER) &&
+                        !rhs_has_wide_operand(cg, node->children[1])) {
                         emit16(cg, 0x48C0);  /* EXT.L D0 */
                     }
                     int depth = find_local_depth(cg, lhs->name);
@@ -2150,10 +2202,12 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                         (sym->type->kind == TK_POINTER ||
                          (sym->type->kind == TK_LONGINT && sz < 4)))
                         sz = rhs_sz;
-                    /* Narrow RHS → wide longint/pointer LHS: sign-extend. */
+                    /* Narrow RHS → wide longint/pointer LHS: sign-extend.
+                     * P77: skip if RHS already 32-bit. */
                     if (sz == 4 && rhs_sz < 4 && sym->type &&
                         (sym->type->kind == TK_LONGINT ||
-                         sym->type->kind == TK_POINTER)) {
+                         sym->type->kind == TK_POINTER) &&
+                        !rhs_has_wide_operand(cg, node->children[1])) {
                         emit16(cg, 0x48C0);  /* EXT.L D0 */
                     }
                     if (depth > 0) {
@@ -2180,10 +2234,12 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                         (sym->type->kind == TK_POINTER ||
                          (sym->type->kind == TK_LONGINT && sz < 4)))
                         sz = rhs_sz;
-                    /* Narrow RHS → wide longint/pointer global: sign-extend. */
+                    /* Narrow RHS → wide longint/pointer global: sign-extend.
+                     * P77: skip if RHS already 32-bit. */
                     if (sz == 4 && rhs_sz < 4 && sym->type &&
                         (sym->type->kind == TK_LONGINT ||
-                         sym->type->kind == TK_POINTER)) {
+                         sym->type->kind == TK_POINTER) &&
+                        !rhs_has_wide_operand(cg, node->children[1])) {
                         emit16(cg, 0x48C0);  /* EXT.L D0 */
                     }
                     if (sz == 4) emit16(cg, 0x2B40);
@@ -2221,7 +2277,8 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                             if (nd->children[i]) stk[stki++] = nd->children[i];
                     }
                 }
-                if (sz == 4 && rhs_sz < 4 && !rhs_has_funcall) {
+                if (sz == 4 && rhs_sz < 4 && !rhs_has_funcall &&
+                    !rhs_has_wide_operand(cg, node->children[1])) {
                     emit16(cg, 0x48C0);  /* EXT.L D0 */
                 }
                 if (sz == 4) {

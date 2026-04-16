@@ -2889,6 +2889,16 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         pc_ring[pc_ring_idx++ & 255] = cpu->pc;
         g_last_cpu_pc = cpu->pc;
 
+        /* P77 diag probes removed (session cleanup). Key findings:
+         * - Build_Syslocal writes to wrong syslocal address (MMU_BASE
+         *   returns $9C0000 instead of $CE0000)
+         * - Semaphore wait_queue contains code addresses (e.g. BUS_ERR)
+         *   instead of valid PCB pointers
+         * - UNLOCKSEGS walks corrupt seglock sentinel → RELSPACE spin
+         * Both are downstream of c_syslocal_ptr miscalculation. */
+
+        /* P77 diagnostic probes removed — see NEXT_SESSION.md */
+
         /* P41: Cache all HLE bypass addresses by symbol name rather
          * than hardcoding post-link offsets. This makes every HLE
          * robust against codegen changes that shift the linker map
@@ -2896,7 +2906,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         static uint32_t pc_FS_CLEANUP, pc_PR_CLEANUP, pc_MEM_CLEANUP;
         static uint32_t pc_SYS_PROC_INIT, pc_excep_setup, pc_REG_OPEN_LIST;
         static uint32_t pc_QUEUE_PR, pc_GETSPACE, pc_Wait_sem, pc_MM_Setup;
-        static uint32_t pc_unitio;
+        static uint32_t pc_unitio, pc_UNLOCKSEGS;
         static int hle_pc_gen = -1;
         if (hle_pc_gen != g_emu_generation) {
             pc_FS_CLEANUP    = boot_progress_lookup("FS_CLEANUP");
@@ -2910,6 +2920,11 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             pc_Wait_sem      = boot_progress_lookup("Wait_sem");
             pc_MM_Setup      = boot_progress_lookup("MM_Setup");
             pc_unitio        = boot_progress_lookup("unitio");
+            pc_UNLOCKSEGS    = boot_progress_lookup("UNLOCKSEGS");
+            if (pc_UNLOCKSEGS)
+                fprintf(stderr, "HLE: UNLOCKSEGS=$%06X\n", pc_UNLOCKSEGS);
+            else
+                fprintf(stderr, "HLE: UNLOCKSEGS not found in symbol table\n");
             hle_pc_gen = g_emu_generation;
         }
         /* P37 HLE bypass: FS_CLEANUP (fsinit.text:136). Fires the
@@ -3072,6 +3087,44 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             cpu->a[7] += 4 /*retPC*/ + 4 /*ecode*/ + 2 /*device*/ + 2 /*oldrefnum*/ + 2 /*newrefnum*/ + 2 /*newrntype*/;
             cpu->pc = ret;
             continue;
+        }
+        /* P77 HLE bypass: UNLOCKSEGS (MM0.TEXT:486). The seglock list
+         * sentinel (hd_seglock_list.fwd_link) isn't initialized by
+         * Build_Syslocal's WITH-block sentinel stores (same P13 class).
+         * Result: UNLOCKSEGS walks a corrupt chain starting at syslocal
+         * base, calling RELSPACE($CE0000, $CE0000) in an infinite loop.
+         * Since newly created processes have no locked segments, bypass
+         * is safe: write errnum=0 and return. Signature:
+         * procedure UNLOCKSEGS(var errnum: integer) — Pascal callee-clean,
+         * stack: retPC(4) + errnum_ptr(4). */
+        /* P77 HLE: guard RELSPACE against freeing pool base itself.
+         * When ordaddr == b_area, the caller is trying to free the pool
+         * header (uninitialized seglock sentinel). Skip the call. */
+        {
+            static uint32_t pc_RELSPACE_cached = 0;
+            static int rs_gen = -1;
+            if (rs_gen != g_emu_generation) {
+                pc_RELSPACE_cached = boot_progress_lookup("RELSPACE");
+                rs_gen = g_emu_generation;
+            }
+            if (pc_RELSPACE_cached && cpu->pc == pc_RELSPACE_cached) {
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                uint32_t retpc = cpu_read32(cpu, sp);
+                /* RELSPACE(ordaddr: absptr; b_area: absptr) - Pascal callee-clean.
+                 * After LINK, params are at 8(A6) and 12(A6). At entry (before LINK):
+                 * SP+4 = b_area (pushed last), SP+8 = ordaddr (pushed first). */
+                uint32_t b_area = cpu_read32(cpu, sp + 4);
+                uint32_t ordaddr = cpu_read32(cpu, sp + 8);
+                if (ordaddr == b_area) {
+                    DBGSTATIC(int, rs_skip, 0);
+                    if (rs_skip++ < 3)
+                        fprintf(stderr, "[P77-RSSKIP] RELSPACE(ordaddr=$%06X, b_area=$%06X) — skipping pool-base free\n",
+                                ordaddr, b_area);
+                    cpu->a[7] += 4 + 8;  /* pop retPC + 2 args */
+                    cpu->pc = retpc;
+                    continue;
+                }
+            }
         }
         /* P32 HLE bypass: QUEUE_PR (PROCASM.TEXT). Pascal vs asm
          * record-offset mismatch — fwd_ReadyQ at A5-1116 (PASCALDEFS
