@@ -74,12 +74,14 @@ cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' bui
 
 Build and audit green. Two milestone labels lost to code layout shifts (cosmetic).
 
-### P79 session fixes (5 structural codegen improvements)
+### P79 session fixes (6 structural codegen improvements)
 
-1. **Record layouts** (P79): int1 word-sizing, string word-padding, CONST pre-pass export. Fixed devrec (70→74), DCB (344→122).
-2. **Push direction** (P79c): `is_callee_clean` used sig's is_external, not symbol's. Fixes all cross-unit Pascal calls with EXTERNAL forward declarations.
-3. **Proc sig pre-pass** (P79d): proc sigs exported during types pre-pass so early-compiled units see non-external body sigs.
-4. **Enum constants** (P79e): AST_TYPE_ENUM now registers each value as a CONST. Previously ALL enum identifiers resolved to 0. Fixes every enum-based dispatch in the OS.
+1. **Record layouts** (P79): string word-padding, CONST pre-pass export. Fixed devrec (70→74), DCB (344→122).
+2. **Push direction** (P79c): `is_callee_clean` prefers sig's is_external over symbol's.
+3. **Proc sig pre-pass** (P79d): proc sigs exported during types pre-pass.
+4. **Enum constants** (P79e): AST_TYPE_ENUM registers ordinal values. Previously ALL enums resolved to 0.
+5. **Byte-subrange sizing** (P79f): range<=255 → natural size=1. Record fields widen to 2. Arrays stay at 1. Fixed sc_par_no overflow into b_syslocal_ptr.
+6. **Record-field array stride** (P79f): resolve element type for FIELD_ACCESS array bases.
 
 ### Bypass-fired milestones (4):
 
@@ -88,13 +90,13 @@ Build and audit green. Two milestone labels lost to code layout shifts (cosmetic
 - **MEM_CLEANUP** (P36): body spins in ADDTO_MMLIST.
 - **PR_CLEANUP** (P38): idle scheduler loop — needs Shell.
 
-### Next blocker: SYS_PROC_INIT body — DS_OPEN BIND_DATASEG path
+### Next blocker: SYS_PROC_INIT body — process creation NULL pointers
 
-P35 disabled: SYS_PROC_INIT reaches Make_SProcess. MAKE_DATASEG
-receives correct params (disc_size=0, dstype=ds_private, ldsn=-1/-2).
-P79c/d fixed BLD_SEG's NULL c_sdb_ptr. P79e fixed GetFCB/ENQUEUE
-NULL leftlink. Remaining: DS_OPEN body writes through NULL in the
-BIND_DATASEG/MMU setup path (VEC-GUARD at $019D18 etc.).
+P35 disabled: 21/27 milestones. SYS_PROC_INIT doesn't complete.
+b_syslocal_ptr now correctly $CE0000 (was $040000 due to SCTAB2
+overflow, fixed by P79f). BLD_SEG fixed (P79c/d). ENQUEUE fixed
+(P79e). Remaining VEC-GUARD writes from GETSPACE/pool code and
+CreateProcess — more codegen bugs to trace.
 
 ### Roadmap to fully bootable Lisa desktop
 
