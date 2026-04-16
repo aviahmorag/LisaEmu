@@ -205,7 +205,7 @@ static int type_size(type_desc_t *t) {
 static cg_symbol_t *find_global(codegen_t *cg, const char *name);
 static cg_symbol_t *find_imported(codegen_t *cg, const char *name);
 static cg_symbol_t *find_symbol_any(codegen_t *cg, const char *name);
-static void register_proc_sig(codegen_t *cg, const char *name, ast_node_t *params[], int num_params);
+static void register_proc_sig(codegen_t *cg, const char *name, ast_node_t *params[], int num_params, int nest_depth);
 static cg_proc_sig_t *find_proc_sig(codegen_t *cg, const char *name);
 
 /* Non-primitive value param (record/string/array): P16 passes by reference
@@ -621,15 +621,55 @@ static int find_local_depth(codegen_t *cg, const char *name) {
 
 /* Emit code to load the frame pointer for a variable at a given nesting depth.
  * depth=0: current scope → A6 is correct
- * depth=1: parent scope → A0 = (A6) (saved A6 from LINK)
- * depth=2: grandparent → A0 = ((A6))
- * Result in A6 (for depth 0) or A0 (for depth > 0). */
+ * depth=1: parent scope  → A0 = -4(A6) (static link)
+ * depth=2: grandparent   → A0 = -4(A6); A0 = -4(A0)
+ * Result in A6 (for depth 0) or A0 (for depth > 0).
+ *
+ * P81: walks the STATIC link chain via the -4(A6) slot that each nested
+ * proc saves on entry, not the DYNAMIC link (saved A6 from LINK). The
+ * dynamic link equals the static link only when the callee is called by
+ * its direct static parent; for sibling-nested calls the dynamic link
+ * points at the caller, which is a SIBLING of the static parent — not
+ * the parent itself. Using (A6) for outer-scope access then corrupted
+ * reads (e.g. SET_INMOTION_SEG reading MOVE_SEG's locals instead of
+ * CLEAR_SPACE's, straddling frame-overhead bytes). */
+/* P81 static-link ABI: emit the load of A2 with the correct static-parent
+ * frame pointer for a call to `sig`. Must be called AFTER all argument
+ * pushes and IMMEDIATELY before the JSR so that A2 isn't clobbered by
+ * any nested calls inside arg evaluation. Safe to call with sig==NULL or
+ * for callees that don't take a static link — in that case, no-op. */
+static void emit_static_link_load(codegen_t *cg, cg_proc_sig_t *sig) {
+    if (!sig || !sig->takes_static_link) return;
+    /* walk_count = caller_depth - callee_depth + 1.
+     * - 0: caller is direct static parent of callee → pass caller's A6.
+     * - 1: caller is sibling of callee (same depth) → pass caller's static link.
+     * - N: caller is N levels deeper → walk N times via static link chain. */
+    int caller_depth = cg->scope_depth;
+    int callee_depth = sig->nest_depth;
+    int walk = caller_depth - callee_depth + 1;
+    if (walk < 0) walk = 0;  /* shouldn't happen, but be safe */
+    if (walk == 0) {
+        emit16(cg, 0x244E);  /* MOVEA.L A6,A2 */
+        return;
+    }
+    /* First hop from A6's static link slot */
+    emit16(cg, 0x246E);  /* MOVEA.L d16(A6),A2 */
+    emit16(cg, 0xFFFC);  /* disp = -4 */
+    for (int i = 1; i < walk; i++) {
+        emit16(cg, 0x246A);  /* MOVEA.L d16(A2),A2 */
+        emit16(cg, 0xFFFC);  /* disp = -4 */
+    }
+}
+
 static void emit_frame_access(codegen_t *cg, int depth) {
     if (depth <= 0) return;  /* Current scope, A6 is fine */
-    /* Follow static link chain through saved A6 values */
-    emit16(cg, 0x2056);  /* MOVEA.L (A6),A0 — get parent's A6 */
+    /* First hop: load static link from caller's -4(A6) slot into A0. */
+    emit16(cg, 0x206E);  /* MOVEA.L d16(A6),A0 */
+    emit16(cg, 0xFFFC);  /* disp = -4 */
+    /* Subsequent hops: follow A0's -4(A0) static link. */
     for (int i = 1; i < depth; i++) {
-        emit16(cg, 0x2050);  /* MOVEA.L (A0),A0 — follow chain */
+        emit16(cg, 0x2068);  /* MOVEA.L d16(A0),A0 */
+        emit16(cg, 0xFFFC);  /* disp = -4 */
     }
 }
 
@@ -1434,6 +1474,7 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                 if (ident_sig->is_external) {
                     emit16(cg, 0x2F00);  /* MOVE.L D0,-(SP) — reserve space for result */
                 }
+                emit_static_link_load(cg, ident_sig);
                 emit16(cg, 0x4EB9);  /* JSR abs.L */
                 emit32(cg, 0);       /* Placeholder — will be relocated */
                 if (cg->num_relocs < CODEGEN_MAX_RELOCS) {
@@ -2224,6 +2265,7 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                 }
             }
             }
+            emit_static_link_load(cg, sig);
             /* JSR to function */
             emit16(cg, 0x4EB9);  /* JSR abs.L */
             emit32(cg, 0);       /* Will be relocated */
@@ -2661,6 +2703,7 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                         }
                     }
                 }
+                emit_static_link_load(cg, call_sig);
                 emit16(cg, 0x4EB9);
                 emit32(cg, 0);
                 if (cg->num_relocs < CODEGEN_MAX_RELOCS) {
@@ -3322,9 +3365,11 @@ static void process_declarations(codegen_t *cg, ast_node_t *node, bool is_global
                 bool has_params = false;
                 for (int j = 0; j < child->num_children; j++) {
                     if (child->children[j]->type == AST_PARAM_LIST) {
+                        /* INTERFACE/top-level declarations: nest_depth = 1. */
                         register_proc_sig(cg, child->name,
                                           child->children[j]->children,
-                                          child->children[j]->num_children);
+                                          child->children[j]->num_children,
+                                          1);
                         has_params = true;
                         break;
                     }
@@ -3343,6 +3388,9 @@ static void process_declarations(codegen_t *cg, ast_node_t *node, bool is_global
                     strncpy(sig->name, child->name, 63);
                     sig->is_external = is_ext;
                     sig->is_function = is_func;
+                    /* Interface/top-level declaration: nest_depth = 1. */
+                    sig->nest_depth = 1;
+                    sig->takes_static_link = false;
                 }
                 /* Set is_function flag on the registered signature */
                 {
@@ -3460,6 +3508,18 @@ static void gen_proc_or_func(codegen_t *cg, ast_node_t *node) {
         if (sc && node->name[0])
             strncpy(sc->proc_name, node->name, sizeof(sc->proc_name) - 1);
     }
+    /* P81 static-link ABI: for procs at depth >= 2, reserve 4 bytes at the
+     * top of the local area (-4(A6)) for a static-link slot. Caller passes
+     * the correct static-parent A6 in A2; callee copies A2 to -4(A6) in
+     * its prologue. emit_frame_access walks this chain to reach outer
+     * scopes' locals. Without this, sibling-nested calls corrupted A0
+     * because the compiler used the dynamic link as the static link. */
+    {
+        cg_scope_t *sc = current_scope(cg);
+        if (sc && cg->scope_depth >= 2) {
+            sc->frame_size = 4;  /* reserved for static link at -4(A6) */
+        }
+    }
 
     /* Reset per-procedure label state */
     cg->num_labels = 0;
@@ -3525,11 +3585,12 @@ static void gen_proc_or_func(codegen_t *cg, ast_node_t *node) {
         }
     }
 
-    /* Register procedure signature for VAR parameter tracking at call sites */
+    /* Register procedure signature for VAR parameter tracking at call sites.
+     * nest_depth is the current scope depth (already pushed above). */
     for (int i = 0; i < node->num_children; i++) {
         if (node->children[i]->type == AST_PARAM_LIST) {
             ast_node_t *params = node->children[i];
-            register_proc_sig(cg, node->name, params->children, params->num_children);
+            register_proc_sig(cg, node->name, params->children, params->num_children, cg->scope_depth);
             break;
         }
     }
@@ -3731,6 +3792,12 @@ static void gen_proc_or_func(codegen_t *cg, ast_node_t *node) {
         fprintf(stderr, "  INITSYS LINK: frame_size=%d at offset %u\n", frame_size, cg->code_size);
     emit16(cg, 0x4E56);
     emit16(cg, (uint16_t)(int16_t)(-frame_size));
+    /* P81 static-link ABI: stash caller-provided static parent (passed in A2)
+     * into the reserved -4(A6) slot so emit_frame_access can find it. */
+    if (cg->scope_depth >= 2) {
+        emit16(cg, 0x2D4A);  /* MOVE.L A2,-4(A6) */
+        emit16(cg, 0xFFFC);
+    }
 
     /* Generate body */
     for (int i = 0; i < node->num_children; i++) {
@@ -3873,11 +3940,26 @@ void codegen_free(codegen_t *cg) {
 }
 
 /* Register a procedure signature for VAR parameter tracking */
-static void register_proc_sig(codegen_t *cg, const char *name, ast_node_t *params[], int num_params) {
+static void register_proc_sig(codegen_t *cg, const char *name, ast_node_t *params[], int num_params, int nest_depth) {
     if (!cg->proc_sigs || cg->num_proc_sigs >= CODEGEN_MAX_PROC_SIGS) return;
+    /* If a sig for this name already exists (forward/interface declaration),
+     * update its nest_depth when we see the real body. */
+    for (int i = 0; i < cg->num_proc_sigs; i++) {
+        if (strcasecmp(cg->proc_sigs[i].name, name) == 0) {
+            if (nest_depth > 0) {
+                cg->proc_sigs[i].nest_depth = nest_depth;
+                cg->proc_sigs[i].takes_static_link = (nest_depth >= 2);
+            }
+            /* Fall through and still create a new entry to keep existing
+             * behavior (caller may add another sig for the body). */
+            break;
+        }
+    }
     /* Log signature registrations for key boot procedures */
     cg_proc_sig_t *sig = &cg->proc_sigs[cg->num_proc_sigs++];
     strncpy(sig->name, name, 63);
+    sig->nest_depth = nest_depth;
+    sig->takes_static_link = (nest_depth >= 2);
     sig->num_params = num_params < CODEGEN_MAX_PARAMS ? num_params : CODEGEN_MAX_PARAMS;
     for (int i = 0; i < sig->num_params; i++) {
         /* str_val[0] != '\0' means VAR parameter (set by parser) */

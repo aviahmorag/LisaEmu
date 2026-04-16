@@ -70,24 +70,56 @@ make audit-linker       # Stage 4: Full pipeline + linker
 cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' build 2>&1 | grep -E "(error:|BUILD)"
 ```
 
-## Current Status (2026-04-16 latest) — MemMgr DISPATCHED (user mode, MMU issue)
+## Current Status (2026-04-17) — STATIC-LINK ABI FIXED, BOOT CLEAN TO IDLE
 
-Build + audit green. 25/27 milestones. Full kernel boot
-INIT→PR_CLEANUP → direct jump to Scheduler. Scheduler calls Launch,
-which RTEs MemMgr into USER MODE successfully — SR transitions to
-$0000, PC popped cleanly — but the post-RTE PC lands at weird addresses
-($DD8D2A00, later $6FFC2000), triggering vector 4 / vector 11 faults.
+Build + audit green. 25/27 milestones reached. Kernel boots cleanly
+INIT → PR_CLEANUP → scheduler → MemMgr → scheduler idle loop. 1000
+headless frames run without a single SYSTEM_ERROR halt (v=4/v=11
+faults that previously blocked progress are gone).
 
-Cause: **MMU mapping mismatch**. Launch RTE goes to user mode, where
-MMU virtual-to-physical translation applies. MemMgr's virtual PC
-$04413C doesn't translate to its physical code address under the
-current user-context MMU. Either (a) the user-domain MMU wasn't set up
-for MemMgr's code segments (Set_Address_Space / Map_Syslocal normally
-handle this and were skipped), or (b) env_save_area.PC needs to be a
-mapped virtual address, not the physical linker address.
+**P81 fix — Pascal static-link ABI for sibling-nested procedure calls.**
+The handoff's "MMU mapping" hypothesis was incorrect. MemMgr's first
+16 user-mode instructions at $04413C ran fine; the real bug was in
+the Pascal code generator. When a proc nested inside a top-level proc
+calls a *sibling* nested proc (e.g., MOVE_SEG → SET_INMOTION_SEG, both
+nested in CLEAR_SPACE), `emit_frame_access` walked the *dynamic* link
+(saved A6 from LINK) to reach outer-scope locals. But dynamic link =
+caller's A6 ≠ static parent's A6 for sibling calls: SET_INMOTION_SEG's
+MOVEA.L (A6),A0 returned MOVE_SEG's A6 instead of CLEAR_SPACE's,
+then MOVE.L disp(A0),D0 at disp=-14 straddled MOVE_SEG's saved-A6 and
+return-PC bytes, loading garbage ($DD980004) that got stuffed into A0
+via MOVEA.L D0,A0 → JMP (A0) → vector 4 crash.
 
-Next: investigate what Map_Syslocal / Set_Address_Space do to MMU
-mappings, and either emulate them in HLE-SelectProcess or let them run.
+**Fix (src/toolchain/pascal_codegen.[ch]):**
+- Each `cg_proc_sig_t` now carries `nest_depth` + `takes_static_link`.
+- Procs at depth ≥ 2 reserve a static-link slot at `-4(A6)`; locals
+  start below that. After `LINK A6,#-N` the prologue emits
+  `MOVE.L A2,-4(A6)` to save the caller-provided static link.
+- Each call site emits `emit_static_link_load(cg, sig)` right before
+  the JSR. Walk count = caller_depth − callee_depth + 1:
+    - 0 → `MOVEA.L A6,A2` (caller is direct static parent)
+    - 1 → `MOVEA.L -4(A6),A2` (caller is sibling)
+    - N → first hop then (N-1) `MOVEA.L -4(A2),A2` hops
+- `emit_frame_access` walks the static chain via -4(A6) / -4(A0), not
+  (A6) / (A0).
+- A2 is used as the caller-saved static-link register (no prior use).
+- Applied at three call sites: AST_IDENT_EXPR (zero-arg call),
+  AST_FUNC_CALL, AST_CALL. Indirect calls via procedure params are
+  not yet static-link-aware (uncommon enough to defer).
+
+### Next
+
+All active HLE bypasses (SelectProcess, CreateProcess/FinishCreate,
+PR_CLEANUP, etc.) remain in place. With the static-link fix in,
+several may no longer be necessary — the generated Pascal code should
+now correctly access outer-scope locals through sibling calls. Worth
+trying to re-enable them (one at a time) to see which the OS can run
+natively now.
+
+Boot still ends in the Workshop/Shell load phase (SHELL/WS_MAIN are
+unreached — the two remaining milestones). Shell loading is a separate
+scope: need SYSTEM.SHELL compiled as a separate binary, plus dynamic
+intrinsic-library loading.
 
 ### P80h2 session fixes (scheduler dispatch plumbing)
 

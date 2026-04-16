@@ -117,6 +117,14 @@ typedef struct {
     struct type_desc *param_type[CODEGEN_MAX_PARAMS]; /* Parameter types (for IMPL body reconstruction) */
     bool is_external;                       /* true = assembly/external (callee-clean) */
     bool is_function;                       /* true = function (returns value), false = procedure */
+    /* P81 static-link ABI. nest_depth = Pascal lexical depth of the proc
+     * (1 = top-level proc declared in a unit; 2 = proc nested in a depth-1
+     * proc; …). Procs at depth>=2 need a static link pointing to their
+     * static parent's frame. The caller passes this in A2 before JSR; the
+     * callee copies A2 to -4(A6) in its prologue. takes_static_link is
+     * true iff nest_depth>=2. */
+    int nest_depth;
+    bool takes_static_link;
 } cg_proc_sig_t;
 
 /* Relocation */
