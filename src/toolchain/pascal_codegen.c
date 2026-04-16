@@ -124,10 +124,29 @@ static void patch16(codegen_t *cg, uint32_t offset, uint16_t val) {
  * ======================================================================== */
 
 static type_desc_t *find_type(codegen_t *cg, const char *name) {
+    type_desc_t *local = NULL;
     for (int i = 0; i < cg->num_types; i++) {
-        if (str_eq_nocase(cg->types[i].name, name))
-            return &cg->types[i];
+        if (str_eq_nocase(cg->types[i].name, name)) {
+            local = &cg->types[i];
+            break;
+        }
     }
+    /* P80g: for RECORD types, prefer imported version if the local has
+     * corrupt field offsets (all zeros). The local type gets its offsets
+     * zeroed by dangling pointer reads after *existing = *t copies.
+     * The imported version (from the pre-pass fixup) has correct offsets. */
+    if (local && local->kind == TK_RECORD && local->num_fields > 1 &&
+        local->fields[1].offset == 0 && cg->imported_types) {
+        for (int i = 0; i < cg->imported_types_count; i++) {
+            if (str_eq_nocase(cg->imported_types[i].name, name) &&
+                cg->imported_types[i].kind == TK_RECORD &&
+                cg->imported_types[i].num_fields > 1 &&
+                cg->imported_types[i].fields[1].offset > 0) {
+                return &cg->imported_types[i];
+            }
+        }
+    }
+    if (local) return local;
     /* Also search imported types from previously compiled units */
     if (cg->imported_types) {
         for (int i = 0; i < cg->imported_types_count; i++) {
@@ -139,7 +158,13 @@ static type_desc_t *find_type(codegen_t *cg, const char *name) {
 }
 
 static type_desc_t *add_type(codegen_t *cg, const char *name, type_kind_t kind, int size) {
-    if (cg->num_types >= CODEGEN_MAX_SYMBOLS) return NULL;
+    if (cg->num_types >= CODEGEN_MAX_SYMBOLS) {
+        static int overflow_warn = 0;
+        if (overflow_warn++ < 3)
+            fprintf(stderr, "WARNING: type table overflow at %d types (max %d)\n",
+                    cg->num_types, CODEGEN_MAX_SYMBOLS);
+        return NULL;
+    }
     type_desc_t *t = &cg->types[cg->num_types++];
     memset(t, 0, sizeof(type_desc_t));
     t->kind = kind;
@@ -406,6 +431,33 @@ static type_desc_t *resolve_type(codegen_t *cg, ast_node_t *node) {
             }
             if (offset % 2) offset++; /* Pad to word boundary */
             t->size = offset;
+            /* P80g: post-creation record repair. If the freshly resolved
+             * record has all-zero offsets (field types resolved to NULL →
+             * default size 2 → offsets 0,2,4... but NOT all zero — this
+             * catches cases where all field types have size 0), try to
+             * use imported version's offsets directly. Actually, the more
+             * common issue: pointer base types reference this record and
+             * the pointer type stores a pointer to THIS (local) record.
+             * If this record's offsets later get corrupted (by dangling
+             * pointer reads), all code using the pointer type gets wrong
+             * offsets. Prevent this by COPYING offsets from the imported
+             * version into the local record, so both are consistent. */
+            if (t->num_fields > 1 && cg->imported_types) {
+                /* Try to find matching imported record and copy its offsets */
+                for (int it = 0; it < cg->imported_types_count; it++) {
+                    type_desc_t *imp = &cg->imported_types[it];
+                    if (imp->kind != TK_RECORD || imp->num_fields != t->num_fields) continue;
+                    /* Match by first field name */
+                    if (!str_eq_nocase(imp->fields[0].name, t->fields[0].name)) continue;
+                    if (imp->num_fields > 1 && imp->fields[1].offset > 0) {
+                        /* Copy offsets from imported to local */
+                        for (int fi = 0; fi < t->num_fields && fi < imp->num_fields; fi++)
+                            t->fields[fi].offset = imp->fields[fi].offset;
+                        t->size = imp->size;
+                        break;
+                    }
+                }
+            }
             /* P80b/c: debug print for records with key field names */
             if (t->num_fields >= 2) {
                 for (int fi = 0; fi < t->num_fields; fi++) {
@@ -3504,16 +3556,18 @@ static void gen_proc_or_func(codegen_t *cg, ast_node_t *node) {
                      * the locally resolved type and keep the imported one. */
                     type_desc_t *existing = find_type(cg, child->name);
                     if (existing && existing != t) {
-                        /* Check: is this an imported record with valid offsets? */
-                        bool imported_ok = false;
-                        if (cg->imported_types && existing->kind == TK_RECORD &&
+                        /* P80g: protect ANY record with valid field offsets from
+                     * being overwritten by *existing = *t. The struct copy
+                     * creates dangling type pointers (into cg->types which
+                     * gets freed after compilation), causing the safety-net
+                     * offset recomputation to read garbage sizes. If the
+                     * existing record already has correct offsets, keep it. */
+                        bool keep_existing = false;
+                        if (existing->kind == TK_RECORD &&
                             existing->num_fields > 1 && existing->fields[1].offset > 0) {
-                            /* Check if 'existing' is in the imported_types array */
-                            if (existing >= cg->imported_types &&
-                                existing < cg->imported_types + cg->imported_types_count)
-                                imported_ok = true;
+                            keep_existing = true;
                         }
-                        if (!imported_ok) {
+                        if (!keep_existing) {
                         char saved_name[64];
                         strncpy(saved_name, child->name, sizeof(saved_name) - 1);
                         saved_name[63] = '\0';

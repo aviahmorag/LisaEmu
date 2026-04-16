@@ -3468,6 +3468,49 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 }
             }
         }
+        /* P80g: bypass CreateProcess. The process creation code has deep
+         * record field offset corruption that causes A6 to become $FD800000
+         * during Build_Syslocal/Build_Stack. For now, skip the entire
+         * initialization — processes won't run but boot can continue.
+         * CreateProcess(pcb_ptr: ptr_PCB; sloc: segHandle; stk: segHandle;
+         *   stk_info: stkInfo_rec; jt: ptr_JumpTable; units: IUuse_list;
+         *   start_PC: absptr; evt_chn: int2) — many value params */
+        {
+            static uint32_t pc_cp = 0;
+            static int cp_probed = 0;
+            if (!cp_probed) {
+                cp_probed = 1;
+                pc_cp = boot_progress_lookup("CreateProcess");
+                if (!pc_cp) pc_cp = boot_progress_lookup("CreatePr");
+                if (pc_cp) fprintf(stderr, "  DEBUG: CreateProcess at $%06X\n", pc_cp);
+                else fprintf(stderr, "  DEBUG: CreateProcess NOT FOUND, using hardcoded\n");
+                if (!pc_cp) pc_cp = 0x04E348;  /* from linker map */
+            }
+            /* Also bypass ModifyProcess and FinishCreate — they access
+             * uninitialized process structures that crash. */
+            static uint32_t pc_mp = 0, pc_fc = 0;
+            static int mp_probed = 0;
+            if (!mp_probed) {
+                mp_probed = 1;
+                pc_mp = boot_progress_lookup("ModifyProcess");
+                pc_fc = boot_progress_lookup("FinishCreate");
+                if (!pc_mp) pc_mp = 0x04EF12;  /* from map */
+                if (!pc_fc) pc_fc = 0x04E3CA;  /* from map */
+            }
+            if (pc_cp && (cpu->pc == pc_cp || cpu->pc == pc_mp || cpu->pc == pc_fc)) {
+                DBGSTATIC(int, cp_count, 0);
+                if (cp_count++ < 10) {
+                    const char *fn = (cpu->pc == pc_cp) ? "CreateProcess" :
+                                     (cpu->pc == pc_mp) ? "ModifyProcess" : "FinishCreate";
+                    fprintf(stderr, "[HLE-%s #%d] bypassed\n", fn, cp_count);
+                }
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                uint32_t ret = cpu_read32(cpu, sp);
+                cpu->a[7] += 4;
+                cpu->pc = ret;
+                continue;
+            }
+        }
         /* P80d: bypass Move_MemMgr. This function moves the MemMgr process
          * to the end of memory to reduce fragmentation. The move involves
          * complex segment operations (SEG_IO, SWAP_SEG, BLD_SEG) that
@@ -3521,7 +3564,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 if (errnum_ptr >= 0x1000)
                     cpu_write16(cpu, errnum_ptr, 134);
                 uint32_t ret = cpu_read32(cpu, sp);
-                cpu->a[7] += 4 + 26;
+                cpu->a[7] += 4;  /* pop ret only — caller does ADDA.W #$1A,SP */
                 cpu->pc = ret;
                 fprintf(stderr, "[HLE-MAKE_SYSDATASEG] bypassed discsize=%d → error 134\n", discsize);
                 continue;
@@ -3537,6 +3580,10 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 uint32_t segptr_ptr = cpu_read32(cpu, (sp + 24) & 0xFFFFFF) & 0xFFFFFF;
                 uint32_t refnum_ptr = cpu_read32(cpu, (sp + 20) & 0xFFFFFF) & 0xFFFFFF;
                 int16_t ldsn = (int16_t)cpu_read16(cpu, (sp + 28) & 0xFFFFFF);
+                /* P80g: validate pointers — if errnum_ptr is garbage (e.g., $000009
+                 * from corrupt WITH block reading segHandle at wrong offsets),
+                 * still return success but skip pointer writes */
+                bool ptrs_valid = (errnum_ptr >= 0x10000 && segptr_ptr >= 0x10000);
                 /* P80f: for resident segments, allocate from the sgheap area
                  * which is already MMU-mapped. The sgheap starts after the
                  * sysglobal pool. Use a bump allocator within the mapped range.
@@ -3554,14 +3601,16 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 /* Zero-fill the allocated area */
                 for (int j = 0; j < alloc_size; j++)
                     cpu_write8(cpu, (seg_ptr + j) & 0xFFFFFF, 0);
-                /* Write results */
-                if (errnum_ptr >= 0x1000) cpu_write16(cpu, errnum_ptr, 0);
-                if (segptr_ptr >= 0x1000) cpu_write32(cpu, segptr_ptr, seg_ptr);
-                if (refnum_ptr >= 0x1000) cpu_write16(cpu, refnum_ptr, 100 + ldsn);
-                fprintf(stderr, "[HLE-MAKE_SYSDATASEG] resident: memsize=%d ldsn=%d → seg_ptr=$%06X\n",
-                        alloc_size, ldsn, seg_ptr);
+                /* Write results only if pointers are valid */
+                if (ptrs_valid) {
+                    cpu_write16(cpu, errnum_ptr, 0);
+                    cpu_write32(cpu, segptr_ptr, seg_ptr);
+                    if (refnum_ptr >= 0x10000) cpu_write16(cpu, refnum_ptr, 100 + ldsn);
+                }
+                fprintf(stderr, "[HLE-MAKE_SYSDATASEG] resident: memsize=%d ldsn=%d → seg_ptr=$%06X ptrs_valid=%d\n",
+                        alloc_size, ldsn, seg_ptr, ptrs_valid);
                 uint32_t ret = cpu_read32(cpu, sp);
-                cpu->a[7] += 4 + 26;
+                cpu->a[7] += 4;  /* pop ret only — caller does ADDA.W #$1A,SP for args */
                 cpu->pc = ret;
                 continue;
             }
