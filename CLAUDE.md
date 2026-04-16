@@ -70,18 +70,16 @@ make audit-linker       # Stage 4: Full pipeline + linker
 cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' build 2>&1 | grep -E "(error:|BUILD)"
 ```
 
-## Current Status (2026-04-16) — 26/27 reported (22 real + 4 bypass-fired)
+## Current Status (2026-04-16) — 25/27 reported (21 real + 4 bypass-fired)
 
-Build and audit green. INITSYS milestone lost to code layout shift (cosmetic).
+Build and audit green. Two milestone labels lost to code layout shifts (cosmetic).
 
-### P79 record layout fixes (this session)
+### P79 session fixes (5 structural codegen improvements)
 
-Fixed 3 record layout bugs in the Pascal codegen:
-- **int1 type**: was TK_BYTE/1, now TK_INTEGER/2 (matches Lisa Pascal word-sized unpacked fields)
-- **String padding**: odd-length strings now word-padded in unpacked records
-- **CONST export in pre-pass**: `max_ename=32` now visible during type resolution
-
-Key records fixed: devrec (70→74), DCB (344→122), reqblk, codesdb, sdb.
+1. **Record layouts** (P79): int1 word-sizing, string word-padding, CONST pre-pass export. Fixed devrec (70→74), DCB (344→122).
+2. **Push direction** (P79c): `is_callee_clean` used sig's is_external, not symbol's. Fixes all cross-unit Pascal calls with EXTERNAL forward declarations.
+3. **Proc sig pre-pass** (P79d): proc sigs exported during types pre-pass so early-compiled units see non-external body sigs.
+4. **Enum constants** (P79e): AST_TYPE_ENUM now registers each value as a CONST. Previously ALL enum identifiers resolved to 0. Fixes every enum-based dispatch in the OS.
 
 ### Bypass-fired milestones (4):
 
@@ -90,13 +88,13 @@ Key records fixed: devrec (70→74), DCB (344→122), reqblk, codesdb, sdb.
 - **MEM_CLEANUP** (P36): body spins in ADDTO_MMLIST.
 - **PR_CLEANUP** (P38): idle scheduler loop — needs Shell.
 
-### Next blocker: SYS_PROC_INIT body — NULL pointers in process creation
+### Next blocker: SYS_PROC_INIT body — DS_OPEN BIND_DATASEG path
 
-P35 disabled: SYS_PROC_INIT → Make_SProcess. Both MAKE_SYSDATASEG
-calls are discsize=0 (resident, memory-only — no FS needed). The crash
-comes from BLD_SEG receiving a NULL c_sdb_ptr and Signal_sem dereferencing
-NULL wait_queue during the second Make_SProcess call. Root cause is in
-CreateProcess → Build_Syslocal pointer chain, not in FS code.
+P35 disabled: SYS_PROC_INIT reaches Make_SProcess. MAKE_DATASEG
+receives correct params (disc_size=0, dstype=ds_private, ldsn=-1/-2).
+P79c/d fixed BLD_SEG's NULL c_sdb_ptr. P79e fixed GetFCB/ENQUEUE
+NULL leftlink. Remaining: DS_OPEN body writes through NULL in the
+BIND_DATASEG/MMU setup path (VEC-GUARD at $019D18 etc.).
 
 ### Roadmap to fully bootable Lisa desktop
 
