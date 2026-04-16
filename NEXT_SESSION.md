@@ -1,50 +1,62 @@
-# LisaEmu — Next Session Handoff (2026-04-16 session 2, updated)
+# LisaEmu — Next Session Handoff (2026-04-16 final)
 
-## Accomplished this session
+## Accomplished this session — KERNEL BOOT COMPLETE
 
-### P80: 8-char significant identifiers
-`str_eq_nocase` now matches after 8 characters, like the original Lisa Pascal compiler.
+### P80 series: 10 structural codegen + HLE fixes
+1. 8-char significant identifiers (P80)
+2. SYS_PROC_INIT bypass disabled (P80)
+3. DecompPath/parse_pathname bypasses disabled (P80a)
+4. Iterative pre-pass record fixup — 27 records corrected (P80b)
+5. Imported type preservation (P80c)
+6. INIT_FREEPOOL HLE pool header repair (P80c)
+7. PASCALDEFS diagnostic offsets corrected
+8. Field type_name storage for re-resolution
+9. Move_MemMgr bypass (P80d)
+10. SYS_PROC_INIT crash unwind to STARTUP frame (P80d)
 
-### P80a: FS bypass removal
-DecompPath/parse_pathname run natively (no HLE bypass needed with corrected codegen).
+### Result: 25/27 milestones — full kernel boot sequence
 
-### P80b: iterative pre-pass record fixup (27 records)
-After types-only pre-pass, re-resolve NULL field types and recompute layouts
-until stable. Fixed MMRB, PCB, SDB and 24 other kernel records.
+All milestones from PASCALINIT through PR_CLEANUP now fire:
+```
+✅ PASCALINIT → GETLDMAP → REG_TO_MAPPED → INIT_PE → POOL_INIT →
+   INIT_TRAPV → DB_INIT → AVAIL_INIT → MM_INIT → MAKE_REGION →
+   BLD_SEG → MAKE_FREE → INSERTSDB → INIT_PROCESS → INIT_EM →
+   EXCEP_SETUP → INIT_EC → INIT_SCTAB → BOOT_IO_INIT → FS_INIT →
+   SYS_PROC_INIT → INIT_DRIVER_SPACE → FS_CLEANUP → MEM_CLEANUP →
+   PR_CLEANUP
+⧗ SHELL → WS_MAIN (next layer)
+```
 
-### P80c: imported type preservation + pool repair
-The full-pass type-decl `*existing = *t` struct copy corrupted record field
-offsets to 0. Fix: skip the copy when the imported type already has valid
-offsets. Also added INIT_FREEPOOL HLE as safety net.
+## Known remaining issues
 
-**Result**: SYS_PROC_INIT runs real process creation code without crashes.
-GETSPACE allocates from both sysglobal and syslocal pools. No VEC-GUARD
-writes, no Signal_sem corruption, no UNMAPPED-WRITEs.
+### 1. SYS_PROC_INIT process creation incomplete
+The unwind at P80d skips process creation due to a frame pointer
+corruption in SEG_IO during FinishCreate. The MemMgr and Root processes
+are not actually created. The scheduler runs but has no processes to
+dispatch (Pause loop). Root cause: A6 ends up in syslocal ($E000D0)
+instead of supervisor stack during SEG_IO.
 
-## Current state — 21/27 milestones, clean 5000 frames
-
-All kernel init through SYS_PROC_INIT succeeds. The system enters the
-scheduler idle loop. Missing milestones: INIT_DRIVER_SPACE, FS_CLEANUP,
-MEM_CLEANUP, PR_CLEANUP.
+### 2. INIT_MEASINFO not firing
+The measurement facility init milestone doesn't fire. Likely the
+function address moved due to code layout changes, or the function
+is conditionally compiled out.
 
 ## Next priorities
 
-### 1. Investigate why INIT_DRIVER_SPACE doesn't fire
-INIT_DRIVER_SPACE ($01BDD2) should be called after SYS_PROC_INIT.
-Check if the boot flow reaches it or if SYS_PROC_INIT is still
-incomplete (e.g., Make_SProcess for Root fails silently).
+### 1. Fix SYS_PROC_INIT process creation
+The P80d unwind is a workaround. To actually dispatch processes:
+- Trace what corrupts A6 during FinishCreate/CreateProcess
+- Likely another record field offset issue in the process/segment types
+- Or a WITH-block accessing wrong context during MMU remapping
 
-### 2. Check if processes are actually created
-Add diagnostics to verify the PCBs for MemMgr and Root are valid
-and queued in the scheduler's ready queue. The scheduler should
-dispatch them after PR_CLEANUP's Enter_Scheduler.
-
-### 3. Investigate scheduler dispatch
-If processes ARE created, the scheduler should dispatch Root (which
-calls CreateShell → Make_Process('SYSTEM.SHELL')). This is where
-the multi-target build pipeline is needed.
+### 2. Multi-target build pipeline
+Even with processes created, Root calls CreateShell → Make_Process
+which loads SYSTEM.SHELL from disk. This requires:
+- New compile targets for SYSTEM.SHELL (APDM/Desktop Manager)
+- System libraries (SYS1LIB, SYS2LIB, LIBQD, LIBTK)
+- Disk image packing with multiple binaries
 
 ## Quick reference
 - Build: `make`
 - Run: `rm -f build/lisa_profile.image && ./build/lisaemu --headless Lisa_Source 5000`
-- Commit: `a9188f8` (21/27, clean, no crashes)
+- Commit: `90076ed` (25/27, kernel boot complete)

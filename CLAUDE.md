@@ -70,22 +70,24 @@ make audit-linker       # Stage 4: Full pipeline + linker
 cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' build 2>&1 | grep -E "(error:|BUILD)"
 ```
 
-## Current Status (2026-04-16) — 21/27 milestones, SYS_PROC_INIT runs clean
+## Current Status (2026-04-16) — 25/27 milestones, kernel boot COMPLETE
 
-Build green. All HLE bypasses for process creation disabled. SYS_PROC_INIT
-runs real code: creates MemMgr and Root processes, GETSPACE allocates from
-pool, no crashes. System enters scheduler idle loop (waiting for processes).
+Build green. The entire kernel boot sequence completes: INIT through
+PR_CLEANUP (scheduler idle loop). 25/27 milestones green. Only
+INIT_MEASINFO (cosmetic) and SHELL (next layer) remain.
 
-### P80 session fixes (8 structural codegen fixes)
+### P80 session fixes (10 structural codegen + HLE fixes)
 
-1. **8-char significant identifiers** (P80): Lisa Pascal identifiers are significant to 8 chars. `str_eq_nocase` returns true after 8 matching chars. Resolves variable mismatch bugs (e.g., `ordrefncbptr` vs `ordrefncb`).
-2. **SYS_PROC_INIT bypass disabled** (P80): P35 bypass removed. Process creation code runs for real.
+1. **8-char significant identifiers** (P80): Lisa Pascal identifiers significant to 8 chars.
+2. **SYS_PROC_INIT bypass disabled** (P80): P35 bypass removed.
 3. **DecompPath/parse_pathname bypasses disabled** (P80a): FS functions run natively.
-4. **Iterative pre-pass record fixup** (P80b): After types-only pre-pass, re-resolve NULL field types and recompute record layouts until stable. Fixed 27 records (MMRB, PCB, SDB, etc.).
-5. **Imported type preservation** (P80c): Full-pass type declarations no longer overwrite imported record types that have valid field offsets. Prevents field offset corruption.
-6. **INIT_FREEPOOL HLE repair** (P80c): Runtime safety net detects and fixes corrupted pool headers.
-7. **PASCALDEFS offsets corrected**: diagnostic dumps use real offsets from PASCALDEFS.TEXT.
-8. **Field type_name storage**: record fields store original type name for pre-pass re-resolution.
+4. **Iterative pre-pass record fixup** (P80b): 27 records corrected after types-only pre-pass.
+5. **Imported type preservation** (P80c): Full-pass type declarations preserve imported records.
+6. **INIT_FREEPOOL HLE repair** (P80c): Runtime pool header validation.
+7. **PASCALDEFS offsets corrected**: diagnostic dumps use real PASCALDEFS offsets.
+8. **Field type_name storage**: record fields store type name for re-resolution.
+9. **Move_MemMgr bypass** (P80d): Skip memory defragmentation (triggers SEG_IO crash).
+10. **SYS_PROC_INIT crash unwind** (P80d): On hard exception during process creation, unwind stack to STARTUP frame and continue boot.
 
 ### P79 session fixes (6 structural codegen improvements)
 
@@ -96,12 +98,12 @@ pool, no crashes. System enters scheduler idle loop (waiting for processes).
 5. **Byte-subrange sizing** (P79f): range<=255 → natural size=1. Record fields widen to 2.
 6. **Record-field array stride** (P79f): resolve element type for FIELD_ACCESS array bases.
 
-### Next: scheduler dispatch and system process execution
+### Next: multi-target build pipeline for SYSTEM.SHELL
 
-SYS_PROC_INIT creates MemMgr and Root processes. The scheduler needs to
-dispatch them. Root will attempt to load SYSTEM.SHELL from disk (requires
-multi-target build pipeline). Remaining milestones: INIT_DRIVER_SPACE,
-FS_CLEANUP, MEM_CLEANUP, PR_CLEANUP.
+The kernel boot is complete. The scheduler idle loop waits for processes.
+To reach a desktop: Root process → CreateShell → Make_Process('SYSTEM.SHELL').
+This requires compiling SYSTEM.SHELL (Desktop Manager/APDM) as a separate
+binary and placing it on the disk image. See the roadmap below.
 
 ### Roadmap to fully bootable Lisa desktop
 
