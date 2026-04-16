@@ -2897,7 +2897,10 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
          * - UNLOCKSEGS walks corrupt seglock sentinel → RELSPACE spin
          * Both are downstream of c_syslocal_ptr miscalculation. */
 
-        /* P77 diagnostic probes removed — see NEXT_SESSION.md */
+        /* P78 probes removed — LDSN_TO_MMU and MMU_BASE work correctly
+         * after the P77 EXT.L fix. Build_Syslocal's syslocal sentinel
+         * stores are still not landing (separate issue in the refdb LDSN
+         * lookup or WITH-block address-of computation). */
 
         /* P41: Cache all HLE bypass addresses by symbol name rather
          * than hardcoding post-link offsets. This makes every HLE
