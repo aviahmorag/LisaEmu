@@ -109,4 +109,11 @@ void lisa_mem_write32(lisa_mem_t *mem, uint32_t addr, uint32_t val);
 /* Get pointer to video RAM for display rendering */
 const uint8_t *lisa_mem_get_video(lisa_mem_t *mem);
 
+/* Register the active memory struct so diagnostics can inspect MMU state
+ * without plumbing a pointer through the CPU callback layer. */
+void lisa_mmu_register(lisa_mem_t *mem);
+
+/* Diagnostic: dump all configured segments for the current context to stderr. */
+void lisa_mmu_dump_segments(void);
+
 #endif /* LISA_MMU_H */

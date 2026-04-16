@@ -1296,6 +1296,7 @@ void lisa_init(lisa_t *lisa) {
     /* Initialize components */
     m68k_init(&lisa->cpu);
     lisa_mem_init(&lisa->mem);
+    lisa_mmu_register(&lisa->mem);
     via_init(&lisa->via1);
     via_init(&lisa->via2);
     cops_queue_init(&lisa->cops_rx);

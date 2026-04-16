@@ -24,6 +24,33 @@
 
 int mmu_write_count_global = 0;
 
+/* Active memory pointer for diagnostic hooks. lisa_init() registers. */
+static lisa_mem_t *g_active_mem = NULL;
+
+void lisa_mmu_register(lisa_mem_t *mem) {
+    g_active_mem = mem;
+}
+
+void lisa_mmu_dump_segments(void) {
+    lisa_mem_t *mem = g_active_mem;
+    if (!mem) {
+        fprintf(stderr, "  [MMU-DUMP] (no active mem)\n");
+        return;
+    }
+    int ctx = mem->current_context;
+    if (ctx >= MMU_NUM_CONTEXTS) ctx = 0;
+    fprintf(stderr, "  [MMU-DUMP] ctx=%d setup=%d configured segs:\n",
+            ctx, mem->setup_mode);
+    for (int si = 0; si < MMU_NUM_SEGMENTS; si++) {
+        mmu_segment_t *s = &mem->segments[ctx][si];
+        if (!s->changed) continue;
+        uint32_t seg_base = (uint32_t)si << 17;
+        uint32_t phys_base = ((uint32_t)s->sor << 9);
+        fprintf(stderr, "    seg%-3d virt=$%06X SOR=$%03X SLR=$%03X chg=$%X → phys=$%06X\n",
+                si, seg_base, s->sor, s->slr, s->changed, phys_base);
+    }
+}
+
 void lisa_mem_init(lisa_mem_t *mem) {
     memset(mem, 0, sizeof(lisa_mem_t));
 

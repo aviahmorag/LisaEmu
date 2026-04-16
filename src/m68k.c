@@ -7,6 +7,7 @@
  */
 
 #include "m68k.h"
+#include "lisa_mmu.h"
 #include "boot_progress.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -5351,6 +5352,110 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         cpu->cycles = 0;
         uint32_t sp_before = cpu->a[7];
         uint32_t pc_before = cpu->pc;
+
+        /* P81b: long-running trace of MemMgr user-mode execution.
+         * MemMgr runs for many instructions then something corrupts A0
+         * before a JMP (A0) (likely at INTSOFF/TRAP7 path). One-shot
+         * activation on first super→user transition; keep tracing for
+         * up to P81B_MAX instructions regardless of SR. Also arm a trip
+         * that fires when A0 suddenly becomes unreadable (high byte
+         * set or non-RAM/ROM/IO). */
+        {
+            /* Ring of recent (PC, op, A0, D0) for trip-proximity postmortem. */
+            #define P81B_RING 32
+            static int p81b_armed = 0;
+            static int p81b_count = 0;
+            static int p81b_tripped = 0;
+            static int p81b_ring_idx = 0;
+            static int p81b_gen_local = -1;
+            static uint32_t p81b_ring_pc[P81B_RING];
+            static uint16_t p81b_ring_op[P81B_RING];
+            static uint32_t p81b_ring_a0[P81B_RING];
+            static uint32_t p81b_ring_d0[P81B_RING];
+            if (p81b_gen_local != g_emu_generation) {
+                p81b_armed = 0;
+                p81b_count = 0;
+                p81b_tripped = 0;
+                p81b_ring_idx = 0;
+                memset(p81b_ring_pc, 0, sizeof(p81b_ring_pc));
+                memset(p81b_ring_op, 0, sizeof(p81b_ring_op));
+                memset(p81b_ring_a0, 0, sizeof(p81b_ring_a0));
+                memset(p81b_ring_d0, 0, sizeof(p81b_ring_d0));
+                p81b_gen_local = g_emu_generation;
+            }
+            int is_super = (cpu->sr & SR_SUPERVISOR) != 0;
+            if (!p81b_armed && !is_super && cpu->pc >= 0x040000 && cpu->pc < 0x080000) {
+                p81b_armed = 1;
+                p81b_count = 0;
+                fprintf(stderr, "[P81b] armed at first user-mode entry PC=$%06X\n", cpu->pc);
+                lisa_mmu_dump_segments();
+            }
+            if (p81b_armed) {
+                uint32_t vpc = cpu->pc;
+                int idx = p81b_ring_idx & (P81B_RING - 1);
+                p81b_ring_pc[idx] = vpc;
+                p81b_ring_op[idx] = cpu_read16(cpu, vpc);
+                p81b_ring_a0[idx] = cpu->a[0];
+                p81b_ring_d0[idx] = cpu->d[0];
+                p81b_ring_idx++;
+
+                /* P81c targeted probe: when PC reaches $041BD8 (MOVE.L d16(A0),D0)
+                 * dump A0, the disp, and the computed memory address + a window. */
+                static int p81c_fired = 0;
+                static int p81c_gen2 = -1;
+                if (p81c_gen2 != g_emu_generation) { p81c_fired = 0; p81c_gen2 = g_emu_generation; }
+                if (!p81c_fired && vpc == 0x041BD8) {
+                    p81c_fired = 1;
+                    uint32_t a0v = cpu->a[0];
+                    int16_t disp = (int16_t)cpu_read16(cpu, 0x041BDA);
+                    uint32_t ea = (a0v + (int32_t)disp) & 0xFFFFFF;
+                    fprintf(stderr, "[P81c] PC=$041BD8 A0=$%08X disp=%d ea=$%06X val=$%08X\n",
+                            a0v, disp, ea, cpu_read32(cpu, ea));
+                    fprintf(stderr, "  window around ea:");
+                    for (int di = -16; di <= 16; di += 4) {
+                        uint32_t ad = (ea + di) & 0xFFFFFF;
+                        fprintf(stderr, " [%+d]$%08X", di, cpu_read32(cpu, ad));
+                    }
+                    fprintf(stderr, "\n");
+                    fprintf(stderr, "  full call chain (A6 walk from $%08X):\n", cpu->a[6]);
+                    uint32_t fp = cpu->a[6] & 0xFFFFFF;
+                    for (int k = 0; k < 8 && fp > 0x400 && fp < 0xFFFFFF; k++) {
+                        uint32_t saved = cpu_read32(cpu, fp) & 0xFFFFFF;
+                        uint32_t ret = cpu_read32(cpu, (fp + 4) & 0xFFFFFF) & 0xFFFFFF;
+                        fprintf(stderr, "    frame[%d]: A6=$%06X saved=$%06X ret=$%06X\n",
+                                k, fp, saved, ret);
+                        if (saved <= fp || saved == 0) break;
+                        fp = saved;
+                    }
+                }
+                /* Trip: A0/A1/A2 or PC has high byte set. D-regs are allowed
+                 * to have high bits (SWAP/MULU for 32-bit math). */
+                int bad = ((cpu->a[0] & 0xFF000000) != 0) ||
+                          ((cpu->a[1] & 0xFF000000) != 0) ||
+                          ((cpu->a[2] & 0xFF000000) != 0) ||
+                          ((vpc & 0xFF000000) != 0);
+                if (!p81b_tripped && bad) {
+                    p81b_tripped = 1;
+                    fprintf(stderr, "[P81b-TRIP] iter=%d PC=$%08X SR=$%04X\n"
+                            "  D0=$%08X D1=$%08X A0=$%08X A1=$%08X A2=$%08X A5=$%08X A6=$%08X A7=$%08X\n",
+                            p81b_count, vpc, cpu->sr,
+                            cpu->d[0], cpu->d[1], cpu->a[0], cpu->a[1], cpu->a[2],
+                            cpu->a[5], cpu->a[6], cpu->a[7]);
+                    fprintf(stderr, "  [ring %d instr leading to trip]:\n", P81B_RING);
+                    for (int k = P81B_RING - 1; k >= 0; k--) {
+                        int ri = (p81b_ring_idx - 1 - k) & (P81B_RING - 1);
+                        fprintf(stderr, "    -%2d PC=$%06X op=%04X A0=$%08X D0=$%08X\n",
+                                k, p81b_ring_pc[ri], p81b_ring_op[ri],
+                                p81b_ring_a0[ri], p81b_ring_d0[ri]);
+                    }
+                }
+                /* First 24 + 4 past trip only, to cap log volume */
+                if (p81b_count < 24 || (p81b_tripped && p81b_count < 2200)) {
+                    /* no-op, handled via trip dump */
+                }
+                p81b_count++;
+            }
+        }
 
         /* HLE: Lisabug auto-entry bypass — execution-time.
          *
