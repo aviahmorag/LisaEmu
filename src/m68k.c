@@ -3091,6 +3091,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         if (pc_SYS_PROC_INIT && cpu->pc == pc_SYS_PROC_INIT && !g_vec_guard_active) {
             g_vec_guard_active = 1;
         }
+        /* (P79-diag removed — BLD_SEG push direction bug diagnosed and fixed) */
         /* P35: SYS_PROC_INIT bypass. Both MAKE_SYSDATASEG calls are
          * resident (discsize=0, memory-only), so the FS isn't the issue.
          * The crash comes from BLD_SEG/Signal_sem with NULL pointers in

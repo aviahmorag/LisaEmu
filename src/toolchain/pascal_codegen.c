@@ -1943,8 +1943,15 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
             cg_proc_sig_t *sig = find_proc_sig(cg, fn);
             cg_symbol_t *callee_sym = find_global(cg, fn);
             if (!callee_sym) callee_sym = find_imported(cg, fn);
-            bool is_callee_clean = (callee_sym && callee_sym->is_external) ||
-                                   (sig && sig->is_external);
+            /* P79: prefer the sig's is_external over the symbol's. The sig
+             * was already resolved by find_proc_sig to prefer the non-external
+             * body sig (P20 fix). But find_global may return the EXTERNAL
+             * declaration symbol from an $I'd interface (e.g., BLD_SEG declared
+             * external in MMPRIM but body defined in MM1). If the sig says
+             * non-external, trust it — the push direction must match the body,
+             * not the forward declaration. */
+            bool is_callee_clean = sig ? sig->is_external :
+                                   (callee_sym && callee_sym->is_external);
             {
 
             /* Push order: left-to-right for callee-clean (assembly),
@@ -2356,8 +2363,9 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                 cg_proc_sig_t *call_sig = find_proc_sig(cg, node->name);
                 cg_symbol_t *call_sym = find_global(cg, node->name);
                 if (!call_sym) call_sym = find_imported(cg, node->name);
-                bool call_callee_clean = (call_sym && call_sym->is_external) ||
-                                         (call_sig && call_sig->is_external);
+                /* P79: same fix as PROC_CALL — prefer sig's is_external */
+                bool call_callee_clean = call_sig ? call_sig->is_external :
+                                         (call_sym && call_sym->is_external);
 
                 /* Push arguments with correct sizes.
                  * Non-primitive value params (RECORD/STRING/ARRAY) are passed

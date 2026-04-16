@@ -769,6 +769,20 @@ build_result_t toolchain_build(const char *source_dir,
     if (startup_idx >= 0) {
         compile_pascal_file_impl(files[startup_idx].path, lk, true);
     }
+    /* P79-diag: check key record sizes after pre-pass */
+    for (int ti = 0; ti < num_shared_types; ti++) {
+        type_desc_t *t = &shared_types[ti];
+        if (t->kind == TK_RECORD && t->num_fields > 0 &&
+            (strcasecmp(t->name, "addrdisc") == 0 ||
+             strcasecmp(t->name, "discaddr") == 0 ||
+             strcasecmp(t->name, "Tsdbtype") == 0 ||
+             strcasecmp(t->name, "segHandle") == 0)) {
+            fprintf(stderr, "  [TYPE] %s: size=%d fields=%d\n", t->name, t->size, t->num_fields);
+            for (int f = 0; f < t->num_fields; f++)
+                fprintf(stderr, "    @%d %s sz=%d\n", t->fields[f].offset, t->fields[f].name,
+                        t->fields[f].type ? t->fields[f].type->size : -1);
+        }
+    }
     fprintf(stderr, "Types-only pre-pass complete: %d shared types, %d shared globals (constants)\n",
             num_shared_types, num_shared_globals);
 
