@@ -162,6 +162,8 @@ static void init_builtin_types(codegen_t *cg) {
     add_type(cg, "text", TK_FILE, 0);
 }
 
+static cg_symbol_t *add_global_sym(codegen_t *cg, const char *name, type_desc_t *type);
+
 static int type_size(type_desc_t *t) {
     if (!t) return 2; /* default word */
     return t->size;
@@ -414,6 +416,21 @@ static type_desc_t *resolve_type(codegen_t *cg, ast_node_t *node) {
 
         case AST_TYPE_ENUM: {
             type_desc_t *t = add_type(cg, "", TK_ENUM, 2);
+            /* P79e: register each enum value as a CONST with its ordinal.
+             * Without this, identifiers like dsmake_nf (=1) resolve to 0
+             * at call sites, breaking enum parameter passing. */
+            for (int i = 0; i < node->num_children; i++) {
+                if (node->children[i]->type == AST_IDENT_EXPR && node->children[i]->name[0]) {
+                    cg_symbol_t *cs = find_global(cg, node->children[i]->name);
+                    if (!cs) {
+                        cs = add_global_sym(cg, node->children[i]->name, t);
+                        if (cs) {
+                            cs->is_const = true;
+                            cs->offset = i;  /* ordinal value */
+                        }
+                    }
+                }
+            }
             return t;
         }
 

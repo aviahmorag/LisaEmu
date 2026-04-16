@@ -3091,15 +3091,15 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         if (pc_SYS_PROC_INIT && cpu->pc == pc_SYS_PROC_INIT && !g_vec_guard_active) {
             g_vec_guard_active = 1;
         }
-        /* (P79c probes removed — BLD_SEG push direction confirmed fixed) */
+        /* (P79e probes removed — enum constant fix verified) */
         /* P35: SYS_PROC_INIT bypass. Both MAKE_SYSDATASEG calls are
          * resident (discsize=0, memory-only), so the FS isn't the issue.
          * The crash comes from BLD_SEG/Signal_sem with NULL pointers in
          * the process creation chain (CreateProcess → Build_Syslocal).
          * Root cause needs investigation in the process creation code. */
-        /* P35: SYS_PROC_INIT bypass. P79c fixed BLD_SEG's push direction
-         * but ENQUEUE and beg_locrefnum still write through NULL pointers
-         * during process creation. Further investigation needed. */
+        /* P35: SYS_PROC_INIT bypass. P79e fixed enum constants, eliminating
+         * GetFCB/ENQUEUE NULL. DS_OPEN body still writes through NULL in
+         * BIND_DATASEG path. Further investigation needed. */
         if (pc_SYS_PROC_INIT && cpu->pc == pc_SYS_PROC_INIT) {
             boot_progress_record_pc(cpu->pc);  /* P45: ensure milestone fires even though body skipped */
             uint32_t sp = cpu->a[7] & 0xFFFFFF;
