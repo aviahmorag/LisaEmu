@@ -1,52 +1,47 @@
 # LisaEmu — Next Session Handoff (2026-04-16)
 
-## Session: 20+ codegen fixes, BOTH processes created
+## Session: 20+ codegen fixes, SCHEDULER DISPATCHES
 
-### Key discoveries:
-1. **8-char identifiers**, **27 record layouts**, **non-local goto/exit A6 restore**
-2. **Boolean NOT for functions**, **enum/const priority**, **record repair generalization**
-3. **MAKE_SYSDATASEG stack pop fix** (double-pop corrupted second call)
-4. **exit(proc) non-local unwind** (same as goto — follows static link chain)
-5. **Root cause identified**: *existing = *t struct copy creates dangling type pointers
+### Milestone: the scheduler dispatches processes!
+Both MemMgr and Root are created, queued in fwd_ReadyQ, and the
+scheduler's SelectProcess finds them and attempts Launch. They crash
+immediately because the environment save area is uninitialized.
 
-### Result: 25/27 milestones, both processes created via HLE chain:
-- MAKE_SYSDATASEG: 4 segments allocated (syslocal+stack × 2 processes)
-- CreateProcess/ModifyProcess/FinishCreate: bypassed (6 calls total)
-- Move_MemMgr: bypassed
-- Scheduler runs in idle loop (Pause instruction)
+## Two issues blocking process execution
 
-## Current state: processes not dispatchable
+### 1. ord(@proc) generates wrong address
+`ord(@MemMgr)` produces $CCB802 (A5-relative global var offset) instead
+of $043F56 (code address). The codegen for `@proc_name` treats procedure
+names as global variables instead of code symbols. This means start_PC
+in Make_SProcess is wrong for both MemMgr and Root.
 
-Both MemMgr and Root are "created" (memory allocated) but PCBs are
-uninitialized. The scheduler scans fwd_ReadyQ which is empty.
+Fix: in gen_expression for `@ident`, check if the identifier is a
+procedure/function (via proc sig lookup) and emit its code address
+(from the linker relocation) instead of an A5-relative offset.
 
-## Next priorities
+### 2. Environment save area not initialized
+CreateProcess HLE sets PCB.priority and blk_state but doesn't set up
+the syslocal's env_save_area. The scheduler's Launch loads:
+- PC from env_save_area.PC (offset 0)
+- SR from env_save_area.SR (offset 4)  
+- A5 from env_save_area.A5 (offset 0 of the env block?)
+- A6, A7 from env_save_area
 
-### 1. HLE PCB initialization + Queue_Process
-Minimum to make processes dispatchable:
-- Set PCB.priority (250 MemMgr, 230 Root)
-- Set PCB.blk_state = 0 (empty set = ready)
-- Set PCB.proctype = sys
-- Set up syslocal env_save_area (A5=sysA5, PC=start_PC, SR=0, etc.)
-- Insert PCB into fwd_ReadyQ
+The env_save_area is in the syslocal segment. For MemMgr:
+- syslocal at $CCC000
+- env_save_area offset = from syslocal record (check SYSGLOBAL type)
 
-The PCB address is from GETSPACE #41/#42. The syslocal/stack addresses
-are from MAKE_SYSDATASEG HLE ($CCC000, $CCCC00, $CCDE00, $CCEA00).
+Fix: in CreateProcess HLE, write correct values to the env_save_area
+at the right offset within the syslocal segment.
 
-### 2. Fix root cause: type pointer dangling
-The *existing = *t struct copy in type-decl processing copies type
-pointers from cg->types (freed after compilation) into shared_types.
-These become dangling pointers when cg is reused. The proper fix:
-after the copy, remap ALL internal type pointers (field types, base
-types) from cg->types to shared_types, like the REMAP_TYPE_PTR logic
-in the pre-pass export code. This would eliminate ALL record offset
-corruption and allow CreateProcess to run natively.
-
-### 3. Multi-target build pipeline
-Once processes dispatch, Root calls CreateShell → Make_Process('SYSTEM.SHELL').
-This requires SYSTEM.SHELL compiled from source and placed on disk image.
+## Segment addresses
+```
+MemMgr: PCB=$CCB880, syslocal=$CCC000(3072B), stack=$CCCC00(4608B)
+Root:   PCB=$CCB8C4, syslocal=$CCDE00(3072B), stack=$CCEA00(10752B)
+```
 
 ## Quick reference
 - Build: `make`
 - Run: `rm -f build/lisa_profile.image && ./build/lisaemu --headless Lisa_Source 5000`
-- Commit: `d7be85e` (25/27, both processes created)
+- Commit: `5e3562c` (scheduler dispatches, processes crash)
+- MemMgr code: $043F56, Root code: check map for 'Root'

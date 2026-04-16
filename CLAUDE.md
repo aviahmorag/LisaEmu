@@ -70,11 +70,12 @@ make audit-linker       # Stage 4: Full pipeline + linker
 cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' build 2>&1 | grep -E "(error:|BUILD)"
 ```
 
-## Current Status (2026-04-16) — 25/27 milestones, both processes created
+## Current Status (2026-04-16) — 25/27 milestones, scheduler dispatches
 
 Build green. Full kernel boot INIT→PR_CLEANUP. Both MemMgr and Root
-processes created via HLE bypass chain. Scheduler runs in idle loop
-(processes not yet in ready queue — need PCB initialization).
+processes created and queued. Scheduler dispatches processes but they
+crash immediately (environment save area not initialized, start_PC wrong).
+Next: fix ord(@proc) codegen and set up syslocal env_save_area.
 
 ### P80 session fixes (20+ structural codegen + HLE fixes)
 
@@ -108,17 +109,15 @@ processes created via HLE bypass chain. Scheduler runs in idle loop
 5. **Byte-subrange sizing** (P79f): range<=255 → size=1
 6. **Record-field array stride** (P79f): resolve element type for field arrays
 
-### Next: process dispatch (PCB initialization)
+### Next: fix process environment for dispatch
 
-Both MemMgr and Root are allocated but their PCBs are uninitialized
-(CreateProcess bypassed). The scheduler needs:
-- PCB.priority set (250 for MemMgr, 230 for Root)
-- PCB.blk_state = empty set (ready)
-- Environment save area in syslocal (A5, PC, A6, A7, SR)
-- Process queued via Queue_Process → fwd_ReadyQ
-
-Either fix CreateProcess codegen (root cause: dangling type pointers
-from *existing = *t struct copy) or build HLE PCB + Queue_Process.
+Scheduler dispatches but processes crash immediately. Two issues:
+1. **ord(@proc) codegen**: `ord(@MemMgr)` generates $CCB802 (global var
+   offset) instead of $043F56 (code address). Need to fix address-of
+   for procedure identifiers.
+2. **Environment save area**: CreateProcess HLE needs to set up the
+   syslocal's env_save_area with correct A5, PC, A6, A7, SR values
+   so Launch can restore registers and jump to the entry point.
 
 ### Roadmap to fully bootable Lisa desktop
 
