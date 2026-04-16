@@ -70,34 +70,38 @@ make audit-linker       # Stage 4: Full pipeline + linker
 cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' build 2>&1 | grep -E "(error:|BUILD)"
 ```
 
-## Current Status (2026-04-16) — 21/27 milestones, P35 disabled
+## Current Status (2026-04-16) — 21/27 milestones, SYS_PROC_INIT runs clean
 
-Build green. P35 (SYS_PROC_INIT bypass) disabled — body runs for real.
-Stalls during MAKE_DATASEG due to corrupted MMRB semaphore.
+Build green. All HLE bypasses for process creation disabled. SYS_PROC_INIT
+runs real code: creates MemMgr and Root processes, GETSPACE allocates from
+pool, no crashes. System enters scheduler idle loop (waiting for processes).
 
-### P80 session fixes (8-char identifiers + FS bypass removal)
+### P80 session fixes (8 structural codegen fixes)
 
-1. **8-char significant identifiers** (P80): Lisa Pascal identifiers are significant to 8 chars. `str_eq_nocase` now returns true after 8 matching characters. Resolves whole class of variable mismatch bugs (e.g., `ordrefncbptr` vs `ordrefncb`).
+1. **8-char significant identifiers** (P80): Lisa Pascal identifiers are significant to 8 chars. `str_eq_nocase` returns true after 8 matching chars. Resolves variable mismatch bugs (e.g., `ordrefncbptr` vs `ordrefncb`).
 2. **SYS_PROC_INIT bypass disabled** (P80): P35 bypass removed. Process creation code runs for real.
-3. **DecompPath/parse_pathname bypasses disabled** (P80a): FS functions run natively with corrected codegen.
-4. **PASCALDEFS offsets corrected**: diagnostic dumps now use real offsets (-24575, -24785, -25691) from PASCALDEFS.TEXT.
+3. **DecompPath/parse_pathname bypasses disabled** (P80a): FS functions run natively.
+4. **Iterative pre-pass record fixup** (P80b): After types-only pre-pass, re-resolve NULL field types and recompute record layouts until stable. Fixed 27 records (MMRB, PCB, SDB, etc.).
+5. **Imported type preservation** (P80c): Full-pass type declarations no longer overwrite imported record types that have valid field offsets. Prevents field offset corruption.
+6. **INIT_FREEPOOL HLE repair** (P80c): Runtime safety net detects and fixes corrupted pool headers.
+7. **PASCALDEFS offsets corrected**: diagnostic dumps use real offsets from PASCALDEFS.TEXT.
+8. **Field type_name storage**: record fields store original type name for pre-pass re-resolution.
 
 ### P79 session fixes (6 structural codegen improvements)
 
-1. **Record layouts** (P79): string word-padding, CONST pre-pass export. Fixed devrec (70→74), DCB (344→122).
+1. **Record layouts** (P79): string word-padding, CONST pre-pass export.
 2. **Push direction** (P79c): `is_callee_clean` prefers sig's is_external over symbol's.
 3. **Proc sig pre-pass** (P79d): proc sigs exported during types pre-pass.
-4. **Enum constants** (P79e): AST_TYPE_ENUM registers ordinal values. Previously ALL enums resolved to 0.
-5. **Byte-subrange sizing** (P79f): range<=255 → natural size=1. Record fields widen to 2. Arrays stay at 1. Fixed sc_par_no overflow into b_syslocal_ptr.
+4. **Enum constants** (P79e): AST_TYPE_ENUM registers ordinal values.
+5. **Byte-subrange sizing** (P79f): range<=255 → natural size=1. Record fields widen to 2.
 6. **Record-field array stride** (P79f): resolve element type for FIELD_ACCESS array bases.
 
-### Next blocker: MMRB semaphore corruption during MAKE_DATASEG
+### Next: scheduler dispatch and system process execution
 
-P35 disabled: 21/27 milestones. SYS_PROC_INIT enters Make_SProcess →
-Get_Resources → MAKE_DATASEG but WAIT_SEM on c_mmrb^.sds_sem has
-bogus sem_count=-12223 ($D041). MMRB record layout likely wrong —
-either field sizes differ from Apple's compiler or MM_INIT generates
-wrong initialization code. See NEXT_SESSION.md for detailed trace.
+SYS_PROC_INIT creates MemMgr and Root processes. The scheduler needs to
+dispatch them. Root will attempt to load SYSTEM.SHELL from disk (requires
+multi-target build pipeline). Remaining milestones: INIT_DRIVER_SPACE,
+FS_CLEANUP, MEM_CLEANUP, PR_CLEANUP.
 
 ### Roadmap to fully bootable Lisa desktop
 
