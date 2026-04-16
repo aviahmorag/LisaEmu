@@ -1,47 +1,52 @@
-# LisaEmu — Next Session Handoff (2026-04-16 final)
+# LisaEmu — Next Session Handoff (2026-04-16)
 
-## Accomplished this session — 13 structural codegen fixes
+## Session summary — 16 structural codegen fixes (P80–P80f)
 
-### P80: 8-char identifiers, P80a: FS bypass removal
-### P80b: 27 record layouts fixed, P80c: imported type preservation
-### P80d: SYS_PROC_INIT unwind, Move_MemMgr bypass
-### P80e: non-local goto fix, boolean NOT fix, CHK_LDSN_FREE bypass
+### Key discoveries:
+1. **8-char significant identifiers** (P80): fundamental codegen fix
+2. **27 record layouts corrected** (P80b): pre-pass type resolution ordering
+3. **Non-local goto A6 restore** (P80e): nested proc gotos follow static link
+4. **Boolean NOT for functions** (P80e): `not SYS_CALLED` used bitwise NOT.W
+5. **Record field offset corruption**: full-pass `*existing = *t` zeroes offsets
+6. **Generalized record repair** (P80f): auto-detect and replace corrupt records
+7. **e_ldsnfree constant mismatch**: compiled code uses 3, source says 1
 
-**Result**: 25/27 kernel milestones green (with SYS_PROC_INIT unwind).
-Full boot sequence INIT→PR_CLEANUP completes. Scheduler idle loop runs.
+### Result: 25/27 kernel milestones, full boot INIT→PR_CLEANUP
 
-## Current blocker: MAKE_DATASEG DS_OPEN failure
+## Current blocker: DS_OPEN fails during process creation
 
-### Symptom
-Make_SProcess → Get_Resources → MAKE_SYSDATASEG → MAKE_DATASEG fails.
-RECOVER fires with error=-18032 (garbage). CHK_LDSN_FREE passes (bypassed
-for ldsn=-1). The error comes from AFTER CHK_LDSN_FREE, likely from
-DS_OPEN or WAIT_SEM.
+MAKE_DATASEG → DS_OPEN returns error, even with CHK_LDSN_FREE bypassed
+and e_ldsnfree constant matched. The DS_OPEN failure (RECOVER error=0)
+is from deep inside the segment open path. Two calls fail:
+1. ret=$01A380 (syserrbase+$808) — inside DS_OPEN/OPENIT code
+2. ret=$01A8D2 (MAKE_DATASEG+$398) — another error check in MAKE_DATASEG
 
-### Root cause hypothesis
-The error -18032 ($B990) is a garbage value, suggesting a record field
-read at a wrong offset. The imported type preservation (P80c) protects
-records in shared_types, but the LOCAL types in the full-pass compilation
-still have the offset corruption bug (all fields at offset 0).
+## Root cause: constant value resolution bug
 
-DS_OPEN accesses records (SDB, refdb, FCB) that may have corrupted field
-layouts. The WITH blocks inside DS_OPEN/OPENIT read from wrong offsets.
+The e_ldsnfree mismatch (source=1, compiled=3) suggests our compiler
+incorrectly resolves CONST values. This likely affects OTHER constants
+too (e_dupds, e_nodiscspace, etc.), causing DS_OPEN's internal checks
+to use wrong comparison values. This is a systemic issue that needs a
+proper fix in the codegen's constant resolution.
 
-### Next steps
-1. **Extend imported type preservation**: also protect pointer base types
-   from being overwritten. Currently only named records are protected —
-   pointer types that reference records may still get corrupted copies.
+## Next priorities
 
-2. **Add WITH-block runtime validation**: in `with_lookup_field`, detect
-   records with all-zero offsets (the corruption signature) and auto-repair
-   from imported types for ANY record, not just hdr_freepool.
+### 1. Fix constant value resolution
+Check how CONST declarations in DS0's INTERFACE are imported and
+resolved in DS2. The issue might be:
+- Constants imported from the pre-pass get wrong values
+- The 8-char matching collides two constant names
+- Constants are resolved as declaration ORDER instead of explicit VALUE
 
-3. **Alternative**: bypass MAKE_DATASEG entirely for system segments
-   (discsize=0, ldsn<0). Allocate memory directly, set up MMU mapping,
-   create a minimal SDB, and return. This avoids the complex DS_OPEN path.
+### 2. Alternative: bypass MAKE_DATASEG for system segments
+For disc_size=0 and ldsn<0, create a minimal memory segment directly:
+- Allocate physical memory via GETSPACE
+- Program MMU for the new segment
+- Create a minimal SDB (segment descriptor block)
+- Return seg_ptr and refnum
+This avoids the complex DS_OPEN path entirely.
 
 ## Quick reference
 - Build: `make`
 - Run: `rm -f build/lisa_profile.image && ./build/lisaemu --headless Lisa_Source 5000`
-- Commit: `fbf8055` (25/27, kernel boot complete, process creation WIP)
-- Key structural fixes: non-local goto (P80e), boolean NOT (P80e), 27 records (P80b)
+- Commit: `d9ea218`
