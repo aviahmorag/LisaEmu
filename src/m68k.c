@@ -3087,6 +3087,29 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
          * P71's unary-minus CONST evaluation which made LDSN_TO_MMU
          * receive the correct ldsn value so DS_OPEN computes the right
          * seg_ptr via real MMU_Base. */
+        /* P80b: trace GETSPACE calls to diagnose pool exhaustion.
+         * Codegen pushes: ord_ptr (4), b_area (4), size (2) — left-to-right.
+         * After JSR: SP+0=ret(4), SP+4=size(2), SP+6=b_area(4), SP+10=ord_ptr(4) */
+        if (pc_GETSPACE && cpu->pc == pc_GETSPACE) {
+            uint32_t sp = cpu->a[7] & 0xFFFFFF;
+            int16_t size = (int16_t)cpu_read16(cpu, (sp + 4) & 0xFFFFFF);
+            uint32_t b_area = cpu_read32(cpu, (sp + 6) & 0xFFFFFF);
+            DBGSTATIC(int, gs_count, 0);
+            if (gs_count++ < 30) {
+                fprintf(stderr, "[GETSPACE #%d] size=%d b_area=$%08X ret=$%06X\n",
+                        gs_count, size, b_area, cpu_read32(cpu, sp) & 0xFFFFFF);
+                /* Dump sg_free_pool area (first 32 bytes) */
+                uint32_t a5 = cpu->a[5] & 0xFFFFFF;
+                uint32_t pool = cpu_read32(cpu, (a5 - 24575) & 0xFFFFFF);
+                fprintf(stderr, "  sg_free_pool=$%08X, pool header:\n", pool);
+                if (pool >= 0xCC0000 && pool < 0xCE0000) {
+                    fprintf(stderr, "   ");
+                    for (int j = 0; j < 32; j += 2)
+                        fprintf(stderr, " %04X", cpu_read16(cpu, (pool + j) & 0xFFFFFF));
+                    fprintf(stderr, "\n");
+                }
+            }
+        }
         /* P78d: activate vector table guard when SYS_PROC_INIT entry is reached */
         if (pc_SYS_PROC_INIT && cpu->pc == pc_SYS_PROC_INIT && !g_vec_guard_active) {
             g_vec_guard_active = 1;

@@ -780,59 +780,62 @@ build_result_t toolchain_build(const char *source_dir,
      * field sizes may be wrong — types compiled early couldn't resolve
      * types defined later (e.g., MMRB's semaphore fields defaulted to
      * size 2 because the semaphore type wasn't defined yet).
-     * Fix: re-resolve field types by name and recompute record layouts. */
+     * Fix: re-resolve field types by name and recompute record layouts.
+     * Iterate until stable — transitive dependencies may require multiple
+     * passes (e.g., record A has field of type record B, which itself
+     * had unresolved fields). */
     {
-        int fixups = 0;
-        for (int ti = 0; ti < num_shared_types; ti++) {
-            type_desc_t *t = &shared_types[ti];
-            if (t->kind != TK_RECORD || t->num_fields == 0) continue;
-            int needs_fixup = 0;
-            for (int fi = 0; fi < t->num_fields; fi++) {
-                if (!t->fields[fi].type && t->fields[fi].type_name[0]) {
-                    /* Re-resolve by stored type name */
-                    /* Look up type by name in shared_types (8-char significant) */
-                    type_desc_t *resolved = NULL;
-                    for (int si = 0; si < num_shared_types; si++) {
-                        const char *a = shared_types[si].name;
-                        const char *b = t->fields[fi].type_name;
-                        int n = 0;
-                        while (*a && *b) {
-                            if (toupper((unsigned char)*a) != toupper((unsigned char)*b)) break;
-                            a++; b++; if (++n >= 8) break;
+        int total_fixups = 0;
+        for (int pass = 0; pass < 5; pass++) {  /* max 5 iterations */
+            int fixups = 0;
+            for (int ti = 0; ti < num_shared_types; ti++) {
+                type_desc_t *t = &shared_types[ti];
+                if (t->kind != TK_RECORD || t->num_fields == 0) continue;
+                /* Phase 1: re-resolve any NULL field types */
+                for (int fi = 0; fi < t->num_fields; fi++) {
+                    if (!t->fields[fi].type && t->fields[fi].type_name[0]) {
+                        /* Look up type by name (8-char significant) */
+                        for (int si = 0; si < num_shared_types; si++) {
+                            const char *a = shared_types[si].name;
+                            const char *b = t->fields[fi].type_name;
+                            int n = 0;
+                            while (*a && *b) {
+                                if (toupper((unsigned char)*a) != toupper((unsigned char)*b)) break;
+                                a++; b++; if (++n >= 8) break;
+                            }
+                            if (n >= 8 || *a == *b) {
+                                t->fields[fi].type = &shared_types[si];
+                                break;
+                            }
                         }
-                        if (n >= 8 || *a == *b) { resolved = &shared_types[si]; break; }
-                    }
-                    if (resolved) {
-                        t->fields[fi].type = resolved;
-                        needs_fixup = 1;
                     }
                 }
+                /* Phase 2: recompute field offsets (even if no NULL types were
+                 * found — a field's type may have changed size since last pass) */
+                int offset = 0;
+                for (int fi = 0; fi < t->num_fields; fi++) {
+                    int fs = t->fields[fi].type ? t->fields[fi].type->size : 2;
+                    if (t->fields[fi].type && t->fields[fi].type->kind == TK_STRING && (fs % 2)) fs++;
+                    if (fs == 1 && t->fields[fi].type &&
+                        (t->fields[fi].type->kind == TK_BYTE || t->fields[fi].type->kind == TK_CHAR ||
+                         t->fields[fi].type->kind == TK_SUBRANGE))
+                        fs = 2;
+                    if (fs >= 2 && (offset % 2)) offset++;
+                    t->fields[fi].offset = offset;
+                    offset += fs;
+                }
+                if (offset % 2) offset++;
+                if (offset != t->size) {
+                    fixups++;
+                    t->size = offset;
+                }
             }
-            if (!needs_fixup) continue;
-            /* Recompute field offsets with correct sizes */
-            int offset = 0;
-            for (int fi = 0; fi < t->num_fields; fi++) {
-                int fs = t->fields[fi].type ? t->fields[fi].type->size : 2;
-                /* P79: string padding */
-                if (t->fields[fi].type && t->fields[fi].type->kind == TK_STRING && (fs % 2)) fs++;
-                /* P79f: byte-scalar widening in unpacked records */
-                if (fs == 1 && t->fields[fi].type &&
-                    (t->fields[fi].type->kind == TK_BYTE || t->fields[fi].type->kind == TK_CHAR ||
-                     t->fields[fi].type->kind == TK_SUBRANGE))
-                    fs = 2;
-                /* Word-align fields >= 2 bytes */
-                if (fs >= 2 && (offset % 2)) offset++;
-                t->fields[fi].offset = offset;
-                offset += fs;
-            }
-            if (offset % 2) offset++;
-            if (offset != t->size) {
-                fixups++;
-                t->size = offset;
-            }
+            total_fixups += fixups;
+            if (fixups == 0) break;  /* stable — no more changes */
+            fprintf(stderr, "Pre-pass fixup round %d: recomputed %d record layouts\n", pass + 1, fixups);
         }
-        if (fixups > 0)
-            fprintf(stderr, "Pre-pass fixup: recomputed %d record layouts with resolved types\n", fixups);
+        if (total_fixups > 0)
+            fprintf(stderr, "Pre-pass fixup total: %d records corrected\n", total_fixups);
     }
     fprintf(stderr, "Types-only pre-pass complete: %d shared types, %d shared globals (constants)\n",
             num_shared_types, num_shared_globals);
