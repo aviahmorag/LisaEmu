@@ -2941,7 +2941,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         static uint32_t pc_SYS_PROC_INIT, pc_excep_setup, pc_REG_OPEN_LIST;
         static uint32_t pc_QUEUE_PR, pc_GETSPACE, pc_Wait_sem, pc_MM_Setup;
         static uint32_t pc_unitio, pc_UNLOCKSEGS, pc_Signal_sem, pc_Make_File;
-        static uint32_t pc_SplitPathname;
+        static uint32_t pc_SplitPathname, pc_MAKE_SYSDATASEG;
         static int hle_pc_gen = -1;
         if (hle_pc_gen != g_emu_generation) {
             pc_FS_CLEANUP    = boot_progress_lookup("FS_CLEANUP");
@@ -2959,6 +2959,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             pc_Signal_sem    = boot_progress_lookup("Signal_sem");
             pc_Make_File     = boot_progress_lookup("Make_File");
             pc_SplitPathname = boot_progress_lookup("SplitPathname");
+            pc_MAKE_SYSDATASEG = boot_progress_lookup("MAKE_SYSDATASEG");
             hle_pc_gen = g_emu_generation;
         }
         /* P37 HLE bypass: FS_CLEANUP (fsinit.text:136). Fires the
@@ -3090,9 +3091,11 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         if (pc_SYS_PROC_INIT && cpu->pc == pc_SYS_PROC_INIT && !g_vec_guard_active) {
             g_vec_guard_active = 1;
         }
-        /* P35: SYS_PROC_INIT bypass — still needed because FS code path
-         * requires functional filesystem backing we don't have yet.
-         * P79 fixed record layouts but process creation needs real Make_File. */
+        /* P35: SYS_PROC_INIT bypass. Both MAKE_SYSDATASEG calls are
+         * resident (discsize=0, memory-only), so the FS isn't the issue.
+         * The crash comes from BLD_SEG/Signal_sem with NULL pointers in
+         * the process creation chain (CreateProcess → Build_Syslocal).
+         * Root cause needs investigation in the process creation code. */
         if (pc_SYS_PROC_INIT && cpu->pc == pc_SYS_PROC_INIT) {
             boot_progress_record_pc(cpu->pc);  /* P45: ensure milestone fires even though body skipped */
             uint32_t sp = cpu->a[7] & 0xFFFFFF;
@@ -3203,6 +3206,33 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 DBGSTATIC(int, dp_count, 0);
                 if (dp_count++ < 5)
                     fprintf(stderr, "[HLE-DecompPath #%d] bypassed\n", dp_count);
+                continue;
+            }
+        }
+        /* P79 HLE bypass: MAKE_SYSDATASEG — when discsize > 0 (non-resident),
+         * the body calls SPLITPATHNAME, OPEN_TEMP, ALLOCPAGES which all need
+         * a functional filesystem. Return error 134 so STARTUP retries with
+         * resident=true (discsize=0, memory-only path that works).
+         * Signature: procedure MAKE_SYSDATASEG(var errnum: int2;
+         *   var progname: pathname; memsize, discsize: int4;
+         *   var refnum: int2; var segptr: absptr; ldsn: int2)
+         * Stack: retPC(4) + ldsn(2) + segptr_ptr(4) + refnum_ptr(4) +
+         *   discsize(4) + memsize(4) + progname_ptr(4) + errnum_ptr(4) = 30 */
+        /* P79 HLE: MAKE_SYSDATASEG — bypass non-resident (discsize>0)
+         * calls, returning error 134 to trigger STARTUP's resident retry.
+         * Currently both calls are discsize=0 (resident), so this doesn't
+         * fire. Kept for when the calling code is fixed to pass discsize>0. */
+        if (pc_MAKE_SYSDATASEG && cpu->pc == pc_MAKE_SYSDATASEG) {
+            uint32_t sp = cpu->a[7] & 0xFFFFFF;
+            /* errnum@SP+4, progname@SP+8, memsize@SP+12, discsize@SP+16 */
+            int32_t discsize = (int32_t)cpu_read32(cpu, (sp + 16) & 0xFFFFFF);
+            if (discsize > 0) {
+                uint32_t errnum_ptr = cpu_read32(cpu, (sp + 4) & 0xFFFFFF) & 0xFFFFFF;
+                if (errnum_ptr >= 0x1000 && errnum_ptr < 0x240000)
+                    cpu_write16(cpu, errnum_ptr, 134);
+                uint32_t ret = cpu_read32(cpu, sp);
+                cpu->a[7] += 30;
+                cpu->pc = ret;
                 continue;
             }
         }
