@@ -2909,7 +2909,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         static uint32_t pc_FS_CLEANUP, pc_PR_CLEANUP, pc_MEM_CLEANUP;
         static uint32_t pc_SYS_PROC_INIT, pc_excep_setup, pc_REG_OPEN_LIST;
         static uint32_t pc_QUEUE_PR, pc_GETSPACE, pc_Wait_sem, pc_MM_Setup;
-        static uint32_t pc_unitio, pc_UNLOCKSEGS;
+        static uint32_t pc_unitio, pc_UNLOCKSEGS, pc_Signal_sem;
         static int hle_pc_gen = -1;
         if (hle_pc_gen != g_emu_generation) {
             pc_FS_CLEANUP    = boot_progress_lookup("FS_CLEANUP");
@@ -2924,10 +2924,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             pc_MM_Setup      = boot_progress_lookup("MM_Setup");
             pc_unitio        = boot_progress_lookup("unitio");
             pc_UNLOCKSEGS    = boot_progress_lookup("UNLOCKSEGS");
-            if (pc_UNLOCKSEGS)
-                fprintf(stderr, "HLE: UNLOCKSEGS=$%06X\n", pc_UNLOCKSEGS);
-            else
-                fprintf(stderr, "HLE: UNLOCKSEGS not found in symbol table\n");
+            pc_Signal_sem    = boot_progress_lookup("Signal_sem");
             hle_pc_gen = g_emu_generation;
         }
         /* P37 HLE bypass: FS_CLEANUP (fsinit.text:136). Fires the
@@ -3100,6 +3097,47 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
          * is safe: write errnum=0 and return. Signature:
          * procedure UNLOCKSEGS(var errnum: integer) — Pascal callee-clean,
          * stack: retPC(4) + errnum_ptr(4). */
+        /* P78 HLE bypass: Signal_sem — when the semaphore's sem_count
+         * is >= 0 before incrementing, there are no real waiters. The
+         * full Signal_sem body reads wait_queue^.semwait_queue which
+         * may contain garbage (code addresses like BUS_ERR) if the
+         * semaphore was embedded in a zero-filled or uninitialized
+         * record. HLE: increment sem_count, clear owner, return.
+         * Signature: procedure Signal_sem(var this_sem: semaphore)
+         * — Pascal callee-clean, stack: retPC(4) + sem_ptr(4). */
+        if (pc_Signal_sem && cpu->pc == pc_Signal_sem) {
+            uint32_t sp = cpu->a[7] & 0xFFFFFF;
+            uint32_t sem_ptr = cpu_read32(cpu, sp + 4);
+            if (sem_ptr) {
+                int16_t sem_count = (int16_t)cpu_read16(cpu, sem_ptr & 0xFFFFFF);
+                if (sem_count >= 0) {
+                    /* No waiters — just increment and return */
+                    cpu_write16(cpu, sem_ptr & 0xFFFFFF, (uint16_t)(sem_count + 1));
+                    /* Clear owner (offset 2, relptr = int2) */
+                    cpu_write16(cpu, (sem_ptr + 2) & 0xFFFFFF, 0);
+                    uint32_t ret = cpu_read32(cpu, sp);
+                    cpu->a[7] += 8;  /* pop retPC + sem_ptr */
+                    cpu->pc = ret;
+                    continue;
+                }
+                /* sem_count < 0: there's supposedly a waiter.
+                 * Check wait_queue (offset 4) — if it's outside sysglobal/
+                 * syslocal range, it's garbage. Skip the waiter path. */
+                uint32_t wait_q = cpu_read32(cpu, (sem_ptr + 4) & 0xFFFFFF);
+                if (wait_q && (wait_q < 0xCA0000 || wait_q > 0xD40000)) {
+                    DBGSTATIC(int, ss_skip, 0);
+                    if (ss_skip++ < 5)
+                        fprintf(stderr, "[P78-SS] Signal_sem: sem_count=%d wait_queue=$%08X (bogus) — skipping waiter path\n",
+                                sem_count, wait_q);
+                    cpu_write16(cpu, sem_ptr & 0xFFFFFF, (uint16_t)(sem_count + 1));
+                    cpu_write16(cpu, (sem_ptr + 2) & 0xFFFFFF, 0);
+                    uint32_t ret = cpu_read32(cpu, sp);
+                    cpu->a[7] += 8;
+                    cpu->pc = ret;
+                    continue;
+                }
+            }
+        }
         /* P77 HLE: guard RELSPACE against freeing pool base itself.
          * When ordaddr == b_area, the caller is trying to free the pool
          * header (uninitialized seglock sentinel). Skip the call. */
