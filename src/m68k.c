@@ -3143,18 +3143,20 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             int16_t size = (int16_t)cpu_read16(cpu, (sp + 4) & 0xFFFFFF);
             uint32_t b_area = cpu_read32(cpu, (sp + 6) & 0xFFFFFF);
             DBGSTATIC(int, gs_count, 0);
-            if (gs_count++ < 60) {
-                fprintf(stderr, "[GETSPACE #%d] size=%d b_area=$%08X ret=$%06X\n",
-                        gs_count, size, b_area, cpu_read32(cpu, sp) & 0xFFFFFF);
-                /* Dump sg_free_pool area (first 32 bytes) */
-                uint32_t a5 = cpu->a[5] & 0xFFFFFF;
-                uint32_t pool = cpu_read32(cpu, (a5 - 24575) & 0xFFFFFF);
-                fprintf(stderr, "  sg_free_pool=$%08X, pool header:\n", pool);
-                if (pool >= 0xCC0000 && pool < 0xCE0000) {
-                    fprintf(stderr, "   ");
-                    for (int j = 0; j < 32; j += 2)
-                        fprintf(stderr, " %04X", cpu_read16(cpu, (pool + j) & 0xFFFFFF));
-                    fprintf(stderr, "\n");
+            if (gs_count++ < 60 || (cpu->a[6] & 0xFFFFFF) >= 0xD00000) {
+                fprintf(stderr, "[GETSPACE #%d] size=%d b_area=$%08X ret=$%06X A6=$%06X\n",
+                        gs_count, size, b_area, cpu_read32(cpu, sp) & 0xFFFFFF,
+                        cpu->a[6] & 0xFFFFFF);
+                if ((cpu->a[6] & 0xFFFFFF) >= 0xD00000) {
+                    /* Dump caller chain for the corrupt A6 call */
+                    uint32_t fp = cpu->a[6] & 0xFFFFFF;
+                    for (int i = 0; i < 6 && fp > 0x400 && fp < 0xFFFFFF; i++) {
+                        uint32_t saved = cpu_read32(cpu, fp) & 0xFFFFFF;
+                        uint32_t ret = cpu_read32(cpu, fp + 4) & 0xFFFFFF;
+                        fprintf(stderr, "  frame[%d]: A6=$%06X saved=$%06X ret=$%06X\n",
+                                i, fp, saved, ret);
+                        fp = saved;
+                    }
                 }
             }
         }
@@ -3346,6 +3348,50 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
          *   var refnum: int2; var segptr: absptr; ldsn: int2)
          * Stack: retPC(4) + ldsn(2) + segptr_ptr(4) + refnum_ptr(4) +
          *   discsize(4) + memsize(4) + progname_ptr(4) + errnum_ptr(4) = 30 */
+        /* P80e: memory watchpoint at saved A6 location.
+         * The saved A6 at $CBFD48 gets overwritten with $E000D0 during
+         * SEG_IO execution. Watch for the exact instruction that writes. */
+        if (g_vec_guard_active && cpu->a[6] == 0xCBFD48) {
+            /* A6 = $CBFD48 means we're in SEG_IO's frame.
+             * Check if saved A6 at [A6] = [$CBFD48] changed. */
+            static uint32_t watch_val = 0;
+            static int watch_gen = -1;
+            if (watch_gen != g_emu_generation) { watch_val = 0; watch_gen = g_emu_generation; }
+            uint32_t cur = cpu_read32(cpu, 0xCBFD48);
+            if (watch_val != 0 && cur != watch_val) {
+                fprintf(stderr, "[P80e-MEMWATCH] [$CBFD48] changed from $%08X to $%08X at PC=$%06X op=$%04X\n",
+                        watch_val, cur, cpu->pc, cpu_read16(cpu, cpu->pc));
+                watch_val = cur;
+            } else if (watch_val == 0) {
+                watch_val = cur;
+            }
+        }
+        /* P80e: A6 watchpoint — detect when A6 enters the $Dxxxxx-$Exxxxx
+         * range (syslocal/new-process area) during SYS_PROC_INIT. */
+        if (g_vec_guard_active) {
+            static uint32_t wp_prev_a6 = 0;
+            static int wp_a6_gen = -1;
+            static int wp_a6_trips = 0;
+            if (wp_a6_gen != g_emu_generation) { wp_prev_a6 = 0; wp_a6_trips = 0; wp_a6_gen = g_emu_generation; }
+            uint32_t a6 = cpu->a[6] & 0xFFFFFF;
+            /* Trigger when A6 moves INTO $D0xxxx-$F0xxxx (syslocal/process area)
+             * from outside that range */
+            if (a6 >= 0xD00000 && a6 < 0xF00000 &&
+                (wp_prev_a6 < 0xD00000 || wp_prev_a6 >= 0xF00000) &&
+                wp_a6_trips++ < 3) {
+                fprintf(stderr, "[P80e-A6TRAP] A6 $%06X→$%06X at PC=$%06X op=$%04X\n",
+                        wp_prev_a6, a6, cpu->pc, cpu_read16(cpu, cpu->pc));
+                uint32_t fp = a6;
+                for (int i = 0; i < 5 && fp > 0x400 && fp < 0xFFFFFF; i++) {
+                    uint32_t saved = cpu_read32(cpu, fp) & 0xFFFFFF;
+                    uint32_t ret = cpu_read32(cpu, fp + 4) & 0xFFFFFF;
+                    fprintf(stderr, "  frame[%d]: A6=$%06X saved=$%06X ret=$%06X\n",
+                            i, fp, saved, ret);
+                    fp = saved;
+                }
+            }
+            wp_prev_a6 = a6;
+        }
         /* P80d: bypass Move_MemMgr. This function moves the MemMgr process
          * to the end of memory to reduce fragmentation. The move involves
          * complex segment operations (SEG_IO, SWAP_SEG, BLD_SEG) that

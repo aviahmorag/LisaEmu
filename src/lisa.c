@@ -2903,6 +2903,26 @@ static bool hle_handle_system_error(lisa_t *lisa __attribute__((unused)), m68k_t
         return true;
     }
 
+    /* P80e: suppress 10101 (Make_SProcess error) during SYS_PROC_INIT.
+     * MAKE_DATASEG fails because CHK_LDSN_FREE or SYS_CALLED rejects
+     * negative LDSNs. The goto fix (P80e) properly returns this error
+     * instead of crashing. Unwind past SYS_PROC_INIT to continue boot. */
+    {
+        extern int g_vec_guard_active;
+        if (g_vec_guard_active && err_code == 10101) {
+            static int supp_10101 = 0;
+            if (supp_10101++ < 3)
+                fprintf(stderr, "HLE: SYSTEM_ERROR(10101) — unwinding past SYS_PROC_INIT\n");
+            uint32_t boot_sp = 0xCBFFFC;
+            uint32_t ret = cpu_read32(cpu, boot_sp);
+            cpu->a[7] = boot_sp + 4;
+            cpu->pc = ret;
+            cpu->a[6] = 0xF7FFF4; /* STARTUP frame from P80 diag */
+            cpu->cycles += 50;
+            return true;
+        }
+    }
+
     /* P80d: hard exception during SYS_PROC_INIT — unwind past the entire
      * SYS_PROC_INIT by walking the A6 chain to find the STARTUP return
      * address. SYS_PROC_INIT's process creation code hits a frame pointer
@@ -2913,9 +2933,13 @@ static bool hle_handle_system_error(lisa_t *lisa __attribute__((unused)), m68k_t
     extern int g_vec_guard_active;
     if (g_vec_guard_active && (err_code == 10201 || err_code == 10204)) {
         static int supp_10201 = 0;
-        if (supp_10201++ < 10) {
-            fprintf(stderr, "HLE: SYSTEM_ERROR(%d) during SYS_PROC_INIT — unwinding to STARTUP\n",
-                    err_code);
+        fprintf(stderr, "HLE: SYSTEM_ERROR(%d) during SYS_PROC_INIT — unwinding to STARTUP (#%d)\n",
+                err_code, supp_10201 + 1);
+        if (supp_10201++ > 0) {
+            /* Second+ occurrence: halt to debug */
+            fprintf(stderr, "SYSTEM_ERROR(%d): HALTING (debug)\n", err_code);
+            cpu->stopped = true;
+            return true;
         }
         /* Restore SP to the boot stack level (before SYS_PROC_INIT was called).
          * Walk the supervisor stack to find a valid return frame. */

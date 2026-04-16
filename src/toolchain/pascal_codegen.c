@@ -2615,6 +2615,25 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
             for (int i = 0; i < cg->num_labels; i++) {
                 if (cg->labels[i].label == lbl) { target = cg->labels[i].code_offset; break; }
             }
+            /* P80e: non-local goto — restore A6 by following the static link
+             * chain. A nested procedure's A6 frame contains the saved A6 of
+             * the enclosing scope at [A6]. For gotos from nested procs to
+             * enclosing labels (e.g., RECOVER's goto 10 → MAKE_DATASEG),
+             * we must unwind A6 so the target code accesses the right locals.
+             * Also restore SP from the unwound A6. */
+            if (cg->scope_depth > 1) {
+                /* P80e: Non-local goto from nested procedure. Restore A6 to
+                 * the enclosing scope's frame so the label's code accesses
+                 * the right locals. Follow the static link chain (saved A6
+                 * at [A6]) for each nesting level.
+                 * DON'T adjust SP — the label code manages its own stack.
+                 * For non-local exits like RECOVER's goto, the stack is
+                 * deeper than the target scope expects, but A6-relative
+                 * access will work correctly. */
+                for (int d = cg->scope_depth - 1; d >= 1; d--) {
+                    emit16(cg, 0x2C56);  /* MOVEA.L (A6),A6 — follow static link */
+                }
+            }
             emit16(cg, 0x6000);  /* BRA.W */
             uint32_t patch = cg->code_size;
             emit16(cg, 0);       /* 16-bit displacement placeholder */
