@@ -585,6 +585,7 @@ static void push_scope(codegen_t *cg) {
     if (cg->scope_depth < CODEGEN_MAX_SCOPE) {
         cg->scopes[cg->scope_depth].num_locals = 0;
         cg->scopes[cg->scope_depth].frame_size = 0;
+        cg->scopes[cg->scope_depth].proc_name[0] = '\0';
         cg->scope_depth++;
     }
 }
@@ -1064,10 +1065,19 @@ static int expr_size(codegen_t *cg, ast_node_t *node) {
     }
 }
 
-/* Emit size-appropriate MOVE (A0),D0 — reads value from address in A0 */
+/* Emit size-appropriate MOVE (A0),D0 — reads value from address in A0.
+ * P80h2: byte loads zero-extend via MOVEQ #0,D0 first. Pascal subrange
+ * 0..255 (e.g. PCB.priority) is a 1-byte field; plain MOVE.B leaves the
+ * upper 24 bits of D0 with whatever was there (often a pointer value),
+ * which poisons any subsequent MOVE.W D0,D2 sign/range test. The
+ * Scheduler's `candidate^.priority > 0` check produced false negatives
+ * whenever the candidate pointer's lower byte had bit 7 set. */
 static void emit_read_a0_to_d0(codegen_t *cg, int sz) {
     if (sz == 4)      emit16(cg, 0x2010);  /* MOVE.L (A0),D0 */
-    else if (sz == 1) emit16(cg, 0x1010);  /* MOVE.B (A0),D0 */
+    else if (sz == 1) {
+        emit16(cg, 0x7000);                /* MOVEQ #0,D0 — zero-extend byte */
+        emit16(cg, 0x1010);                /* MOVE.B (A0),D0 */
+    }
     else              emit16(cg, 0x3010);  /* MOVE.W (A0),D0 */
 }
 
@@ -1955,10 +1965,12 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
              * P80g: exit(proc_name) from a nested procedure must unwind
              * A6 to the target procedure's frame BEFORE UNLK/RTS.
              * Otherwise UNLK uses the nested proc's frame, exiting the
-             * wrong function. Same static-link chain as non-local goto. */
+             * wrong function. Same static-link chain as non-local goto.
+             * P80h3: only walk the static link when the target is an
+             * ENCLOSING procedure, not when it's the current one.
+             * exit(CurrentProc) is just a local return — UNLK+RTS. */
             if (str_eq_nocase(fn, "EXIT")) {
                 if (cg->scope_depth > 1) {
-                    /* Nested proc: restore A6 to enclosing scope */
                     for (int d = cg->scope_depth - 1; d >= 1; d--)
                         emit16(cg, 0x2C56);  /* MOVEA.L (A6),A6 */
                 }
@@ -3440,6 +3452,14 @@ static void gen_proc_or_func(codegen_t *cg, ast_node_t *node) {
     if (entry) entry->offset = (int)cg->code_size;
 
     push_scope(cg);
+    /* P80h3: remember this scope's proc name so exit(name) can tell
+     * whether it's exiting the current proc (no static-link walk) or an
+     * enclosing proc (walk up N levels). */
+    {
+        cg_scope_t *sc = current_scope(cg);
+        if (sc && node->name[0])
+            strncpy(sc->proc_name, node->name, sizeof(sc->proc_name) - 1);
+    }
 
     /* Reset per-procedure label state */
     cg->num_labels = 0;

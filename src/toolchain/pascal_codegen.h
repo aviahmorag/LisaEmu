@@ -102,6 +102,7 @@ typedef struct {
     cg_symbol_t locals[CODEGEN_MAX_LOCALS];
     int num_locals;
     int frame_size;         /* Total size of local variables */
+    char proc_name[64];     /* Procedure this scope belongs to (for exit()) */
 } cg_scope_t;
 
 /* Procedure signature — tracks VAR params, sizes, and calling convention */

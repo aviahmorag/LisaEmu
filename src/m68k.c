@@ -2868,6 +2868,13 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         static uint32_t pc_ring[256];
         static int pc_ring_idx = 0;
         static int pc_ring_gen = 0;
+        /* P80h3: track (PCB, syslocal) pairs created via HLE-CreateProcess
+         * so HLE-SelectProcess can update b_syslocal_ptr when the
+         * Scheduler dispatches a process. Map_Syslocal (the normal
+         * Pascal routine that does this) is never called under our
+         * bypasses. */
+        static struct { uint32_t pcb, sloc; } pcb_sloc_map[8];
+        static int pcb_sloc_count = 0;
         if (pc_ring_gen != g_emu_generation) { memset(pc_ring, 0, sizeof(pc_ring)); pc_ring_idx = 0; pc_ring_gen = g_emu_generation; }
         /* High-byte PC trip: fire once when PC first leaves the 24-bit
          * range. Dump the PC ring (previous instruction(s)) to identify
@@ -2889,6 +2896,8 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         }
         pc_ring[pc_ring_idx++ & 255] = cpu->pc;
         g_last_cpu_pc = cpu->pc;
+
+
 
         /* P77 diag probes removed (session cleanup). Key findings:
          * - Build_Syslocal writes to wrong syslocal address (MMU_BASE
@@ -2989,6 +2998,12 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                  * nil-ed c_pcb_ptr below so there's nothing to save
                  * anyway). The stack and A5 are already correct for the
                  * jump. */
+                /* Jump straight to the Pascal Scheduler body, skipping
+                 * ENTER_SC's TRAP #2 dance. Note: the map's Scheduler
+                 * symbol at $05B832 is the segment's reentry RTS trampoline
+                 * — a few bytes further (past the BRA) is the actual
+                 * prologue. Either works since Scheduler's prologue only
+                 * needs the current A5/A6 to be sane. */
                 pc_enter_sched = boot_progress_lookup("Scheduler");
                 if (!pc_enter_sched) pc_enter_sched = 0x05B832;
                 fprintf(stderr, "  DEBUG: Scheduler lookup → $%06X\n", pc_enter_sched);
@@ -3009,13 +3024,12 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             int guard = 0;
             while (cur && cur != ready_head && guard++ < 16) {
                 uint32_t next = cpu_read32(cpu, cur + 0) & 0xFFFFFF;
-                int16_t pri = (int16_t)cpu_read16(cpu, cur + 12);
-                /* Remove any PCB that isn't one of our created system
-                 * processes or the sentinel. c_pcb's priority may have been
-                 * corrupted during the (bypassed) STARTUP init — it shows up
-                 * as priority -256 here. Anything negative means it's not a
-                 * runnable process and would block the scheduler walk. */
-                if (pri < 0 || pri >= 255) {
+                int pri = cpu_read8(cpu, cur + 12);  /* 1-byte subrange 0..255 */
+                /* Remove STARTUP's pseudo c_pcb (priority 255) so the
+                 * scheduler doesn't try to Launch it — its env_save_area
+                 * was never populated. Keep MemMgr (250), Root (230), and
+                 * the sentinel (0). */
+                if (pri == 255) {
                     uint32_t prev = cpu_read32(cpu, cur + 4) & 0xFFFFFF;
                     if (!prev) prev = ready_head;
                     cpu_write32(cpu, prev + 0, next);
@@ -3031,6 +3045,81 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             cpu->a[7] += 4;
             cpu->pc = pc_enter_sched;
             continue;
+        }
+        /* P80h3: HLE SelectProcess. Our Pascal compiler's codegen for
+         * exit(SelectProcess) inside SelectProcess emits
+         * `MOVEA.L (A6),A6; UNLK A6; RTS`, which walks the static link
+         * one level up and then UNLK's the WRONG frame — A7 jumps into
+         * garbage and RTS pops 0 → PC=0 crash. Rather than rewrite the
+         * codegen (turned out to have subtle interactions with
+         * depth-1/2 procs that the OS relies on), emulate SelectProcess
+         * directly: pick the highest-priority ready PCB, write it to
+         * Scheduler's `candidate` local at -6(A6), then RTS.
+         *
+         * At entry: cpu->a[6] = Scheduler's A6 (SelectProcess's LINK
+         * hasn't executed yet since we intercept on its first byte).
+         * [A7] = return PC pushed by JSR. */
+        {
+            static uint32_t pc_select = 0;
+            static int select_probed = 0;
+            if (!select_probed) {
+                select_probed = 1;
+                pc_select = boot_progress_lookup("SelectProcess");
+                if (pc_select)
+                    fprintf(stderr, "  DEBUG: SelectProcess → $%06X\n", pc_select);
+            }
+            if (pc_select && cpu->pc == pc_select) {
+                uint32_t a6 = cpu->a[6] & 0xFFFFFF;
+                uint32_t a5 = cpu->a[5] & 0xFFFFFF;
+                uint32_t head = (a5 - 1116) & 0xFFFFFF;   /* @fwd_ReadyQ */
+                /* Walk the ready queue, pick first PCB with priority > 0
+                 * and (priority < 255) — skip c_pcb (255) if it's still
+                 * lingering, and skip the sentinel (0). */
+                uint32_t candidate = 0;
+                uint32_t cur = cpu_read32(cpu, head) & 0xFFFFFF;
+                int safety = 0;
+                while (cur && cur != head && safety++ < 32) {
+                    int pri = cpu_read8(cpu, cur + 12);
+                    if (pri > 0 && pri < 255) { candidate = cur; break; }
+                    cur = cpu_read32(cpu, cur) & 0xFFFFFF;
+                }
+                /* Write candidate to Scheduler's local at -6(A6). */
+                cpu_write32(cpu, (a6 - 6) & 0xFFFFFF, candidate);
+                /* Also update b_syslocal_ptr so Launch's SETREGS reads
+                 * env_save_area from the right syslocal. b_syslocal_ptr
+                 * is at A5-1389 per the linker map. */
+                if (candidate) {
+                    uint32_t sloc = 0;
+                    for (int i = 0; i < pcb_sloc_count; i++) {
+                        if (pcb_sloc_map[i].pcb == candidate) {
+                            sloc = pcb_sloc_map[i].sloc;
+                            break;
+                        }
+                    }
+                    if (sloc) {
+                        /* Launch reads b_syslocal_ptr via B_SYSLOCAL_PTR
+                         * (PASCALDEFS -24785) from the sysglobal base
+                         * register. Our runtime diagnostics confirm the
+                         * slot is at A5-24785. */
+                        cpu_write32(cpu, (a5 - 24785) & 0xFFFFFF, sloc);
+                        fprintf(stderr, "  [HLE-SelectProcess] "
+                                "b_syslocal_ptr ← $%06X\n", sloc);
+                    }
+                }
+                DBGSTATIC(int, sp_count, 0);
+                if (sp_count++ < 5)
+                    fprintf(stderr, "[HLE-SelectProcess #%d] "
+                            "candidate=$%06X (pri=%d) → [A6-6]=$%06X\n",
+                            sp_count, candidate,
+                            candidate ? cpu_read8(cpu, candidate + 12) : 0,
+                            (a6 - 6) & 0xFFFFFF);
+                /* RTS: pop return PC from [A7]. */
+                uint32_t sp_ret = cpu->a[7] & 0xFFFFFF;
+                uint32_t ret = cpu_read32(cpu, sp_ret);
+                cpu->a[7] += 4;
+                cpu->pc = ret;
+                continue;
+            }
         }
         /* P36 HLE bypass: MEM_CLEANUP (STARTUP/MM4). Called after
          * FS_CLEANUP with stksdb_ptr+slsdb_ptr — since we bypassed
@@ -3589,13 +3678,19 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                  * PCB layout: next_schedPtr(4), prev_schedPtr(4), semwait_queue(4),
                  * priority(2), norm_pri(2), blk_state(2), domain(2), sems_owned(2) */
                 if (pcb >= 0xCC0000 && pcb < 0xCE0000) {
-                    /* priority from Make_SProcess (250 MemMgr, 230 Root) */
+                    /* priority from Make_SProcess (250 MemMgr, 230 Root).
+                     * P80h2: our Pascal compiler packs subrange 0..255 as a
+                     * 1-byte field (Scheduler compiles priority read as
+                     * MOVE.B $0C(A0),D0). Writing a 16-bit word put $00 in
+                     * the high byte at offset 12, so the scheduler read
+                     * priority as 0 and SelectProcess returned nil. Write
+                     * priority/norm_pri as bytes; blk_state/domain as words. */
                     static int pri_vals[] = {250, 230, 200, 200};
                     int pri = pri_vals[(cp_count-1) < 4 ? (cp_count-1) : 3];
-                    cpu_write16(cpu, pcb + 12, (uint16_t)pri);   /* priority */
-                    cpu_write16(cpu, pcb + 14, (uint16_t)pri);   /* norm_pri */
-                    cpu_write16(cpu, pcb + 16, 0);               /* blk_state = empty */
-                    cpu_write16(cpu, pcb + 18, 0);               /* domain = 0 */
+                    cpu_write8(cpu, pcb + 12, (uint8_t)pri);     /* priority */
+                    cpu_write8(cpu, pcb + 13, (uint8_t)pri);     /* norm_pri */
+                    cpu_write16(cpu, pcb + 14, 0);               /* blk_state = empty */
+                    cpu_write16(cpu, pcb + 16, 0);               /* domain = 0 */
                 }
                 /* P80h2: set up env_save_area in the syslocal so Launch's
                  * SETREGS has real register state to RTE into. Pascal's
@@ -3650,6 +3745,11 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                     cpu_write32(cpu, sloc_seg_ptr + 0, (sloc_seg_ptr + 256) & 0xFFFFFF);
                     fprintf(stderr, "  [HLE-CP env] PC=$%06X A5=$%06X A6=A7=$%06X\n",
                             start_pc_val & 0xFFFFFF, sys_a5, stk_top);
+                    if (pcb_sloc_count < 8) {
+                        pcb_sloc_map[pcb_sloc_count].pcb = pcb;
+                        pcb_sloc_map[pcb_sloc_count].sloc = sloc_seg_ptr & 0xFFFFFF;
+                        pcb_sloc_count++;
+                    }
                 }
                 uint32_t ret = cpu_read32(cpu, sp);
                 cpu->a[7] += 4;
@@ -3681,12 +3781,12 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 fc_count++;
                 uint32_t a5 = cpu->a[5] & 0xFFFFFF;
                 uint32_t head = (a5 - 1116) & 0xFFFFFF;  /* @fwd_ReadyQ */
-                int16_t new_pri = (int16_t)cpu_read16(cpu, pcb + 12);
+                int new_pri = cpu_read8(cpu, pcb + 12);  /* 1-byte priority */
                 /* Walk the queue: cur starts at fwd_ReadyQ's first entry. */
                 uint32_t cur = cpu_read32(cpu, head) & 0xFFFFFF;
                 int safety = 0;
                 while (cur && cur != head && safety++ < 64) {
-                    int16_t cur_pri = (int16_t)cpu_read16(cpu, cur + 12);
+                    int cur_pri = cpu_read8(cpu, cur + 12);
                     if (new_pri > cur_pri) break;
                     cur = cpu_read32(cpu, cur) & 0xFFFFFF;
                 }

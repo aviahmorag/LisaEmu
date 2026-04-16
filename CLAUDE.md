@@ -70,18 +70,53 @@ make audit-linker       # Stage 4: Full pipeline + linker
 cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' build 2>&1 | grep -E "(error:|BUILD)"
 ```
 
-## Current Status (2026-04-16) — 25/27 milestones, scheduler runs to idle
+## Current Status (2026-04-16 latest) — MemMgr DISPATCHED (user mode, MMU issue)
 
-Build green. Full kernel boot INIT→PR_CLEANUP. Both MemMgr and Root
-processes created, start_PC resolved to real code addresses, queued via
-priority-sorted insertion. PR_CLEANUP's HLE now unlinks the stale outer
-PCB and redirects to the Scheduler (instead of returning). The Scheduler
-Pascal body reaches its idle Pause (STOP) — but does NOT dispatch
-MemMgr, suggesting fwd_ReadyQ lives at a different runtime address than
-the HLE writes to. Next: find the Pascal compiler's actual A5-offset
-(or absolute address) for fwd_ReadyQ and point FinishCreate at it.
+Build + audit green. 25/27 milestones. Full kernel boot
+INIT→PR_CLEANUP → direct jump to Scheduler. Scheduler calls Launch,
+which RTEs MemMgr into USER MODE successfully — SR transitions to
+$0000, PC popped cleanly — but the post-RTE PC lands at weird addresses
+($DD8D2A00, later $6FFC2000), triggering vector 4 / vector 11 faults.
+
+Cause: **MMU mapping mismatch**. Launch RTE goes to user mode, where
+MMU virtual-to-physical translation applies. MemMgr's virtual PC
+$04413C doesn't translate to its physical code address under the
+current user-context MMU. Either (a) the user-domain MMU wasn't set up
+for MemMgr's code segments (Set_Address_Space / Map_Syslocal normally
+handle this and were skipped), or (b) env_save_area.PC needs to be a
+mapped virtual address, not the physical linker address.
+
+Next: investigate what Map_Syslocal / Set_Address_Space do to MMU
+mappings, and either emulate them in HLE-SelectProcess or let them run.
 
 ### P80h2 session fixes (scheduler dispatch plumbing)
+
+- **Byte-subrange loads zero-extend** (`src/toolchain/pascal_codegen.c:1067`):
+  `emit_read_a0_to_d0` now emits `MOVEQ #0,D0; MOVE.B (A0),D0` instead
+  of bare `MOVE.B (A0),D0`. Without the zero-extend, D0's upper 24 bits
+  retained whatever was there (often a PCB pointer). A subsequent
+  `MOVE.W D0,D2` then `CMP.W D1(0),D0` looked at the polluted low word
+  — for priority=250 with a candidate pointer $CCB880, `SGT` saw a
+  negative 16-bit value and `candidate^.priority > 0` evaluated FALSE,
+  causing SelectProcess to always return nil. This was the reason the
+  scheduler dispatched nothing after Launch. Keep an eye on byte-load
+  sites — this is a general codegen fix, not scoped to the scheduler.
+- **Priority fields are 1-byte in PCB** (`src/m68k.c:3546`): CreateProcess
+  HLE now writes `priority`/`norm_pri` as bytes at offsets 12/13, not
+  16-bit words. Matches the compiler's layout for `0..255` subranges.
+- **HLE-SelectProcess**: our Pascal codegen for `exit(SelectProcess)` emits
+  a buggy `MOVEA.L (A6),A6; UNLK A6; RTS` sequence that walks the static
+  link when it shouldn't — clobbers A7 and crashes. Tried fixing the
+  codegen (NOP or walk-target-aware), both caused early-boot regressions
+  the OS depended on. Chose instead to bypass the whole proc: at
+  `$05B59A` the emulator picks the highest-priority PCB in the ready
+  queue, writes it to Scheduler's `candidate` local at `-6(A6)`, sets
+  `b_syslocal_ptr ← candidate's syslocal` (so Launch's SETREGS reads
+  the right env_save_area), then RTSes. (`src/m68k.c:3069`)
+- **PCB → syslocal tracking**: CreateProcess HLE now stores (pcb, sloc)
+  pairs so SelectProcess can resolve which syslocal to point
+  b_syslocal_ptr at for the dispatched process.
+
 
 - **ord(@proc) emits proc-address relocation**: `AST_ADDR_OF` now detects
   procedure identifiers via `find_proc_sig` and emits `MOVE.L #imm32,D0`
