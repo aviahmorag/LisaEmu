@@ -3188,14 +3188,16 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             static uint32_t pc_parse_pathname = 0;
             if (dp_gen == g_emu_generation && !pc_parse_pathname)
                 pc_parse_pathname = boot_progress_lookup("parse_pathname");
-            /* P79-diag: trace parse_pathname bypass */
+            /* P80a: DecompPath and parse_pathname bypasses DISABLED.
+             * The 8-char identifier fix (P80) resolved the codegen bugs
+             * that caused bogus pointer writes from these FS functions.
+             * Let them run natively so they set device numbers correctly. */
+#if 0
+            /* parse_pathname bypass (was P79) */
             if (pc_parse_pathname && cpu->pc == pc_parse_pathname) {
                 uint32_t sp = cpu->a[7] & 0xFFFFFF;
                 uint32_t ret = cpu_read32(cpu, sp);
-                /* parse_pathname: 6 VAR params = 24 bytes, callee-clean */
                 uint32_t ecode_ptr = cpu_read32(cpu, sp + 24) & 0xFFFFFF;
-                /* P79: validate pointer before writing — ecode_ptr can be
-                 * garbage ($000000) when caller's record layouts were wrong */
                 if (ecode_ptr >= 0x1000 && ecode_ptr < 0x240000)
                     cpu_write16(cpu, ecode_ptr, 0);
                 cpu->a[7] += 4 + 24;
@@ -3205,26 +3207,24 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                     fprintf(stderr, "[HLE-parse_pathname #%d] bypassed\n", pp_count);
                 continue;
             }
+            /* DecompPath bypass (was P78c) */
             if (pc_DecompPath && cpu->pc == pc_DecompPath) {
                 uint32_t sp = cpu->a[7] & 0xFFFFFF;
                 uint32_t ret = cpu_read32(cpu, sp);
-                /* 5 VAR params, right-to-left push (Pascal convention):
-                 * SP+4: volPath_ptr(4), SP+8: parID_ptr(4), SP+12: device_ptr(4),
-                 * SP+16: path_ptr(4), SP+20: ecode_ptr(4) */
                 uint32_t ecode_ptr = cpu_read32(cpu, sp + 20) & 0xFFFFFF;
                 uint32_t device_ptr = cpu_read32(cpu, sp + 12) & 0xFFFFFF;
-                /* P79: validate pointers before writing */
                 if (ecode_ptr >= 0x1000 && ecode_ptr < 0x240000)
-                    cpu_write16(cpu, ecode_ptr, 0);    /* ecode = 0 */
+                    cpu_write16(cpu, ecode_ptr, 0);
                 if (device_ptr >= 0x1000 && device_ptr < 0x240000)
-                    cpu_write16(cpu, device_ptr, 0);   /* device = 0 (bootdev) */
-                cpu->a[7] += 4 + 20;  /* retPC + 5 VAR params */
+                    cpu_write16(cpu, device_ptr, 0);
+                cpu->a[7] += 4 + 20;
                 cpu->pc = ret;
                 DBGSTATIC(int, dp_count, 0);
                 if (dp_count++ < 5)
                     fprintf(stderr, "[HLE-DecompPath #%d] bypassed\n", dp_count);
                 continue;
             }
+#endif
         }
         /* P79 HLE bypass: MAKE_SYSDATASEG — when discsize > 0 (non-resident),
          * the body calls SPLITPATHNAME, OPEN_TEMP, ALLOCPAGES which all need
