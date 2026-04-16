@@ -2451,22 +2451,23 @@ int lisa_run_frame(lisa_t *lisa) {
                     lisa_mem_read32(&lisa->mem, 0xCC5FFC - 8),
                     lisa_mem_read32(&lisa->mem, 0xCC5FFC - 4),
                     lisa_mem_read32(&lisa->mem, 0xCC5FFC));
-            /* Dump specific key globals by known A5 offsets */
-            fprintf(stderr, "  KEY GLOBALS (from A5=$CC5FFC):\n");
-            fprintf(stderr, "    sg_free_pool_addr (A5-148): $%08X\n",
-                    lisa_mem_read32(&lisa->mem, 0xCC5FFC - 148));
-            fprintf(stderr, "    size_sglobal      (A5-150): $%04X\n",
-                    lisa_mem_read16(&lisa->mem, 0xCC5FFC - 150));
-            fprintf(stderr, "    b_syslocal_ptr    (A5-358): $%08X\n",
-                    lisa_mem_read32(&lisa->mem, 0xCC5FFC - 358));
-            fprintf(stderr, "    mmrb_addr         (A5-1264): $%08X\n",
-                    lisa_mem_read32(&lisa->mem, 0xCC5FFC - 1264));
-            fprintf(stderr, "    b_sysglobal_ptr   (A5-1272): $%08X\n",
-                    lisa_mem_read32(&lisa->mem, 0xCC5FFC - 1272));
-            fprintf(stderr, "    sysg_free         (A5-1274): $%04X\n",
-                    lisa_mem_read16(&lisa->mem, 0xCC5FFC - 1274));
-            fprintf(stderr, "    grow_sysglobal    (A5-1314): $%02X\n",
-                    lisa_mem_read16(&lisa->mem, 0xCC5FFC - 1314) & 0xFF);
+            /* Dump specific key globals using PASCALDEFS offsets (A5-relative) */
+            uint32_t a5v = 0xCC6FFC; /* expected A5 from boot setup */
+            fprintf(stderr, "  KEY GLOBALS (A5=$%06X, PASCALDEFS offsets):\n", a5v);
+            fprintf(stderr, "    SGLOBAL @$200:                 $%08X\n",
+                    lisa_mem_read32(&lisa->mem, 0x200));
+            fprintf(stderr, "    sg_free_pool_addr (A5-24575):  $%08X\n",
+                    lisa_mem_read32(&lisa->mem, a5v - 24575));
+            fprintf(stderr, "    size_sglobal      (A5-24577):  $%04X\n",
+                    lisa_mem_read16(&lisa->mem, a5v - 24577));
+            fprintf(stderr, "    c_pcb_ptr         (A5-24617):  $%08X\n",
+                    lisa_mem_read32(&lisa->mem, a5v - 24617));
+            fprintf(stderr, "    b_syslocal_ptr    (A5-24785):  $%08X\n",
+                    lisa_mem_read32(&lisa->mem, a5v - 24785));
+            fprintf(stderr, "    mmrb_addr         (A5-25691):  $%08X\n",
+                    lisa_mem_read32(&lisa->mem, a5v - 25691));
+            fprintf(stderr, "    invoke_sched      (A5-24786):  $%02X\n",
+                    lisa_mem_read8(&lisa->mem, a5v - 24786));
         }
         /* Check both framebuffers (main $1F8000, alt $1F0000). */
         {

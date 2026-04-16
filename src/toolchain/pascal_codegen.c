@@ -48,10 +48,17 @@ static void cg_error(codegen_t *cg, int line, const char *fmt, ...) {
  * Returning true means the caller should NOT emit a call. */
 static bool is_pascal_runtime_stub_proc(const char *name);
 
+/* Lisa Pascal: identifiers are significant to 8 characters only.
+ * "ordrefncbptr" and "ordrefncb" both resolve to the same variable
+ * because their first 8 characters ("ordrefnc") match.
+ * Compare case-insensitively, treating identifiers as equal if their
+ * first 8 characters match (shorter strings must match exactly). */
 static bool str_eq_nocase(const char *a, const char *b) {
+    int n = 0;
     while (*a && *b) {
         if (toupper((unsigned char)*a) != toupper((unsigned char)*b)) return false;
         a++; b++;
+        if (++n >= 8) return true;  /* 8-char significant match */
     }
     return *a == *b;
 }

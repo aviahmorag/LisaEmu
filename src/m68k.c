@@ -3090,21 +3090,37 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         /* P78d: activate vector table guard when SYS_PROC_INIT entry is reached */
         if (pc_SYS_PROC_INIT && cpu->pc == pc_SYS_PROC_INIT && !g_vec_guard_active) {
             g_vec_guard_active = 1;
+            /* P80: dump key globals at SYS_PROC_INIT entry using PASCALDEFS offsets */
+            uint32_t a5 = cpu->a[5] & 0xFFFFFF;
+            fprintf(stderr, "[P80-DIAG] SYS_PROC_INIT entered. A5=$%06X A6=$%06X A7=$%06X\n",
+                    a5, cpu->a[6]&0xFFFFFF, cpu->a[7]&0xFFFFFF);
+            fprintf(stderr, "  SGLOBAL @$200:                 $%08X\n", cpu_read32(cpu, 0x200));
+            fprintf(stderr, "  sg_free_pool_addr (A5-24575):  $%08X\n", cpu_read32(cpu, (a5 - 24575) & 0xFFFFFF));
+            fprintf(stderr, "  size_sglobal      (A5-24577):  $%04X\n", cpu_read16(cpu, (a5 - 24577) & 0xFFFFFF));
+            fprintf(stderr, "  c_pcb_ptr         (A5-24617):  $%08X\n", cpu_read32(cpu, (a5 - 24617) & 0xFFFFFF));
+            fprintf(stderr, "  sct_ptr           (A5-24781):  $%08X\n", cpu_read32(cpu, (a5 - 24781) & 0xFFFFFF));
+            fprintf(stderr, "  b_syslocal_ptr    (A5-24785):  $%08X\n", cpu_read32(cpu, (a5 - 24785) & 0xFFFFFF));
+            fprintf(stderr, "  mmrb_addr         (A5-25691):  $%08X\n", cpu_read32(cpu, (a5 - 25691) & 0xFFFFFF));
+            fprintf(stderr, "  sctab             (A5-25661):  $%08X\n", cpu_read32(cpu, (a5 - 25661) & 0xFFFFFF));
+            fprintf(stderr, "  invoke_sched      (A5-24786):  $%02X\n", cpu_read8(cpu, (a5 - 24786) & 0xFFFFFF));
         }
+        /* P80: VEC-GUARD PC trace removed — binary layout shifts on recompile.
+         * Use generic VEC-GUARD dump in lisa_mmu.c instead. */
         /* (P79f probes removed — b_syslocal_ptr corruption traced to SCTAB2 overflow, fixed) */
-        /* P35: SYS_PROC_INIT bypass. Both MAKE_SYSDATASEG calls are
-         * resident (discsize=0, memory-only), so the FS isn't the issue.
-         * The crash comes from BLD_SEG/Signal_sem with NULL pointers in
-         * the process creation chain (CreateProcess → Build_Syslocal).
-         * Root cause needs investigation in the process creation code. */
+        /* P35: SYS_PROC_INIT bypass — DISABLED (P80).
+         * P79 fixes (record layouts, push direction, enum constants,
+         * byte-subrange sizing) resolved the NULL pointer crashes in
+         * BLD_SEG/Signal_sem/ENQUEUE. Let the body run for real. */
+#if 0
         if (pc_SYS_PROC_INIT && cpu->pc == pc_SYS_PROC_INIT) {
-            boot_progress_record_pc(cpu->pc);  /* P45: ensure milestone fires even though body skipped */
+            boot_progress_record_pc(cpu->pc);
             uint32_t sp = cpu->a[7] & 0xFFFFFF;
             uint32_t ret = cpu_read32(cpu, sp);
-            cpu->a[7] += 4;  /* pop retPC */
+            cpu->a[7] += 4;
             cpu->pc = ret;
             continue;
         }
+#endif
         /* P34 HLE bypass: excep_setup (EXCEPNR1.TEXT:232) when called
          * with a wild b_sloc_ptr (top byte set → can't be valid RAM).
          * MAKE_PROCESS for non-first processes appears to pass an
