@@ -2259,10 +2259,34 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
             emit_read_a0_to_d0(cg, expr_size(cg, node));
             break;
 
-        case AST_ADDR_OF:
+        case AST_ADDR_OF: {
+            /* P80h2: @proc — procedure identifiers need the CODE address, not
+             * an A5-relative global slot. Without this, ord(@MemMgr) resolves
+             * via find_symbol_any to whatever stale global happens to share
+             * the name and emits LEA offset(A5),A0 — yielding e.g. $CCB802
+             * instead of the entry-point $043F56. Detect proc-sig first and
+             * emit MOVE.L #procaddr,D0 with a linker relocation, mirroring
+             * the bare-ident branch at AST_IDENT_EXPR above. */
+            ast_node_t *child = node->children[0];
+            if (child && child->type == AST_IDENT_EXPR && child->name[0]) {
+                cg_proc_sig_t *psig = find_proc_sig(cg, child->name);
+                if (psig) {
+                    emit16(cg, 0x203C);  /* MOVE.L #imm32,D0 */
+                    emit32(cg, 0);       /* relocated to proc address */
+                    if (cg->num_relocs < CODEGEN_MAX_RELOCS) {
+                        cg_reloc_t *r = &cg->relocs[cg->num_relocs++];
+                        r->offset = cg->code_size - 4;
+                        strncpy(r->symbol, child->name, sizeof(r->symbol) - 1);
+                        r->size = 4;
+                        r->pc_relative = false;
+                    }
+                    break;
+                }
+            }
             gen_lvalue_addr(cg, node->children[0]);
             emit16(cg, 0x2008);  /* MOVE.L A0,D0 */
             break;
+        }
 
         case AST_SET_EXPR:
             /* Simplified: just push 0 for now */
@@ -3293,24 +3317,30 @@ static void process_declarations(codegen_t *cg, ast_node_t *node, bool is_global
                         break;
                     }
                 }
+                /* P80h2: always register a sig for every proc/func decl, even
+                 * parameterless non-external ones. Without this, bodies like
+                 * `procedure MEMMGR;` never enter proc_sigs, so find_proc_sig
+                 * returns NULL at @MEMMGR sites and the codegen falls back to
+                 * treating the name as an A5-relative global variable. That
+                 * shipped garbage addresses into PCB.start_PC (e.g. $CCB802
+                 * instead of MEMMGR's actual entry $043F56). */
+                if (!has_params && !find_proc_sig(cg, child->name) &&
+                    cg->proc_sigs && cg->num_proc_sigs < CODEGEN_MAX_PROC_SIGS) {
+                    cg_proc_sig_t *sig = &cg->proc_sigs[cg->num_proc_sigs++];
+                    memset(sig, 0, sizeof(*sig));
+                    strncpy(sig->name, child->name, 63);
+                    sig->is_external = is_ext;
+                    sig->is_function = is_func;
+                }
                 /* Set is_function flag on the registered signature */
                 {
                     cg_proc_sig_t *sig = find_proc_sig(cg, child->name);
                     if (sig) sig->is_function = is_func;
                 }
-                /* If external declaration without params, mark existing signature */
+                /* If external declaration, mark existing signature */
                 if (is_ext) {
                     cg_proc_sig_t *existing = find_proc_sig(cg, child->name);
                     if (existing) { existing->is_external = true; existing->is_function = is_func; }
-                    /* Also register empty sig if no params and no existing sig */
-                    if (!has_params && !existing && cg->proc_sigs &&
-                        cg->num_proc_sigs < CODEGEN_MAX_PROC_SIGS) {
-                        cg_proc_sig_t *sig = &cg->proc_sigs[cg->num_proc_sigs++];
-                        memset(sig, 0, sizeof(*sig));
-                        strncpy(sig->name, child->name, 63);
-                        sig->is_external = true;
-                        sig->is_function = is_func;
-                    }
                 }
                 /* P54: capture the return type of functions so expr_size()
                  * correctly sizes FUNC_CALL expressions. Without this, a

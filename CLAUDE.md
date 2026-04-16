@@ -70,12 +70,42 @@ make audit-linker       # Stage 4: Full pipeline + linker
 cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' build 2>&1 | grep -E "(error:|BUILD)"
 ```
 
-## Current Status (2026-04-16) — 25/27 milestones, scheduler dispatches
+## Current Status (2026-04-16) — 25/27 milestones, scheduler runs to idle
 
 Build green. Full kernel boot INIT→PR_CLEANUP. Both MemMgr and Root
-processes created and queued. Scheduler dispatches processes but they
-crash immediately (environment save area not initialized, start_PC wrong).
-Next: fix ord(@proc) codegen and set up syslocal env_save_area.
+processes created, start_PC resolved to real code addresses, queued via
+priority-sorted insertion. PR_CLEANUP's HLE now unlinks the stale outer
+PCB and redirects to the Scheduler (instead of returning). The Scheduler
+Pascal body reaches its idle Pause (STOP) — but does NOT dispatch
+MemMgr, suggesting fwd_ReadyQ lives at a different runtime address than
+the HLE writes to. Next: find the Pascal compiler's actual A5-offset
+(or absolute address) for fwd_ReadyQ and point FinishCreate at it.
+
+### P80h2 session fixes (scheduler dispatch plumbing)
+
+- **ord(@proc) emits proc-address relocation**: `AST_ADDR_OF` now detects
+  procedure identifiers via `find_proc_sig` and emits `MOVE.L #imm32,D0`
+  with a linker relocation, instead of falling through to
+  `gen_lvalue_addr` which emitted a bogus `LEA offset(A5),A0`. MemMgr's
+  start_PC now resolves to `$043FB4` (the real code entry) instead of
+  `$CCB802` (a stale A5-relative global slot).
+  (`src/toolchain/pascal_codegen.c:2262`)
+- **Proc-sig registration for all decls**: parameterless Pascal bodies
+  like `procedure MEMMGR;` are now registered in `proc_sigs`, not only
+  external ones. Without this, `find_proc_sig` returned NULL for all
+  body-decl procs and `@MEMMGR` fell back to variable-lookup.
+  (`src/toolchain/pascal_codegen.c:3320`)
+- **CreateProcess HLE populates env_save_area**: writes PC=start_PC,
+  SR=0, A5=sysA5, A6=A7=stack top, plus SCB fields and
+  sl_free_pool_addr, so the scheduler's SETREGS/RTE launches into a
+  runnable register state.  (`src/m68k.c:3515`)
+- **FinishCreate HLE does priority-sorted queue insert**: doubly-linked
+  walk from `@fwd_ReadyQ` finds the insertion point, maintains both
+  next/prev pointers.  (`src/m68k.c:3632`)
+- **PR_CLEANUP HLE unlinks stale PCBs and redirects to Scheduler**:
+  walks the ready queue, unlinks any PCB with priority&lt;0 or ≥255
+  (covers STARTUP's pseudo c_pcb whose priority got garbled), then jumps
+  directly to the Scheduler body at `$05B832`.  (`src/m68k.c:2978`)
 
 ### P80 session fixes (20+ structural codegen + HLE fixes)
 

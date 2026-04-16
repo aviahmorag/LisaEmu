@@ -2976,15 +2976,60 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             continue;
         }
         /* P38 HLE bypass: PR_CLEANUP (STARTUP:2082). No args.
-         * Real proc enters scheduler then SYSTEM_ERROR(stup_didntblock);
-         * since our scheduler isn't functional, bypass after firing
-         * milestone. */
+         * Real proc unlinks c_pcb_ptr from the Ready queue (which crashes
+         * since c_pcb_ptr is nil during boot) then enters the scheduler.
+         * Skip the PCB-cleanup preamble but DO enter the scheduler — that's
+         * the whole point of getting this far: let it dispatch MemMgr. */
         if (pc_PR_CLEANUP && cpu->pc == pc_PR_CLEANUP) {
             boot_progress_record_pc(cpu->pc);
+            static uint32_t pc_enter_sched = 0;
+            if (!pc_enter_sched) {
+                /* Jump straight to the Pascal Scheduler body, skipping
+                 * ENTER_SC's TRAP #2 dance and SCHDTRAP's save-state (we
+                 * nil-ed c_pcb_ptr below so there's nothing to save
+                 * anyway). The stack and A5 are already correct for the
+                 * jump. */
+                pc_enter_sched = boot_progress_lookup("Scheduler");
+                if (!pc_enter_sched) pc_enter_sched = 0x05B832;
+                fprintf(stderr, "  DEBUG: Scheduler lookup → $%06X\n", pc_enter_sched);
+            }
+            /* Unlink c_pcb (STARTUP's pseudo-process) from the ready queue so
+             * the scheduler doesn't try to Launch it — it has no valid env
+             * save area, and the real PR_CLEANUP body normally does this
+             * before entering the scheduler. */
+            uint32_t a5 = cpu->a[5] & 0xFFFFFF;
+            uint32_t ready_head = (a5 - 1116) & 0xFFFFFF;  /* @fwd_ReadyQ */
+            /* Walk the ready queue and unlink STARTUP's pseudo-PCB (priority
+             * 255 with need_mem=false), plus any orphan PCBs whose env_save
+             * area wasn't set up — we only want MemMgr and Root. Our Pascal
+             * compiler's global layout isn't byte-for-byte compatible with
+             * PASCALDEFS so locating c_pcb_ptr by fixed A5 offset was off by
+             * a couple of bytes; scanning is more robust. */
+            uint32_t cur = cpu_read32(cpu, ready_head) & 0xFFFFFF;
+            int guard = 0;
+            while (cur && cur != ready_head && guard++ < 16) {
+                uint32_t next = cpu_read32(cpu, cur + 0) & 0xFFFFFF;
+                int16_t pri = (int16_t)cpu_read16(cpu, cur + 12);
+                /* Remove any PCB that isn't one of our created system
+                 * processes or the sentinel. c_pcb's priority may have been
+                 * corrupted during the (bypassed) STARTUP init — it shows up
+                 * as priority -256 here. Anything negative means it's not a
+                 * runnable process and would block the scheduler walk. */
+                if (pri < 0 || pri >= 255) {
+                    uint32_t prev = cpu_read32(cpu, cur + 4) & 0xFFFFFF;
+                    if (!prev) prev = ready_head;
+                    cpu_write32(cpu, prev + 0, next);
+                    cpu_write32(cpu, next + 4, prev);
+                    fprintf(stderr, "  [PR_CLEANUP HLE] unlinked pri-255 PCB "
+                            "$%06X (prev=$%06X next=$%06X)\n", cur, prev, next);
+                }
+                cur = next;
+            }
+            /* Pop PR_CLEANUP's return address — scheduler never returns. */
             uint32_t sp = cpu->a[7] & 0xFFFFFF;
-            uint32_t ret = cpu_read32(cpu, sp);
+            cpu_read32(cpu, sp);
             cpu->a[7] += 4;
-            cpu->pc = ret;
+            cpu->pc = pc_enter_sched;
             continue;
         }
         /* P36 HLE bypass: MEM_CLEANUP (STARTUP/MM4). Called after
@@ -3552,6 +3597,60 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                     cpu_write16(cpu, pcb + 16, 0);               /* blk_state = empty */
                     cpu_write16(cpu, pcb + 18, 0);               /* domain = 0 */
                 }
+                /* P80h2: set up env_save_area in the syslocal so Launch's
+                 * SETREGS has real register state to RTE into. Pascal's
+                 * Build_Stack normally does this; we bypassed it. Without
+                 * this, every dispatched process crashes immediately when
+                 * SETREGS pops $00000000 as PC and jumps to vector 0.
+                 *
+                 * syslocal layout (source-SYSGLOBAL.TEXT):
+                 *   +0  sl_free_pool_addr  (4)
+                 *   +4  size_slocal        (2)
+                 *   +6  env_save_area      (env_area, 70 bytes)
+                 *         +0  PC (4)
+                 *         +4  SR (2)
+                 *         +6..+37  D0..D7 (8*4)
+                 *         +38..+65 A0..A5 (6*4)
+                 *         +62 A6 (4) — NB: record says A6 after A5, so +58+4
+                 *         +66 A7 (4)
+                 *   +76 SCB { A5value(4), PCvalue(4), domvalue(2) }
+                 *
+                 * Recompute env_area offsets: PC@+0, SR@+4, D0@+6, ..., A0@+38,
+                 *   A1@+42, A2@+46, A3@+50, A4@+54, A5@+58, A6@+62, A7@+66.
+                 * So absolute syslocal offsets: PC=6, SR=10, D0=12, A5=64,
+                 *   A6=68, A7=72, SCB_A5value=76, SCB_PCvalue=80.
+                 *
+                 * We skip the Initiate/init_stack dance and RTE directly into
+                 * start_PC. The process body will LINK/UNLK normally with
+                 * A6=A7=stack top. sl_free_pool_addr is set so MemMgr's
+                 * GETSPACE calls don't fault on an empty free pool. */
+                if (sloc_seg_ptr >= 0xCC0000 && sloc_seg_ptr < 0xCE0000 &&
+                    stk_seg_ptr  >= 0xCC0000 && stk_seg_ptr  < 0xCE0000 &&
+                    (start_pc_val & 0xFFFFFF) >= 0x000400 &&
+                    (start_pc_val & 0xFFFFFF) <  0x800000) {
+                    uint32_t stk_top = (stk_seg_ptr + stk_seg_size) & 0xFFFFFF;
+                    uint32_t env = (sloc_seg_ptr + 6) & 0xFFFFFF;
+                    /* PC, SR */
+                    cpu_write32(cpu, env + 0,  start_pc_val & 0xFFFFFF);
+                    cpu_write16(cpu, env + 4,  0x0000);          /* SR = user, IPL=0 */
+                    /* D0..D7, A0..A4 = 0 */
+                    for (uint32_t off = 6; off <= 54; off += 4)
+                        cpu_write32(cpu, env + off, 0);
+                    cpu_write32(cpu, env + 58, sys_a5);           /* A5 = sysA5 */
+                    cpu_write32(cpu, env + 62, stk_top);          /* A6 = stack top */
+                    cpu_write32(cpu, env + 66, stk_top);          /* A7 = stack top */
+                    /* SCB: used for syscall PC/A5 save, but pre-populate so
+                     * trap handlers that read it find sane values. */
+                    cpu_write32(cpu, sloc_seg_ptr + 76, sys_a5);           /* SCB.A5value */
+                    cpu_write32(cpu, sloc_seg_ptr + 80, start_pc_val & 0xFFFFFF); /* SCB.PCvalue */
+                    cpu_write16(cpu, sloc_seg_ptr + 84, 1);                /* SCB.domvalue */
+                    /* sl_free_pool_addr → just past the syslocal record.
+                     * size_slocal is already implicit (slot stays 0, but
+                     * GETSPACE reads sl_free_pool_addr first). */
+                    cpu_write32(cpu, sloc_seg_ptr + 0, (sloc_seg_ptr + 256) & 0xFFFFFF);
+                    fprintf(stderr, "  [HLE-CP env] PC=$%06X A5=$%06X A6=A7=$%06X\n",
+                            start_pc_val & 0xFFFFFF, sys_a5, stk_top);
+                }
                 uint32_t ret = cpu_read32(cpu, sp);
                 cpu->a[7] += 4;
                 cpu->pc = ret;
@@ -3566,29 +3665,47 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 continue;
             }
             if (pc_cp && cpu->pc == pc_fc) {
-                /* P80h: HLE FinishCreate — queue process in ready list.
-                 * FinishCreate(pcb: ptr_PCB; stk: segHandle; sloc: segHandle; obj: ObjHandle)
-                 * Push order L→R: obj(4), sloc_addr(4), stk_addr(4), pcb(4)
-                 * After JSR: SP+4=pcb, SP+8=stk_addr, SP+12=sloc_addr, SP+16=obj */
+                /* P80h2: HLE FinishCreate — priority-sorted insert into ready
+                 * queue. Mirrors Queue_Process (PROCASM.TEXT:174): walk from
+                 * @fwd_ReadyQ following next_schedPtr until we find a node
+                 * with priority < newpcb.priority, insert before that node.
+                 *
+                 * Queue is a doubly-linked list of absolute 4-byte pointers:
+                 *   PCB+0 = next_schedPtr, PCB+4 = prev_schedPtr
+                 * fwd_ReadyQ lives at A5-1116 (PFWD_REA); the sentinel PCB
+                 * has priority 0 and wraps back to @fwd_ReadyQ, so the walk
+                 * always terminates. */
                 uint32_t sp = cpu->a[7] & 0xFFFFFF;
                 uint32_t pcb = cpu_read32(cpu, (sp + 4) & 0xFFFFFF) & 0xFFFFFF;
                 DBGSTATIC(int, fc_count, 0);
                 fc_count++;
-                fprintf(stderr, "[HLE-FinishCreate #%d] pcb=$%06X → queuing\n",
-                        fc_count, pcb);
-                /* Insert into fwd_ReadyQ. The ReadyQ is at A5-1116 (PFWD_REA
-                 * from PASCALDEFS). It's a relptr (int2) linked list. */
                 uint32_t a5 = cpu->a[5] & 0xFFFFFF;
-                uint32_t b_sysglobal = cpu_read32(cpu, 0x200);
-                /* Queue_Process inserts by priority. For simplicity, just
-                 * set the process as the first in the ready queue. */
-                int16_t old_fwd = (int16_t)cpu_read16(cpu, (a5 - 1116) & 0xFFFFFF);
-                /* fwd_ReadyQ is a relptr (relative to b_sysglobal_ptr) */
-                int16_t new_rp = (int16_t)(pcb - b_sysglobal);
-                /* PCB.next_schedPtr = old fwd_ReadyQ (as relptr) */
-                cpu_write32(cpu, pcb, old_fwd ? (b_sysglobal + old_fwd) : 0);
-                /* fwd_ReadyQ = new process */
-                cpu_write16(cpu, (a5 - 1116) & 0xFFFFFF, (uint16_t)new_rp);
+                uint32_t head = (a5 - 1116) & 0xFFFFFF;  /* @fwd_ReadyQ */
+                int16_t new_pri = (int16_t)cpu_read16(cpu, pcb + 12);
+                /* Walk the queue: cur starts at fwd_ReadyQ's first entry. */
+                uint32_t cur = cpu_read32(cpu, head) & 0xFFFFFF;
+                int safety = 0;
+                while (cur && cur != head && safety++ < 64) {
+                    int16_t cur_pri = (int16_t)cpu_read16(cpu, cur + 12);
+                    if (new_pri > cur_pri) break;
+                    cur = cpu_read32(cpu, cur) & 0xFFFFFF;
+                }
+                if (!cur || safety >= 64) {
+                    fprintf(stderr, "[HLE-FinishCreate #%d] queue walk failed "
+                            "(cur=$%06X safety=%d) — forcing head insert\n",
+                            fc_count, cur, safety);
+                    cur = head;
+                }
+                uint32_t prev = cpu_read32(cpu, cur + 4) & 0xFFFFFF;
+                if (!prev) prev = head;
+                /* Insert pcb between prev and cur. */
+                cpu_write32(cpu, pcb + 0, cur);   /* pcb.next = cur */
+                cpu_write32(cpu, pcb + 4, prev);  /* pcb.prev = prev */
+                cpu_write32(cpu, prev + 0, pcb);  /* prev.next = pcb */
+                cpu_write32(cpu, cur + 4, pcb);   /* cur.prev  = pcb */
+                fprintf(stderr, "[HLE-FinishCreate #%d] pcb=$%06X pri=%d "
+                        "inserted between prev=$%06X and cur=$%06X\n",
+                        fc_count, pcb, new_pri, prev, cur);
                 uint32_t ret = cpu_read32(cpu, sp);
                 cpu->a[7] += 4;
                 cpu->pc = ret;
