@@ -70,9 +70,17 @@ make audit-linker       # Stage 4: Full pipeline + linker
 cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' build 2>&1 | grep -E "(error:|BUILD)"
 ```
 
-## Current Status (2026-04-16) — 25/27 reported (21 real + 4 bypass-fired)
+## Current Status (2026-04-16) — 21/27 milestones, P35 disabled
 
-Build and audit green. Two milestone labels lost to code layout shifts (cosmetic).
+Build green. P35 (SYS_PROC_INIT bypass) disabled — body runs for real.
+Stalls during MAKE_DATASEG due to corrupted MMRB semaphore.
+
+### P80 session fixes (8-char identifiers + FS bypass removal)
+
+1. **8-char significant identifiers** (P80): Lisa Pascal identifiers are significant to 8 chars. `str_eq_nocase` now returns true after 8 matching characters. Resolves whole class of variable mismatch bugs (e.g., `ordrefncbptr` vs `ordrefncb`).
+2. **SYS_PROC_INIT bypass disabled** (P80): P35 bypass removed. Process creation code runs for real.
+3. **DecompPath/parse_pathname bypasses disabled** (P80a): FS functions run natively with corrected codegen.
+4. **PASCALDEFS offsets corrected**: diagnostic dumps now use real offsets (-24575, -24785, -25691) from PASCALDEFS.TEXT.
 
 ### P79 session fixes (6 structural codegen improvements)
 
@@ -83,20 +91,13 @@ Build and audit green. Two milestone labels lost to code layout shifts (cosmetic
 5. **Byte-subrange sizing** (P79f): range<=255 → natural size=1. Record fields widen to 2. Arrays stay at 1. Fixed sc_par_no overflow into b_syslocal_ptr.
 6. **Record-field array stride** (P79f): resolve element type for FIELD_ACCESS array bases.
 
-### Bypass-fired milestones (4):
+### Next blocker: MMRB semaphore corruption during MAKE_DATASEG
 
-- **SYS_PROC_INIT** (P35): entry PC reached, body skipped.
-- **FS_CLEANUP** (P37): body spins in FIND_REFNCB_ENTRY.
-- **MEM_CLEANUP** (P36): body spins in ADDTO_MMLIST.
-- **PR_CLEANUP** (P38): idle scheduler loop — needs Shell.
-
-### Next blocker: SYS_PROC_INIT body — process creation NULL pointers
-
-P35 disabled: 21/27 milestones. SYS_PROC_INIT doesn't complete.
-b_syslocal_ptr now correctly $CE0000 (was $040000 due to SCTAB2
-overflow, fixed by P79f). BLD_SEG fixed (P79c/d). ENQUEUE fixed
-(P79e). Remaining VEC-GUARD writes from GETSPACE/pool code and
-CreateProcess — more codegen bugs to trace.
+P35 disabled: 21/27 milestones. SYS_PROC_INIT enters Make_SProcess →
+Get_Resources → MAKE_DATASEG but WAIT_SEM on c_mmrb^.sds_sem has
+bogus sem_count=-12223 ($D041). MMRB record layout likely wrong —
+either field sizes differ from Apple's compiler or MM_INIT generates
+wrong initialization code. See NEXT_SESSION.md for detailed trace.
 
 ### Roadmap to fully bootable Lisa desktop
 
