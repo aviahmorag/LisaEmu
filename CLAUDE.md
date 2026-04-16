@@ -70,24 +70,33 @@ make audit-linker       # Stage 4: Full pipeline + linker
 cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' build 2>&1 | grep -E "(error:|BUILD)"
 ```
 
-## Current Status (2026-04-16) — 27/27 reported (23 real + 4 bypass-fired)
+## Current Status (2026-04-16) — 26/27 reported (22 real + 4 bypass-fired)
 
-All OS-kernel boot checkpoints reached. Build and audit green.
+Build and audit green. INITSYS milestone lost to code layout shift (cosmetic).
 
-### Real milestones (23): PASCALINIT through FS_INIT + SYS_PROC_INIT entry
+### P79 record layout fixes (this session)
 
-All reached by actual Pascal/asm code execution.
+Fixed 3 record layout bugs in the Pascal codegen:
+- **int1 type**: was TK_BYTE/1, now TK_INTEGER/2 (matches Lisa Pascal word-sized unpacked fields)
+- **String padding**: odd-length strings now word-padded in unpacked records
+- **CONST export in pre-pass**: `max_ename=32` now visible during type resolution
+
+Key records fixed: devrec (70→74), DCB (344→122), reqblk, codesdb, sdb.
 
 ### Bypass-fired milestones (4):
 
-- **SYS_PROC_INIT** (P35): entry PC reached, body skipped. FS code corrupts vector table → F-line trap.
+- **SYS_PROC_INIT** (P35): entry PC reached, body skipped.
 - **FS_CLEANUP** (P37): body spins in FIND_REFNCB_ENTRY.
 - **MEM_CLEANUP** (P36): body spins in ADDTO_MMLIST.
 - **PR_CLEANUP** (P38): idle scheduler loop — needs Shell.
 
-### Next blocker: SYS_PROC_INIT F-line trap
+### Next blocker: SYS_PROC_INIT body — NULL pointers in process creation
 
-When P35 bypass is disabled, boot reaches SYS_PROC_INIT → Make_SProcess but crashes from F-line trap (SYSTEM_ERROR 10204). Root cause: filesystem code around SplitPathname writes to the CPU vector table (addr $00 and $CC), corrupting exception handlers. This is a pointer arithmetic or field offset bug in the FS init code path.
+P35 disabled: SYS_PROC_INIT → Make_SProcess. Both MAKE_SYSDATASEG
+calls are discsize=0 (resident, memory-only — no FS needed). The crash
+comes from BLD_SEG receiving a NULL c_sdb_ptr and Signal_sem dereferencing
+NULL wait_queue during the second Make_SProcess call. Root cause is in
+CreateProcess → Build_Syslocal pointer chain, not in FS code.
 
 ### Roadmap to fully bootable Lisa desktop
 
