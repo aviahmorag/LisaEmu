@@ -702,12 +702,18 @@ static type_desc_t *repair_corrupt_record(codegen_t *cg, type_desc_t *rt) {
     for (int fj = 1; fj < rt->num_fields; fj++)
         if (rt->fields[fj].offset != 0) { all_zero = 0; break; }
     if (!all_zero) return rt;  /* Offsets look valid */
-    if (!cg->imported_types || !rt->name[0]) return rt;
-    /* Search imported types for a matching record with valid offsets */
+    if (!cg->imported_types) return rt;
+    /* Search imported types for a matching record with valid offsets.
+     * Match by name if available, or by field count + first field name
+     * for anonymous records. */
     for (int it = 0; it < cg->imported_types_count; it++) {
         type_desc_t *imp = &cg->imported_types[it];
         if (imp->kind != TK_RECORD || imp->num_fields != rt->num_fields) continue;
-        if (!str_eq_nocase(imp->name, rt->name)) continue;
+        /* Named match */
+        if (rt->name[0] && imp->name[0] && !str_eq_nocase(imp->name, rt->name)) continue;
+        /* Anonymous match: compare first field name */
+        if (!rt->name[0] && rt->num_fields > 0 &&
+            !str_eq_nocase(imp->fields[0].name, rt->fields[0].name)) continue;
         if (imp->num_fields > 1 && imp->fields[1].offset > 0) {
             static int fix_count = 0;
             if (fix_count++ < 20)
