@@ -3419,9 +3419,17 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 if (clf_all++ < 10)
                     fprintf(stderr, "[CHK_LDSN_FREE #%d] ldsn=%d numb=%d\n", clf_all, ldsn, numb);
                 if (ldsn < 0) {
-                    uint32_t errnum_ptr = cpu_read32(cpu, (sp + 4) & 0xFFFFFF) & 0xFFFFFF;
-                    if (errnum_ptr >= 0x1000 && errnum_ptr < 0x240000)
-                        cpu_write16(cpu, errnum_ptr, 1);  /* e_ldsnfree = 1 */
+                    uint32_t errnum_ptr = cpu_read32(cpu, (sp + 4) & 0xFFFFFF);
+                    fprintf(stderr, "  errnum_ptr=$%08X (raw from SP+4)\n", errnum_ptr);
+                    errnum_ptr &= 0xFFFFFF;
+                    /* Expand valid range to include sysglobal/syslocal addresses.
+                     * P80f: the compiled code compares errnum against 3, not 1
+                     * for e_ldsnfree — the constant value resolution is off.
+                     * Write 3 to match the compiled comparison. */
+                    if (errnum_ptr >= 0x1000) {
+                        cpu_write16(cpu, errnum_ptr, 3);  /* compiled e_ldsnfree = 3 */
+                        fprintf(stderr, "  wrote errnum=3 to $%06X\n", errnum_ptr);
+                    }
                     uint32_t ret = cpu_read32(cpu, sp);
                     cpu->a[7] += 4;  /* pop return address only — caller's ADDQ.L #8 cleans args */
                     cpu->pc = ret;

@@ -689,48 +689,48 @@ static void gen_ptr_expression(codegen_t *cg, ast_node_t *node) {
      * at source. Together they should cover nearly all pointer loads. */
 }
 
+/* P80f: repair a corrupt record type by finding the imported version.
+ * Returns the repaired type, or the original if no repair is needed/possible. */
+static type_desc_t *repair_corrupt_record(codegen_t *cg, type_desc_t *rt) {
+    if (!rt || rt->kind != TK_RECORD || rt->num_fields <= 1) return rt;
+    /* Check for all-zero offsets (corruption signature) */
+    int all_zero = 1;
+    for (int fj = 1; fj < rt->num_fields; fj++)
+        if (rt->fields[fj].offset != 0) { all_zero = 0; break; }
+    if (!all_zero) return rt;  /* Offsets look valid */
+    if (!cg->imported_types || !rt->name[0]) return rt;
+    /* Search imported types for a matching record with valid offsets */
+    for (int it = 0; it < cg->imported_types_count; it++) {
+        type_desc_t *imp = &cg->imported_types[it];
+        if (imp->kind != TK_RECORD || imp->num_fields != rt->num_fields) continue;
+        if (!str_eq_nocase(imp->name, rt->name)) continue;
+        if (imp->num_fields > 1 && imp->fields[1].offset > 0) {
+            static int fix_count = 0;
+            if (fix_count++ < 20)
+                fprintf(stderr, "  [P80f-REPAIR] '%s' (%d fields) → imported with field[1]@%d\n",
+                        rt->name, rt->num_fields, imp->fields[1].offset);
+            return imp;
+        }
+    }
+    return rt;
+}
+
 /* Check if an identifier is a field of an active WITH record.
  * Returns the field index and sets *out_type to the record type,
- * or returns -1 if not found. Searches from innermost WITH outward.
- *
- * P80c: if the found record type has all field offsets = 0 (a known
- * corruption issue where the full-pass local type gets zeroed), try
- * to find the same record in imported_types which has correct offsets
- * from the pre-pass fixup. */
+ * or returns -1 if not found. Searches from innermost WITH outward. */
 static int with_lookup_field(codegen_t *cg, const char *name,
                              type_desc_t **out_type, int *out_with_idx) {
     for (int w = cg->with_depth - 1; w >= 0; w--) {
         type_desc_t *rt = cg->with_stack[w].record_type;
         if (!rt || rt->kind != TK_RECORD) continue;
+        /* P80f: auto-repair corrupt records on first access */
+        type_desc_t *repaired = repair_corrupt_record(cg, rt);
+        if (repaired != rt) {
+            rt = repaired;
+            cg->with_stack[w].record_type = rt;
+        }
         for (int fi = 0; fi < rt->num_fields; fi++) {
             if (str_eq_nocase(rt->fields[fi].name, name)) {
-                /* P80c: detect and repair corrupt record types.
-                 * A record with >1 field where ALL offsets are 0 is corrupt. */
-                if (fi > 0 && rt->fields[fi].offset == 0 && rt->num_fields > 1) {
-                    int all_zero = 1;
-                    for (int fj = 1; fj < rt->num_fields; fj++)
-                        if (rt->fields[fj].offset != 0) { all_zero = 0; break; }
-                    if (all_zero && cg->imported_types) {
-                        /* Search imported types for a matching record */
-                        for (int it = 0; it < cg->imported_types_count; it++) {
-                            type_desc_t *imp = &cg->imported_types[it];
-                            if (imp->kind != TK_RECORD || imp->num_fields != rt->num_fields) continue;
-                            if (!str_eq_nocase(imp->name, rt->name)) continue;
-                            /* Verify imported version has non-zero offsets */
-                            if (imp->num_fields > 1 && imp->fields[1].offset > 0) {
-                                /* Replace the corrupt type with the imported one */
-                                fprintf(stderr, "  [P80c-FIX] repaired '%s' field '%s' offset %d→%d\n",
-                                        rt->name, name, 0, imp->fields[fi > 0 ? fi : 1].offset);
-                                rt = imp;
-                                cg->with_stack[w].record_type = rt;
-                                /* Re-find the field in the corrected type */
-                                for (fi = 0; fi < rt->num_fields; fi++)
-                                    if (str_eq_nocase(rt->fields[fi].name, name)) break;
-                                break;
-                            }
-                        }
-                    }
-                }
                 if (out_type) *out_type = rt;
                 if (out_with_idx) *out_with_idx = w;
                 return fi;
@@ -927,6 +927,8 @@ static int expr_size(codegen_t *cg, ast_node_t *node) {
                     }
                 }
             }
+            /* P80f: repair corrupt record before field lookup */
+            if (rt) rt = repair_corrupt_record(cg, rt);
             if (rt && rt->kind == TK_RECORD) {
                 for (int i = 0; i < rt->num_fields; i++) {
                     if (str_eq_nocase(rt->fields[i].name, node->name)) {
@@ -1170,16 +1172,16 @@ static void gen_lvalue_addr(codegen_t *cg, ast_node_t *node) {
         if (node->children[0]->type == AST_IDENT_EXPR) {
             cg_symbol_t *rec_sym = find_symbol_any(cg, node->children[0]->name);
             if (rec_sym && rec_sym->type && rec_sym->type->kind == TK_RECORD) {
-                for (int fi = 0; fi < rec_sym->type->num_fields; fi++) {
-                    if (str_eq_nocase(rec_sym->type->fields[fi].name, node->name)) {
-                        field_off = rec_sym->type->fields[fi].offset;
+                type_desc_t *rec_rt = repair_corrupt_record(cg, rec_sym->type);
+                for (int fi = 0; fi < rec_rt->num_fields; fi++) {
+                    if (str_eq_nocase(rec_rt->fields[fi].name, node->name)) {
+                        field_off = rec_rt->fields[fi].offset;
                         break;
                     }
                 }
             } else if (rec_sym && rec_sym->type && rec_sym->type->kind == TK_POINTER &&
                        rec_sym->type->base_type && rec_sym->type->base_type->kind == TK_RECORD) {
-                /* Pointer to record — look up field in the pointed-to record */
-                type_desc_t *rt = rec_sym->type->base_type;
+                type_desc_t *rt = repair_corrupt_record(cg, rec_sym->type->base_type);
                 for (int fi = 0; fi < rt->num_fields; fi++) {
                     if (str_eq_nocase(rt->fields[fi].name, node->name)) {
                         field_off = rt->fields[fi].offset;
@@ -1199,6 +1201,7 @@ static void gen_lvalue_addr(codegen_t *cg, ast_node_t *node) {
                     type_desc_t *ft = wrt->fields[wfld].type;
                     if (ft && ft->kind == TK_POINTER && ft->base_type)
                         ft = ft->base_type;
+                    if (ft) ft = repair_corrupt_record(cg, ft);
                     if (ft && ft->kind == TK_RECORD) {
                         for (int fi = 0; fi < ft->num_fields; fi++) {
                             if (str_eq_nocase(ft->fields[fi].name, node->name)) {
@@ -1217,7 +1220,7 @@ static void gen_lvalue_addr(codegen_t *cg, ast_node_t *node) {
                 cg_symbol_t *ptr_sym = find_symbol_any(cg, ptr_node->name);
                 if (ptr_sym && ptr_sym->type && ptr_sym->type->kind == TK_POINTER &&
                     ptr_sym->type->base_type && ptr_sym->type->base_type->kind == TK_RECORD) {
-                    rec_type = ptr_sym->type->base_type;
+                    rec_type = repair_corrupt_record(cg, ptr_sym->type->base_type);
                 } else if (!ptr_sym && cg->with_depth > 0) {
                     /* WITH field whose type is a pointer to a record */
                     type_desc_t *wrt = NULL;
