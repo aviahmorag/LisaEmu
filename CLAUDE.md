@@ -107,19 +107,53 @@ via MOVEA.L D0,A0 → JMP (A0) → vector 4 crash.
   AST_FUNC_CALL, AST_CALL. Indirect calls via procedure params are
   not yet static-link-aware (uncommon enough to defer).
 
+### P81a — trimmed 6 of 7 HLE bypasses the static-link fix made redundant
+
+Commit `6b6d9b0`. With the static-link ABI in, natural kernel code
+now runs cleanly through the paths these HLEs were substituting.
+Removed:
+
+- CHK_LDSN_FREE (P80e) — natural errnum resolution works now
+- MAKE_SYSDATASEG (P79/P80f/g) — natural DS_OPEN / GetFree / MMU-program
+- Move_MemMgr (P80d) — MM free-space bookkeeping now coherent
+- Wait_sem (P43) — byte-subrange D0 fix (P80h2) had the real cause
+- Signal_sem (P78) — corrupt wait_queue was a static-link downstream
+- CreateProcess + ModifyProcess + FinishCreate (P80g/h2) — natural
+  body populates PCB / syslocal / env_save_area correctly now
+
+Boot: 50 boot_progress checkpoints reached in 200 frames, clean through
+PR_CLEANUP into the scheduler idle loop. No SYSTEM_ERROR halts, no
+vector 4 / vector 11 faults.
+
+### Still kept: HLE-SelectProcess
+
+The natural body does `exit(SelectProcess)` (a named exit to the
+current proc). Our `exit()` codegen walks `MOVEA.L (A6),A6`
+`scope_depth-1` times regardless of target — one level too far when
+target == current proc, corrupting A6 before UNLK.
+
+Naive fix attempted: skip the walk when target matches current scope's
+proc_name. Regressed 8 checkpoints: something else relies on the old
+"always unwind to outermost" behavior. The correct behavior is
+`walk = current_depth − target_depth`, but multiple callers seem to
+rely on the buggy behavior (probably calling `exit(SomeEnclosingProc)`
+expecting it to unwind further than lexically indicated). Needs deeper
+analysis before retrying.
+
 ### Next
 
-All active HLE bypasses (SelectProcess, CreateProcess/FinishCreate,
-PR_CLEANUP, etc.) remain in place. With the static-link fix in,
-several may no longer be necessary — the generated Pascal code should
-now correctly access outer-scope locals through sibling calls. Worth
-trying to re-enable them (one at a time) to see which the OS can run
-natively now.
+Two threads:
 
-Boot still ends in the Workshop/Shell load phase (SHELL/WS_MAIN are
-unreached — the two remaining milestones). Shell loading is a separate
-scope: need SYSTEM.SHELL compiled as a separate binary, plus dynamic
-intrinsic-library loading.
+1. **Fix `exit()` codegen properly.** Audit all `exit(Name)` call sites
+   in the linked OS, determine actual Pascal semantics the code relies
+   on, then land a codegen that matches. Once done, HLE-SelectProcess
+   comes off and the kernel is 100% self-hosting.
+
+2. **SYSTEM.SHELL as second compile target.** Adds a second binary to
+   the disk image, with an intrinsic-library loader. Unlocks SHELL and
+   WS_MAIN milestones and the actual Lisa desktop. Larger scope —
+   toolchain_bridge needs multi-target pipeline, linker needs separate
+   output files, disk image layout needs MDDF entries for both.
 
 ### P80h2 session fixes (scheduler dispatch plumbing)
 
