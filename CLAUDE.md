@@ -93,7 +93,46 @@ Phases (see NEXT_SESSION.md for detail):
 6. **Cleanup HLEs** (FS/MEM/PR)
 7. **Safety nets** (REG_OPEN_LIST, excep_setup, etc.)
 
-## Current Status (2026-04-18 session 2 — strategic pivot, P89i INTSON-defer added)
+## Current Status (2026-04-18 session 3 — Phase 1 PMEM: DBRA asm bug fixed, PRAM stub now valid)
+
+21/27 milestones. Regressed 1 from prior session because a major asm
+assembler bug (DBRA → DBT miscompile) was fixed, and the fix unmasks
+downstream bugs in other DBRA-dependent asm loops. This session:
+
+- **Cross-assembler DBRA encoding bug fixed** (`src/toolchain/asm68k.c:1391-1403`).
+  DBRA was encoding as `cc=0` (DBT — condition TRUE, always exits) instead
+  of `cc=1` (DBF, the correct alias). Every DBRA loop in Apple's asm
+  sources (14 total: source-LDASM, source-LDPROF, source-LDTWIG,
+  source-STARASM2) was silently running exactly one iteration. The most
+  visible victim was `INIT_READ_PM`'s `MOVEP.L` loop: it completed only
+  one 4-byte MOVEP instead of 16, so `pm_image` stayed mostly garbage
+  and `pm_good` never became true.
+
+- **PRAM stub now encodes a correct `cd_paraport` CD entry**
+  (`src/lisa.c` `io_read_cb` at `$FCC181`). Previous stub had `pm_slot=9`
+  (decodes to `cd_scc`) despite a comment claiming ProFile. Now
+  `pm_slot=11 = cd_paraport`, `pm_chan=7` (emptychan), `pm_dev=31`
+  (emptydev), `driverID=34`, short form. Checksum recomputed to `0x680C`
+  so the 32-word XOR is 0 (required by VERIFY_CKSUM for `pm_good := true`).
+
+- **Result**: INIT_CONFIG → INIT_READ_PM → VERIFY_CKSUM → `pm_good = 1` ✓.
+  FIND_PM_IDS's `if snap_good or pm_good` branch correctly calls
+  INIT_READ_PM a second time to populate `param_mem.parm_mem[]`. Verified
+  via probes that the valid cd_paraport entry reaches param_mem.
+
+- **Still open**: FIND_PM_IDS still returns false despite having valid
+  input. The inner match test `(boot_slot = pos.slot) and
+  (boot_chan = pos.chan) and (boot_dev = pos.dev)` doesn't fire on any
+  GetNxtConfig iteration. 10738 suppression still load-bearing.
+
+- **Saved**: `.claude/memory/project_dbra_asm_bug.md` durable rule about
+  DBRA miscompile, so any future "Apple-asm loop runs once then bails"
+  symptom points straight back to `asm68k.c` DBcc encoding.
+
+Commits this session: `268ca31` (DBRA fix), `0c5f668` (PRAM stub fix),
+`69dace3` (NEXT_SESSION.md handoff).
+
+## Previous Status (2026-04-18 session 2 — strategic pivot, P89i INTSON-defer added)
 
 22/27 milestones, same as start of session. This session:
 
