@@ -70,13 +70,81 @@ make audit-linker       # Stage 4: Full pipeline + linker
 cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' build 2>&1 | grep -E "(error:|BUILD)"
 ```
 
-## Current Status (2026-04-17) — P82 codegen fixes land; FS_INIT runs clean, CLEAR_SPACE is next blocker
+## Current Status (2026-04-17) — P82b/c: CASE tag + packed byte pairs, CLEAR_SPACE spin fixed
 
-Build + audit green. 22/27 milestones reached. Boot now runs cleanly
-past FS_INIT without crashing — the UNMAPPED-WRITE at `$F23204` from
-`P_DEQUEUE` is gone. Kernel now spins inside CLEAR_SPACE (called from
-ALLOC_MEM after FIND_FREE returns false); that's the next bug to
-chase. Net: milestone count unchanged but *crash class eliminated*.
+Build + audit green. 22/27 milestones. Boot reaches FS_INIT and halts
+cleanly at `SYSTEM_ERROR(10598)` — a real kernel assertion
+("TAKE_FREE: sdb not free"). The CLEAR_SPACE infinite loop is fixed.
+
+### P82b — parser emits CASE tag as a field (commit `1571efa`)
+
+`case sdbtype: Tsdbtype of ...` was being skipped entirely by the
+parser, so references to `sdbtype` everywhere compiled as offset 0
+(memchain.fwd_link's high word). Result: `if next_sdb^.sdbtype =
+free` was always true (high byte of a 24-bit pointer = 0), sending
+CLEAR_SPACE's inner while into infinite spin. Fix: when
+`CASE IDENT : TYPE OF` is detected via `lexer_peek` for the colon,
+emit the IDENT as a normal fixed field before `__variant_begin__`.
+
+### P82c — 1-byte enums + pair-aware byte widening
+
+Apple's hardcoded `oset_freechain = 14` in MMPRIM assumes codesdb
+packs lockcount(1) + sdbtype(1) tight. Two changes to match:
+
+- Enum types with ≤256 values default to 1 byte (was 2). `Tsdbtype`
+  (7 values) is now 1 byte natively.
+- The P79f "widen int1 to 2 bytes in unpacked records" rule now
+  peeks at the NEXT field — if it's also a byte-sized scalar, don't
+  widen, so consecutive 1-byte fields pack tight. Isolated bytes
+  still widen for asm-compat MOVE.W reads. Both the AST record
+  resolver and the pre-pass Phase-2 fixup honor the rule.
+
+Post-fix codesdb: memchain(8)@0, memaddr(2)@8, memsize(2)@10,
+lockcount(1)@12, sdbtype(1)@13, variant_start=14 — freechain@14
+matches `oset_freechain = 14`. ✓
+
+### Open blocker: SYSTEM_ERROR(10598) — TAKE_FREE asserts sdb not free
+
+```
+HLE SYSTEM_ERROR(10598) at ret=$040D0A SP=$00CBFD6B A6=$00CBFD75
+SYSTEM_ERROR(10598): HALTING CPU
+```
+
+Call chain (from probes): ALLOC_MEM → FIND_FREE returns false →
+CLEAR_SPACE's inner while walks free_sdb around the ring → reaches
+head_sdb (sdbtype=header) → MOVE_SEG → TAKE_FREE → assert fails.
+
+The free chain is **empty at FS_INIT time**:
+```
+head_sdb=$CCB034 fwd_link=$00CCB5CE bkwd_link=$00CCB062 memaddr=$0000 memsize=$0CD5 sdbtype=$05
+head_sdb.freechain.fwd_link=$00CCB070 bkwd_link=$00CCB070
+first_free_sdb=$CCB062 (= tail_sdb) memsize=$0000 sdbtype=$05
+```
+
+Two weird signals:
+1. **head_sdb.memsize=$0CD5** — but head_sdb is a sentinel, should
+   be 0. The value $0CD5 matches MAKE_FREE's `msize` arg, suggesting
+   MAKE_FREE wrote to head_sdb (or an overlapping address).
+2. **first_free_sdb = tail_sdb**, i.e. the freechain is empty. So
+   MAKE_FREE either didn't run or didn't insert properly.
+
+Start here next session:
+- Probe MAKE_FREE entry + exit, dump new_sdb address (`ord4(maddr)*
+  hmempgsize*2 + logrealmem`), memsize, sdbtype, and the freechain
+  state after INSERTSDB.
+- Verify INSERTSDB's linkage writes: memchain.fwd_link writes at
+  offset 0, bkwd_link at +4, plus freechain at +14..+21. With the
+  variant-arm-aware layout, those offsets should now be correct,
+  but confirm via disasm.
+- Check whether head_sdb is being overwritten by *where new_sdb
+  lands*. `logrealmem` is the base — if it collides with the MMRB
+  region, MAKE_FREE stomps on head_sdb. Unlikely but worth ruling
+  out.
+
+Memory layout-wise, this may also be a sign that BLD_SEG is
+computing codesdb size wrong in one place and sdb size wrong in
+another — cross-record size mismatch. Check `sdb_ptr` vs
+`codesdb_ptr` dereference widths.
 
 ### P82 — variant records + chained field access (commit `3ad488c`)
 
