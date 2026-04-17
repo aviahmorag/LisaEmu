@@ -157,27 +157,53 @@ Commits `1cd425f` through `c8dc5d4`:
   because other HLEs upstream were still poisoning state; natural
   body runs cleanly now.
 
-### Still kept: FS_CLEANUP
+### P81d — exit(CurrentProc) codegen fix (`f010d4f`)
 
-Natural body regresses the boot (26/27 → 24/27) even with every other
-HLE off. Probably wants FS mounttable / catalog state that our
-minimal FS doesn't populate. Needs disk-image + FS infrastructure
-work before it can run natively.
+`EXIT(init_boot_cds)` inside INIT_BOOT_CDS (nested depth 2) was
+unwinding its caller BOOT_IO_INIT too, because our `exit()` codegen
+walked `scope_depth-1` hops of the dynamic link unconditionally.
+That hit `MOVEA.L (A6),A6` once, landing on BOOT_IO_INIT's frame,
+then UNLK+RTS blew BOOT_IO_INIT away along with INIT_BOOT_CDS —
+skipping BOOT_IO_INIT's for-loop and its `case 4:` dispatch to
+FS_INIT.
+
+Fix: when `exit(Name)` target matches the current scope's proc_name,
+emit UNLK+RTS with **no walk**. For `exit(Named)` where the target
+is an enclosing proc, keep the old walk-to-outermost behavior —
+lexically not perfectly correct but changing it cascades regressions
+via the name-collision / flat-find_proc_sig issues.
+
+**Result: FS_INIT now reached** for the first time (27th resolved
+milestone visible). But FS_INIT's natural body crashes downstream
+(writes to `$F23204` from P_DEQUEUE with an unmapped segment), so
+SYS_PROC_INIT etc. no longer fire — boot stops at 22/27.
+
+### Still kept: FS_CLEANUP (was 26/27's holdout)
+
+Unchanged: natural body still regresses boot, needs FS infrastructure
+work (mounttable / catalog state) before it can run. Currently
+subsumed by the bigger FS_INIT-crashes issue above — fixing FS_INIT
+likely also unblocks FS_CLEANUP since both depend on the same FS
+state machinery.
 
 ### Next
 
-The kernel is now 98% self-hosting (one HLE left, blocked on FS
-infrastructure). Two remaining threads:
+The big remaining kernel blocker: **FS_MASTER_INIT fails with
+unmapped writes at `$F23204` from P_DEQUEUE** (part of the FS's
+sysglobal queue manipulation). Almost certainly a memory-manager
+bookkeeping mismatch — natural FS_INIT calls FS_MASTER_INIT which
+walks/updates queue structures that our current state doesn't
+populate with valid pointers. Needs diagnosis of P_DEQUEUE's caller
+and the syslocal/sysglobal fields it reads.
 
-1. **Populate FS state so FS_CLEANUP runs.** Our disk image layout
-   and FS_INIT flow likely need real MDDF / mounttable entries.
-   Fixing this probably also makes FS_INIT the 27th reached milestone.
+After that, remaining work to a booting Lisa:
 
-2. **SYSTEM.SHELL as second compile target.** Multi-target build
-   pipeline + intrinsic-library loader + disk-image catalog entries.
-   Unlocks SHELL and WS_MAIN and the actual Lisa desktop.
+1. **FS state population** (MDDF / mounttable / catalog entries in
+   the disk image, so FS_MASTER_INIT finds what it needs).
 
-Thread 1 is a prerequisite for thread 2 (SHELL needs FS to load).
+2. **SYSTEM.SHELL as second compile target** (multi-target build +
+   intrinsic-library loader + disk-image catalog entries). Unlocks
+   SHELL and WS_MAIN milestones and the actual Lisa desktop.
 
 ### P80h2 session fixes (scheduler dispatch plumbing)
 
