@@ -128,15 +128,78 @@ in system code").
    from env_save_area. If env_save_area has any byte-shift or
    zero-padding, PC will be wrong.
 
+### UPDATE (end of session): P89e fix emits all 13 Build_Stack stores, but env_save_area.PC is still $00CBFF at Launch entry
+
+After P89e (AST_FIELD_ACCESS in AST_WITH), `Build_Stack` correctly emits
+13 record-field stores including `env_save_area.PC := ord(@Initiate) =
+$0503F8`. The emit_reloc for @Initiate works. All offsets resolve.
+
+BUT runtime probe of env_save_area at Launch entry shows:
+```
+env_save_area@$CE0006: PC=$0000CBFF SR=$0001 A5=$00CC6FFC A6=$00CBFF8E A7=$00F7FD14
+```
+
+PC is still $00CBFF — not @Initiate. Investigation:
+
+- Build_Stack writes correctly, but to the sloc_ptr it receives as a
+  param (newpcb_ptr's sloc_handle-derived sloc_ptr).
+- Launch reads from `b_syslocal_ptr` (A5-24785), which points to the
+  CURRENT process's syslocal — = POP's syslocal at $CE0000.
+- POP is the pseudo-outer-process. Apple's code does NOT call
+  CreateProcess for POP — POP runs INITSYS directly as the boot
+  process. Its env_save_area is never populated.
+- Our boot path: after FS_INIT + error-unwind (10738, 10707 both
+  suppressed), Scheduler fires → Launch → RTE's from POP's
+  uninitialized env_save_area → garbage PC = whatever sits in that
+  memory (observed: $CBFF or $CC25 depending on link layout).
+
+So the **next blocker is not a codegen bug — it's a control-flow
+bug**: Scheduler/Launch shouldn't be firing before SYS_PROC_INIT runs.
+The HLE that suppresses SYSTEM_ERROR(10707) "unwind to FS_INIT caller"
+must be dropping us into the Scheduler dispatch path instead of
+returning to STARTUP's INITSYS to continue with SYS_PROC_INIT.
+
+### Root-caused (earlier in session): `ord(@Initiate)` codegen bug in Build_Stack
+
+The PC ring at the illegal trap shows:
+```
+... $06FD76 $06FD7A $06FD7C $00CBFF $00CC01 $00CC05 $00CC07
+```
+
+$06FD7C is the **RTE in `Launch`** (opcode $4E73). Launch reads the
+process's `env_save_area` starting at syslocal+6 (PC at offset 0, SR
+at offset 4) and pushes them onto SSP before RTE. The popped PC is
+$00CBFF — odd, so the emulator fetches $00CBFF, $00CC01, $00CC05,
+hits opcode $00CA at $00CC07 which is illegal → hard_excep.
+
+**Build_Stack (`PMMAKE.TEXT:403`) does** `PC := ord(@Initiate);`.
+Initiate is a procedure in PMMAKE. Its actual address in the linker
+map:
+```
+$04FD7C  Initiate
+```
+
+But the stored value is $0000CBFF — completely wrong. Same class of
+bug as P80h2: `ord(@proc)` codegen must detect procedure identifiers
+via find_proc_sig and emit `MOVE.L #imm32, D0` with a linker
+relocation, not fall through to gen_lvalue_addr's `LEA offset(A5),A0`.
+
+If Initiate is a **nested** proc (inside CreateProcess), it might not
+be registered in proc_sigs the way find_proc_sig expects, so `@Initiate`
+falls back to the A5-relative (global-variable-style) lookup and
+produces garbage.
+
 ### Starting point
 
-Instrument the CPU just before the illegal trap fires:
-- At v=4 handler entry, dump the exception frame (SR, PC, SSP, A6 chain).
-- At the instruction BEFORE the trap (walk back from PC=$CC07 via the
-  last PC ring), log what instruction set PC=$CC07.
-- Probe CreateProcess HLE entry/exit; if it HLE-bypasses, note where
-  start_PC comes from and whether the env_save_area it wrote is
-  byte-aligned.
+1. Check whether Initiate is registered via find_proc_sig. Add a probe
+   in AST_ADDR_OF that logs the resolved address/path for "Initiate".
+2. If not registered: ensure nested procs are registered in proc_sigs
+   (the P81b commit did this for parameterless nested procs; verify it
+   covers Initiate's case here).
+3. If registered: check the relocation emission path — is the imm32
+   being written as a 4-byte relocation or getting truncated somewhere?
+4. Once fixed, re-run. Expected: env_save_area.PC = $04FD7C, RTE jumps
+   to Initiate, boot progresses past SYS_PROC_INIT.
 
 ## Verify-before-continuing
 
@@ -158,17 +221,27 @@ make && ./build/lisaemu --headless Lisa_Source 300 2>&1 | grep "Milestones"
 
 Paste this prompt to resume:
 
-> Continue from NEXT_SESSION.md. Two structural Pascal-codegen bugs got
-> fixed this session (P80g post-creation-repair gate + find_proc_sig
-> resolution-tiering) — MAP_SYSLOCAL now correctly maps seg 103 syslocmmu
-> with origin=$043B access=$07 limit=$20. Launch no longer crashes from
-> stack corruption. Boot now hits a NEW blocker: vector 4 (illegal instr)
-> at odd PC=$00CC07 in user mode → hard_excep → SYSTEM_ERROR(10201). Odd
-> PC suggests a byte-shift bug still lurking, likely in CreateProcess HLE
-> or another Pascal-Pascal call site that treats pointer params as
-> WORDs. Start by instrumenting just before vector 4 fires (walk back
-> the last PC ring to find the instruction that JMP/RTE'd to $CC07), and
-> check CreateProcess HLE's start_PC computation. Same class as the
-> MAP_SYSLOCAL fix — once you find the next WORD-vs-LONG parameter push,
-> check whether it's also fixable via find_proc_sig's new resolution
-> tiering or requires its own fix.
+> Continue from NEXT_SESSION.md. Three Pascal-codegen bugs got fixed
+> this session (P80g post-creation-repair gate + find_proc_sig
+> resolution-tiering + AST_FIELD_ACCESS in AST_WITH). MAP_SYSLOCAL
+> now correctly maps seg 103 syslocmmu with origin=$043B. Build_Stack
+> now emits all 13 env_save_area stores. But boot still halts at 22/27
+> with hard_excep (SYSTEM_ERROR 10201) at odd PC.
+>
+> The runtime probe at Launch entry shows env_save_area.PC = $0000CBFF
+> — despite Build_Stack correctly writing @Initiate = $0503F8 to the
+> same field. The discrepancy is because Build_Stack writes to the
+> NEW process's sloc_ptr, but Launch is firing on POP (the
+> pseudo-outer-process) whose env_save_area was never populated
+> (Apple's code doesn't call CreateProcess for POP).
+>
+> So this is now a **control-flow issue, not a codegen issue**: our
+> post-FS_INIT error-recovery path (HLE suppression of 10738 + 10707)
+> is dropping into Scheduler/Launch BEFORE SYS_PROC_INIT runs. The
+> recovery should return control to STARTUP's INITSYS body so it
+> proceeds to the SYS_PROC_INIT call, not dispatch a process yet.
+>
+> Next: instrument the 10707 suppression path in src/m68k.c — dump
+> the stack/A6-chain at that point, verify the unwind target is
+> actually INITSYS's FS_INIT call site and not the scheduler. If the
+> unwind RTE/JMP target is wrong, fix the suppression logic.
