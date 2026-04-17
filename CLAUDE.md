@@ -70,13 +70,86 @@ make audit-linker       # Stage 4: Full pipeline + linker
 cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' build 2>&1 | grep -E "(error:|BUILD)"
 ```
 
-## Current Status (2026-04-17 late) — P85c fixes QUEUE_PR spin; FS_INIT body fails
+## Current Status (2026-04-17 very late) — P86 linker A5-pin fix unlocks 4 new kernel milestones
 
-Build + audit green. 22/27 milestones. Boot reaches FS_INIT, the
-scheduler now dispatches (QUEUE_PR RQSCAN exits correctly), but
-FS_INIT's body then hits SYSTEM_ERROR(10707) suppressed and
-SYSTEM_ERROR(10701) fatal — "nospace during Startup". Path: GETSPACE
-via RELSPACE hits UNMAPPED writes to seg 32 ($414000..$41FFFF).
+Build + audit green. **26/27 milestones.** Boot now reaches
+PASCALINIT → INITSYS → ... → FS_INIT → SYS_PROC_INIT →
+INIT_DRIVER_SPACE → FS_CLEANUP → MEM_CLEANUP. Only PR_CLEANUP (the
+scheduler idle loop) still unreached. Current blocker: crash at
+PC=$00EF14 (inside DEL_MMLIST) during MEM_CLEANUP, routed to stub
+at $3F8.
+
+### P86 — Linker phase-2 must not add base_addr to A5-relative pins (src/toolchain/linker.c:509)
+
+The PASCALDEFS pin table in pascal_codegen.c (~29 entries) assigns
+specific A5-relative offsets to globals that hand-coded asm
+references at hardcoded positions — `b_syslocal_ptr=-24785`,
+`c_pcb_ptr=-24617`, `Invoke_sched=-24786`, `smt_addr=-24887`, etc.
+These offsets MUST match what Apple's asm (LAUNCH, SCHDTRAP,
+PROCASM, MMASM) reads.
+
+Linker Phase 2 was blindly adding `mod->base_addr` to every
+exported symbol's value, including negative A5-relative ones. So
+`b_syslocal_ptr = -24785` in SYSGLOBAL became `-24785 +
+SYSGLOBAL.base_addr = -953`. Pascal `POOL_INIT` still wrote to
+the emitted-code offset (-24785 is baked into instruction bytes
+at compile time), so the actual storage sat at A5-24785 =
+$CC0F2B. But Apple's LAUNCH read `B_SYSLOC(A6) = -24785` and
+expected the VAR to be there — which was uninitialized
+($FFFFFFFF). Launch dereferenced garbage and dispatched into
+$00010C46 on first scheduler firing.
+
+Fix: in Phase 2, only add `mod->base_addr` when `sym->value >= 0`.
+Code entry points have non-negative offsets (bytes into module
+code); A5-relative data always has negative offsets. The sign test
+cleanly separates them.
+
+### P86 TRAP6 HLE fix — use `g_hle_smt_base`, not map `smt_base` (src/m68k.c:2293)
+
+`DO_AN_MMU`'s TRAP #6 HLE needs the physical SMT data address.
+It was looking up `smt_base` in the linker map. Two symbols share
+that name: (1) a local LDASM label (NOT exported) and (2) a Pascal
+VAR declared in source-parms.text. The Pascal VAR's linker value
+is the A5-relative offset of its STORAGE SLOT (negative), not the
+SMT data's physical location.
+
+Pre-P86-linker-fix, `mod->base_addr` was added to the VAR's
+negative offset, producing a positive value that coincidentally
+landed near `os_end` where bootrom_build primes the SMT region.
+So the HLE "worked" by accident. Post-P86-linker-fix, the negative
+value resolved correctly, and the HLE read garbage from RAM,
+programming bogus segment mappings — seg 60 writes (buffer pool at
+$0078xxxx) got dropped, FlushNodes walked zeros, boot stalled.
+
+Fix: prefer `g_hle_smt_base` (deterministically set by
+bootrom_build to `os_end`). Fall back to map lookup only when it
+looks like a real physical address.
+
+### Current blocker: DEL_MMLIST crash at $00EF14 during MEM_CLEANUP
+
+Post-P86 boot sequence:
+1. FS_INIT reached; SYSTEM_ERROR(10707) suppressed (unchanged).
+2. SYS_PROC_INIT entered. SYSTEM_ERROR(10101) suppressed via HLE
+   unwind-past-SYS_PROC_INIT.
+3. INIT_DRIVER_SPACE reached.
+4. FS_CLEANUP reached.
+5. MEM_CLEANUP reached.
+6. Inside MEM_CLEANUP body (PC=$00EF14, in DEL_MMLIST), `CRASH TO
+   VECTORS: prev_pc=$00EF14 → pc=$0003F8 opcode=$7001 A7=$00CBFEA0`.
+7. PR_CLEANUP not reached.
+
+DEL_MMLIST at $00EF08. Opcode $7001 = MOVEQ #1,D0 — executed at
+$3F8 (the stub area). Something is JSRing to $3F8 (an unresolved
+symbol stub). Likely an external proc reference that wasn't
+resolved.
+
+Start next session:
+- Find what DEL_MMLIST calls. Disassemble from $00EF08 looking for
+  the JSR that lands at $3F8.
+- Check build/lisa_linked.map for any symbols that still resolve
+  to $3F8 (stubs).
+- If the target is a real proc that just didn't link, add it to
+  compile_targets.c; if it's a primitive, add an HLE bypass.
 
 ### P85c — inline byte-subrange fields widen to 2 bytes (src/toolchain/pascal_codegen.c:421, toolchain_bridge.c:845)
 
