@@ -3599,9 +3599,26 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                             rt = sym->type->base_type->element_type;
                     }
                 } else if (rec_expr->type == AST_FIELD_ACCESS) {
-                    /* WITH rec.subfield DO ... — resolve nested field type */
-                    int es = expr_size(cg, rec_expr);
-                    (void)es; /* type resolution is complex; push NULL and hope for the best */
+                    /* P89e — WITH rec.subfield DO ... — walk the field chain
+                     * via lvalue_record_type, which handles AST_IDENT_EXPR /
+                     * AST_DEREF / nested AST_FIELD_ACCESS bases. Without this,
+                     * Build_Stack's `with sloc_ptr^.env_save_area, stk_handle
+                     * do begin SR := 0; PC := ord(@Initiate) end` had rt=NULL,
+                     * field stores silently became no-ops, env_save_area.PC
+                     * stayed $0 (later stomped to $CBFF by adjacent code), and
+                     * Launch RTE'd to an odd PC → hard_excep → boot halt. */
+                    type_desc_t *parent = lvalue_record_type(cg, rec_expr->children[0]);
+                    if (parent && parent->kind == TK_RECORD) {
+                        for (int pfi = 0; pfi < parent->num_fields; pfi++) {
+                            if (str_eq_nocase(parent->fields[pfi].name, rec_expr->name)) {
+                                type_desc_t *ft = parent->fields[pfi].type;
+                                if (ft && ft->kind == TK_POINTER && ft->base_type)
+                                    ft = ft->base_type;
+                                rt = ft;
+                                break;
+                            }
+                        }
+                    }
                 }
 
                 cg->with_stack[cg->with_depth].record_type = (rt && rt->kind == TK_RECORD) ? rt : NULL;
