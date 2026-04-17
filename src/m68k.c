@@ -3497,6 +3497,66 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             }
         }
 
+        /* P86e HLE guard: DEL_MMLIST spin when SRB list is empty.
+         *
+         * MEM_CLEANUP calls Del_SRB twice to remove the pseudo-outer
+         * process from SRB lists of shrsegmmu and IUDsdb. Del_SRB computes
+         * c_mmlist = c_sdb_ptr->srbRP + b_sysglobal_ptr and calls
+         * DEL_MMLIST(c_mmlist, c_pcb).
+         *
+         * If srbRP is 0 (no SRBs on this SDB — which is our state during
+         * boot because no one ever added to these SRB lists), c_mmlist =
+         * b_sysglobal_ptr = $CC6FFC. DEL_MMLIST's repeat-until reads
+         * chain.fwd_link at b_sysglobal_ptr+offset, which is arbitrary
+         * globals data. f_mmlist never comes back to c_mmlist and the
+         * loop spins forever.
+         *
+         * Apple's source doesn't guard against this either — on real
+         * hardware srbRP is always populated before Del_SRB runs, because
+         * ADDTO_SRB is called during process setup paths we haven't fully
+         * wired up. The right long-term fix is to make sure srbRP is
+         * initialized; the short-term is to detect the degenerate case
+         * and return early.
+         *
+         * Heuristic: if c_mmlist (arg 1) equals b_sysglobal_ptr, the list
+         * was empty. Return immediately (no-op, matches "nothing to
+         * delete"). */
+        {
+            static uint32_t pc_DEL_MMLIST = 0;
+            static int pc_gen_p86e = -1;
+            if (pc_gen_p86e != g_emu_generation) {
+                pc_DEL_MMLIST = boot_progress_lookup("DEL_MMLIST");
+                pc_gen_p86e = g_emu_generation;
+            }
+            if (pc_DEL_MMLIST && cpu->pc == pc_DEL_MMLIST) {
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                uint32_t ret = cpu_read32(cpu, sp);
+                uint32_t c_mmlist = cpu_read32(cpu, sp + 4);
+                uint32_t entry    = cpu_read32(cpu, sp + 8);
+                uint32_t sgbase = cpu_read32(cpu, 0x200);  /* b_sysglobal_ptr */
+                /* mmlist.chain.fwd_link is a 2-byte offset at record
+                 * offset 0. If 0, list has no next entry — treat as
+                 * empty and return. Also catch the c_mmlist==sgbase
+                 * case (srbRP was 0). */
+                uint16_t fwd_link = 0;
+                bool mmlist_valid = (c_mmlist >= 0x000400 && c_mmlist < 0x00F00000);
+                if (mmlist_valid)
+                    fwd_link = cpu_read16(cpu, c_mmlist);
+                bool empty = (c_mmlist == sgbase) || (mmlist_valid && fwd_link == 0);
+                if (empty) {
+                    DBGSTATIC(int, p86e_skip, 0);
+                    if (p86e_skip++ < 4)
+                        fprintf(stderr, "[P86e] DEL_MMLIST guard: empty SRB list "
+                                "(c_mmlist=$%06X fwd_link=$%04X sgbase=$%06X), ret=$%06X\n",
+                                c_mmlist, fwd_link, sgbase, ret);
+                    cpu->a[7] = (sp + 4) & 0xFFFFFF;
+                    cpu->pc = ret;
+                    (void)entry;
+                    continue;
+                }
+            }
+        }
+
         /* P37 HLE bypass: FS_CLEANUP (fsinit.text:136). Fires the
          * milestone on entry then bypasses — its body crashes into
          * $F8xxxx wild-PC space because downstream calls hit a
