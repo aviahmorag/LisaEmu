@@ -137,47 +137,47 @@ chain was poisoned.
 
 Result: **26/27 milestones** (up from 25/27). INITSYS is now reached.
 
-### Still kept: HLE-SelectProcess (blocked by deeper codegen issues)
+### P81c — all remaining process/memory/FS HLEs trimmed (one commit each)
 
-Fixing `exit()` properly (walk = current_depth − target_depth via the
--4(A6) static chain) regressed the boot when re-tried with the
-parameterless-sig fix. Root causes:
+Each removal verified individually with `make && ./build/lisaemu
+--headless Lisa_Source 200` staying at 26/27 resolved milestones.
+Commits `1cd425f` through `c8dc5d4`:
 
-1. **Nested-proc name collision.** PMMAKE declares four different
-   `Recover` procs, each nested in a different outer proc with a
-   different signature (three take `error:int2`, one is parameterless).
-   Our linker exports only one `Recover` symbol globally, so every
-   `call Recover` site JSRs to the same address regardless of lexical
-   intent. Correct exit() unwinding can't compensate for the wrong
-   callee actually running.
+- **MM_Setup** (`1cd425f`) — syslocal setup; natural body works now.
+- **excep_setup** (`ae641a9`) — wild b_sloc_ptr was a CreateProcess
+  static-link symptom.
+- **MEM_CLEANUP** (`2fa0f3c`) — SYS_PROC_INIT's args are properly
+  initialized now.
+- **REG_OPEN_LIST** (`743f01f`) — sentinel-init was static-link.
+- **Make_File** (`be0d4bf`) — DecompPath/SplitPathname garbage-write
+  path was static-link.
+- **PR_CLEANUP** (`9505ada`) — natural body unlinks c_pcb_ptr and
+  enters scheduler correctly.
+- **HLE-SelectProcess** (`c8dc5d4`) — earlier removal attempts failed
+  because other HLEs upstream were still poisoning state; natural
+  body runs cleanly now.
 
-2. **Flat `find_proc_sig`.** The sig lookup is by name across a flat
-   list, first-match wins. Pascal name resolution is lexically scoped.
-   Switching to newest-first scan cascades stack-layout mismatches
-   (proc_sigs accumulates across the whole compile, including imports
-   and siblings).
+### Still kept: FS_CLEANUP
 
-Proper fix requires scope-aware name resolution in both the linker
-and the codegen — a significant refactor. Until then, `exit()` uses
-the old dynamic-link walker (lexically wrong for `exit(CurrentProc)`
-from depth ≥ 2 but good enough for current boot paths), and
-HLE-SelectProcess stays on.
+Natural body regresses the boot (26/27 → 24/27) even with every other
+HLE off. Probably wants FS mounttable / catalog state that our
+minimal FS doesn't populate. Needs disk-image + FS infrastructure
+work before it can run natively.
 
 ### Next
 
-Two threads:
+The kernel is now 98% self-hosting (one HLE left, blocked on FS
+infrastructure). Two remaining threads:
 
-1. **Scope-aware symbol resolution.** Disambiguate nested procs with
-   shared names in the linker (name-mangle by enclosing proc?) and
-   make `find_proc_sig` prefer the lexically-nearest candidate. Once
-   that works, `exit()` codegen can switch to static-link walk and
-   HLE-SelectProcess comes off.
+1. **Populate FS state so FS_CLEANUP runs.** Our disk image layout
+   and FS_INIT flow likely need real MDDF / mounttable entries.
+   Fixing this probably also makes FS_INIT the 27th reached milestone.
 
-2. **SYSTEM.SHELL as second compile target.** Adds a second binary to
-   the disk image, with an intrinsic-library loader. Unlocks SHELL and
-   WS_MAIN milestones and the actual Lisa desktop. Larger scope —
-   toolchain_bridge needs multi-target pipeline, linker needs separate
-   output files, disk image layout needs MDDF entries for both.
+2. **SYSTEM.SHELL as second compile target.** Multi-target build
+   pipeline + intrinsic-library loader + disk-image catalog entries.
+   Unlocks SHELL and WS_MAIN and the actual Lisa desktop.
+
+Thread 1 is a prerequisite for thread 2 (SHELL needs FS to load).
 
 ### P80h2 session fixes (scheduler dispatch plumbing)
 
