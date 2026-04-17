@@ -1693,6 +1693,16 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                      * For outer-scope variables, follow frame chain first. */
                     int depth = find_local_depth(cg, node->name);
                     int sz = type_load_size(sym->type);
+                    int byte_offset_adj = 0;
+                    /* P84: 1-byte parameters are pushed as word (2 bytes) for
+                     * alignment. On 68k big-endian, the byte value lives in
+                     * the LOW byte (offset+1), not offset+0. Reading MOVE.B
+                     * at offset+0 pulls the zero padding byte, so `kind`
+                     * params (Tsdbtype, ord 0..6) silently read as 0. Offset
+                     * +1 for byte reads of params; locals (allocated by us
+                     * via LINK) start at negative offsets with no padding. */
+                    if (sym->is_param && sz == 1 && sym->offset > 0)
+                        byte_offset_adj = 1;
                     if (depth > 0) {
                         /* Outer scope: follow static link chain into A0, then use A0 */
                         emit_frame_access(cg, depth);
@@ -1704,7 +1714,7 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                         else if (sz == 1) emit16(cg, 0x102E);  /* MOVE.B offset(A6),D0 */
                         else              emit16(cg, 0x302E);  /* MOVE.W offset(A6),D0 */
                     }
-                    emit16(cg, (uint16_t)(int16_t)sym->offset);
+                    emit16(cg, (uint16_t)(int16_t)(sym->offset + byte_offset_adj));
                 } else {
                     /* Global: size-aware load from A5 */
                     int sz = type_load_size(sym->type);
@@ -1794,6 +1804,20 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                     if (!is_boolean && child->name[0]) {
                         cg_proc_sig_t *sig = find_proc_sig(cg, child->name);
                         if (sig) is_boolean = true;
+                    }
+                }
+                /* P84: field-access of boolean. Without this, `not sdbstate.memoryF`
+                 * emits bitwise `NOT.W D0` which only turns true(=1)→$FFFE (nonzero).
+                 * MAKE_MRDATA's `while not sdbstate.memoryF do CHECK_DS(c_sdb)` loop
+                 * then never exits even after INIT_SWAPIN sets memoryF:=true, because
+                 * the compiled test reads the word, bitwise-inverts, and exits only
+                 * on $0000 (i.e. pre-NOT value must be $FFFF). Treat AST_FIELD_ACCESS
+                 * as boolean if the resolved field type is TK_BOOLEAN. */
+                if (!is_boolean && child->type == AST_FIELD_ACCESS &&
+                    child->num_children > 0 && child->name[0]) {
+                    type_desc_t *ft = NULL;
+                    if (lvalue_field_info(cg, child->children[0], child->name, NULL, &ft)) {
+                        if (ft && ft->kind == TK_BOOLEAN) is_boolean = true;
                     }
                 }
                 if (is_boolean) {

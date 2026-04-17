@@ -33,15 +33,32 @@ static inline uint32_t cpu_read32(m68k_t *cpu, uint32_t addr) {
     return cpu->read32(mask_24(addr));
 }
 
+/* P84 debug: trace writes to the MAKE_MRDATA sdb region to diagnose
+ * why BLD_SEG's field writes don't land in the right place. */
+extern int g_p84_trace;
+int g_p84_trace = 0;
+static inline void p84_log_write(m68k_t *cpu, uint32_t addr, uint32_t val, int width) {
+    if (!g_p84_trace) return;
+    uint32_t a = mask_24(addr);
+    if (a < 0x00CCBA60 || a > 0x00CCBA90) return;
+    static int budget = 60;
+    if (budget-- <= 0) return;
+    fprintf(stderr, "[P84W] pc=$%06X write%d @$%06X <= $%0*X\n",
+            cpu->pc & 0xFFFFFF, width, a, width * 2, val);
+}
+
 static inline void cpu_write8(m68k_t *cpu, uint32_t addr, uint8_t val) {
+    p84_log_write(cpu, addr, val, 1);
     cpu->write8(mask_24(addr), val);
 }
 
 static inline void cpu_write16(m68k_t *cpu, uint32_t addr, uint16_t val) {
+    p84_log_write(cpu, addr, val, 2);
     cpu->write16(mask_24(addr), val);
 }
 
 static inline void cpu_write32(m68k_t *cpu, uint32_t addr, uint32_t val) {
+    p84_log_write(cpu, addr, val, 4);
     cpu->write32(mask_24(addr), val);
 }
 
@@ -3014,15 +3031,61 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
          * in place boot gets past FS_INIT then enters an infinite loop
          * between CHECK_DS ($043CAE) and INIT_SWAPIN ($045DFE). Log the
          * first few CHECK_DS entries to see which sdb is being swapped
-         * in and why sdbstate.memoryF isn't becoming true. */
+         * in and why sdbstate.memoryF isn't becoming true.
+         *
+         * P83c extension — also probe MAKE_MRDATA entry and BLD_SEG
+         * entry/exit so we can see whether BLD_SEG actually populated
+         * the sdb the MAKE_MRDATA loop later calls CHECK_DS with. */
         {
-            static uint32_t pc_CHECK_DS = 0;
-            static int pc_CHECK_DS_gen = -1;
-            if (pc_CHECK_DS_gen != g_emu_generation) {
-                pc_CHECK_DS = boot_progress_lookup("CHECK_DS");
-                pc_CHECK_DS_gen = g_emu_generation;
+            static uint32_t pc_CHECK_DS = 0, pc_MAKE_MRDATA = 0, pc_BLD_SEG = 0;
+            static int pc_gen = -1;
+            if (pc_gen != g_emu_generation) {
+                pc_CHECK_DS    = boot_progress_lookup("CHECK_DS");
+                pc_MAKE_MRDATA = boot_progress_lookup("MAKE_MRDATA");
+                pc_BLD_SEG     = boot_progress_lookup("BLD_SEG");
+                pc_gen = g_emu_generation;
             }
             DBGSTATIC(int, check_ds_count, 0);
+            DBGSTATIC(int, make_mrd_count, 0);
+            DBGSTATIC(int, bld_seg_after_mrd, 0);
+            DBGSTATIC(uint32_t, last_mrd_ret_sp, 0);
+
+            if (pc_MAKE_MRDATA && cpu->pc == pc_MAKE_MRDATA && make_mrd_count < 3) {
+                make_mrd_count++;
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                uint32_t ret_pc   = cpu_read32(cpu, sp);
+                uint32_t errnum_p = cpu_read32(cpu, sp + 4);
+                uint32_t size     = cpu_read32(cpu, sp + 8);
+                uint32_t addr_p   = cpu_read32(cpu, sp + 12);
+                fprintf(stderr, "[P83c] MAKE_MRDATA#%d entry ret=$%06X errnum=$%08X size=$%08X addr=$%08X\n",
+                        make_mrd_count, ret_pc, errnum_p, size, addr_p);
+                last_mrd_ret_sp = ret_pc;
+                bld_seg_after_mrd = 1;
+                /* g_p84_trace = 1;  // enable write trace for the sdb region (noisy) */
+            }
+
+            if (pc_BLD_SEG && cpu->pc == pc_BLD_SEG && bld_seg_after_mrd) {
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                uint32_t ret_pc = cpu_read32(cpu, sp);
+                /* BLD_SEG(kind, csize, newsize, disca, discspace, pkedLen, var sdb) */
+                uint8_t  kind     = cpu_read8(cpu, sp + 7);   /* Tsdbtype on stack, low byte of word */
+                uint32_t csize    = cpu_read32(cpu, sp + 8);
+                uint16_t newsize  = cpu_read16(cpu, sp + 12);
+                uint32_t sdb_ref  = cpu_read32(cpu, sp + 14 + 6 + 4 + 4); /* var param — last */
+                /* Back off: we don't know exact stack layout for BLD_SEG
+                 * params with addrdisc (6 bytes) in the middle. Instead,
+                 * just log the top-of-stack for manual decoding. */
+                fprintf(stderr, "[P83c] BLD_SEG entry (post-MAKE_MRDATA) ret=$%06X kind=$%02X csize=$%08X newsize=$%04X\n",
+                        ret_pc, kind, csize, newsize);
+                fprintf(stderr, "       stack@+0..+32: ");
+                for (int i = 0; i <= 32; i += 4) {
+                    fprintf(stderr, "%08X ", cpu_read32(cpu, sp + i));
+                }
+                fprintf(stderr, "\n");
+                (void)sdb_ref;
+                bld_seg_after_mrd = 0; /* only log first one after each MAKE_MRDATA */
+            }
+
             if (pc_CHECK_DS && cpu->pc == pc_CHECK_DS && check_ds_count < 3) {
                 check_ds_count++;
                 uint32_t sp = cpu->a[7] & 0xFFFFFF;
@@ -3040,6 +3103,30 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                             cpu_read8(cpu,  c_sdb + 13),
                             sdbstate0,
                             cpu_read16(cpu, c_sdb + 32));
+                    /* Dump full 48 bytes of sdb so we can look for
+                     * offset-shift bugs (maybe data is there but at
+                     * different offsets than our probe assumes). */
+                    fprintf(stderr, "      c_sdb bytes: ");
+                    for (int i = 0; i < 48; i++) {
+                        fprintf(stderr, "%02X", cpu_read8(cpu, c_sdb + i));
+                        if ((i & 3) == 3) fprintf(stderr, " ");
+                    }
+                    fprintf(stderr, "\n");
+                    /* Dump bytes around caller return PC so we can see
+                     * which offset MAKE_MRDATA's while-condition reads
+                     * for sdbstate.memoryF. ret_pc is the insn AFTER
+                     * the JSR, so the JSR + loop test is just before. */
+                    if (ret_pc >= 0x010800 && ret_pc < 0x010A00) {
+                        uint32_t dump_start = ret_pc - 32;
+                        fprintf(stderr, "      caller insn bytes @$%06X..$%06X: ",
+                                dump_start, ret_pc + 16);
+                        for (uint32_t i = 0; i < 48; i++) {
+                            fprintf(stderr, "%02X", cpu_read8(cpu, dump_start + i));
+                            if ((i & 1) == 1) fprintf(stderr, " ");
+                            if ((i & 15) == 15) fprintf(stderr, " ");
+                        }
+                        fprintf(stderr, "\n");
+                    }
                 }
             }
         }
