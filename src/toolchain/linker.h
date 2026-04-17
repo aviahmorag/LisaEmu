@@ -38,6 +38,12 @@ typedef struct {
     int module_idx;          /* Which module defines this */
     int segment_idx;         /* Which segment */
     bool resolved;
+    /* P88: symbol is a Pascal CONST — value is the literal constant, not
+     * a module-relative offset. Phase-2 must not add base_addr to it.
+     * Without this, e.g. `logrealmem = $AA0000` got relocated to
+     * $AA0000 + module_base, pushing MAKE_FREE's new_sdb pointer into
+     * a realmemmmu alias that clobbered kernel code. */
+    bool is_const;
 } link_symbol_t;
 
 /* A loaded object module */
@@ -52,7 +58,8 @@ typedef struct {
     struct {
         char name[64];
         uint8_t type;        /* 0=entry, 1=external */
-        int32_t value;       /* Offset within module's code */
+        uint8_t is_const;    /* P88: 1 = Pascal CONST — value is literal, skip base_addr relocation */
+        int32_t value;       /* Offset within module's code, or literal value for CONSTs */
     } symbols[16384];
     int num_symbols;
 

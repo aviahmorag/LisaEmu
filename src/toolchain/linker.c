@@ -375,7 +375,9 @@ bool linker_load_obj(linker_t *lk, const char *filename) {
     /* Register symbols in global table */
     for (int i = 0; i < mod->num_symbols; i++) {
         link_sym_type_t st = (mod->symbols[i].type == 1) ? LSYM_EXTERN : LSYM_ENTRY;
-        add_global_symbol(lk, mod->symbols[i].name, st, mod->symbols[i].value, mod_idx);
+        int gidx = add_global_symbol(lk, mod->symbols[i].name, st, mod->symbols[i].value, mod_idx);
+        if (gidx >= 0 && mod->symbols[i].is_const)
+            lk->symbols[gidx].is_const = true;
     }
 
     return true;
@@ -407,6 +409,7 @@ bool linker_load_codegen(linker_t *lk, const char *name,
         int si = mod->num_symbols++;
         strncpy(mod->symbols[si].name, cg_syms[i].name, 63);
         mod->symbols[si].type = cg_syms[i].is_external ? 1 : 0;
+        mod->symbols[si].is_const = cg_syms[i].is_const ? 1 : 0;
         mod->symbols[si].value = cg_syms[i].offset;
     }
 
@@ -432,7 +435,9 @@ bool linker_load_codegen(linker_t *lk, const char *name,
     /* Register symbols */
     for (int i = 0; i < mod->num_symbols; i++) {
         link_sym_type_t st = (mod->symbols[i].type == 1) ? LSYM_EXTERN : LSYM_ENTRY;
-        add_global_symbol(lk, mod->symbols[i].name, st, mod->symbols[i].value, mod_idx);
+        int gidx = add_global_symbol(lk, mod->symbols[i].name, st, mod->symbols[i].value, mod_idx);
+        if (gidx >= 0 && mod->symbols[i].is_const)
+            lk->symbols[gidx].is_const = true;
     }
 
     return true;
@@ -510,7 +515,14 @@ bool linker_link(linker_t *lk) {
             sym->module_idx < lk->num_modules) {
             link_module_t *mod = lk->modules[sym->module_idx];
             if (mod->is_kernel) {
-                if (sym->value >= 0) {
+                /* P88: Pascal CONSTs carry their literal value, not a
+                 * module-relative offset — skip base_addr relocation.
+                 * Without this, e.g. `logrealmem = $AA0000` got bumped
+                 * to $AA0000 + module_base, making MAKE_FREE's self-
+                 * descriptive SDB pointer (maddr*512 + logrealmem) land
+                 * at a realmemmmu alias that clobbered kernel code at
+                 * phys $019400 — the ILLEGAL after SYS_PROC_INIT. */
+                if (sym->value >= 0 && !sym->is_const) {
                     sym->value += mod->base_addr;
                 }
                 sym->resolved = true;

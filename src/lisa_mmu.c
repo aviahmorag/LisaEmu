@@ -373,24 +373,6 @@ void lisa_mem_write8(lisa_mem_t *mem, uint32_t addr, uint8_t val) {
              * slot reads $FFFFFFFF. Something in between is clobbering
              * it. Log every byte write that lands in that range so we
              * can identify the offending instruction + caller. */
-            /* Code-region watchpoint: bytes at $2FDA..$2FDF are supposed
-             * to be D1C1 301F 3080 (Pascal array-store epilogue) but at
-             * runtime read back as 3080 526E ... — some stray write is
-             * clobbering boot code. Log every write that lands there so
-             * we can trace back to the offending instruction. */
-            if (addr >= 0x2FDA && addr <= 0x2FDF) {
-                extern uint32_t g_last_cpu_pc;
-                static int wcode_count = 0;
-                static int wcode_gen = -1;
-                extern int g_emu_generation;
-                if (wcode_gen != g_emu_generation) {
-                    wcode_count = 0; wcode_gen = g_emu_generation;
-                }
-                if (wcode_count++ < 32) {
-                    fprintf(stderr, "WATCH-CODE2FDA [%d]: PC=$%06X log=$%06X phys=$%06X val=$%02X\n",
-                            wcode_count, g_last_cpu_pc, addr, phys, val);
-                }
-            }
             if (addr >= 0xCC0F2B && addr <= 0xCC0F2E) {
                 extern uint32_t g_last_cpu_pc;
                 static int wbsl_count = 0;
