@@ -114,7 +114,15 @@ struct ContentView: View {
                     )
                     .labelStyle(.titleAndIcon)
                 }
-                .help(viewModel.isRunning ? "Power off the Lisa" : "Power on the Lisa")
+                // Power On requires an image to be loaded (either from
+                // "Build from Source" or "Open Image"). Disable otherwise —
+                // no point firing up the CPU with nothing to run.
+                .disabled(!viewModel.isRunning && !viewModel.buildComplete)
+                .help(viewModel.isRunning
+                      ? "Power off the Lisa"
+                      : (viewModel.buildComplete
+                         ? "Power on the Lisa"
+                         : "Build from Source or Open Image first"))
             }
 
             ToolbarItem(placement: .automatic) {

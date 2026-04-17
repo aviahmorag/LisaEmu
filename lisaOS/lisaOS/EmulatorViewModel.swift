@@ -72,9 +72,10 @@ final class EmulatorViewModel {
     }
 
     func startEmulation() {
-        guard romLoaded || buildComplete else {
-            statusMessage = "Load a ROM or Build from Source first"
-            log("Power On failed: no ROM or built image loaded")
+        guard buildComplete else {
+            // Button should be disabled in this state; this is defensive.
+            statusMessage = "Build from Source or Open Image first"
+            log("Power On failed: no image loaded")
             return
         }
 
