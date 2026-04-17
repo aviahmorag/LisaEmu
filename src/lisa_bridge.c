@@ -4,30 +4,36 @@
 
 #include "lisa_bridge.h"
 #include "lisa.h"
+#include "boot_progress.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 
 static lisa_t lisa;
 static bool initialized = false;
+/* Set to true by a successful emu_load_rom(), cleared by emu_init()
+ * (which runs on every Power On teardown+re-init cycle). Can't probe
+ * the ROM bytes for "is it loaded" — a valid Lisa boot ROM has reset
+ * vectors like SSP=$000FFFFE / PC=$00FE0400 whose FIRST bytes ARE zero
+ * (24-bit address space ⇒ top byte of every pointer is $00). */
+static bool rom_loaded = false;
 
 void emu_init(void) {
     if (initialized) return;
     lisa_init(&lisa);
+    rom_loaded = false;
     initialized = true;
 }
 
 void emu_destroy(void) {
     if (!initialized) return;
     lisa_destroy(&lisa);
+    rom_loaded = false;
     initialized = false;
 }
 
 bool emu_has_rom(void) {
-    if (!initialized) return false;
-    /* A real boot ROM has the reset vector in its first 8 bytes; a fresh
-     * lisa_t has rom zeroed. Treat first+fifth byte being zero as "no ROM". */
-    return !(lisa.mem.rom[0] == 0 && lisa.mem.rom[4] == 0);
+    return initialized && rom_loaded;
 }
 
 void emu_reset(void) {
@@ -46,12 +52,60 @@ void emu_reset(void) {
 
 bool emu_load_rom(const char *path) {
     if (!initialized) return false;
-    return lisa_load_rom(&lisa, path);
+    bool ok = lisa_load_rom(&lisa, path);
+    if (ok) rom_loaded = true;
+    return ok;
 }
 
 bool emu_mount_profile(const char *path) {
     if (!initialized) return false;
     return lisa_mount_profile(&lisa, path);
+}
+
+/* Parse hle_addrs.txt (one "LABEL 0xHEX" per line) and wire the values
+ * into lisa->hle. Without this, the kernel's CALLDRIVER / SYSTEM_ERROR /
+ * loader-trap intercepts are dead and the CPU falls off during boot.
+ * Returns true on success. */
+bool emu_load_hle_addrs(const char *path) {
+    if (!initialized) return false;
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "emu_load_hle_addrs: cannot open %s\n", path);
+        return false;
+    }
+    uint32_t calldriver = 0, call_hdisk = 0, hdiskio = 0, prodriver = 0;
+    uint32_t system_error = 0, badcall = 0, parallel = 0, use_hdisk = 0;
+    char label[64];
+    uint32_t value;
+    while (fscanf(f, "%63s 0x%X", label, &value) == 2) {
+        if      (strcmp(label, "CALLDRIVER")   == 0) calldriver   = value;
+        else if (strcmp(label, "CALL_HDISK")   == 0) call_hdisk   = value;
+        else if (strcmp(label, "HDISKIO")      == 0) hdiskio      = value;
+        else if (strcmp(label, "PRODRIVER")    == 0) prodriver    = value;
+        else if (strcmp(label, "SYSTEM_ERROR") == 0) system_error = value;
+        else if (strcmp(label, "BADCALL")      == 0) badcall      = value;
+        else if (strcmp(label, "PARALLEL")     == 0) parallel     = value;
+        else if (strcmp(label, "USE_HDISK")    == 0) use_hdisk    = value;
+    }
+    fclose(f);
+    lisa_hle_set_addresses(&lisa, calldriver, call_hdisk, hdiskio, prodriver,
+                           system_error, badcall, parallel, use_hdisk);
+    fprintf(stderr, "HLE wired from %s: CALLDRIVER=$%X SYSTEM_ERROR=$%X\n",
+            path, calldriver, system_error);
+    return (calldriver != 0 || system_error != 0);
+}
+
+/* Load the linker symbol map so boot_progress_record_pc() can resolve
+ * entry points, AND so the dynamic HLE lookups that query
+ * boot_progress_lookup() (e.g. CreateProcess, Make_SProcess) find their
+ * target addresses. The SDL harness calls this too — without it, several
+ * emulated kernel code paths fall back to hardcoded addresses or fail
+ * silently, and the boot crashes mid-sequence. */
+bool emu_load_symbol_map(const char *path) {
+    if (!initialized) return false;
+    bool ok = boot_progress_init(path);
+    if (!ok) fprintf(stderr, "emu_load_symbol_map: boot_progress_init(%s) failed\n", path);
+    return ok;
 }
 
 bool emu_mount_floppy(const char *path) {

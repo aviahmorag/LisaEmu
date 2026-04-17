@@ -13,14 +13,14 @@ struct ContentView: View {
         case image        // picking a .lisa system bundle
     }
 
-    // ".lisa" system bundle type — a folder package containing profile.image +
-    // build byproducts. Declared at runtime as conforming to .package so the
-    // Open dialog treats it as a single selectable item (no drill-in).
-    // For proper Finder package treatment across the OS, add a matching UTI
-    // declaration to Info.plist later.
+    // ".lisa" system bundle type — exported by the app via Info.plist
+    // (see UTExportedTypeDeclarations, identifier com.aviahmorag.lisaOS.system,
+    // conforming to com.apple.package). At runtime we prefer the declared
+    // identifier; fall back to a filename-extension lookup if for some
+    // reason LaunchServices hasn't finished registering it yet.
     static let lisaBundleType: UTType = {
-        UTType(filenameExtension: "lisa", conformingTo: .package)
-            ?? UTType(filenameExtension: "lisa")
+        UTType("com.aviahmorag.lisaOS.system")
+            ?? UTType(filenameExtension: "lisa", conformingTo: .package)
             ?? .package
     }()
 

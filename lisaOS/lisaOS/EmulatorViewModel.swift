@@ -24,61 +24,26 @@ final class EmulatorViewModel {
 
     private var emulatorTimer: Timer?
 
-    // URLs whose security scope is currently active. Populated at Power On
-    // from stored bookmarks so the sandboxed app can fopen() built files in
-    // user-chosen locations. Drained at Power Off.
-    private var activeScopes: [URL] = []
-
     let screenWidth = Int(emu_screen_width())
     let screenHeight = Int(emu_screen_height())
 
     init() {
         emu_init()
-        // One-time purge of any stale "last image" bookmarks from prior
-        // sessions. The app no longer auto-restores anything on launch —
-        // every launch starts clean. See feedback_no_auto_restore.md.
-        UserDefaults.standard.removeObject(forKey: "lastDiskImageBookmark")
-        UserDefaults.standard.removeObject(forKey: "lastDiskImage")
+        // Purge obsolete UserDefaults keys from earlier sandbox-era builds.
+        // The app is no longer sandboxed and stores nothing across sessions
+        // about paths; every launch starts with no remembered state. File
+        // paths are derived from whatever the user picks in the current
+        // session — see openDiskImage/buildFromSource.
+        for k in ["lastDiskImageBookmark", "lastDiskImage",
+                  "lastSourceBookmark", "lastOutputBookmark"] {
+            UserDefaults.standard.removeObject(forKey: k)
+        }
     }
 
     func cleanup() {
         emulatorTimer?.invalidate()
         emulatorTimer = nil
-        deactivateAllScopes()
         emu_destroy()
-    }
-
-    /// Resolve a security-scoped bookmark from UserDefaults, start access,
-    /// and track the URL so we can stop access later. Returns nil if the
-    /// bookmark is missing, stale, or access couldn't be started.
-    private func activateScope(bookmarkKey: String) -> URL? {
-        guard let data = UserDefaults.standard.data(forKey: bookmarkKey) else {
-            return nil
-        }
-        var isStale = false
-        guard let url = try? URL(resolvingBookmarkData: data,
-                                 options: .withSecurityScope,
-                                 relativeTo: nil,
-                                 bookmarkDataIsStale: &isStale) else {
-            log("⚠️ Could not resolve bookmark \(bookmarkKey)")
-            return nil
-        }
-        if isStale {
-            log("⚠️ Bookmark \(bookmarkKey) is stale (path: \(url.path))")
-        }
-        guard url.startAccessingSecurityScopedResource() else {
-            log("⚠️ Could not start security scope for \(url.path)")
-            return nil
-        }
-        activeScopes.append(url)
-        return url
-    }
-
-    private func deactivateAllScopes() {
-        for url in activeScopes {
-            url.stopAccessingSecurityScopedResource()
-        }
-        activeScopes.removeAll()
     }
 
     func loadROM(url: URL) {
@@ -117,8 +82,7 @@ final class EmulatorViewModel {
 
     func startEmulation() {
         guard buildComplete else {
-            // Button should be disabled in this state; this is defensive.
-            statusMessage = "Build from Source or Open Image first"
+            statusMessage = "Build from Source or Open System first"
             log("Power On failed: no image loaded")
             return
         }
@@ -129,50 +93,18 @@ final class EmulatorViewModel {
         emu_destroy()
         emu_init()
 
-        // Activate security scopes for the folders/files we're about to
-        // fopen(). Without this, the sandboxed app can't read paths outside
-        // its container and emu_load_rom / emu_mount_profile silently fail,
-        // leaving the emulator to boot against a stub ROM + empty disk.
-        // Activate in both cases: folder scope covers any siblings (built
-        // output), file scope covers an individually-imported disk image.
-        deactivateAllScopes()
-        let outputScope = activateScope(bookmarkKey: "lastOutputBookmark")
-        let imageScope = activateScope(bookmarkKey: "lastDiskImageBookmark")
-        if outputScope == nil && imageScope == nil {
-            log("⚠️ No active security scope — fopen of built files will fail under sandbox.")
-        }
-
-        // Re-load ROM. Order of precedence:
-        //   1. builtRomPath — set by a successful build, or by
-        //      openDiskImage if it found a sibling lisa_boot.rom.
-        //   2. cached ROM at <output>/rom/lisa_boot.rom — reachable via
-        //      the output scope regardless of which image we're booting,
-        //      so any previously-built ROM applies to images opened from
-        //      anywhere the user has granted access.
+        // Re-load ROM. Sandbox is off, so this is just a plain fopen.
         romLoaded = false
         if let romPath = builtRomPath, emu_load_rom(romPath) {
             romLoaded = true
             log("Boot ROM loaded: \(romPath)")
+        } else if let romPath = builtRomPath {
+            log("⚠️ Failed to load ROM at \(romPath)")
         } else {
-            if let romPath = builtRomPath {
-                log("⚠️ Failed to load ROM at \(romPath) — trying cached ROM")
-            }
-            if let outURL = outputScope {
-                let cached = outURL.appendingPathComponent("rom/lisa_boot.rom").path
-                if FileManager.default.fileExists(atPath: cached),
-                   emu_load_rom(cached) {
-                    romLoaded = true
-                    builtRomPath = cached
-                    log("Boot ROM loaded (cached): \(cached)")
-                } else {
-                    log("⚠️ No cached ROM at \(cached) — run Build from Source to produce one.")
-                }
-            } else {
-                log("⚠️ No output scope active — can't reach cached ROM.")
-            }
+            log("⚠️ No ROM path set — this session has no ROM to load.")
         }
 
-        // Mount image if we have a path
+        // Mount image
         var imageMounted = false
         if let imagePath = builtImagePath {
             if emu_mount_profile(imagePath) {
@@ -185,14 +117,35 @@ final class EmulatorViewModel {
             log("⚠️ No builtImagePath — ProFile disk is empty")
         }
 
+        // Wire HLE intercepts (CALLDRIVER, SYSTEM_ERROR, loader traps, ...)
+        // and load the symbol map for boot-progress tracking + dynamic HLE
+        // lookups (CreateProcess, Make_SProcess, etc.). Both files live
+        // inside the .lisa bundle. Without both, the kernel's intercepts
+        // and dynamic symbol resolution are dead and the CPU walks off
+        // during boot. The SDL harness does the same two steps.
+        if let imagePath = builtImagePath {
+            let bundleDir = (imagePath as NSString).deletingLastPathComponent
+            let hlePath = bundleDir + "/hle_addrs.txt"
+            let mapPath = bundleDir + "/linked.map"
+            if emu_load_hle_addrs(hlePath) {
+                log("HLE wired from: \(hlePath)")
+            } else {
+                log("⚠️ HLE wiring failed (\(hlePath))")
+            }
+            if emu_load_symbol_map(mapPath) {
+                log("Symbol map loaded: \(mapPath)")
+            } else {
+                log("⚠️ Symbol map load failed (\(mapPath)) — dynamic HLE lookups will fall back to hardcoded values.")
+            }
+        }
+
         // Hard gate: refuse to Power On without a real ROM. The emulator
         // side no longer auto-generates a stub, so the choice is load a ROM
         // or don't boot — no silent fake fallback.
         guard emu_has_rom() else {
             log("⛔ Power On aborted — no boot ROM loaded.")
-            log("   Build from Source to produce one, or place a valid lisa_boot.rom next to the disk image.")
+            log("   Build from Source to produce one, or open a .lisa bundle whose sibling rom/lisa_boot.rom exists.")
             statusMessage = "No boot ROM — can't Power On"
-            deactivateAllScopes()
             return
         }
         if !imageMounted {
@@ -223,17 +176,11 @@ final class EmulatorViewModel {
         isRunning = false
         emu_set_running(false)
         displayImage = nil
-        // File contents are fully read into memory by load_rom / mount_profile,
-        // so it's safe to drop sandbox scopes now. They'll be re-activated on
-        // the next Power On.
-        deactivateAllScopes()
-        // Restore a "ready to boot" message so the placeholder shows the
-        // same welcome text it would on a fresh launch.
         if let imagePath = builtImagePath {
             let name = (imagePath as NSString).lastPathComponent
-            statusMessage = "Last image: \(name). Power On to boot."
+            statusMessage = "System: \(name). Power On to boot."
         } else {
-            statusMessage = "Click 'Build from Source' to compile Lisa OS, or load a ROM"
+            statusMessage = "Click 'Build from Source' to compile Lisa OS, or open a .lisa"
         }
         log("Power Off")
     }
@@ -330,27 +277,13 @@ final class EmulatorViewModel {
         let sourcePath = sourceURL.path
         let outputDir = outputURL.path
 
-        // Save bookmarks so we can re-access both locations next launch.
-        if let srcBookmark = try? sourceURL.bookmarkData(options: .withSecurityScope,
-                                                         includingResourceValuesForKeys: nil,
-                                                         relativeTo: nil) {
-            UserDefaults.standard.set(srcBookmark, forKey: "lastSourceBookmark")
-        }
-        if let outBookmark = try? outputURL.bookmarkData(options: .withSecurityScope,
-                                                         includingResourceValuesForKeys: nil,
-                                                         relativeTo: nil) {
-            UserDefaults.standard.set(outBookmark, forKey: "lastOutputBookmark")
-        }
-
-        let srcAccessing = sourceURL.startAccessingSecurityScopedResource()
-        let outAccessing = outputURL.startAccessingSecurityScopedResource()
+        // Sandbox is off (ENABLE_APP_SANDBOX = NO), so paths from the file
+        // picker are plain strings. No bookmarks, no security scopes.
 
         // Use Thread with 8MB stack — the recursive descent parser needs
         // deep stack for INTRINSIC units with complex type declarations.
         let thread = Thread {
             let result = toolchain_build(sourcePath, outputDir, nil)
-            if srcAccessing { sourceURL.stopAccessingSecurityScopedResource() }
-            if outAccessing { outputURL.stopAccessingSecurityScopedResource() }
 
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
@@ -369,13 +302,6 @@ final class EmulatorViewModel {
                     self.statusMessage = "Build complete — Power On to boot."
                     self.log("Build succeeded. Image: \(imagePath)")
                     self.log("Build succeeded. ROM:   \(romPath)")
-
-                    // NOTE: we do not persist a bookmark for the built
-                    // bundle. The app does not auto-restore images on
-                    // launch — every session starts clean. The output
-                    // bookmark (already saved above) is only used by
-                    // Power On to reach the cached ROM, not to reopen
-                    // any disk image.
                 } else {
                     var errBuf = result.error_message
                     let errMsg = withUnsafePointer(to: &errBuf) {
@@ -383,11 +309,7 @@ final class EmulatorViewModel {
                     }
                     self.buildProgress = "Build failed"
                     self.statusMessage = "Build failed"
-                    if errMsg.isEmpty {
-                        self.log("Build FAILED: no files compiled (sandbox access issue?)")
-                    } else {
-                        self.log("Build FAILED: \(errMsg)")
-                    }
+                    self.log(errMsg.isEmpty ? "Build FAILED: no files compiled" : "Build FAILED: \(errMsg)")
                 }
             }
         }
@@ -396,13 +318,12 @@ final class EmulatorViewModel {
     }
 
     /// Open a `.lisa` system bundle. The bundle is a folder containing
-    /// `profile.image` + build byproducts. ROM is NOT inside the bundle —
-    /// it lives beside it at `<parent>/rom/lisa_boot.rom` (produced by
-    /// Build from Source).
+    /// `profile.image` (+ build byproducts). The ROM lives beside it at
+    /// `<bundleParent>/rom/lisa_boot.rom` — same parent folder that was
+    /// the "output" folder the last time someone ran Build from Source.
+    /// All paths are derived from the URL the user just picked; nothing
+    /// is remembered across sessions.
     func openDiskImage(url: URL) {
-        let accessing = url.startAccessingSecurityScopedResource()
-        defer { if accessing { url.stopAccessingSecurityScopedResource() } }
-
         let imagePath = url.appendingPathComponent("profile.image").path
         guard FileManager.default.fileExists(atPath: imagePath),
               (try? FileManager.default.attributesOfItem(atPath: imagePath))?[.size] as? UInt64 ?? 0 > 0 else {
@@ -421,23 +342,20 @@ final class EmulatorViewModel {
         statusMessage = "System loaded: \(url.lastPathComponent). Power On to boot."
         log("System bundle loaded: \(url.path)")
 
-        // No bookmark is persisted for the opened bundle — the app does
-        // not auto-restore on launch (see feedback_no_auto_restore.md).
-
-        // Sibling ROM resolution: <bundleParent>/rom/lisa_boot.rom.
-        // Reading it requires access to the bundle's PARENT folder — the
-        // just-granted file scope on the bundle itself may or may not
-        // include the parent. If not, Power On will re-resolve via
-        // lastOutputBookmark. We only try here as a best-effort preload.
+        // ROM path is fully derived from the bundle's parent folder — the
+        // "output" folder convention. No bookmarks, no UserDefaults, just
+        // path arithmetic against the URL the user just clicked.
         let romPath = url.deletingLastPathComponent()
             .appendingPathComponent("rom/lisa_boot.rom").path
         if FileManager.default.fileExists(atPath: romPath),
            emu_load_rom(romPath) {
             builtRomPath = romPath
             romLoaded = true
-            log("Sibling ROM loaded: \(romPath)")
+            log("Boot ROM loaded: \(romPath)")
         } else {
-            log("Sibling ROM at \(romPath) not yet accessible — will try again via output bookmark at Power On")
+            log("⚠️ No ROM at \(romPath) — run Build from Source to produce one.")
+            builtRomPath = nil
+            romLoaded = false
         }
     }
 

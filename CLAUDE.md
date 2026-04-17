@@ -70,41 +70,61 @@ make audit-linker       # Stage 4: Full pipeline + linker
 cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' build 2>&1 | grep -E "(error:|BUILD)"
 ```
 
-## Current Status (2026-04-17 evening) — App-layer fixes: no stub ROM, sandbox scope honored
+## Current Status (2026-04-17 evening) — App-layer rewrite: sandbox off, no bookmarks, pure path derivation
 
-Kernel milestones unchanged (still 27/27 — see next section). This session's
-work was app-side plumbing in `lisaOS/lisaOS/EmulatorViewModel.swift` and
-`src/lisa_bridge.[ch]`:
+Kernel milestones unchanged (still 27/27 — see next section). This session
+rewrote the lisaOS app's file-access story end-to-end. Two converging
+forces drove the design:
 
-- **No more silent stub-ROM fallback.** `emu_reset()` previously cooked a
-  bare `bootrom_generate()` ROM into RAM any time `rom[0..4]==0`, so a
-  failed ROM load silently booted against a ROM with none of the
-  symbol-pinning / patch-site wiring that `toolchain_bridge` applies during
-  a real build. Now `emu_reset()` refuses to run without a loaded ROM,
-  prints to stderr, and the new `emu_has_rom()` accessor lets Swift gate
-  Power On deterministically. `bootrom_generate()` is still used by
-  `main_sdl.c` (headless tests) and `toolchain_bridge.c` (writes the real
-  `lisa_boot.rom` during a build) — those paths are unchanged.
-- **Security-scoped bookmarks honored at Power On.** The sandboxed app was
-  storing `lastOutputBookmark` / `lastDiskImageBookmark` but only
-  activating them during the build or at first launch — so Power On's
-  `emu_load_rom(...)` / `emu_mount_profile(...)` hit `fopen()` with no
-  active scope and silently failed. New helpers `activateScope`,
-  `deactivateAllScopes`, and `activeScopes` re-resolve bookmarks and hold
-  scope across Power On → Power Off.
-- **Honest logging.** Every ROM-load / image-mount attempt now logs its
-  return value (success **or** failure). The old code logged "Mounted
-  image: …" unconditionally and stayed silent when ROM load failed.
-- **Unified ROM-beside-image convention.** Both `openDiskImage` (user
-  picks a prebuilt image) and `checkForLastImage` (auto-restore at
-  launch) now look for `lisa_boot.rom` in the image's parent folder.
-  Previously only the auto-restore path did this, so the same image
-  behaved differently depending on how you opened it.
+1. **The user repeatedly said: no bookmarks, no auto-restore, no
+   "remember from last time."** Logged durably as
+   `feedback_no_auto_restore.md`.
+2. **The macOS sandbox made "no bookmarks + fixed paths" impossible to
+   satisfy simultaneously** — bookmarks were the only cross-session
+   mechanism to reach user-chosen paths.
 
-The canonical ROM story is now: `lisa_boot.rom` is a file produced by the
-build (or copied next to a prebuilt image). It must exist and it must
-load. No stub, no fake, no fallback — if Power On can't load a real ROM,
-it aborts with a loud message in the app log.
+Resolution: **sandbox turned off**
+(`ENABLE_APP_SANDBOX = NO` for the lisaOS target in `project.pbxproj`,
+Debug + Release). With the sandbox gone, any path the user hands us via
+`.fileImporter` is just a plain path string usable by `fopen()`, and no
+bookmark machinery is needed.
+
+### C-side changes (`src/lisa_bridge.[ch]`)
+
+- `emu_reset()` no longer auto-generates a stub ROM. If no ROM is loaded,
+  it prints to stderr and returns without resetting. The previous
+  fallback silently booted against a bare `bootrom_generate()` result
+  with none of the symbol-pinning / patch-site wiring that
+  `toolchain_bridge` applies around the same generator during a real
+  build — a footgun masquerading as convenience.
+- New `emu_has_rom()` accessor — used by Swift to hard-gate Power On.
+- `bootrom_generate()` is still used by `main_sdl.c` (headless tests)
+  and `toolchain_bridge.c` (writes the real `lisa_boot.rom` during a
+  build). Those paths are unchanged.
+
+### Swift-side changes (`lisaOS/lisaOS/EmulatorViewModel.swift` + ContentView)
+
+- **No bookmarks at all.** `activeScopes`, `activateScope`,
+  `deactivateAllScopes`, every `startAccessingSecurityScopedResource` —
+  gone. `UserDefaults` holds no path/bookmark keys for the app. `init()`
+  purges any stale keys from the sandbox era.
+- **No auto-restore.** `checkForLastImage` removed entirely; nothing
+  reopens on launch. See `feedback_no_auto_restore.md`.
+- **Honest logging.** Every `emu_load_rom` / `emu_mount_profile` call
+  logs its return value (success AND failure). The old code logged
+  "Mounted image: ..." unconditionally.
+- **Hard ROM gate.** Power On aborts with an explicit message if no
+  real ROM is loaded, instead of silently falling through to
+  `emu_reset()`'s old stub fallback.
+- **Pure path derivation.** When the user opens a `.lisa` bundle, the
+  ROM path is computed as `<bundleParent>/rom/lisa_boot.rom` directly
+  from the picked URL. Nothing is remembered; everything is derived
+  from the user's most recent click.
+
+The canonical ROM story: `lisa_boot.rom` is a file the toolchain writes
+at `<output>/rom/lisa_boot.rom`. Any `.lisa` bundle in `<output>/` can
+find it as a sibling. It must exist and it must load — no stub, no fake,
+no fallback.
 
 ### Build output layout — `.lisa` system bundle
 
@@ -123,13 +143,15 @@ chosen output folder:
                           # .lisa bundle in <output> can reuse it
 ```
 
-The `.lisa` extension is filtered in the Open dialog via a runtime
-`UTType(filenameExtension: "lisa", conformingTo: .package)` so users
-can't accidentally pick a `.map` or `.bin`. For Finder to also treat
-`.lisa` as a single-file package (no drill-in), Info.plist needs a
-matching UTI declaration with `LSTypeIsPackage=true` — not yet added;
-current build still uses `GENERATE_INFOPLIST_FILE = YES`. Adding a
-custom Info.plist is a follow-up.
+The `.lisa` extension is filtered in the Open dialog via the app's
+exported UTI `com.aviahmorag.lisaOS.system` (declared in
+`lisaOS/Info.plist` via `UTExportedTypeDeclarations`, conforming to
+`com.apple.package`). The project.pbxproj now points at that Info.plist
+(`GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = "lisaOS/Info.plist";`)
+for both the lisaOS Debug and Release configs; the test targets are
+unchanged. With the UTI registered, Finder will treat `.lisa` folders
+as single-file packages (double-click opens in the app instead of
+drilling in).
 
 The ROM assumption is explicit: a `.lisa` bundle opened on a machine
 without a local `<output>/rom/lisa_boot.rom` won't boot. That's correct
@@ -137,11 +159,12 @@ without a local `<output>/rom/lisa_boot.rom` won't boot. That's correct
 compile their own from their licensed Lisa source.
 
 Both user flows end at the same state:
-- **Build from Source**: bundle + ROM produced together, both loaded
-  automatically.
-- **Open System** (prebuilt `.lisa`): bundle mounted from the picked
-  path; ROM resolved via `lastOutputBookmark` pointing at the folder
-  where the last build ran.
+- **Build from Source**: bundle + ROM produced together. `builtImagePath`
+  and `builtRomPath` point at `<output>/LisaOS.lisa/profile.image` and
+  `<output>/rom/lisa_boot.rom` respectively.
+- **Open System** (prebuilt `.lisa`): `builtImagePath` = picked bundle's
+  `profile.image`; `builtRomPath` = `<bundleParent>/rom/lisa_boot.rom`.
+  All derived from the URL the user just clicked — no persistence.
 
 ## Current Status (2026-04-17 very late) — 🎉 27/27 KERNEL MILESTONES, full boot sequence complete
 

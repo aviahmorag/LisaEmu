@@ -31,6 +31,16 @@ bool emu_has_rom(void);
 /* Mount a ProFile hard disk image. Returns true on success. */
 bool emu_mount_profile(const char *path);
 
+/* Parse hle_addrs.txt produced by the build and wire HLE intercepts.
+ * Must be called after emu_load_rom + emu_mount_profile and before
+ * emu_reset, or the kernel's syscall/loader intercepts are dead. */
+bool emu_load_hle_addrs(const char *path);
+
+/* Load the linker symbol map (linked.map from the build). Needed both
+ * for boot-progress instrumentation AND for dynamic HLE lookups used
+ * by several kernel intercepts. Must be called before emu_reset. */
+bool emu_load_symbol_map(const char *path);
+
 /* Mount a floppy disk image. Returns true on success. */
 bool emu_mount_floppy(const char *path);
 
