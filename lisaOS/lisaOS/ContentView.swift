@@ -4,13 +4,13 @@ import UniformTypeIdentifiers
 struct ContentView: View {
     @State private var viewModel = EmulatorViewModel()
     @State private var showingFilePicker = false
-    @State private var showingSavePicker = false
     @State private var pickerMode: PickerMode = .image
     @State private var pendingSourceURL: URL?
 
     enum PickerMode {
-        case source  // picking a folder
-        case image   // picking a file
+        case source       // picking Lisa_Source folder
+        case output       // picking output folder (after source is chosen)
+        case image        // picking an existing disk image file
     }
 
     var body: some View {
@@ -150,25 +150,39 @@ struct ContentView: View {
         }
         .fileImporter(
             isPresented: $showingFilePicker,
-            allowedContentTypes: pickerMode == .source ? [.folder] : [.data],
+            allowedContentTypes: (pickerMode == .source || pickerMode == .output) ? [.folder] : [.data],
             allowsMultipleSelection: false
         ) { result in
             switch result {
             case .success(let urls):
                 guard let url = urls.first else { return }
-                if pickerMode == .source {
+                switch pickerMode {
+                case .source:
                     viewModel.log("Selected source folder: \(url.path)")
                     if viewModel.validateSource(url: url) {
-                        viewModel.buildFromSource(sourceURL: url) {
-                            // On success, trigger save dialog
-                            showingSavePicker = true
+                        // Hold the source URL and prompt for output folder next.
+                        pendingSourceURL = url
+                        pickerMode = .output
+                        // Re-open the picker asynchronously so SwiftUI
+                        // processes the sheet dismissal before we raise it again.
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                            showingFilePicker = true
                         }
                     } else {
                         let msg = "Not a valid Lisa_Source folder (expected LISA_OS subdirectory)"
                         viewModel.statusMessage = msg
                         viewModel.log(msg)
+                        pendingSourceURL = nil
                     }
-                } else {
+                case .output:
+                    guard let srcURL = pendingSourceURL else {
+                        viewModel.log("No source folder pending — click Build from Source first")
+                        return
+                    }
+                    pendingSourceURL = nil
+                    viewModel.log("Selected output folder: \(url.path)")
+                    viewModel.buildFromSource(sourceURL: srcURL, outputURL: url)
+                case .image:
                     viewModel.log("Opening disk image: \(url.path)")
                     viewModel.openDiskImage(url: url)
                 }
@@ -176,16 +190,7 @@ struct ContentView: View {
                 let msg = "Error: \(error.localizedDescription)"
                 viewModel.statusMessage = msg
                 viewModel.log(msg)
-            }
-        }
-        .fileExporter(
-            isPresented: $showingSavePicker,
-            document: DiskImageDocument(),
-            contentType: .data,
-            defaultFilename: "LisaOS.image"
-        ) { result in
-            if case .success(let saveURL) = result {
-                viewModel.saveBuiltImage(to: saveURL)
+                pendingSourceURL = nil
             }
         }
         .sheet(isPresented: $viewModel.showDebugger) {
@@ -194,16 +199,6 @@ struct ContentView: View {
         .onAppear {
             viewModel.checkForLastImage()
         }
-    }
-}
-
-/// Placeholder document for fileExporter save panel
-struct DiskImageDocument: FileDocument {
-    static var readableContentTypes: [UTType] { [.data] }
-    init() {}
-    init(configuration: ReadConfiguration) throws {}
-    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
-        FileWrapper(regularFileWithContents: Data())
     }
 }
 

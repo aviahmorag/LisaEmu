@@ -207,26 +207,45 @@ final class EmulatorViewModel {
 
     // MARK: - Build from Source
 
-    /// Build Lisa OS from source. On success, calls onSuccess so the UI can prompt for save location.
-    func buildFromSource(sourceURL: URL, onSuccess: @escaping () -> Void = {}) {
+    /// Build Lisa OS from source directly into a user-chosen output folder.
+    /// Toolchain writes lisa_profile.image, lisa_boot.rom, lisa_linked.bin,
+    /// lisa_linked.map all into `outputURL` (a folder the user picked).
+    /// No internal/container locations are used. After success, builtImagePath
+    /// and builtRomPath point at the user-chosen files and Power On uses them
+    /// directly.
+    func buildFromSource(sourceURL: URL, outputURL: URL) {
         guard !isBuilding else { return }
         isBuilding = true
         showLogs = true
         buildProgress = "Starting build..."
         statusMessage = "Building..."
         log("Build started from: \(sourceURL.path)")
+        log("Output folder: \(outputURL.path)")
 
         let sourcePath = sourceURL.path
-        let outputDir = buildCacheDirectory()
-        log("Output directory: \(outputDir)")
+        let outputDir = outputURL.path
 
-        let accessing = sourceURL.startAccessingSecurityScopedResource()
+        // Save bookmarks so we can re-access both locations next launch.
+        if let srcBookmark = try? sourceURL.bookmarkData(options: .withSecurityScope,
+                                                         includingResourceValuesForKeys: nil,
+                                                         relativeTo: nil) {
+            UserDefaults.standard.set(srcBookmark, forKey: "lastSourceBookmark")
+        }
+        if let outBookmark = try? outputURL.bookmarkData(options: .withSecurityScope,
+                                                         includingResourceValuesForKeys: nil,
+                                                         relativeTo: nil) {
+            UserDefaults.standard.set(outBookmark, forKey: "lastOutputBookmark")
+        }
+
+        let srcAccessing = sourceURL.startAccessingSecurityScopedResource()
+        let outAccessing = outputURL.startAccessingSecurityScopedResource()
 
         // Use Thread with 8MB stack — the recursive descent parser needs
         // deep stack for INTRINSIC units with complex type declarations.
         let thread = Thread {
             let result = toolchain_build(sourcePath, outputDir, nil)
-            if accessing { sourceURL.stopAccessingSecurityScopedResource() }
+            if srcAccessing { sourceURL.stopAccessingSecurityScopedResource() }
+            if outAccessing { outputURL.stopAccessingSecurityScopedResource() }
 
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
@@ -238,15 +257,23 @@ final class EmulatorViewModel {
                     let imagePath = "\(outputDir)/lisa_profile.image"
                     let romPath = "\(outputDir)/lisa_boot.rom"
                     self.builtImagePath = imagePath
+                    self.builtRomPath = romPath
                     self.buildComplete = true
                     self.buildProgress = "Built: \(result.files_compiled) compiled, \(result.files_assembled) assembled"
-                    self.statusMessage = "Build complete! Choose where to save the image."
-                    self.log("Build succeeded. Image at: \(imagePath)")
+                    self.statusMessage = "Build complete — Power On to boot."
+                    self.log("Build succeeded. Image: \(imagePath)")
+                    self.log("Build succeeded. ROM:   \(romPath)")
 
-                    // Store ROM path for later loading when image is opened
-                    self.builtRomPath = romPath
-                    self.log("Build complete. Save the image and open it to boot.")
-                    onSuccess()
+                    // Record bookmarks so next launch can auto-restore
+                    // from this user-chosen location (never a container).
+                    let imageURL = URL(fileURLWithPath: imagePath)
+                    if let bookmark = try? imageURL.bookmarkData(
+                        options: .withSecurityScope,
+                        includingResourceValuesForKeys: nil,
+                        relativeTo: nil) {
+                        UserDefaults.standard.set(bookmark, forKey: "lastDiskImageBookmark")
+                        UserDefaults.standard.set(imagePath, forKey: "lastDiskImage")
+                    }
                 } else {
                     var errBuf = result.error_message
                     let errMsg = withUnsafePointer(to: &errBuf) {
@@ -264,33 +291,6 @@ final class EmulatorViewModel {
         }
         thread.stackSize = 8 * 1024 * 1024  // 8MB stack for parser
         thread.start()
-    }
-
-    /// Copy the built image to a user-chosen location
-    func saveBuiltImage(to url: URL) {
-        guard let sourcePath = builtImagePath else {
-            log("No built image to save")
-            return
-        }
-        do {
-            if FileManager.default.fileExists(atPath: url.path) {
-                try FileManager.default.removeItem(at: url)
-            }
-            try FileManager.default.copyItem(atPath: sourcePath, toPath: url.path)
-            log("Image saved to: \(url.path)")
-            statusMessage = "Image saved. Power On to boot."
-            UserDefaults.standard.set(url.path, forKey: "lastDiskImage")
-        } catch {
-            log("Failed to save image: \(error.localizedDescription)")
-            statusMessage = "Failed to save image"
-        }
-    }
-
-    private func buildCacheDirectory() -> String {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let cacheDir = appSupport.appendingPathComponent("LisaEmu/build").path
-        try? FileManager.default.createDirectory(atPath: cacheDir, withIntermediateDirectories: true)
-        return cacheDir
     }
 
     /// Open a previously built disk image
@@ -322,11 +322,24 @@ final class EmulatorViewModel {
         }
     }
 
-    /// Restore the last used disk image on launch
+    /// Restore the last used disk image on launch. Never restores anything
+    /// inside the app's container — only user-chosen paths.
     func checkForLastImage() {
         guard let bookmarkData = UserDefaults.standard.data(forKey: "lastDiskImageBookmark") else { return }
         var isStale = false
-        guard let url = try? URL(resolvingBookmarkData: bookmarkData, options: .withSecurityScope, relativeTo: nil, bookmarkDataIsStale: &isStale) else { return }
+        guard let url = try? URL(resolvingBookmarkData: bookmarkData,
+                                 options: .withSecurityScope,
+                                 relativeTo: nil,
+                                 bookmarkDataIsStale: &isStale) else { return }
+
+        // Refuse to auto-restore anything inside the sandbox container —
+        // those are leftovers from prior builds and must not be reused.
+        if url.path.contains("/Library/Containers/") {
+            log("Ignoring stale container-path last image: \(url.path)")
+            UserDefaults.standard.removeObject(forKey: "lastDiskImageBookmark")
+            UserDefaults.standard.removeObject(forKey: "lastDiskImage")
+            return
+        }
 
         let accessing = url.startAccessingSecurityScopedResource()
         log("Restoring: \(url.path)")
@@ -341,6 +354,7 @@ final class EmulatorViewModel {
             let romPath = url.deletingLastPathComponent().appendingPathComponent("lisa_boot.rom").path
             if FileManager.default.fileExists(atPath: romPath) {
                 romLoaded = emu_load_rom(romPath)
+                builtRomPath = romPath
                 log("ROM: \(romLoaded)")
             }
         } else {
