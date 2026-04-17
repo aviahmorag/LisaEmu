@@ -414,6 +414,37 @@ void lisa_mem_write8(lisa_mem_t *mem, uint32_t addr, uint8_t val) {
                             seg, ctx, s->sor, s->slr);
                 }
             }
+            /* SMT-region watchpoint (P88-followup): the realmemmmu segs
+             * (85-100) end up with SOR=0 at the moment PROG_MMU's TRAP6
+             * HLE reads the SMT entry. Either Pascal SETMMU writes to a
+             * different address, writes at a different time, or never
+             * writes at all. Log every byte-write into domain-0's SMT
+             * range [smt_base .. smt_base+$400) with PC, logical addr,
+             * decoded (seg, field) and the new value so we can correlate
+             * with PROG_MMU TRAP6 firings. */
+            {
+                extern uint32_t g_hle_smt_base;
+                uint32_t smt_lo = g_hle_smt_base;
+                uint32_t smt_hi = g_hle_smt_base + 0x400;
+                if (smt_lo != 0 && phys >= smt_lo && phys < smt_hi) {
+                    extern uint32_t g_last_cpu_pc;
+                    static int wsmt_count = 0;
+                    static int wsmt_gen = -1;
+                    extern int g_emu_generation;
+                    if (wsmt_gen != g_emu_generation) {
+                        wsmt_count = 0; wsmt_gen = g_emu_generation;
+                    }
+                    if (wsmt_count++ < 128) {
+                        uint32_t off  = phys - smt_lo;
+                        uint32_t seg  = off / 4;
+                        uint32_t fld  = off % 4;   /* 0/1=origin hi/lo, 2=access, 3=limit */
+                        const char *fn = (fld < 2) ? "origin" : (fld == 2 ? "access" : "limit");
+                        fprintf(stderr,
+                            "WATCH-SMT[%d]: PC=$%06X log=$%06X phys=$%06X val=$%02X (dom=0 seg=%u %s byte=%u)\n",
+                            wsmt_count, g_last_cpu_pc, addr, phys, val, seg, fn, fld);
+                    }
+                }
+            }
             mem->ram[phys] = val;
             break;
         }

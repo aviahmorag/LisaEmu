@@ -1607,6 +1607,25 @@ static void gen_lvalue_addr(codegen_t *cg, ast_node_t *node) {
                         }
                     }
                 }
+            } else if (node->children[0]->type == AST_DEREF &&
+                       node->children[0]->children[0] &&
+                       node->children[0]->children[0]->type == AST_IDENT_EXPR) {
+                /* ptr^[i]: resolve element size through the pointer.
+                 * Without this, elem_size defaults to 2, so for smtent (4 B)
+                 * in `ptr_smt^[128*domain+index]` the stride is halved and
+                 * the store addresses collide — which is why SETMMU's SMT
+                 * writes land on random bytes (or get silently dropped when
+                 * paired with the WITH field-lookup miss). */
+                cg_symbol_t *ptr_sym = find_symbol_any(cg, node->children[0]->children[0]->name);
+                if (ptr_sym && ptr_sym->type &&
+                    ptr_sym->type->kind == TK_POINTER &&
+                    ptr_sym->type->base_type &&
+                    ptr_sym->type->base_type->kind == TK_ARRAY) {
+                    type_desc_t *at = ptr_sym->type->base_type;
+                    array_low = at->array_low;
+                    if (at->element_type)
+                        elem_size = type_size(at->element_type);
+                }
             } else if (node->children[0]->type == AST_IDENT_EXPR) {
                 cg_symbol_t *arr_sym = find_symbol_any(cg, node->children[0]->name);
                 type_desc_t *at = (arr_sym && arr_sym->type) ? arr_sym->type : NULL;
@@ -3529,11 +3548,30 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                         }
                     }
                 } else if (rec_expr->type == AST_ARRAY_ACCESS && rec_expr->children[0]) {
-                    /* WITH arr[i] DO ... — get element type */
-                    if (rec_expr->children[0]->type == AST_IDENT_EXPR) {
-                        cg_symbol_t *sym = find_symbol_any(cg, rec_expr->children[0]->name);
-                        if (sym && sym->type && sym->type->kind == TK_ARRAY && sym->type->element_type)
-                            rt = sym->type->element_type;
+                    /* WITH arr[i] DO ... — get element type. Cases:
+                     *   arr[i]     where arr is a direct array variable
+                     *   ptr^[i]    where ptr is a pointer-to-array — used in
+                     *              SETMMU's `with ptr_smt^[128*domain+index] do`
+                     *              and source-LOADER's `with smt_adr^[i] do`.
+                     *              Without this branch the WITH body loses its
+                     *              record context; field writes silently become
+                     *              no-ops and the SMT never gets written. */
+                    ast_node_t *base = rec_expr->children[0];
+                    if (base->type == AST_IDENT_EXPR) {
+                        cg_symbol_t *sym = find_symbol_any(cg, base->name);
+                        type_desc_t *at = (sym && sym->type) ? sym->type : NULL;
+                        if (at && at->kind == TK_POINTER && at->base_type)
+                            at = at->base_type;
+                        if (at && at->kind == TK_ARRAY && at->element_type)
+                            rt = at->element_type;
+                    } else if (base->type == AST_DEREF && base->children[0] &&
+                               base->children[0]->type == AST_IDENT_EXPR) {
+                        cg_symbol_t *sym = find_symbol_any(cg, base->children[0]->name);
+                        if (sym && sym->type && sym->type->kind == TK_POINTER &&
+                            sym->type->base_type &&
+                            sym->type->base_type->kind == TK_ARRAY &&
+                            sym->type->base_type->element_type)
+                            rt = sym->type->base_type->element_type;
                     }
                 } else if (rec_expr->type == AST_FIELD_ACCESS) {
                     /* WITH rec.subfield DO ... — resolve nested field type */
