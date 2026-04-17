@@ -70,6 +70,79 @@ make audit-linker       # Stage 4: Full pipeline + linker
 cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' build 2>&1 | grep -E "(error:|BUILD)"
 ```
 
+## Current Status (2026-04-17 evening) — App-layer fixes: no stub ROM, sandbox scope honored
+
+Kernel milestones unchanged (still 27/27 — see next section). This session's
+work was app-side plumbing in `lisaOS/lisaOS/EmulatorViewModel.swift` and
+`src/lisa_bridge.[ch]`:
+
+- **No more silent stub-ROM fallback.** `emu_reset()` previously cooked a
+  bare `bootrom_generate()` ROM into RAM any time `rom[0..4]==0`, so a
+  failed ROM load silently booted against a ROM with none of the
+  symbol-pinning / patch-site wiring that `toolchain_bridge` applies during
+  a real build. Now `emu_reset()` refuses to run without a loaded ROM,
+  prints to stderr, and the new `emu_has_rom()` accessor lets Swift gate
+  Power On deterministically. `bootrom_generate()` is still used by
+  `main_sdl.c` (headless tests) and `toolchain_bridge.c` (writes the real
+  `lisa_boot.rom` during a build) — those paths are unchanged.
+- **Security-scoped bookmarks honored at Power On.** The sandboxed app was
+  storing `lastOutputBookmark` / `lastDiskImageBookmark` but only
+  activating them during the build or at first launch — so Power On's
+  `emu_load_rom(...)` / `emu_mount_profile(...)` hit `fopen()` with no
+  active scope and silently failed. New helpers `activateScope`,
+  `deactivateAllScopes`, and `activeScopes` re-resolve bookmarks and hold
+  scope across Power On → Power Off.
+- **Honest logging.** Every ROM-load / image-mount attempt now logs its
+  return value (success **or** failure). The old code logged "Mounted
+  image: …" unconditionally and stayed silent when ROM load failed.
+- **Unified ROM-beside-image convention.** Both `openDiskImage` (user
+  picks a prebuilt image) and `checkForLastImage` (auto-restore at
+  launch) now look for `lisa_boot.rom` in the image's parent folder.
+  Previously only the auto-restore path did this, so the same image
+  behaved differently depending on how you opened it.
+
+The canonical ROM story is now: `lisa_boot.rom` is a file produced by the
+build (or copied next to a prebuilt image). It must exist and it must
+load. No stub, no fake, no fallback — if Power On can't load a real ROM,
+it aborts with a loud message in the app log.
+
+### Build output layout — `.lisa` system bundle
+
+A successful Build from Source writes this structure into the user's
+chosen output folder:
+
+```
+<output>/
+├── LisaOS.lisa/          # macOS bundle package — appears as one file
+│   ├── profile.image     # the bootable Lisa disk
+│   ├── linked.bin        # raw linker output (offline disassembly)
+│   ├── linked.map        # symbol map
+│   └── hle_addrs.txt     # HLE wiring addresses
+└── rom/
+    └── lisa_boot.rom     # shared boot ROM — outside the bundle so any
+                          # .lisa bundle in <output> can reuse it
+```
+
+The `.lisa` extension is filtered in the Open dialog via a runtime
+`UTType(filenameExtension: "lisa", conformingTo: .package)` so users
+can't accidentally pick a `.map` or `.bin`. For Finder to also treat
+`.lisa` as a single-file package (no drill-in), Info.plist needs a
+matching UTI declaration with `LSTypeIsPackage=true` — not yet added;
+current build still uses `GENERATE_INFOPLIST_FILE = YES`. Adding a
+custom Info.plist is a follow-up.
+
+The ROM assumption is explicit: a `.lisa` bundle opened on a machine
+without a local `<output>/rom/lisa_boot.rom` won't boot. That's correct
+— Apple's license prohibits ROM redistribution, so every user needs to
+compile their own from their licensed Lisa source.
+
+Both user flows end at the same state:
+- **Build from Source**: bundle + ROM produced together, both loaded
+  automatically.
+- **Open System** (prebuilt `.lisa`): bundle mounted from the picked
+  path; ROM resolved via `lastOutputBookmark` pointing at the folder
+  where the last build ran.
+
 ## Current Status (2026-04-17 very late) — 🎉 27/27 KERNEL MILESTONES, full boot sequence complete
 
 Build + audit green. **27/27 kernel milestones reached.** Boot now

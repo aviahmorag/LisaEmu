@@ -25,6 +25,9 @@ void emu_reset(void);
 /* Load ROM image from file path. Returns true on success. */
 bool emu_load_rom(const char *path);
 
+/* True iff a real boot ROM has been loaded (non-zero reset vector). */
+bool emu_has_rom(void);
+
 /* Mount a ProFile hard disk image. Returns true on success. */
 bool emu_mount_profile(const char *path);
 

@@ -10,8 +10,19 @@ struct ContentView: View {
     enum PickerMode {
         case source       // picking Lisa_Source folder
         case output       // picking output folder (after source is chosen)
-        case image        // picking an existing disk image file
+        case image        // picking a .lisa system bundle
     }
+
+    // ".lisa" system bundle type — a folder package containing profile.image +
+    // build byproducts. Declared at runtime as conforming to .package so the
+    // Open dialog treats it as a single selectable item (no drill-in).
+    // For proper Finder package treatment across the OS, add a matching UTI
+    // declaration to Info.plist later.
+    static let lisaBundleType: UTType = {
+        UTType(filenameExtension: "lisa", conformingTo: .package)
+            ?? UTType(filenameExtension: "lisa")
+            ?? .package
+    }()
 
     var body: some View {
         VStack(spacing: 0) {
@@ -94,10 +105,10 @@ struct ContentView: View {
                     pickerMode = .image
                     showingFilePicker = true
                 } label: {
-                    Label("Open Image", systemImage: "doc")
+                    Label("Open System", systemImage: "doc")
                         .labelStyle(.titleAndIcon)
                 }
-                .help("Open a disk image file")
+                .help("Open a .lisa system bundle (built with Build from Source)")
             }
 
             ToolbarItem(placement: .automatic) {
@@ -158,7 +169,12 @@ struct ContentView: View {
         }
         .fileImporter(
             isPresented: $showingFilePicker,
-            allowedContentTypes: (pickerMode == .source || pickerMode == .output) ? [.folder] : [.data],
+            allowedContentTypes: {
+                switch pickerMode {
+                case .source, .output: return [.folder]
+                case .image:           return [Self.lisaBundleType]
+                }
+            }(),
             allowsMultipleSelection: false
         ) { result in
             switch result {
@@ -203,9 +219,6 @@ struct ContentView: View {
         }
         .sheet(isPresented: $viewModel.showDebugger) {
             DebuggerView(viewModel: viewModel)
-        }
-        .onAppear {
-            viewModel.checkForLastImage()
         }
     }
 }

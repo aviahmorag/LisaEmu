@@ -617,6 +617,24 @@ build_result_t toolchain_build(const char *source_dir,
         return result;
     }
 
+    /* Create output + bundle + rom directories up front so every subsequent
+     * write has a home. Layout produced by a build:
+     *   <output>/LisaOS.lisa/profile.image          (disk)
+     *   <output>/LisaOS.lisa/linked.bin             (raw linker output)
+     *   <output>/LisaOS.lisa/linked.map             (symbol map)
+     *   <output>/LisaOS.lisa/hle_addrs.txt          (HLE wiring for the app)
+     *   <output>/rom/lisa_boot.rom                  (shared boot ROM)
+     * The .lisa folder is declared a macOS package type so it shows up as
+     * one file in Finder and in the Open dialog. The ROM lives outside the
+     * bundle because it's shared across every bundle the user creates. */
+    char bundle_dir[512];
+    char rom_dir[512];
+    mkdir(output_dir, 0755);
+    snprintf(bundle_dir, sizeof(bundle_dir), "%s/LisaOS.lisa", output_dir);
+    snprintf(rom_dir, sizeof(rom_dir), "%s/rom", output_dir);
+    (void)mkdir(bundle_dir, 0755);
+    (void)mkdir(rom_dir, 0755);
+
     if (progress) progress("Finding source files...", 0, 100);
 
     /* Find all source files */
@@ -982,7 +1000,7 @@ build_result_t toolchain_build(const char *source_dir,
             {NULL, NULL}
         };
         char hle_path[512];
-        snprintf(hle_path, sizeof(hle_path), "%s/hle_addrs.txt", output_dir);
+        snprintf(hle_path, sizeof(hle_path), "%s/hle_addrs.txt", bundle_dir);
         FILE *hle_f = fopen(hle_path, "w");
         if (hle_f) {
             for (int h = 0; hle_syms[h].name; h++) {
@@ -1030,7 +1048,7 @@ build_result_t toolchain_build(const char *source_dir,
         /* Save raw linked output for offline disassembly */
         {
             char raw_path[512];
-            snprintf(raw_path, sizeof(raw_path), "%s/lisa_linked.bin", output_dir);
+            snprintf(raw_path, sizeof(raw_path), "%s/linked.bin", bundle_dir);
             FILE *rf = fopen(raw_path, "wb");
             if (rf) {
                 fwrite(link_data, 1, link_size, rf);
@@ -1040,7 +1058,7 @@ build_result_t toolchain_build(const char *source_dir,
 
             /* Sorted symbol map alongside the raw binary */
             char map_path[512];
-            snprintf(map_path, sizeof(map_path), "%s/lisa_linked.map", output_dir);
+            snprintf(map_path, sizeof(map_path), "%s/linked.map", bundle_dir);
             FILE *mf = fopen(map_path, "w");
             if (mf) {
                 int *order = (int*)malloc(sizeof(int) * lk->num_symbols);
@@ -1105,21 +1123,21 @@ build_result_t toolchain_build(const char *source_dir,
 
     disk_finalize(db);
 
-    /* Create output directory if needed */
-    mkdir(output_dir, 0755);
-
-    /* Write disk image */
+    /* Write disk image into the bundle (output dirs already exist). */
     char image_path[512];
-    snprintf(image_path, sizeof(image_path), "%s/lisa_profile.image", output_dir);
+    snprintf(image_path, sizeof(image_path), "%s/profile.image", bundle_dir);
     disk_write_image(db, image_path);
     strncpy(result.output_path, image_path, sizeof(result.output_path) - 1);
 
-    /* Phase 5: Generate boot ROM */
+    /* Phase 5: Generate boot ROM.
+     * Written to "<output>/rom/lisa_boot.rom" — the ROM is a long-lived
+     * artifact that's reused across any disk image the user opens, so it
+     * gets its own dedicated subfolder distinct from the disk images. */
     if (progress) progress("Generating boot ROM...", 90, 100);
     uint8_t *rom = bootrom_generate();
     if (rom) {
         char rom_path[512];
-        snprintf(rom_path, sizeof(rom_path), "%s/lisa_boot.rom", output_dir);
+        snprintf(rom_path, sizeof(rom_path), "%s/lisa_boot.rom", rom_dir);
         FILE *rf = fopen(rom_path, "wb");
         if (rf) {
             fwrite(rom, 1, ROM_SIZE, rf);
@@ -1146,11 +1164,11 @@ build_result_t toolchain_build(const char *source_dir,
 const char *toolchain_get_artifact(const char *output_dir, const char *artifact) {
     static char path[512];
     if (strcmp(artifact, "profile") == 0) {
-        snprintf(path, sizeof(path), "%s/lisa_profile.image", output_dir);
+        snprintf(path, sizeof(path), "%s/LisaOS.lisa/profile.image", output_dir);
     } else if (strcmp(artifact, "rom") == 0) {
-        snprintf(path, sizeof(path), "%s/lisa_rom.bin", output_dir);
+        snprintf(path, sizeof(path), "%s/rom/lisa_boot.rom", output_dir);
     } else if (strcmp(artifact, "floppy") == 0) {
-        snprintf(path, sizeof(path), "%s/lisa_floppy.image", output_dir);
+        snprintf(path, sizeof(path), "%s/LisaOS.lisa/floppy.image", output_dir);
     } else {
         path[0] = '\0';
     }

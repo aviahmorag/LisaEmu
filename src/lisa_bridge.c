@@ -4,11 +4,6 @@
 
 #include "lisa_bridge.h"
 #include "lisa.h"
-#if __has_include("toolchain/bootrom.h")
-#include "toolchain/bootrom.h"
-#else
-#include "bootrom.h"
-#endif
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -28,19 +23,24 @@ void emu_destroy(void) {
     initialized = false;
 }
 
+bool emu_has_rom(void) {
+    if (!initialized) return false;
+    /* A real boot ROM has the reset vector in its first 8 bytes; a fresh
+     * lisa_t has rom zeroed. Treat first+fifth byte being zero as "no ROM". */
+    return !(lisa.mem.rom[0] == 0 && lisa.mem.rom[4] == 0);
+}
+
 void emu_reset(void) {
     if (!initialized) return;
-
-    /* Auto-generate boot ROM if none loaded */
-    if (lisa.mem.rom[0] == 0 && lisa.mem.rom[4] == 0) {
-        printf("No ROM loaded — generating boot ROM\n");
-        uint8_t *rom = bootrom_generate();
-        if (rom) {
-            lisa_mem_load_rom(&lisa.mem, rom, ROM_SIZE);
-            free(rom);
-        }
+    /* No auto-generated stub fallback. If the caller didn't load a real
+     * boot ROM, that's a caller bug — fail loudly instead of silently
+     * booting against a bare stub (which bypasses the symbol-pinning /
+     * patch wiring that toolchain_bridge applies around bootrom_generate
+     * during a real build). */
+    if (!emu_has_rom()) {
+        fprintf(stderr, "emu_reset: refused — no ROM loaded. Load a ROM before Power On.\n");
+        return;
     }
-
     lisa_reset(&lisa);
 }
 

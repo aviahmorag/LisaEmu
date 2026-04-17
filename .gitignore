@@ -1,5 +1,7 @@
 # Build artifacts
 build/
+output/
+*.lisa/
 *.o
 *.a
 *.dylib
