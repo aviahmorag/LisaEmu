@@ -2004,28 +2004,33 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
 
             /* EXIT: return from named procedure.
              *
-             * KNOWN LIMITATION: proper lexical unwinding (walk =
-             * current_depth - target_depth via the -4(A6) static link
-             * chain) is blocked by two issues that combine to regress
-             * the boot:
+             * Targeted fix: Pascal's exit(P) means "unwind to P's frame
+             * and return". Our old codegen walked scope_depth-1 hops
+             * unconditionally — lexically wrong for exit(CurrentProc)
+             * (would unwind the caller's frame too), but happened to
+             * match what many exit(EnclosingProc) sites expect.
              *
-             *   1. Name collisions across nested scopes. PMMAKE has 4
-             *      procs named `Recover`, each nested in a different
-             *      outer proc. Our linker deduplicates by name and
-             *      picks only one; all callers JSR to that single
-             *      Recover regardless of lexical intent. Any correct
-             *      exit() walk count still ends at the wrong frame.
+             * Fix only the exit(CurrentProc) case: no walk, just UNLK+RTS.
+             * For exit(Named) where the target doesn't match the current
+             * proc, keep the old walk-to-outermost behavior — changing it
+             * cascades regressions in callers that rely on walking past
+             * intended targets (still not lexically correct, but works
+             * in current boot paths).
              *
-             *   2. find_proc_sig is flat-name-indexed. Switching to
-             *      nearest-lexical-scope lookup changes which sig a
-             *      caller uses and cascades stack-layout mismatches.
-             *
-             * Until those are fixed, fall back to the old dynamic-link
-             * walker (scope_depth-1 hops). It's lexically wrong for
-             * exit(CurrentProc) from depth ≥ 2, but works in practice
-             * because OS code rarely takes that path during boot. */
+             * The exit(CurrentProc)-only fix unblocks INIT_BOOT_CDS's
+             * EXIT(init_boot_cds) which was mis-unwinding its caller
+             * BOOT_IO_INIT, skipping BOOT_IO_INIT's case-4 → FS_INIT. */
             if (str_eq_nocase(fn, "EXIT")) {
-                if (cg->scope_depth > 1) {
+                const char *target = NULL;
+                if (node->num_children > 0 &&
+                    node->children[0]->type == AST_IDENT_EXPR &&
+                    node->children[0]->name[0]) {
+                    target = node->children[0]->name;
+                }
+                cg_scope_t *cur = current_scope(cg);
+                bool target_is_current = (target && cur &&
+                                          str_eq_nocase(cur->proc_name, target));
+                if (!target_is_current && cg->scope_depth > 1) {
                     for (int d = cg->scope_depth - 1; d >= 1; d--)
                         emit16(cg, 0x2C56);  /* MOVEA.L (A6),A6 */
                 }
