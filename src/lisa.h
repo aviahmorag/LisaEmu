@@ -99,6 +99,11 @@ typedef struct {
     /* Machine state */
     bool         running;
     bool         power_on;
+    /* Sticky "permanent halt" flag — set when the kernel's SYSTEM_ERROR
+     * handler fires (a fatal non-returnable kernel fault). Survives the
+     * CPU stopping/waking via interrupts, unlike cpu->stopped. Cleared
+     * only on lisa_init. Swift watches this to stop the frame timer. */
+    bool         halted;
 
     /* HLE (High-Level Emulation) disk I/O — bypasses ProFile driver */
     struct {

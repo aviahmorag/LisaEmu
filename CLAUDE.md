@@ -70,6 +70,107 @@ make audit-linker       # Stage 4: Full pipeline + linker
 cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' build 2>&1 | grep -E "(error:|BUILD)"
 ```
 
+## Current Status (2026-04-17 late evening) — App-path parity achieved, kernel bug isolated at INIT_SCTAB
+
+**App path now matches SDL headless harness exactly** — reaches 23/27 kernel
+milestones, halts at `SYSTEM_ERROR(10101)` via `Make_SProcess` inside
+`SYS_PROC_INIT`, same PC ($005E6C) and register state as SDL. Root cause
+bisected to a Pascal-codegen stride bug; see "Kernel bug — isolated" below.
+
+### Session 2026-04-17 late evening — finishing the plumbing
+
+Beyond the sandbox-off / no-bookmarks / bundle-format work documented in the
+next section, this session closed two remaining gaps that made the app path
+diverge from SDL:
+
+1. **HLE intercepts wired from app path**. `lisa_bridge.c` now exposes
+   `emu_load_hle_addrs(const char *path)` which parses `hle_addrs.txt`
+   (produced by the build, stored inside the `.lisa` bundle) and calls
+   `lisa_hle_set_addresses(...)`. Without this, the kernel's CALLDRIVER /
+   SYSTEM_ERROR / loader-trap intercepts were dead and the CPU walked off
+   during boot. The stub-ROM fallback had been masking this; once the
+   real ROM loaded, the crash surfaced.
+2. **Boot-progress symbol map loaded from app path**. New bridge API
+   `emu_load_symbol_map(const char *path)` wraps `boot_progress_init()`.
+   Used both for milestone instrumentation AND for the dynamic HLE
+   lookups (`boot_progress_lookup`) that resolve CreateProcess,
+   Make_SProcess etc. by name. Without this, lookups failed and the HLE
+   fell back to hardcoded addresses, causing downstream crashes.
+
+Both are called from `EmulatorViewModel.startEmulation()` right after
+`emu_mount_profile`. The SDL `main_sdl.c` has always done the equivalent.
+
+### Halt + boot-progress surfacing (app UX)
+
+- `lisa->halted` sticky flag in `lisa_t` (set in `hle_system_error`,
+  cleared by `lisa_init`). Survives CPU wake-up on interrupt.
+- `emu_is_halted()` / `emu_get_boot_progress_report(buf, size)` bridge
+  APIs. Report capture uses `open_memstream` to convert the
+  `boot_progress_report(FILE*)` API into a string.
+- Swift `runFrame` checks halt each frame; on halt, calls
+  `haltAndReport()` which stops the timer and logs the milestone table
+  line-by-line to the app log panel.
+- `emu_run_frame` short-circuits to 0 cycles when halted — no more per-
+  frame `SYSTEM_ERROR: HALTING CPU` spam in the Xcode console.
+- `hle_system_error` now prints the `HALTING CPU` line only once per
+  halt (guarded by `reported_once`).
+
+### `emu_has_rom()` fixed — false-negative bug
+
+Previous implementation peeked at `lisa.mem.rom[0]` and `rom[4]`, returning
+`false` when both were zero. This was **exactly backwards**: every valid
+Lisa boot ROM has reset vectors in 24-bit address space (e.g. SSP=$000FFFFE,
+PC=$00FE0400), so the first byte of each vector IS always `$00`. The test
+flagged every loaded ROM as missing. Now tracks a `static bool rom_loaded`
+flag set by `emu_load_rom` on success, cleared by `emu_init`.
+
+### Kernel bug — isolated, NOT yet fixed
+
+Boot halts at `SYSTEM_ERROR(10101)` because `b_syslocal_ptr` (A5-relative
+global at `A5-24785`, phys $CC0F2B) gets corrupted from `$00CE0000` (set
+correctly by POOL_INIT) to `$FFFFFFFF` before `SYS_PROC_INIT` runs. Then
+`Make_SProcess → MAKE_DATASEG → CHK_LDSN_FREE` dereferences the junk
+pointer, fails with error 20083, recovery propagates three times, and
+SYS_PROC_INIT calls SYSTEM_ERROR(10101).
+
+**Traced to a Pascal codegen stride bug** at PC=$002FDA, in the
+`INIT_SCTAB` region of STARTUP (matches memory entry
+`project_apple_codegen_splits`: Apple split sctab1/sctab2 to dodge their
+own Pascal codegen bugs; ours fails same class on SCTAB2):
+
+```
+$2FD0: 3200           MOVE.W D0,D1
+$2FD2: C2FC 0001      MULU.W #$0001,D1       ← elem_size = 1 !!
+$2FD6: D1C1           ADDA.L D1,A0
+$2FD8: 301F           MOVE.W (A7)+,D0        ← D0 = $FFFF
+$2FDA: 3080           MOVE.W D0,(A0)         ← 2-byte store at 1-byte stride
+$2FDC: 526E FFFA      ADDQ.W #1,-6(A6)
+$2FE0: 6000 FFC6      BRA.W back
+```
+
+Array element size compiled as 1 (byte) but the assignment emits a word
+store. Consecutive iterations write overlapping WORDs at byte-stepped
+addresses. Five iterations stepping $CC0F2A..$CC0F2E produce the exact
+8 byte-writes the watchpoint captured (each non-endpoint address written
+twice).
+
+**Watchpoints added** in `src/lisa_mmu.c`:
+- `WATCH-B_SLOC` on `$CC0F2B..$CC0F2E` — logs PC + runtime opcodes at PC.
+- `WATCH-CODE2FDA` on logical `$002FDA..$002FDF` — never triggered
+  (code is original, not overwritten; the apparent "wrong opcodes"
+  finding earlier was a disassembly alignment error on my part:
+  `linked.bin` has 0x400 bytes of vector/padding at the start, so the
+  file is PC-indexed directly, not module-offset indexed).
+
+**Next-session task**: find the offending Pascal array declaration in
+`Lisa_Source/LISA_OS/OS/source-sctabs.text` (or SCTAB init in
+SOURCE-STARTUP.TEXT) and fix the codegen in `src/toolchain/pascal_codegen.c`
+array-store path. Decide based on the declared element type whether to
+emit `MULU #2` (fix stride) or `MOVE.B` (fix store width). See
+`NEXT_SESSION.md` for the resume prompt.
+
+---
+
 ## Current Status (2026-04-17 evening) — App-layer rewrite: sandbox off, no bookmarks, pure path derivation
 
 Kernel milestones unchanged (still 27/27 — see next section). This session

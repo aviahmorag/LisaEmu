@@ -217,6 +217,25 @@ final class EmulatorViewModel {
         if showDebugger {
             updateCPUState()
         }
+
+        // Detect permanent halt (kernel fired SYSTEM_ERROR). Stop the
+        // frame timer, log the boot-progress report once, and flip state
+        // so subsequent Power On cycles restart cleanly.
+        if emu_is_halted() {
+            haltAndReport()
+        }
+    }
+
+    private func haltAndReport() {
+        var buf = [CChar](repeating: 0, count: 4096)
+        emu_get_boot_progress_report(&buf, Int32(buf.count))
+        let report = String(cString: buf)
+        log("⛔ CPU halted (SYSTEM_ERROR). Boot-progress report:")
+        for line in report.split(separator: "\n", omittingEmptySubsequences: false) {
+            log(String(line))
+        }
+        stopEmulation()
+        statusMessage = "Halted — see log for boot-progress report"
     }
 
     private func updateDisplay() {

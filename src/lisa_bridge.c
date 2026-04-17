@@ -115,7 +115,32 @@ bool emu_mount_floppy(const char *path) {
 
 int emu_run_frame(void) {
     if (!initialized) return 0;
+    if (lisa.halted) return 0;
     return lisa_run_frame(&lisa);
+}
+
+bool emu_is_halted(void) {
+    return initialized && lisa.halted;
+}
+
+/* Copy the boot-progress report into a caller-provided buffer. Returns
+ * the number of bytes written (including NUL). Uses open_memstream so
+ * boot_progress_report's FILE-based API works against memory directly. */
+int emu_get_boot_progress_report(char *buf, int bufsize) {
+    if (!buf || bufsize <= 0) return 0;
+    char *mem = NULL;
+    size_t mem_size = 0;
+    FILE *f = open_memstream(&mem, &mem_size);
+    if (!f) { buf[0] = '\0'; return 1; }
+    boot_progress_report(f);
+    fclose(f);  /* flushes into mem/mem_size */
+    int to_copy = (int)mem_size < bufsize - 1 ? (int)mem_size : bufsize - 1;
+    if (mem) {
+        memcpy(buf, mem, to_copy);
+        free(mem);
+    }
+    buf[to_copy] = '\0';
+    return to_copy + 1;
 }
 
 const uint32_t *emu_get_framebuffer(void) {

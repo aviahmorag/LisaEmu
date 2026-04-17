@@ -67,6 +67,14 @@ void emu_mouse_button(bool pressed);
 bool emu_is_running(void);
 void emu_set_running(bool running);
 
+/* True once the kernel has executed SYSTEM_ERROR (a fatal non-returnable
+ * fault). Sticky — survives interrupt wake-up; cleared only by emu_init. */
+bool emu_is_halted(void);
+
+/* Fill `buf` with a human-readable boot-progress report (milestones
+ * reached + per-milestone status). Returns bytes written (incl NUL). */
+int emu_get_boot_progress_report(char *buf, int bufsize);
+
 /* Debug: get CPU state as formatted string */
 void emu_get_cpu_state(char *buf, int bufsize);
 

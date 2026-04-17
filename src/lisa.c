@@ -2958,16 +2958,17 @@ static bool hle_handle_system_error(lisa_t *lisa __attribute__((unused)), m68k_t
     }
 
     /* SYSTEM_ERROR should halt — it never returns on a real Lisa.
-     * Stop the CPU to prevent infinite recursion. */
-    fprintf(stderr, "SYSTEM_ERROR(%d): HALTING CPU\n", err_code);
-    cpu->stopped = true;
-    /* Dump the boot-progress report once on first halt so we can see
-     * how far we got before failing. */
+     * Stop the CPU to prevent infinite recursion. lisa->halted is sticky
+     * (survives cpu->stopped getting cleared by an interrupt), so the
+     * bridge/app layer can detect the halt and stop its frame timer. */
     static bool reported_once = false;
     if (!reported_once) {
         reported_once = true;
+        fprintf(stderr, "SYSTEM_ERROR(%d): HALTING CPU\n", err_code);
         boot_progress_report(stderr);
     }
+    cpu->stopped = true;
+    lisa->halted = true;
     return true;
 }
 

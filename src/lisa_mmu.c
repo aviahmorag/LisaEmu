@@ -366,6 +366,51 @@ void lisa_mem_write8(lisa_mem_t *mem, uint32_t addr, uint8_t val) {
                     }
                 }
             }
+            /* b_syslocal_ptr watchpoint: 4-byte slot at A5-24785 sits at
+             * logical $00CC0F2B..$00CC0F2E. POOL_INIT writes the correct
+             * value there (verified via INIT_FREEPOOL #2 firing with the
+             * right sl_free_pool_addr), but by SYS_PROC_INIT entry the
+             * slot reads $FFFFFFFF. Something in between is clobbering
+             * it. Log every byte write that lands in that range so we
+             * can identify the offending instruction + caller. */
+            /* Code-region watchpoint: bytes at $2FDA..$2FDF are supposed
+             * to be D1C1 301F 3080 (Pascal array-store epilogue) but at
+             * runtime read back as 3080 526E ... — some stray write is
+             * clobbering boot code. Log every write that lands there so
+             * we can trace back to the offending instruction. */
+            if (addr >= 0x2FDA && addr <= 0x2FDF) {
+                extern uint32_t g_last_cpu_pc;
+                static int wcode_count = 0;
+                static int wcode_gen = -1;
+                extern int g_emu_generation;
+                if (wcode_gen != g_emu_generation) {
+                    wcode_count = 0; wcode_gen = g_emu_generation;
+                }
+                if (wcode_count++ < 32) {
+                    fprintf(stderr, "WATCH-CODE2FDA [%d]: PC=$%06X log=$%06X phys=$%06X val=$%02X\n",
+                            wcode_count, g_last_cpu_pc, addr, phys, val);
+                }
+            }
+            if (addr >= 0xCC0F2B && addr <= 0xCC0F2E) {
+                extern uint32_t g_last_cpu_pc;
+                static int wbsl_count = 0;
+                static int wbsl_gen = -1;
+                extern int g_emu_generation;
+                if (wbsl_gen != g_emu_generation) {
+                    wbsl_count = 0; wbsl_gen = g_emu_generation;
+                }
+                if (wbsl_count++ < 64) {
+                    /* Read the opcode at PC via the same MMU translation path
+                     * the CPU uses, so we see what's ACTUALLY there (the code
+                     * may have been overwritten at runtime). */
+                    uint8_t op0 = lisa_mem_read8(mem, g_last_cpu_pc);
+                    uint8_t op1 = lisa_mem_read8(mem, g_last_cpu_pc + 1);
+                    uint8_t op2 = lisa_mem_read8(mem, g_last_cpu_pc + 2);
+                    uint8_t op3 = lisa_mem_read8(mem, g_last_cpu_pc + 3);
+                    fprintf(stderr, "WATCH-B_SLOC [%d]: PC=$%06X op=%02X%02X%02X%02X log=$%06X phys=$%06X val=$%02X\n",
+                            wbsl_count, g_last_cpu_pc, op0, op1, op2, op3, addr, phys, val);
+                }
+            }
             /* $08658A watchpoint: post-P26 illegal-instr at this PC
              * with opcode $00CC, while linked binary has $3400 — code
              * overwrite, same class as the pre-P23 $2600 one. Log
