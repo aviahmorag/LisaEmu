@@ -3369,18 +3369,8 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
          * was CreateProcess passing a garbage syslocal pointer — a
          * static-link symptom. With CreateProcess native, b_sloc_ptr
          * is now always valid. */
-        /* P33 HLE bypass: REG_OPEN_LIST (fsui1.text:1071). Walks
-         * mounttable[device]^.openchain — same Pascal-vs-asm
-         * sentinel-init class as QUEUE_PR. Set ecode^:=0 and return. */
-        if (pc_REG_OPEN_LIST && cpu->pc == pc_REG_OPEN_LIST) {
-            uint32_t sp = cpu->a[7] & 0xFFFFFF;
-            uint32_t ret    = cpu_read32(cpu, sp);
-            uint32_t ecode_addr = cpu_read32(cpu, sp + 4);  /* VAR ecode */
-            cpu_write16(cpu, ecode_addr, 0);                /* success */
-            cpu->a[7] += 4 /*retPC*/ + 4 /*ecode*/ + 2 /*device*/ + 2 /*oldrefnum*/ + 2 /*newrefnum*/ + 2 /*newrntype*/;
-            cpu->pc = ret;
-            continue;
-        }
+        /* P81c: REG_OPEN_LIST HLE bypass DISABLED. The "same sentinel-init
+         * class as QUEUE_PR" was the static-link bug; natural body works. */
         /* P77 HLE bypass: UNLOCKSEGS (MM0.TEXT:486). The seglock list
          * sentinel (hd_seglock_list.fwd_link) isn't initialized by
          * Build_Syslocal's WITH-block sentinel stores (same P13 class).
