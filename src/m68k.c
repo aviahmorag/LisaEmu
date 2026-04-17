@@ -3375,22 +3375,10 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             continue;
         }
 #endif
-        /* P34 HLE bypass: excep_setup (EXCEPNR1.TEXT:232) when called
-         * with a wild b_sloc_ptr (top byte set → can't be valid RAM).
-         * MAKE_PROCESS for non-first processes appears to pass an
-         * uninitialized syslocal pointer; the inner GETSPACE then
-         * fails → SYSTEM_ERROR(10207). Let the first call (valid
-         * b_sloc_ptr from INIT_PROCESS) execute normally. */
-        if (pc_excep_setup && cpu->pc == pc_excep_setup) {
-            uint32_t sp = cpu->a[7] & 0xFFFFFF;
-            uint32_t arg = cpu_read32(cpu, sp + 4);
-            if (arg & 0xFF000000) {
-                uint32_t ret = cpu_read32(cpu, sp);
-                cpu->a[7] += 4 + 4;  /* pop retPC + arg */
-                cpu->pc = ret;
-                continue;
-            }
-        }
+        /* P81c: excep_setup HLE bypass DISABLED. The "wild b_sloc_ptr"
+         * was CreateProcess passing a garbage syslocal pointer — a
+         * static-link symptom. With CreateProcess native, b_sloc_ptr
+         * is now always valid. */
         /* P33 HLE bypass: REG_OPEN_LIST (fsui1.text:1071). Walks
          * mounttable[device]^.openchain — same Pascal-vs-asm
          * sentinel-init class as QUEUE_PR. Set ecode^:=0 and return. */
