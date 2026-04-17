@@ -70,14 +70,21 @@ make audit-linker       # Stage 4: Full pipeline + linker
 cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' build 2>&1 | grep -E "(error:|BUILD)"
 ```
 
-## Current Status (2026-04-18 late-late — P89d: two structural codegen bugs fixed, boot progresses past A5-clobbering Launch crash)
+## Current Status (2026-04-18 end — P89d/e: three structural codegen fixes; env_save_area stores now emit; 12 of 13 Build_Stack fields written)
 
-22/27 milestones reached (same count as pre-session 22/27, but DIFFERENT
-failure mode: previously silent stack corruption in Launch crashed the CPU;
-now boot progresses past that and hits a NEW hard_excep blocker further in).
-Baseline (pre-P89) reaches 23/27 by accident.
+22/27 milestones reached. Boot now progresses past three previously-silent
+codegen failures (p_linkage record collision, proc_sig-resolution gap,
+AST_FIELD_ACCESS-in-AST_WITH). Build_Stack emits 12 of the expected 13
+record-field stores (was 8); one A6 field still drops (the complex
+MMU_Base/seg_size subtraction expression). Boot halts with hard_excep
+(SYSTEM_ERROR 10201) because the RTE in Launch pops an odd PC from the
+partially-written env_save_area.
 
-Five structural fixes landed this session (uncommitted):
+Baseline (pre-P89) still reaches 23/27 by accident.
+
+### Structural fixes this session (all committed, pushed)
+
+Six fixes total (see commits 5b2f848, 6b4a290, 48d8972):
 
 1. **main_sdl.c: fresh bundle artifact paths**. Previously loaded stale
    `build/lisa_boot.rom`/`lisa_linked.map`/`lisa_profile.image` when the
@@ -114,34 +121,42 @@ Five structural fixes landed this session (uncommitted):
    local-resolved > local-partial > imported-resolved > imported-partial
    > external.
 
-### What the fixes unlocked
+6. **P89e: AST_WITH handles AST_FIELD_ACCESS record expression**
+   (`pascal_codegen.c`). The `with sloc_ptr^.env_save_area, stk_handle
+   do begin SR := 0; PC := ord(@Initiate) end` in Build_Stack had its
+   first WITH expression as AST_FIELD_ACCESS. AST_WITH's type
+   resolver had that case as a stub ("type resolution is complex; push
+   NULL and hope for the best"), so record_type stayed NULL and the
+   body's field stores silently no-op'd. Fix: walk the field-access
+   chain via `lvalue_record_type` and look up the named field in the
+   parent record. Net effect: Build_Stack now emits 12 of 13
+   record-field stores (was 8); env_save_area.PC actually gets
+   assigned `ord(@Initiate) = $0004FD7C` instead of staying zero.
 
-Pre-fix: MAP_SYSLOCAL computed c_sysl_sdb = $CC7AB8 (uninitialized) from
-a byte-shifted c_pcb parameter, read memaddr=0, wrote origin=0 to
-SMT[seg 103], zeroing the syslocmmu mapping. Launch's RTE then read
-A5=$3F8 from the "env_save_area" (actually stomped TRAP6 vector in the
-now-unmapped syslocal region) and the CPU walked off into a CRASH TO
-VECTORS loop.
+### What the fixes unlocked (cumulative)
 
-Post-fix: MAP_SYSLOCAL reads c_sysl_sdb=$CCB4FA correctly, writes
-origin=$043B access=$07 limit=$20 to SMT[103]. Syslocmmu mapping is
-preserved. Launch completes. But a later path hits a hardware exception
-(vector 4, illegal instruction at odd PC=$00CC07 in user mode) handled
-by `hard_excep` → SYSTEM_ERROR(10201). SYS_PROC_INIT milestone still
-not reached (22/27 same as pre-fix, but progressed further into boot).
+- Linker resolves STARTUP's 5-arg SETMMU (not LOADER's 4-arg) → callers
+  push the right number of args.
+- Scheduler finds the correctly-resolved Map_Syslocal sig → pushes
+  c_pcb as LONG (4 bytes), not WORD.
+- MMPRIM's p_linkage record isn't clobbered by DRIVERDEFS's linkage →
+  sdb memaddr at correct offset 8 (not offset 4).
+- MAP_SYSLOCAL writes correct origin=$043B/access=$07/limit=$20 into
+  SMT[seg 103]. Syslocmmu mapping survives.
+- Build_Stack's env_save_area assignments actually emit stores.
 
-### Next blocker: hard_excep (10201) at PC=$00CC07
+### Remaining blocker: partial env_save_area causes odd-PC RTE
 
-The CPU tries to execute at logical $00CC07 — an odd address inside
-seg 0 (in context 0 / start mode). Likely causes:
-- CreateProcess HLE stored wrong start_PC in env_save_area (maybe
-  byte-shifted again like the c_pcb push was).
-- Launch's RTE unwound to a wrong PC because the saved context is
-  still partially corrupted.
-- Some dispatched proc has a broken entry PC.
-
-Trace in `.claude-handoffs/` and NEXT_SESSION.md for the next session's
-plan.
+Boot halts with `hard_excep` → SYSTEM_ERROR(10201) because Launch's RTE
+pops an odd PC (observed: $CC25, was $CC07 pre-P89e). Build_Stack now
+emits 12 stores but one A6 field still seems to drop. The assignment
+`A6 := MMU_Base(stackmmu+1) - (seg_size - (ord(@stk_base^.start_addr)
+- seg_ptr))` has a nested expression with multiple function calls and
+record-field address-of that may not codegen cleanly. Next session:
+disassemble Build_Stack at its new address (`$050F4E` or whatever the
+post-P89e link places it) and find the missing store. Expected stores
+in order: start_addr, glob_base, In_buffptr, Out_buffptr, units_size,
+OSorMonitor, C_parms, V_parms, A5, A6, A7, SR, PC = 13 total.
 
 ### This session's structural fixes (uncommitted)
 
