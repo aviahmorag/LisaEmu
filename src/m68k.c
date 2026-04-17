@@ -3122,19 +3122,9 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 continue;
             }
         }
-        /* P36 HLE bypass: MEM_CLEANUP (STARTUP/MM4). Called after
-         * FS_CLEANUP with stksdb_ptr+slsdb_ptr — since we bypassed
-         * SYS_PROC_INIT (P35), those args are uninitialized globals
-         * and MEM_CLEANUP jumps to garbage. Let PC enter so the
-         * milestone fires, then pop args+return. 2 longword args. */
-        if (pc_MEM_CLEANUP && cpu->pc == pc_MEM_CLEANUP) {
-            boot_progress_record_pc(cpu->pc);   /* ensure milestone */
-            uint32_t sp = cpu->a[7] & 0xFFFFFF;
-            uint32_t ret = cpu_read32(cpu, sp);
-            cpu->a[7] += 4 + 8;
-            cpu->pc = ret;
-            continue;
-        }
+        /* P81c: MEM_CLEANUP HLE bypass DISABLED. With SYS_PROC_INIT
+         * running natively, its stksdb_ptr+slsdb_ptr args are now
+         * properly initialized, so the real MEM_CLEANUP body works. */
         /* P35 HLE bypass: SYS_PROC_INIT (STARTUP:2042). Creates the
          * MemMgr and Root system processes. Each Make_SProcess call
          * cascades through MM_Setup → init_proc_syslocal → crea_ecb,
