@@ -65,7 +65,7 @@ typedef struct type_desc {
     struct {
         char name[64];
         char type_name[12];  /* Original type name for re-resolution (8-char significant) */
-        int offset;
+        int offset;          /* byte offset of the containing byte */
         struct type_desc *type;
         /* P82: variant record tracking.
          * variant_arm = 0 for fixed fields, 1..N for fields in variant arm N.
@@ -74,12 +74,28 @@ typedef struct type_desc {
          * Without this, recomputed layouts lay arms out sequentially and
          * downstream field offsets in e.g. codesdb.freechain get wrong. */
         signed char variant_arm;
+        /* P87d: bit-packed field tracking (only meaningful in packed records).
+         * bit_width == 0 means "whole-byte field" — read/write the byte at
+         * `offset` normally. bit_width > 0 means a bit-packed field at
+         * bits [bit_offset .. bit_offset + bit_width - 1] of the byte at
+         * `offset`. Used for Lisa Pascal's Tnibble (0..15, 4 bits) and
+         * booleans in packed records — e.g. pmem's BootVol/NormCont share
+         * byte 4 (bits 7-4 and 3-0 respectively). */
+        unsigned char bit_offset;   /* LSB position within the byte, 0..7 */
+        unsigned char bit_width;    /* 0 = whole-byte; 1..7 = bit-packed */
     } fields[64];
     int num_fields;
     /* P82: variant layout bookkeeping. variant_start is the offset at which
      * the variant region begins (i.e. first variant arm's first field offset).
      * Used during Phase-2 fixup to correctly overlap arms. 0 when no variants. */
     int variant_start;
+    /* P87c: record was declared `packed`. Both the initial resolver and the
+     * Phase-2 fixup in toolchain_bridge use this to skip word-alignment and
+     * to pack booleans at 1 byte. Without it, pmem's DevConfig lands at
+     * offset 22 (booleans word-sized, fields word-aligned) instead of 18,
+     * and the DEFAULTPM init loop overruns the 64-byte param_mem backing
+     * store, corrupting b_syslocal_ptr. */
+    bool is_packed;
 
     /* For pointers */
     struct type_desc *base_type;

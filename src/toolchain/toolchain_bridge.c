@@ -840,6 +840,23 @@ build_result_t toolchain_build(const char *source_dir,
                 int variant_start = -1;
                 int variant_max_end = 0;
                 int prev_arm = 0;
+                /* P87d: bit cursor parallel to offset; only consulted for
+                 * packed records. See the matching block in
+                 * pascal_codegen.c AST_TYPE_RECORD for the algorithm. */
+                int bit_cursor = 0;
+                /* P87d: only bit-pack packed records that contain at least
+                 * one Tnibble — see resolver comment for rationale. */
+                bool record_has_nibble = false;
+                if (t->is_packed) {
+                    for (int fi2 = 0; fi2 < t->num_fields; fi2++) {
+                        type_desc_t *ft2 = t->fields[fi2].type;
+                        if (ft2 && ft2->kind == TK_SUBRANGE &&
+                            ft2->range_low == 0 && ft2->range_high == 15) {
+                            record_has_nibble = true;
+                            break;
+                        }
+                    }
+                }
                 for (int fi = 0; fi < t->num_fields; fi++) {
                     int arm = t->fields[fi].variant_arm;
                     if (arm != 0 && prev_arm == 0) {
@@ -847,19 +864,45 @@ build_result_t toolchain_build(const char *source_dir,
                         if (offset % 2) offset++;
                         variant_start = offset;
                         variant_max_end = offset;
+                        bit_cursor = offset * 8;
                     } else if (arm != 0 && arm != prev_arm) {
                         /* Crossed an arm boundary — reset to variant_start */
                         if (offset > variant_max_end) variant_max_end = offset;
                         offset = variant_start;
+                        bit_cursor = offset * 8;
                     } else if (arm == 0 && prev_arm != 0) {
                         /* Exited the variant region (unusual — fixed after variant) */
                         if (offset > variant_max_end) variant_max_end = offset;
                         offset = variant_max_end;
+                        bit_cursor = offset * 8;
                         variant_start = -1;
                     }
                     prev_arm = arm;
                     int fs = t->fields[fi].type ? t->fields[fi].type->size : 2;
+                    /* P87c: packed records with nibble-packed fields pack
+                     * booleans to 1 byte (then bit-packed below). Gated on
+                     * record_has_nibble to keep boolean-only packed
+                     * records (segstates etc.) at the pre-P87c 2-byte
+                     * layout that matches hand-coded asm pins. */
+                    if (record_has_nibble && t->fields[fi].type &&
+                        t->fields[fi].type->kind == TK_BOOLEAN && fs == 2)
+                        fs = 1;
                     if (t->fields[fi].type && t->fields[fi].type->kind == TK_STRING && (fs % 2)) fs++;
+                    /* P87d: packed bit-field placement — booleans (1 bit)
+                     * and Tnibble-sized subranges (0..15, 4 bits). Mirrors
+                     * the resolver in pascal_codegen.c. Gated on
+                     * record_has_nibble to leave boolean-only packed
+                     * records untouched (segstates etc.). */
+                    int packed_bits = 0;
+                    if (record_has_nibble && t->fields[fi].type) {
+                        type_desc_t *ft = t->fields[fi].type;
+                        if (ft->kind == TK_BOOLEAN) {
+                            packed_bits = 1;
+                        } else if (ft->kind == TK_SUBRANGE &&
+                                   ft->range_low == 0 && ft->range_high == 15) {
+                            packed_bits = 4;
+                        }
+                    }
                     /* P82c/P85c: TK_BYTE/TK_CHAR keep pair-pack; only INLINE
                      * byte-subranges widen at even offsets. A field is inline
                      * iff its type_name is empty (no named type reference). */
@@ -867,7 +910,7 @@ build_result_t toolchain_build(const char *source_dir,
                     /* P85c: narrowed to PCB (see pascal_codegen.c comment). */
                     int is_inline_sub = (t->fields[fi].type_name[0] == '\0') &&
                                         (strcasecmp(t->name, "PCB") == 0);
-                    if (fs == 1 && t->fields[fi].type &&
+                    if (packed_bits == 0 && fs == 1 && t->fields[fi].type &&
                         (t->fields[fi].type->kind == TK_BYTE || t->fields[fi].type->kind == TK_CHAR ||
                          (t->fields[fi].type->kind == TK_SUBRANGE && is_inline_sub))) {
                         int should_widen = 1;
@@ -887,9 +930,31 @@ build_result_t toolchain_build(const char *source_dir,
                             if (is_inline_sub) widen_sub = 1;
                         }
                     }
-                    if (fs >= 2 && (offset % 2)) offset++;
-                    t->fields[fi].offset = offset + (widen_sub ? 1 : 0);
-                    offset += fs;
+                    if (fs >= 2 && (offset % 2) && !t->is_packed) offset++;
+                    if (packed_bits > 0) {
+                        int byte_idx = bit_cursor / 8;
+                        int bit_in_byte = bit_cursor % 8;
+                        if (bit_in_byte + packed_bits > 8) {
+                            byte_idx++;
+                            bit_in_byte = 0;
+                            bit_cursor = byte_idx * 8;
+                        }
+                        t->fields[fi].offset = byte_idx;
+                        t->fields[fi].bit_offset = (unsigned char)(8 - bit_in_byte - packed_bits);
+                        t->fields[fi].bit_width = (unsigned char)packed_bits;
+                        bit_cursor += packed_bits;
+                        if (byte_idx + 1 > offset) offset = byte_idx + 1;
+                    } else {
+                        if (t->is_packed && (bit_cursor % 8)) {
+                            bit_cursor = (bit_cursor + 7) & ~7;
+                            if (bit_cursor / 8 > offset) offset = bit_cursor / 8;
+                        }
+                        t->fields[fi].offset = offset + (widen_sub ? 1 : 0);
+                        t->fields[fi].bit_offset = 0;
+                        t->fields[fi].bit_width = 0;
+                        offset += fs;
+                        if (t->is_packed) bit_cursor = offset * 8;
+                    }
                 }
                 /* If we were in a variant region at end, finalize it */
                 if (prev_arm != 0) {

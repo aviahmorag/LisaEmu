@@ -357,10 +357,40 @@ static type_desc_t *resolve_type(codegen_t *cg, ast_node_t *node) {
 
         case AST_TYPE_RECORD: {
             type_desc_t *t = add_type(cg, "", TK_RECORD, 0);
+            if (cg->in_packed) t->is_packed = true;
             int offset = 0;
             int variant_start = -1;   /* offset where variants begin; -1 = not yet */
             int variant_max_end = 0;  /* max end offset across all variant arms */
             int current_arm = 0;      /* 0 = fixed part, 1..N = variant arm index */
+            /* P87d: bit-level cursor for packed records. Tracks total bits
+             * consumed from the start of the record (or current variant arm).
+             * bit_cursor % 8 gives the free-bit position within the byte at
+             * bit_cursor / 8. For whole-byte fields we byte-align this up
+             * before advancing, which keeps the unpacked semantics intact.
+             * For bit-packable fields (Tnibble 4 bits, boolean 1 bit) in
+             * packed context we subdivide the byte. First-declared field
+             * gets the HIGH bits, matching Apple's pmem comment layout. */
+            int bit_cursor = 0;
+            /* P87d: only enable boolean/Tnibble bit-packing when the record
+             * actually contains a Tnibble-sized field. That narrows the
+             * change to records (like pmem) whose layout is unreachable
+             * without nibble splitting, while leaving boolean-only packed
+             * records (e.g. segstates: nine booleans) at their existing
+             * 1-byte-per-field layout — the asm pin tables and embedded-
+             * record offset chains still expect those sizes. */
+            bool record_has_nibble = false;
+            if (cg->in_packed) {
+                for (int pi = 0; pi < node->num_children; pi++) {
+                    ast_node_t *pf = node->children[pi];
+                    if (pf->type != AST_FIELD || pf->num_children == 0) continue;
+                    type_desc_t *pft = resolve_type(cg, pf->children[0]);
+                    if (pft && pft->kind == TK_SUBRANGE &&
+                        pft->range_low == 0 && pft->range_high == 15) {
+                        record_has_nibble = true;
+                        break;
+                    }
+                }
+            }
             for (int i = 0; i < node->num_children; i++) {
                 ast_node_t *field = node->children[i];
                 if (field->type != AST_FIELD) continue;
@@ -375,14 +405,17 @@ static type_desc_t *resolve_type(codegen_t *cg, ast_node_t *node) {
                         variant_max_end = offset;
                         t->variant_start = offset;
                         current_arm = 1;  /* fields that follow belong to arm 1 */
+                        bit_cursor = offset * 8;
                     } else if (strcmp(field->name, "__variant_arm__") == 0) {
                         /* Track the end of the previous arm, reset to variant start */
                         if (offset > variant_max_end) variant_max_end = offset;
                         offset = variant_start;
+                        bit_cursor = offset * 8;
                         current_arm++;
                     } else if (strcmp(field->name, "__variant_end__") == 0) {
                         if (offset > variant_max_end) variant_max_end = offset;
                         offset = variant_max_end;
+                        bit_cursor = offset * 8;
                         variant_start = -1;
                         current_arm = 0;
                     }
@@ -406,6 +439,33 @@ static type_desc_t *resolve_type(codegen_t *cg, ast_node_t *node) {
                     }
                 }
                 int fs = ft ? ft->size : 2;
+                /* P87c: in packed records with nibble-packed fields (e.g.
+                 * pmem), booleans collapse to 1 byte (and further to
+                 * individual bits in the bit-packing path below). Other
+                 * packed records (boolean-only like segstates) keep the
+                 * unpacked default of 2 bytes so their layouts match
+                 * hand-coded asm pin tables that have been validated over
+                 * the existing boot sequence. */
+                if (cg->in_packed && record_has_nibble && ft &&
+                    ft->kind == TK_BOOLEAN && fs == 2)
+                    fs = 1;
+                /* P87d: bit-packed field decision. Only in packed records
+                 * that contain at least one Tnibble (range 0..15, 4 bits);
+                 * such records can't be correctly laid out without bit
+                 * splitting. For TK_BOOLEAN → 1 bit, for that Tnibble
+                 * subrange → 4 bits. Gating on record_has_nibble leaves
+                 * boolean-only packed records (segstates, flags bitfields
+                 * elsewhere) at their existing byte-sized layout so the
+                 * handwritten asm-pin tables stay consistent. */
+                int packed_bits = 0;
+                if (record_has_nibble && ft) {
+                    if (ft->kind == TK_BOOLEAN) {
+                        packed_bits = 1;
+                    } else if (ft->kind == TK_SUBRANGE &&
+                               ft->range_low == 0 && ft->range_high == 15) {
+                        packed_bits = 4;
+                    }
+                }
                 /* P79: In Lisa Pascal unpacked records, string fields are
                  * padded to even length. string[32] = 33 bytes → 34. */
                 if (ft && ft->kind == TK_STRING && (fs % 2)) fs++;
@@ -470,8 +530,48 @@ static type_desc_t *resolve_type(codegen_t *cg, ast_node_t *node) {
                         if (is_inline_subrange) widen_byte_subrange = 1;
                     }
                 }
-                /* Word-align fields */
-                if (fs >= 2 && (offset % 2)) offset++;
+                /* Word-align fields — skipped in packed records so byte
+                 * fields don't force a padding hole between odd-offset
+                 * neighbors. */
+                if (fs >= 2 && (offset % 2) && !cg->in_packed) offset++;
+                /* P87d: packed bit-field placement. If this field is
+                 * bit-packable (boolean or Tnibble in packed context),
+                 * place it at the current bit_cursor; otherwise byte-align
+                 * bit_cursor and advance by fs bytes. We keep `offset`
+                 * synced with bit_cursor / 8 so downstream consumers
+                 * (variant bookkeeping, t->size) still see byte-aligned
+                 * numbers. Apple's pmem layout requires MSB-first packing:
+                 * first declared field gets the HIGH bits of the byte, so
+                 * bit_offset (LSB position) = 8 - (cursor_in_byte + W). */
+                int placed_byte_offset = offset;
+                int placed_bit_offset = 0;
+                int placed_bit_width = 0;
+                if (packed_bits > 0) {
+                    int byte_idx = bit_cursor / 8;
+                    int bit_in_byte = bit_cursor % 8;
+                    /* Need packed_bits free bits in the current byte. If
+                     * bit_in_byte + packed_bits > 8, advance to next byte. */
+                    if (bit_in_byte + packed_bits > 8) {
+                        byte_idx++;
+                        bit_in_byte = 0;
+                        bit_cursor = byte_idx * 8;
+                    }
+                    placed_byte_offset = byte_idx;
+                    /* MSB-first: LSB position = 8 - used - width */
+                    placed_bit_offset = 8 - bit_in_byte - packed_bits;
+                    placed_bit_width = packed_bits;
+                    bit_cursor += packed_bits;
+                    /* Keep `offset` as the byte just after the highest byte
+                     * this field could touch, matching the pre-existing
+                     * invariant that offset == end-of-last-placed-field. */
+                    offset = byte_idx + 1;
+                } else {
+                    /* Whole-byte (or multi-byte) field: byte-align cursor. */
+                    if (bit_cursor % 8) bit_cursor = (bit_cursor + 7) & ~7;
+                    if (bit_cursor / 8 > offset) offset = bit_cursor / 8;
+                    placed_byte_offset = offset;
+                    bit_cursor = (offset + fs) * 8;
+                }
                 if (t->num_fields < 64) {
                     strncpy(t->fields[t->num_fields].name, field->name, 63);
                     t->fields[t->num_fields].name[63] = '\0';
@@ -485,7 +585,10 @@ static type_desc_t *resolve_type(codegen_t *cg, ast_node_t *node) {
                      * the field's offset so byte-sized reads/writes access the
                      * correct byte. Apple's ASM MOVE.W at the slot's even
                      * offset still sees $00XX (pad+value) as intended. */
-                    t->fields[t->num_fields].offset = offset + (widen_byte_subrange ? 1 : 0);
+                    t->fields[t->num_fields].offset = placed_byte_offset +
+                        (widen_byte_subrange ? 1 : 0);
+                    t->fields[t->num_fields].bit_offset = (unsigned char)placed_bit_offset;
+                    t->fields[t->num_fields].bit_width = (unsigned char)placed_bit_width;
                     t->fields[t->num_fields].type = ft;
                     t->fields[t->num_fields].variant_arm = (signed char)current_arm;
                     /* P80c trace: record layout for freepool fields */
@@ -494,9 +597,18 @@ static type_desc_t *resolve_type(codegen_t *cg, ast_node_t *node) {
                                 t->name[0] ? t->name : "(anon)", field->name, offset, fs);
                     t->num_fields++;
                 }
-                offset += fs;
+                /* In packed mode we already advanced offset via bit_cursor
+                 * tracking above. For unpacked records, keep the historical
+                 * linear byte-advance. */
+                if (packed_bits == 0 && !cg->in_packed) offset += fs;
             }
-            if (offset % 2) offset++; /* Pad to word boundary */
+            /* Close out any trailing bits in packed mode; t->size always
+             * reports a byte count. Unpacked records keep their legacy
+             * even-byte pad. */
+            if (cg->in_packed) {
+                if (bit_cursor % 8) bit_cursor = (bit_cursor + 7) & ~7;
+                offset = bit_cursor / 8;
+            } else if (offset % 2) offset++;
             t->size = offset;
             /* P80g: post-creation record repair. If the freshly resolved
              * record has all-zero offsets (field types resolved to NULL →
@@ -960,10 +1072,15 @@ static type_desc_t *lvalue_record_type(codegen_t *cg, ast_node_t *node) {
 }
 
 /* P82: resolve field metadata (offset + type) on an lvalue expression
- * `parent.field`. Returns true on success. */
-static bool lvalue_field_info(codegen_t *cg, ast_node_t *parent_node,
-                              const char *field_name, int *out_offset,
-                              type_desc_t **out_type) {
+ * `parent.field`. Returns true on success.
+ *
+ * P87d: also returns bit_offset / bit_width when non-null. bit_width == 0
+ * means "whole-byte field". Callers that don't care can pass NULL for
+ * the bit pointers. */
+static bool lvalue_field_info_full(codegen_t *cg, ast_node_t *parent_node,
+                                   const char *field_name, int *out_offset,
+                                   type_desc_t **out_type,
+                                   int *out_bit_offset, int *out_bit_width) {
     type_desc_t *parent = lvalue_record_type(cg, parent_node);
     if (!parent) return false;
     parent = repair_corrupt_record(cg, parent);
@@ -971,10 +1088,19 @@ static bool lvalue_field_info(codegen_t *cg, ast_node_t *parent_node,
         if (str_eq_nocase(parent->fields[fi].name, field_name)) {
             if (out_offset) *out_offset = parent->fields[fi].offset;
             if (out_type) *out_type = parent->fields[fi].type;
+            if (out_bit_offset) *out_bit_offset = parent->fields[fi].bit_offset;
+            if (out_bit_width) *out_bit_width = parent->fields[fi].bit_width;
             return true;
         }
     }
     return false;
+}
+
+static bool lvalue_field_info(codegen_t *cg, ast_node_t *parent_node,
+                              const char *field_name, int *out_offset,
+                              type_desc_t **out_type) {
+    return lvalue_field_info_full(cg, parent_node, field_name,
+                                  out_offset, out_type, NULL, NULL);
 }
 
 /* P80f: repair a corrupt record type by finding the imported version.
@@ -1353,6 +1479,47 @@ static void emit_write_d1_to_a0(codegen_t *cg, int sz) {
     if (sz == 4)      emit16(cg, 0x2081);  /* MOVE.L D1,(A0) */
     else if (sz == 1) emit16(cg, 0x1081);  /* MOVE.B D1,(A0) */
     else              emit16(cg, 0x3081);  /* MOVE.W D1,(A0) */
+}
+
+/* P87d: bit-field read. A0 holds the address of the byte containing the
+ * field. bit_offset = LSB position (0..7), bit_width = field width (1..7).
+ * On exit D0 holds the zero-extended field value. Uses only D0. */
+static void emit_read_a0_to_d0_bit(codegen_t *cg, int bit_offset, int bit_width) {
+    emit16(cg, 0x7000);                /* MOVEQ #0,D0 */
+    emit16(cg, 0x1010);                /* MOVE.B (A0),D0 */
+    if (bit_offset > 0) {
+        /* LSR.B #bit_offset,D0 — 68k shift immediate uses ROR/LSR with
+         * count field in bits 9-11; encoding `1110 ccc0 ss 001 reg` where
+         * cc=count (0=8,1..7=that count), ss=size (00=byte), dr=0 (right),
+         * ir=0 (immediate), type=01 (LSR). */
+        uint16_t cc = (bit_offset & 7);
+        emit16(cg, 0xE008 | (cc << 9));  /* LSR.B #cc,D0 */
+    }
+    int mask = (1 << bit_width) - 1;
+    emit16(cg, 0x0200);                /* ANDI.B #imm8,D0 */
+    emit16(cg, (uint16_t)mask);        /* immediate byte (pads to word) */
+}
+
+/* P87d: bit-field write. Caller has already pushed the value as a word
+ * via `MOVE.W D0,-(SP)` and put the byte address in A0. On exit, that
+ * byte has its [bit_offset .. bit_offset + bit_width - 1] bits replaced
+ * with the low `bit_width` bits of the saved value. The remaining bits
+ * of the byte are preserved. Clobbers D0, D1. */
+static void emit_write_d0_to_a0_bit(codegen_t *cg, int bit_offset, int bit_width) {
+    int mask = (1 << bit_width) - 1;
+    int shifted_mask = mask << bit_offset;
+    emit16(cg, 0x1210);                /* MOVE.B (A0),D1 */
+    emit16(cg, 0x301F);                /* MOVE.W (SP)+,D0 */
+    emit16(cg, 0x0200);                /* ANDI.B #mask,D0 */
+    emit16(cg, (uint16_t)mask);
+    if (bit_offset > 0) {
+        uint16_t cc = (bit_offset & 7);
+        emit16(cg, 0xE108 | (cc << 9));  /* LSL.B #cc,D0 */
+    }
+    emit16(cg, 0x0201);                /* ANDI.B #~shifted_mask,D1 */
+    emit16(cg, (uint16_t)(0xFF & ~shifted_mask));
+    emit16(cg, 0x8200);                /* OR.B D0,D1 (D1 is dest) */
+    emit16(cg, 0x1081);                /* MOVE.B D1,(A0) */
 }
 
 /* Load a variable's address into A0 */
@@ -1808,8 +1975,15 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                         emit16(cg, 0xD0FC);  /* ADDA.W #offset,A0 */
                         emit16(cg, (uint16_t)(int16_t)foff);
                     }
-                    int fsz = type_load_size(wrt->fields[fld].type);
-                    emit_read_a0_to_d0(cg, fsz);
+                    /* P87d: bit-packed WITH fields (e.g. MouseOn inside
+                     * `With PMRec^ do`) need a bit-read, not a byte-read. */
+                    int fbw = wrt->fields[fld].bit_width;
+                    if (fbw > 0) {
+                        emit_read_a0_to_d0_bit(cg, wrt->fields[fld].bit_offset, fbw);
+                    } else {
+                        int fsz = type_load_size(wrt->fields[fld].type);
+                        emit_read_a0_to_d0(cg, fsz);
+                    }
                 } else {
                     /* Not a WITH field — check for built-in constants
                      * before falling through to placeholder */
@@ -2589,10 +2763,23 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
             emit_read_a0_to_d0(cg, expr_size(cg, node));
             break;
 
-        case AST_FIELD_ACCESS:
-            gen_lvalue_addr(cg, node);
-            emit_read_a0_to_d0(cg, expr_size(cg, node));
+        case AST_FIELD_ACCESS: {
+            /* P87d: check for a bit-packed field. gen_lvalue_addr already
+             * emits ADDA.W to reach the containing byte, but we need to
+             * issue a bit-read rather than a byte-read afterwards. */
+            int bit_off = 0, bit_w = 0;
+            if (node->num_children > 0 &&
+                lvalue_field_info_full(cg, node->children[0], node->name,
+                                       NULL, NULL, &bit_off, &bit_w) &&
+                bit_w > 0) {
+                gen_lvalue_addr(cg, node);
+                emit_read_a0_to_d0_bit(cg, bit_off, bit_w);
+            } else {
+                gen_lvalue_addr(cg, node);
+                emit_read_a0_to_d0(cg, expr_size(cg, node));
+            }
             break;
+        }
 
         case AST_DEREF:
             gen_ptr_expression(cg, node->children[0]);
@@ -2728,6 +2915,21 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                 int widx = -1;
                 int fld = with_lookup_field(cg, lhs->name, &wrt, &widx);
                 if (fld >= 0 && wrt) {
+                    /* P87d: bit-packed WITH field write. Emit read-modify-
+                     * write so we don't clobber neighboring bits (e.g.
+                     * assigning NormCont must leave BootVol intact). */
+                    int fbw = wrt->fields[fld].bit_width;
+                    if (fbw > 0) {
+                        emit16(cg, 0x3F00);  /* MOVE.W D0,-(SP) */
+                        gen_with_base(cg, widx);
+                        int foff = wrt->fields[fld].offset;
+                        if (foff != 0) {
+                            emit16(cg, 0xD0FC);
+                            emit16(cg, (uint16_t)(int16_t)foff);
+                        }
+                        emit_write_d0_to_a0_bit(cg, wrt->fields[fld].bit_offset, fbw);
+                        break;
+                    }
                     /* WITH field assignment: save RHS, load base, add offset, store */
                     int fsz = type_load_size(wrt->fields[fld].type);
                     if (fsz > 4) fsz = 4;
@@ -2854,6 +3056,19 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                     emit16(cg, (uint16_t)(int16_t)sym->offset);
                 }
             } else if (lhs->type == AST_ARRAY_ACCESS || lhs->type == AST_FIELD_ACCESS || lhs->type == AST_DEREF) {
+                /* P87d: bit-packed FIELD_ACCESS write. Emit a read-modify-
+                 * write that leaves neighbor bits intact. */
+                if (lhs->type == AST_FIELD_ACCESS && lhs->num_children > 0) {
+                    int bit_off = 0, bit_w = 0;
+                    if (lvalue_field_info_full(cg, lhs->children[0], lhs->name,
+                                               NULL, NULL, &bit_off, &bit_w) &&
+                        bit_w > 0) {
+                        emit16(cg, 0x3F00);          /* MOVE.W D0,-(SP) */
+                        gen_lvalue_addr(cg, lhs);
+                        emit_write_d0_to_a0_bit(cg, bit_off, bit_w);
+                        break;
+                    }
+                }
                 /* Complex LHS: size-aware save/restore/store.
                  * expr_size already returns 4 for pointer/longint via type_load_size,
                  * so no unconditional widening — that overwrites adjacent fields. */
