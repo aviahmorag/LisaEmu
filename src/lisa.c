@@ -2879,11 +2879,20 @@ static bool hle_handle_system_error(lisa_t *lisa __attribute__((unused)), m68k_t
          * until we find a return address outside FS_INIT. FS_INIT is
          * at $0026F4..~$0027D0 per linker map; its caller return is
          * in BOOT_IO_INIT. */
-        /* P85d refresh: FS_INIT moved as codegen evolved. Per current
-         * linker map (lisa_linked.map) FS_INIT = $002C8C, next proc
-         * FADECONERT = $002D4C, so FS_INIT body spans $002C8C..$002D4B. */
-        uint32_t fs_init_pc = 0x002C8C;
-        uint32_t fs_init_end = 0x002D4C;
+        /* P89f refresh: FS_INIT and adjacent FADECONERT move with every
+         * codegen change. Look them up dynamically instead of hardcoding,
+         * so the unwind finds the correct caller frame (BOOT_IO_INIT) in
+         * every build. The old hardcoded range ($002C8C..$002D4C) was
+         * stale post-P89 and matched no current code — unwind terminated
+         * too early, landing INITSYS at a half-executed state. */
+        extern uint32_t boot_progress_lookup(const char *name);
+        uint32_t fs_init_pc  = boot_progress_lookup("FS_INIT");
+        uint32_t fs_init_end = boot_progress_lookup("FADECONERT");
+        if (!fs_init_pc || !fs_init_end || fs_init_end <= fs_init_pc) {
+            /* Fallback if lookup fails: use a generous range around FS_INIT. */
+            if (fs_init_pc == 0) fs_init_pc = 0x002C8C;
+            fs_init_end = fs_init_pc + 0x200;
+        }
         cpu->a[7] += 4 + 2;  /* pop SYSTEM_ERROR retPC + err */
         /* Unwind A6 chain until saved retPC is outside FS_INIT. */
         for (int i = 0; i < 8; i++) {
