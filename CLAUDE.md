@@ -70,7 +70,38 @@ make audit-linker       # Stage 4: Full pipeline + linker
 cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' build 2>&1 | grep -E "(error:|BUILD)"
 ```
 
-## Current Status (2026-04-17 very late) — Kernel boots past SYS_PROC_INIT, packed-record bit-packing in place
+## Current Status (2026-04-17 night — post-P88) — Linker CONST relocation fixed; post-SYS_PROC_INIT ILLEGAL still blocks on MMU programming
+
+**P88 — Linker preserves Pascal CONST literal values**
+(`src/toolchain/linker.{h,c}`, `src/m68k.c`). Phase-2 symbol
+relocation was adding `mod->base_addr` to any non-negative exported
+symbol value. That was the correct behavior for code entry points,
+but WRONG for Pascal CONSTs whose "value" is the literal constant,
+not a module-relative offset. With the fix: `logrealmem` in
+`linked.map` resolves to `$AA0000` (was `$AAE466`), `hmempgsize` to
+`$00000100`, `mempgsize` to `$00000200`, `maxmmusize` to `$00020000`.
+Same class of bug as P86 (A5-relative pins), but for positive CONST
+literals.
+
+Implementation:
+- `link_symbol_t.is_const` bool flag.
+- `link_module_t.symbols[]` gets a parallel byte flag, propagated
+  from `cg_symbol_t.is_const` in `linker_load_codegen`.
+- `add_global_symbol` callers capture the returned global-symbol
+  index and copy `is_const` into the global table.
+- Phase-2 sentinel skips `sym->value += mod->base_addr` when
+  `is_const` is true.
+
+**Known remaining issue — post-SYS_PROC_INIT ILLEGAL at `$019400`**:
+the realmemmmu segs (85-100) get collapsed to SOR=0 because the
+PROG_MMU TRAP6 HLE reads the SMT entry as `$00000000` at the moment
+Pascal SETMMU triggers it. That makes logical `$B20000-$B3FFFF`
+alias to phys `$0-$1FFFF` (kernel code), so MAKE_FREE's
+self-descriptive SDB pointer `maddr*512 + logrealmem` scribbles
+kernel code and BIND_DATASEG eventually runs over garbage. Full
+diagnosis in NEXT_SESSION.md.
+
+## Previous Status (2026-04-17 very late) — Kernel boots past SYS_PROC_INIT, packed-record bit-packing in place
 
 **Boot now runs cleanly past SYS_PROC_INIT** (23/27 milestones reached,
 including SYS_PROC_INIT ✅) with no SYSTEM_ERROR halt. 1000 headless
