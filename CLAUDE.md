@@ -70,12 +70,67 @@ make audit-linker       # Stage 4: Full pipeline + linker
 cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' build 2>&1 | grep -E "(error:|BUILD)"
 ```
 
-## Current Status (2026-04-17 late evening) — App-path parity achieved, kernel bug isolated at INIT_SCTAB
+## Current Status (2026-04-17 very late) — Kernel boots past SYS_PROC_INIT, packed-record bit-packing in place
 
-**App path now matches SDL headless harness exactly** — reaches 23/27 kernel
-milestones, halts at `SYSTEM_ERROR(10101)` via `Make_SProcess` inside
-`SYS_PROC_INIT`, same PC ($005E6C) and register state as SDL. Root cause
-bisected to a Pascal-codegen stride bug; see "Kernel bug — isolated" below.
+**Boot now runs cleanly past SYS_PROC_INIT** (23/27 milestones reached,
+including SYS_PROC_INIT ✅) with no SYSTEM_ERROR halt. 1000 headless
+frames complete; the kernel enters the scheduler idle loop. Next
+kernel milestone (INIT_DRIVER_SPACE) is not yet reached but nothing
+halts — needs investigation of why the driver allocator isn't being
+invoked after SYS_PROC_INIT succeeds.
+
+### Session 2026-04-17 very late — DEFAULTPM corruption fixed via packed bit-packing
+
+Two root causes stacked on top of each other corrupted `b_syslocal_ptr`
+at A5-24785 during DEFAULTPM init, crashing Make_SProcess later:
+
+**P87a — `expr_size` resolves WITH-field byte arrays** (`src/toolchain/pascal_codegen.c`).
+`expr_size(AST_ARRAY_ACCESS)` only handled globally-findable arrays. For
+`devconfig[i]` inside `With PMRec^ do`, `find_symbol_any` missed it and
+expr_size defaulted to 2, emitting `MOVE.W D0,(A0)` on a 1-byte-stride
+loop. Now falls back to `with_lookup_field` when no global matches, but
+only returns the corrected size for byte elements (pointer-array paths
+still default to 2 because widening there broke MMPRIM code that
+depended on the prior-2-byte default).
+
+**P87d — packed-record bit-packing for Tnibble and boolean fields**
+(`src/toolchain/pascal_codegen.{h,c}`, `src/toolchain/toolchain_bridge.c`).
+Apple's `pmem = packed record` has Tnibble (0..15, 4-bit) fields paired
+into bytes and booleans bit-packed, so `DevConfig` lands at byte 10.
+Our codegen previously gave booleans 2 bytes and Tnibbles 1 byte each,
+so DevConfig landed at offset 22, overrunning the 64-byte
+`param_mem` backing store by 8 bytes and clobbering `b_syslocal_ptr`.
+Fix:
+
+- `type_desc_t.fields[].bit_offset` / `bit_width` added; `bit_width > 0`
+  marks a bit-packed field.
+- Resolver (AST_TYPE_RECORD) maintains a parallel `bit_cursor` when
+  `cg->in_packed`. TK_BOOLEAN → 1 bit, TK_SUBRANGE 0..15 → 4 bits.
+  First-declared field gets the HIGH bits, matching Apple's comments.
+- Phase-2 fixup in toolchain_bridge mirrors the resolver.
+- Scope: only activates when the packed record contains at least one
+  Tnibble. Boolean-only packed records (`segstates` = nine booleans,
+  referenced at specific byte offsets by hand-coded asm pins) keep
+  their existing 2-byte-per-boolean layout — broader activation
+  desynchronised PASCALDEFS offsets and regressed FS_INIT.
+- Codegen:
+  - `emit_read_a0_to_d0_bit`: `MOVE.B (A0),D0; LSR.B #off,D0; ANDI.B #mask`.
+  - `emit_write_d0_to_a0_bit`: read-modify-write that preserves neighbor
+    bits (`MOVE.B (A0),D1; pop D0; mask+shift; ANDI.B #~mask,D1; OR.B; MOVE.B`).
+  - AST_IDENT_EXPR in WITH, AST_FIELD_ACCESS read, AST_ASSIGN WITH
+    write, and AST_ASSIGN complex-LHS FIELD write each dispatch to the
+    bit-field emitters when `bit_width > 0`.
+- `lvalue_field_info_full` returns bit info; the old
+  `lvalue_field_info` wraps it.
+
+Verified: `pmem.DevConfig` now emits `ADDA.W #$0A,A0` (offset 10); the
+devconfig init loop stays inside `param_mem`; no more b_syslocal_ptr
+corruption; boot reaches SYS_PROC_INIT ✅. The earlier
+`DEFAULT_PM_GUARD` MMU-level write guard (P87b) was a workaround for
+exactly this corruption and has been **removed** now that the layout
+is correct.
+
+### Earlier this evening — App-path parity with SDL (kept below for context)
 
 ### Session 2026-04-17 late evening — finishing the plumbing
 
