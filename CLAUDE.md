@@ -125,29 +125,53 @@ Boot: 50 boot_progress checkpoints reached in 200 frames, clean through
 PR_CLEANUP into the scheduler idle loop. No SYSTEM_ERROR halts, no
 vector 4 / vector 11 faults.
 
-### Still kept: HLE-SelectProcess
+### P81b — parameterless nested procs now get sigs registered
 
-The natural body does `exit(SelectProcess)` (a named exit to the
-current proc). Our `exit()` codegen walks `MOVEA.L (A6),A6`
-`scope_depth-1` times regardless of target — one level too far when
-target == current proc, corrupting A6 before UNLK.
+Commit landed alongside the exit() investigation. Previously
+`gen_proc_or_func` only called `register_proc_sig` when the proc had
+an AST_PARAM_LIST child. That left every parameterless nested proc
+(e.g. `SET_INMOTION_SEG`) without a sig entry, so callers couldn't
+look it up and didn't emit `emit_static_link_load` — A2 stayed stale,
+the callee's prologue saved that stale A2 to -4(A6), and the static
+chain was poisoned.
 
-Naive fix attempted: skip the walk when target matches current scope's
-proc_name. Regressed 8 checkpoints: something else relies on the old
-"always unwind to outermost" behavior. The correct behavior is
-`walk = current_depth − target_depth`, but multiple callers seem to
-rely on the buggy behavior (probably calling `exit(SomeEnclosingProc)`
-expecting it to unwind further than lexically indicated). Needs deeper
-analysis before retrying.
+Result: **26/27 milestones** (up from 25/27). INITSYS is now reached.
+
+### Still kept: HLE-SelectProcess (blocked by deeper codegen issues)
+
+Fixing `exit()` properly (walk = current_depth − target_depth via the
+-4(A6) static chain) regressed the boot when re-tried with the
+parameterless-sig fix. Root causes:
+
+1. **Nested-proc name collision.** PMMAKE declares four different
+   `Recover` procs, each nested in a different outer proc with a
+   different signature (three take `error:int2`, one is parameterless).
+   Our linker exports only one `Recover` symbol globally, so every
+   `call Recover` site JSRs to the same address regardless of lexical
+   intent. Correct exit() unwinding can't compensate for the wrong
+   callee actually running.
+
+2. **Flat `find_proc_sig`.** The sig lookup is by name across a flat
+   list, first-match wins. Pascal name resolution is lexically scoped.
+   Switching to newest-first scan cascades stack-layout mismatches
+   (proc_sigs accumulates across the whole compile, including imports
+   and siblings).
+
+Proper fix requires scope-aware name resolution in both the linker
+and the codegen — a significant refactor. Until then, `exit()` uses
+the old dynamic-link walker (lexically wrong for `exit(CurrentProc)`
+from depth ≥ 2 but good enough for current boot paths), and
+HLE-SelectProcess stays on.
 
 ### Next
 
 Two threads:
 
-1. **Fix `exit()` codegen properly.** Audit all `exit(Name)` call sites
-   in the linked OS, determine actual Pascal semantics the code relies
-   on, then land a codegen that matches. Once done, HLE-SelectProcess
-   comes off and the kernel is 100% self-hosting.
+1. **Scope-aware symbol resolution.** Disambiguate nested procs with
+   shared names in the linker (name-mangle by enclosing proc?) and
+   make `find_proc_sig` prefer the lexically-nearest candidate. Once
+   that works, `exit()` codegen can switch to static-link walk and
+   HLE-SelectProcess comes off.
 
 2. **SYSTEM.SHELL as second compile target.** Adds a second binary to
    the disk image, with an intrinsic-library loader. Unlocks SHELL and

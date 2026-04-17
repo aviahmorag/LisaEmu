@@ -2003,13 +2003,27 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
             }
 
             /* EXIT: return from named procedure.
-             * P80g: exit(proc_name) from a nested procedure must unwind
-             * A6 to the target procedure's frame BEFORE UNLK/RTS.
-             * Otherwise UNLK uses the nested proc's frame, exiting the
-             * wrong function. Same static-link chain as non-local goto.
-             * P80h3: only walk the static link when the target is an
-             * ENCLOSING procedure, not when it's the current one.
-             * exit(CurrentProc) is just a local return — UNLK+RTS. */
+             *
+             * KNOWN LIMITATION: proper lexical unwinding (walk =
+             * current_depth - target_depth via the -4(A6) static link
+             * chain) is blocked by two issues that combine to regress
+             * the boot:
+             *
+             *   1. Name collisions across nested scopes. PMMAKE has 4
+             *      procs named `Recover`, each nested in a different
+             *      outer proc. Our linker deduplicates by name and
+             *      picks only one; all callers JSR to that single
+             *      Recover regardless of lexical intent. Any correct
+             *      exit() walk count still ends at the wrong frame.
+             *
+             *   2. find_proc_sig is flat-name-indexed. Switching to
+             *      nearest-lexical-scope lookup changes which sig a
+             *      caller uses and cascades stack-layout mismatches.
+             *
+             * Until those are fixed, fall back to the old dynamic-link
+             * walker (scope_depth-1 hops). It's lexically wrong for
+             * exit(CurrentProc) from depth ≥ 2, but works in practice
+             * because OS code rarely takes that path during boot. */
             if (str_eq_nocase(fn, "EXIT")) {
                 if (cg->scope_depth > 1) {
                     for (int d = cg->scope_depth - 1; d >= 1; d--)
@@ -3586,12 +3600,24 @@ static void gen_proc_or_func(codegen_t *cg, ast_node_t *node) {
     }
 
     /* Register procedure signature for VAR parameter tracking at call sites.
-     * nest_depth is the current scope depth (already pushed above). */
-    for (int i = 0; i < node->num_children; i++) {
-        if (node->children[i]->type == AST_PARAM_LIST) {
-            ast_node_t *params = node->children[i];
-            register_proc_sig(cg, node->name, params->children, params->num_children, cg->scope_depth);
-            break;
+     * nest_depth is the current scope depth (already pushed above).
+     * P81b: register a sig for EVERY proc/func body, including parameterless
+     * ones. Without this, nested parameterless procs (e.g. SET_INMOTION_SEG)
+     * had no sig, so callers didn't pass the static link — the callee's
+     * prologue then saved stale A2 into -4(A6), poisoning the static chain. */
+    {
+        bool had_params = false;
+        for (int i = 0; i < node->num_children; i++) {
+            if (node->children[i]->type == AST_PARAM_LIST) {
+                ast_node_t *params = node->children[i];
+                register_proc_sig(cg, node->name, params->children,
+                                  params->num_children, cg->scope_depth);
+                had_params = true;
+                break;
+            }
+        }
+        if (!had_params) {
+            register_proc_sig(cg, node->name, NULL, 0, cg->scope_depth);
         }
     }
 
