@@ -3009,6 +3009,57 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             hle_pc_gen = g_emu_generation;
         }
 
+
+
+        /* P89c — prime LOADER's `smt_adr` VAR on first SETMMU entry.
+         *
+         * LOADER.TEXT and STARTUP.TEXT both export `SETMMU`. Our linker's
+         * "first ENTRY wins" policy picks LOADER's 4-param version because
+         * LOADER compiles before STARTUP. LOADER's SETMMU reads `smt_adr`
+         * (A5-6112) to find where to write SMT entries — but `smt_adr` is
+         * initialized in LOADER's BOOTINIT, which we skip. So before P89c,
+         * SETMMU writes origin/limit/access to `$0 + index*4`, stomping
+         * the vector table; after boot progresses a little, a crashed
+         * RTE/RTS loads SSP from the stomped vector 0 and the CPU dies.
+         *
+         * P89b (codegen) made SETMMU actually emit those writes. Without
+         * this prime, the writes go to low memory. With this prime,
+         * SETMMU writes to `g_hle_smt_base + index*4` (the real SMT),
+         * and the TRAP6 PROG_MMU HLE reads real SOR/SLR values from
+         * those entries.
+         *
+         * We do this lazily at SETMMU entry (not at bootrom time) because
+         * PASCALINIT runs between reset and SETMMU and may clear the
+         * A5-relative area. Lazy priming sidesteps the timing question. */
+        {
+            static uint32_t pc_SETMMU = 0;
+            static int smt_prime_gen = -1;
+            extern uint32_t g_hle_smt_base;
+            if (smt_prime_gen != g_emu_generation) {
+                pc_SETMMU = boot_progress_lookup("SETMMU");
+                smt_prime_gen = g_emu_generation;
+            }
+            if (pc_SETMMU && cpu->pc == pc_SETMMU && g_hle_smt_base != 0) {
+                uint32_t a5 = cpu->a[5] & 0xFFFFFF;
+                /* Only fire once A5 has been moved to the sysglobal area
+                 * by PASCALINIT (A5=$CC6FFC for our memory layout). Writing
+                 * at the early-reset A5=$14000 would stomp random RAM. */
+                if (a5 >= 0x00CC0000 && a5 < 0x00CE0000) {
+                    uint32_t slot = (a5 - 6112) & 0xFFFFFF;
+                    uint32_t cur = cpu_read32(cpu, slot);
+                    if (cur == 0) {
+                        cpu_write32(cpu, slot, g_hle_smt_base);
+                        DBGSTATIC(int, prime_count, 0);
+                        if (prime_count++ < 2) {
+                            fprintf(stderr, "[P89c] primed smt_adr @A5-6112 "
+                                    "(log=$%06X) <= $%08X on first SETMMU entry (A5=$%06X)\n",
+                                    slot, g_hle_smt_base, a5);
+                        }
+                    }
+                }
+            }
+        }
+
         /* P83a HLE guard — MERGE_FREE must only merge when c_sdb_ptr is
          * itself a free region. Apple's source comment says "merge two
          * adjacent free regions" but the code has no guard; when

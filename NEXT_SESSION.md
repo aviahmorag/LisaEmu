@@ -1,220 +1,172 @@
-# Next Session Handoff (2026-04-18 — P89 investigation of realmemmmu SMT programming)
+# Next Session Handoff (2026-04-18 late — P89 regression root-caused to PCB field-offset skew)
 
 ## TL;DR
 
-Root-caused why seg 85-100 end up with SOR=0: the compiled SETMMU
-body was a **no-op** because our Pascal codegen didn't handle the
-`with ptr^[N] do ... end` pattern. Fixed the codegen (two edits in
-`pascal_codegen.c`), and now SETMMU actually emits field writes to
-the SMT. But:
+The P89 codegen fix exposes a **cross-module record-layout inconsistency for
+the PCB record**. `STARTUP.INIT_PROCESS` writes `slocal_sdbRP` at PCB
+offset **+48** (correct, matches Apple's record order). `MMPRIM.MAP_SYSLOCAL`
+reads it at offset **+20** (= glob_id). The reader gets $ABC (glob_id's magic
+value) instead of $44FE, computes c_sysl_sdb = b_sysglobal_ptr + $ABC =
+$CC7AB8 (uninitialized area with memaddr=memsize=0), then writes origin=0
+to SMT[seg 103], zeroing the syslocmmu mapping and crashing Launch.
 
-1. The SMT writes still go to the wrong address because LOADER's
-   SETMMU uses `smt_adr` (A5-6112), which we never initialize — we
-   skip BOOTINIT where Apple's code would set it.
-2. The fix exposes a 1-milestone downstream regression: previously
-   silent WITH bodies in kernel modules (MMPRIM2, MEASURE, PMMAKE,
-   LOAD, DS0, STARTUP itself) now actually run their field writes,
-   and one of them breaks boot at FS_INIT (was 23/27 with
-   SYS_PROC_INIT reached; is now 22/27).
+This is the same class as the long series of field-offset bugs already
+fixed (P80b iterative record-pre-pass, P82 variant records, P87a/d
+byte-array stride + packed bit-packing). **PCB is a known-complex record
+and hasn't been fully stabilized across all modules that use it.**
 
-**Uncommitted** on purpose so main stays at 23/27 until the
-downstream regression is diagnosed. `git diff` shows the two files
-with the proposed fix.
+State: **22/27**, FS_INIT reached. Baseline (pre-P89): 23/27 — works by
+accident because P89's codegen fix is what made MAP_SYSLOCAL's
+`with c_smt^[syslocmmu] do` actually emit writes. Before P89, the whole
+body was a no-op, so the wrong offset was harmless.
 
 ## Accomplished this session
 
-### SMT-region physical watchpoint added (`src/lisa_mmu.c`)
+### Uncommitted (see `git diff`)
 
-Fires on any byte-write into `[g_hle_smt_base, g_hle_smt_base +
-0x400)` — that's domain 0 of the SMT, covering segs 0..255. Each
-hit prints PC, logical/physical address, value, decoded (seg, field
-name, byte offset). Survived the session and is worth keeping —
-it's how we proved SETMMU emits zero SMT writes.
+- `src/main_sdl.c` — bundle-path loading for ROM/map/disk. Previously the
+  headless runner was loading **stale** `build/lisa_boot.rom`,
+  `build/lisa_linked.map`, `build/lisa_profile.image` instead of the fresh
+  `build/rom/lisa_boot.rom` / `build/LisaOS.lisa/{linked.map,profile.image}`.
+  This meant "22/27 with P89" in the previous handoff was actually running
+  STALE code (the one in the 18:11 build directory). With fresh artifacts:
+  baseline = 23/27, P89+fixes = 22/27 — now reproducible and deterministic.
 
-### Pascal codegen fix for `with ptr^[N] do` (WIP, uncommitted)
+- `src/toolchain/linker.c` — LOADER-yields-to-non-LOADER rule in
+  duplicate-ENTRY resolution. LOADER.TEXT and STARTUP.TEXT both export
+  `SETMMU` with different signatures (4-arg vs 5-arg). Kernel callers
+  pass 5 args, so STARTUP's version needs to win. Added alongside the
+  existing DRIVERASM-yields and stub-yields rules. After this, linker
+  map has `$000404 SETMMU` (STARTUP's) instead of LOADER's $03ED38.
 
-**P89a — AST_WITH resolves record type for pointer-to-array-indexed
-WITH** (`src/toolchain/pascal_codegen.c:3531-3558`). The AST_WITH
-type resolver only handled `AST_ARRAY_ACCESS` where `children[0]`
-was `AST_IDENT_EXPR`. For `ptr_smt^[128*domain+index]` the tree is
-`AST_ARRAY_ACCESS(AST_DEREF(AST_IDENT_EXPR("ptr_smt")), N)`, which
-fell through → `rt == NULL` → `with_stack[].record_type = NULL` →
-field lookups via `with_lookup_field` return -1 → assignments to
-`origin`, `limit`, `access` silently lvalue-resolve to placeholder
-addr 0 and the emits become no-ops. Added a branch that follows
-the pointer's `base_type->element_type` to get the record.
+- `src/m68k.c` — **P89c smt_adr prime**. On first SETMMU entry when A5
+  is in sysglobal range ($CC0000-$CE0000), writes `g_hle_smt_base` into
+  A5-6112 (= LOADER's `smt_adr` VAR). Redundant after the linker fix
+  above (STARTUP uses `smt_addr` at A5-24887, not `smt_adr`), but kept
+  as belt-and-suspenders for any remaining LOADER references.
 
-**P89b — gen_lvalue_addr AST_ARRAY_ACCESS resolves elem_size
-through AST_DEREF base** (`pascal_codegen.c:1610-1629`). Same
-structural issue in the address-computation path: for `ptr^[i]`,
-`elem_size` defaulted to 2, which for `smtent` (4 bytes) halves
-the stride. Added the AST_DEREF + IDENT_EXPR case before the
-existing IDENT_EXPR case.
+- `NEXT_SESSION.md` — this file.
 
-**Verified** via hex-dump of SETMMU post-fix: now correctly emits
-`MOVE.W D0,(A0)` at offset 0 (origin), `MOVE.B D0,(A0)` at offset
-3 (limit), `MOVE.B D0,(A0)` at offset 2 (access) — all at the SMT
-entry address `smt_adr + index*4` for domain 0.
+### Diagnostic findings
 
-## Root cause of SMT still reading zeros
+**MAKE_REGION args arrive correct.** Probed entry with right-to-left arg
+decoding — MAKE_REGION#4 (syslocal) gets memaddr=$087600, memsize=$4000.
+Calls 1–5 all have sensible args.
 
-Two separate problems stack:
+**The sdb the syslocal MAKE_REGION creates IS populated correctly.**
+Its real address is $CCB4FA (per INIT_PROCESS probe). Dumping bytes:
+`00CC B544 | 00CC B4B0 | 043B 0020 | 0102 0001 | ...`
+- fwd_link=$CCB544, bkwd_link=$CCB4B0 (valid pointers)
+- memaddr=$043B (= $087600/$200 ✓)
+- memsize=$0020 (= $4000/$200 ✓)
+- lockcount=$01, sdbtype=$02 (data)
 
-### (1) Pascal has TWO SETMMU procedures
+So MAKE_REGION ran correctly and the sdb has the right data. The
+regression is NOT a MAKE_REGION codegen bug.
 
-- `SOURCE-STARTUP.TEXT:111-154` — kernel's 5-param
-  `SETMMU(index, domain, base, length, permits)` using
-  `ptr_smt^[128*domain+index]`.
-- `source-LOADER.TEXT:253-277` — bootloader's 4-param
-  `SETMMU(index, base, length, permits)` using `smt_adr^[index]`.
+**INIT_PROCESS (in STARTUP) writes slocal_sdbRP at PCB+48.** Observed:
+c_pcb dump at MAP_SYSLOCAL entry shows `+48: 000044FE` — which is
+`slsdb - b_sysglobal_ptr` = `$CCB4FA - $CC6FFC` = $44FE ✓.
 
-LOADER is in the same directory as STARTUP. Our LOOSE-mode fileset
-compiles both. They both export a symbol named `SETMMU`. Our
-linker's "first ENTRY wins" policy (`linker.c:199-252`) keeps
-LOADER's because Pascal modules are compiled before STARTUP (which
-is deliberately last-compiled to see all imports).
+**MAP_SYSLOCAL (in MMPRIM) reads from PCB+20.** The c_sysl_sdb computation
+resolves to $CC6FFC + $ABC = $CC7AB8, which is glob_id's offset (+20)
+holding Apple's magic value $ABC. So MMPRIM's compile of the PCB record
+has slocal_sdbRP laid out at a DIFFERENT offset than STARTUP's compile.
 
-So when INITSYS's realmemmmu loop calls `SETMMU(i, oscontext, ...)`
-with 5 args, the linker dispatches to LOADER's 4-param SETMMU. For
-domain=0 (oscontext) the math happens to still work — LOADER writes
-`smt_adr^[index]`, same offset as `ptr_smt^[0*128+index]`.
-
-### (2) `smt_adr` is never initialized
-
-Per `source-LOADER.TEXT:398`:
-
-```pascal
-smt_base := INITMMUTIL(BGETSPACE(lo, 5*pagesize, onpage));
-smt_adr  := pointer(smt_base);
+PCB field order per `source-procprims.text.unix.txt:53-87`:
+```
+next_schedPtr, prev_schedPtr, semwait_queue,      { 12 bytes of ptrs }
+priority, norm_pri, blk_state, domain, sems_owned, { mixed-size scalars }
+glob_id, proctype, np_count,                       { more scalars }
+gplist_ptr, softints, fatherptr, sonptr, brotherptr,
+fam_sem,                                           { nested semaphore record }
+terming, termcause,
+slocal_sdbRP,                                      { ← here }
+plcbRP, need_mem, excep_pending, pcbfreqptr
 ```
 
-This runs in `BOOTINIT`, which is part of the bootloader. We skip
-the bootloader entirely — our C-side `bootrom_build` primes memory
-and jumps straight into STARTUP. So `smt_adr` (the Pascal VAR at
-A5-6112) stays $00000000 forever, and LOADER's SETMMU ends up
-writing origin/access/limit to `$0154..$0190` (low memory /
-vector-table range), which the emulator's VEC-GUARD silently
-drops after SYS_PROC_INIT (and before that, corrupts the vector
-table).
+**Likely cause:** MMPRIM's compile doesn't see the full PCB type definition,
+OR sees a truncated/stale version. Could be:
+1. PCB is declared in procprims and imported into MMPRIM via `type` clause;
+   if the import loses fields, offsets collapse.
+2. Forward type declaration without proper back-patching.
+3. Record pre-pass (`toolchain_bridge.c` Phase 2 fixup) handles PCB
+   inconsistently — fixes STARTUP's copy but not MMPRIM's.
+4. Some field type between glob_id and slocal_sdbRP is sized wrong in
+   MMPRIM's view, shifting the later offsets.
 
-The **STARTUP-version** of the same initialization (line 340)
-would have handled it:
+**To pin down which:** add a debug dump in pascal_codegen.c's record
+finalization (or toolchain_bridge Phase 2 fixup) printing the PCB layout
+(all field names + offsets) for each module that references PCB. Compare
+STARTUP's PCB layout vs MMPRIM's. Differences → fix the pre-pass to sync
+them.
 
-```pascal
-smt_addr := smt_base;        {establish base address of smt to OS/Pascal}
-sys_smt := pointer(smt_addr);
-```
+## Next step plan (prioritized)
 
-where `smt_addr` is pinned by our PASCALDEFS to A5-24887 (and
-IS being read correctly by our boot-time plumbing). Note the
-`_addr` vs `_adr` — different names, different slots, different
-initialization stories.
+### Option 1 — root-cause the PCB layout mismatch (the real fix)
 
-## Tried and backed out: exclude LOADER.TEXT from the kernel fileset
+1. Instrument pascal_codegen.c or toolchain_bridge Phase 2 pre-pass to
+   dump PCB record layout per module. Find the offset of slocal_sdbRP
+   in STARTUP.compile vs MMPRIM.compile.
+2. Likely fix pattern (see P82/P80b precedents): extend the iterative
+   pre-pass to ensure all cross-module references to PCB pick up the
+   SAME offsets. Pin slocal_sdbRP if needed.
 
-Added an exclusion list to `toolchain_bridge.c` LOOSE branch so
-`source-LOADER.TEXT` gets skipped. Result: LOADER's SETMMU gone,
-STARTUP's SETMMU promoted to `$000404`, linker map clean.
+### Option 2 — PASCALDEFS-pin slocal_sdbRP (quick hammer)
 
-But boot broke much earlier — crashed at
-`SYSTEM_ERROR(code=46572)` with `ret=$005D70` inside PR_CLEANUP.
-Stack dumps showed A6-chain corrupted (`A6=$F7FFF4 → $F80000`),
-which means something in the now-missing LOADER code was silently
-providing a dependency the kernel needed. Reverted.
+If the layout is stable in STARTUP (+48), add a per-field pin in the
+codegen (like the PASCALDEFS-pin table for A5 globals, but for record
+fields). Force slocal_sdbRP to always be at offset 48. Narrow scope,
+probably fast to implement.
 
-Didn't have time to diagnose which LOADER symbol the kernel
-depends on. Candidates: BGETSPACE, FINDSPARE, INITMMUTIL, or one
-of LOADER's TERMINATE/RANGEERR (PASLIB hooks).
+### Option 3 — HLE-guard MAP_SYSLOCAL (fallback only; user dislikes)
+
+If c_sysl_sdb.memaddr == 0 at MAP_SYSLOCAL entry, skip the SETMMU +
+PROG_MMU calls and let bootrom's pre-programmed seg 103 stand. Restores
+23/27 but masks the underlying bug. **Only use as a stopgap while
+investigating Option 1/2** — user has strong preference for proper
+structural fixes (memory `feedback_do_the_real_fix.md`).
 
 ## Verify-before-continuing
 
 ```bash
-# Baseline (stash my fix):
+git status                      # should show 4 modified files + NEXT_SESSION.md
 git stash
+git checkout 3585952 -- src/toolchain/pascal_codegen.c
 make && ./build/lisaemu --headless Lisa_Source 300 2>&1 | grep "Milestones reached:"
-# Expect: 23/27 (SYS_PROC_INIT reached)
+# Expect: 23/27  (pre-P89 baseline, with my infra fixes on top)
+git checkout HEAD -- src/toolchain/pascal_codegen.c
 git stash pop
-
-# With fix (current):
 make && ./build/lisaemu --headless Lisa_Source 300 2>&1 | grep "Milestones reached:"
-# Expect: 22/27 (FS_INIT last, SYS_PROC_INIT no longer reached)
+# Expect: 22/27  (P89 + my fixes, blocked on PCB offset skew)
 ```
 
-Dig for the regression: diff two trace runs, find which milestone
-between FS_INIT and SYS_PROC_INIT regresses — it's one of the
-previously-silent WITH bodies now actually writing. Likely
-candidates (based on the grep of `with.*\^\[`): MMPRIM2's four
-`with c_mrbt^[...] do` sites, STARTUP's own `with sys_mrbt^[...] do`
-block, or a PMMAKE/MEASURE variant.
+## Files changed this session (uncommitted)
 
-## Recommended plan for next session
+- `src/main_sdl.c` — 9 lines; fresh bundle paths.
+- `src/toolchain/linker.c` — 25 lines; LOADER-yields duplicate rule.
+- `src/m68k.c` — 49 lines; P89c smt_adr prime hook.
+- `CLAUDE.md` — Current Status section refreshed for P89d findings.
+- `NEXT_SESSION.md` — this handoff (new).
 
-**Start by deciding which of the two problems to solve first:**
-
-### Option A — fix the regression, then solve SMT
-
-1. Keep my WIP codegen fixes.
-2. Compare `smt_trace4.stderr` (with-fix, 22/27) vs `baseline.stderr`
-   (without-fix, 23/27) head-to-tail to find where the runs diverge
-   — first instruction that runs differently between the two is
-   probably the WITH body whose previously-silent writes now break
-   something.
-3. Diagnose that specific regression. It might be another
-   codegen-adjacent bug (wrong record-type resolution for some
-   WITH-base, wrong element size), or a legitimate behavioral
-   change that reveals a latent kernel init bug.
-4. Once 23/27 is restored WITH the codegen fix, address smt_adr
-   initialization by one of:
-   - (a) prime `smt_adr`'s A5-slot in `lisa.c`'s bootrom init (the
-     slot lives at A5-6112 = `A5+$FFFFE820`).
-   - (b) rename `smt_adr` to `smt_addr` in LOADER's parse — hacky.
-   - (c) find the LOADER-provided dependency the kernel needs,
-     stub it, and re-enable the LOADER exclusion so STARTUP's
-     SETMMU wins cleanly.
-
-### Option B — solve the SETMMU collision first
-
-1. Figure out what LOADER actually provides that the kernel
-   depends on. Probably one of the loader-helper functions is
-   being called by a kernel path (unexpected — LOADER is
-   supposed to run BEFORE the kernel). Grep for each exported
-   symbol from LOADER in the SYSTEM.OS kernel sources.
-2. Stub or replicate the needed pieces.
-3. Re-apply the LOADER exclusion so STARTUP's `SETMMU` wins,
-   and STARTUP's `smt_addr := smt_base` path initializes the
-   pointer.
-4. Verify SMT entries get correct values, seg 85-100 programmed
-   with real SORs, boot progresses past 23/27 including the
-   previously-blocking `$019400` crash documented in the
-   previous handoff.
-
-**Both options are multi-hour investigations. Option A is closer
-to where we stopped and probably faster. Option B is the cleaner
-structural answer.**
-
-## Files changed (uncommitted)
-
-- `src/lisa_mmu.c` — added WATCH-SMT watchpoint (lines ~417-443).
-- `src/toolchain/pascal_codegen.c`:
-  - `gen_lvalue_addr` AST_ARRAY_ACCESS — added AST_DEREF(IDENT)
-    base resolver (lines ~1610-1629).
-  - AST_WITH type resolver — added AST_ARRAY_ACCESS(AST_DEREF)
-    branch (lines ~3531-3558).
-
-Previous pre-existing clang-tidy warning still not fixed (line
-355 misleading-indentation on AST_TYPE_ARRAY case).
+Toolchain audit: **100% assemble, 100% parser, link OK, 94.4% JSR resolution**
+— no structural regression.
 
 ## Pick up here
 
 Paste this prompt to resume:
 
-> Continue from NEXT_SESSION.md. P89a (AST_WITH for ptr^[N]) and
-> P89b (gen_lvalue_addr AST_ARRAY_ACCESS AST_DEREF base) are in
-> the working tree uncommitted. They enable SETMMU to emit SMT
-> writes that were previously silent, but cause a 1-milestone
-> regression (22/27 vs 23/27 baseline — SYS_PROC_INIT no longer
-> reached). Also, SMT writes still go to address 0 because
-> LOADER's `smt_adr` Pascal VAR is never initialized (we skip
-> BOOTINIT). Two problems to solve — see "Recommended plan".
-> Start with Option A: diff baseline vs with-fix traces to find
-> which WITH body's newly-active writes regress boot past FS_INIT.
+> Continue from NEXT_SESSION.md. We root-caused the P89 regression to a
+> cross-module PCB record-layout mismatch: STARTUP's INIT_PROCESS writes
+> slocal_sdbRP at PCB+48 (correct), but MMPRIM's MAP_SYSLOCAL reads from
+> PCB+20 (= glob_id's offset). MAP_SYSLOCAL gets $ABC instead of $44FE,
+> resolves c_sysl_sdb to an uninitialized area ($CC7AB8 instead of
+> $CCB4FA), reads memaddr=memsize=0, writes origin=0 to SMT[seg 103],
+> zeros the syslocmmu mapping, and Launch crashes reading env_save_area
+> through a now-unmapped syslocal region. MAKE_REGION itself works fine
+> (probed: memaddr=$087600 memsize=$4000 arrive correctly; sdb at
+> $CCB4FA has correct memaddr=$043B memsize=$0020). Next: instrument
+> pascal_codegen.c or toolchain_bridge Phase 2 pre-pass to dump PCB
+> layout per module. Compare STARTUP's vs MMPRIM's slocal_sdbRP offset.
+> Fix the pre-pass to sync them. See Option 1 in NEXT_SESSION.md for
+> the full plan; don't apply Option 3 (HLE guard) — user prefers real fixes.

@@ -227,22 +227,41 @@ static int add_global_symbol(linker_t *lk, const char *name, link_sym_type_t typ
                  *    by these thunks, so any non-DRIVERASM entry replaces
                  *    a DRIVERASM one.
                  *
-                 * 3. Otherwise: first non-DRIVERASM, non-stub ENTRY wins.
+                 * 3. LOADER.TEXT is the bootloader. It defines helper
+                 *    routines (SETMMU, TERMINATE, RANGEERR, BGETSPACE…)
+                 *    with signatures that differ from the kernel's.
+                 *    STARTUP.TEXT re-declares SETMMU with the kernel's
+                 *    5-param signature, and kernel callers pass 5 args.
+                 *    We skip LOADER's BOOTINIT entirely in emulation, so
+                 *    LOADER's routines should never win collision — let
+                 *    any non-LOADER entry replace a LOADER one.
+                 *
+                 * 4. Otherwise: first non-DRIVERASM, non-stub, non-LOADER
+                 *    ENTRY wins.
                  */
                 int ex_mod = lk->symbols[existing].module_idx;
                 bool existing_is_stub = (ex_mod < 0);
                 bool new_is_real      = (module_idx >= 0);
                 bool existing_is_driverasm = false;
                 bool new_is_driverasm = false;
-                if (ex_mod >= 0 && ex_mod < lk->num_modules)
+                bool existing_is_loader = false;
+                bool new_is_loader = false;
+                if (ex_mod >= 0 && ex_mod < lk->num_modules) {
                     existing_is_driverasm = (strcasestr(lk->modules[ex_mod]->filename, "DRIVERASM") != NULL);
-                if (module_idx >= 0 && module_idx < lk->num_modules)
+                    existing_is_loader    = (strcasestr(lk->modules[ex_mod]->filename, "LOADER")    != NULL);
+                }
+                if (module_idx >= 0 && module_idx < lk->num_modules) {
                     new_is_driverasm = (strcasestr(lk->modules[module_idx]->filename, "DRIVERASM") != NULL);
+                    new_is_loader    = (strcasestr(lk->modules[module_idx]->filename, "LOADER")    != NULL);
+                }
 
                 if (existing_is_stub && new_is_real) {
                     lk->symbols[existing].value = value;
                     lk->symbols[existing].module_idx = module_idx;
                 } else if (existing_is_driverasm && !new_is_driverasm) {
+                    lk->symbols[existing].value = value;
+                    lk->symbols[existing].module_idx = module_idx;
+                } else if (existing_is_loader && !new_is_loader) {
                     lk->symbols[existing].value = value;
                     lk->symbols[existing].module_idx = module_idx;
                 }

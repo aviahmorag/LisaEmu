@@ -160,13 +160,16 @@ int main(int argc, char *argv[]) {
         printf("Build OK: %d compiled, %d assembled, %d linked\n",
                br.files_compiled, br.files_assembled, br.files_linked);
 
-        /* Load generated ROM */
-        if (!lisa_load_rom(&lisa, "build/lisa_boot.rom")) {
+        /* Load generated ROM. Toolchain writes the fresh ROM to
+         * build/rom/lisa_boot.rom; fall back to the legacy flat path. */
+        if (!lisa_load_rom(&lisa, "build/rom/lisa_boot.rom") &&
+            !lisa_load_rom(&lisa, "build/lisa_boot.rom")) {
             fprintf(stderr, "Failed to load generated ROM\n");
             return 1;
         }
-        /* Mount generated disk image */
-        lisa_mount_profile(&lisa, "build/lisa_profile.image");
+        /* Mount generated disk image (bundle path first, then legacy). */
+        if (!lisa_mount_profile(&lisa, "build/LisaOS.lisa/profile.image"))
+            lisa_mount_profile(&lisa, "build/lisa_profile.image");
 
         /* Load HLE addresses from toolchain globals (set during linking) */
         if (hle_addr_calldriver || hle_addr_system_error) {
@@ -188,8 +191,12 @@ int main(int argc, char *argv[]) {
         if (argc > 3) lisa_mount_floppy(&lisa, argv[3]);
     }
 
-    /* Load boot-progress symbol map (ignored if missing — e.g. --image mode) */
-    boot_progress_init("build/lisa_linked.map");
+    /* Load boot-progress symbol map. The toolchain writes the fresh map
+     * to build/LisaOS.lisa/linked.map; fall back to the legacy path
+     * build/lisa_linked.map if the bundle path doesn't exist (e.g. --image
+     * mode with no build). */
+    if (!boot_progress_init("build/LisaOS.lisa/linked.map"))
+        boot_progress_init("build/lisa_linked.map");
 
     if (headless) {
         lisa_reset(&lisa);
