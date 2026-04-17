@@ -70,7 +70,61 @@ make audit-linker       # Stage 4: Full pipeline + linker
 cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' build 2>&1 | grep -E "(error:|BUILD)"
 ```
 
-## Current Status (2026-04-17 night — post-P88) — Linker CONST relocation fixed; post-SYS_PROC_INIT ILLEGAL still blocks on MMU programming
+## Current Status (2026-04-18 — P89 WIP) — `with ptr^[N] do` codegen fix lands, exposes SETMMU/smt_adr collision; 1-milestone regression under investigation
+
+**P89 — Pascal codegen handles `with ptr^[N] do` correctly**
+(commit 19a7fdd, `src/toolchain/pascal_codegen.c`). The AST_WITH
+type resolver previously only handled `AST_IDENT_EXPR` as the
+record expression or `AST_ARRAY_ACCESS(AST_IDENT_EXPR, N)`. For
+`ptr_smt^[128*domain+index]` the tree is
+`AST_ARRAY_ACCESS(AST_DEREF(AST_IDENT_EXPR), N)` — which fell
+through, `record_type=NULL`, and every field lookup inside the
+WITH body silently failed → emits became no-ops. Similarly,
+`gen_lvalue_addr`'s AST_ARRAY_ACCESS branch didn't know how to
+resolve `elem_size` through an AST_DEREF base, so even when a
+write did emit, the stride was wrong (defaulted to 2 for a 4-byte
+record).
+
+Fix:
+- AST_WITH handler resolves pointer→base_type→element_type for
+  `ptr^[N]`-style record expressions.
+- gen_lvalue_addr AST_ARRAY_ACCESS adds an AST_DEREF(IDENT) case
+  to pick up the array's `element_type` via the pointer.
+
+Verified in disasm: SETMMU now emits `MOVE.W D0,(A0)` at offset
+0 (origin), `MOVE.B D0,(A0)` at offsets 3 (limit) and 2 (access)
+— all at the SMT entry address `base + index*4`.
+
+**WATCH-SMT physical watchpoint** (`src/lisa_mmu.c`) over
+`[g_hle_smt_base, +0x400)` — proved SETMMU was a silent no-op
+prior to P89, and proves SMT still gets zero writes even with
+P89 because of two stacked downstream issues (below).
+
+**Stacked issues that keep SMT at zeros:**
+
+1. **LOADER.TEXT vs STARTUP.TEXT SETMMU name collision**.
+   LOADER exports a 4-param `SETMMU(index, base, length, permits)`
+   using `smt_adr^[index]`; STARTUP exports a 5-param
+   `SETMMU(index, domain, base, length, permits)` using
+   `ptr_smt^[128*domain+index]`. Our linker's "first ENTRY wins"
+   policy (`linker.c:199-252`) picks LOADER's because LOADER
+   compiles before STARTUP.
+
+2. **`smt_adr` is never initialized**. LOADER's SETMMU reads
+   `smt_adr` from A5-6112 ($FFFFE820), but that Pascal VAR is
+   initialized in LOADER's BOOTINIT — which we skip entirely.
+   So SETMMU writes origin/limit/access to addresses near 0
+   (ptr_smt=0 + index*4), where VEC-GUARD drops them after
+   SYS_PROC_INIT.
+
+**Regression (uncommitted-cause → committed with fix):** 22/27
+milestones reached with P89 (FS_INIT last), vs 23/27 baseline
+(SYS_PROC_INIT reached). The newly-active WITH bodies in
+MMPRIM2/MEASURE/PMMAKE/LOAD/DS0/STARTUP now actually emit their
+MRBT writes; one of those exposes a latent bug that breaks boot
+before SYS_PROC_INIT. Full triage plan in NEXT_SESSION.md.
+
+## Previous Status (2026-04-17 night — post-P88) — Linker CONST relocation fixed; post-SYS_PROC_INIT ILLEGAL still blocks on MMU programming
 
 **P88 — Linker preserves Pascal CONST literal values**
 (`src/toolchain/linker.{h,c}`, `src/m68k.c`). Phase-2 symbol
@@ -92,14 +146,13 @@ Implementation:
 - Phase-2 sentinel skips `sym->value += mod->base_addr` when
   `is_const` is true.
 
-**Known remaining issue — post-SYS_PROC_INIT ILLEGAL at `$019400`**:
-the realmemmmu segs (85-100) get collapsed to SOR=0 because the
-PROG_MMU TRAP6 HLE reads the SMT entry as `$00000000` at the moment
-Pascal SETMMU triggers it. That makes logical `$B20000-$B3FFFF`
-alias to phys `$0-$1FFFF` (kernel code), so MAKE_FREE's
-self-descriptive SDB pointer `maddr*512 + logrealmem` scribbles
-kernel code and BIND_DATASEG eventually runs over garbage. Full
-diagnosis in NEXT_SESSION.md.
+**P88-followup (the `$019400` ILLEGAL)** — still unresolved at the
+conceptual level: the realmemmmu segs (85-100) get collapsed to
+SOR=0 because the PROG_MMU TRAP6 HLE reads the SMT entry as
+`$00000000`. P89 found WHY the SMT read returns zero (SETMMU body
+was a no-op) and fixed the codegen, but the two stacked downstream
+issues above still need to be resolved before SMT entries get
+real values and the `$019400` ILLEGAL class goes away.
 
 ## Previous Status (2026-04-17 very late) — Kernel boots past SYS_PROC_INIT, packed-record bit-packing in place
 
