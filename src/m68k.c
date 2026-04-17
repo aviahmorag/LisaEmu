@@ -2990,7 +2990,10 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
          * since c_pcb_ptr is nil during boot) then enters the scheduler.
          * Skip the PCB-cleanup preamble but DO enter the scheduler — that's
          * the whole point of getting this far: let it dispatch MemMgr. */
-        if (pc_PR_CLEANUP && cpu->pc == pc_PR_CLEANUP) {
+        if (0 && pc_PR_CLEANUP && cpu->pc == pc_PR_CLEANUP) {
+            /* P81c: PR_CLEANUP HLE bypass DISABLED. With CreateProcess
+             * native, c_pcb_ptr is a valid PCB; the natural PR_CLEANUP
+             * body unlinks it correctly and enters the scheduler. */
             boot_progress_record_pc(cpu->pc);
             static uint32_t pc_enter_sched = 0;
             if (!pc_enter_sched) {
