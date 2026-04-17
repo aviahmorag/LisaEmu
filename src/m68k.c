@@ -3072,7 +3072,12 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 if (pc_select)
                     fprintf(stderr, "  DEBUG: SelectProcess → $%06X\n", pc_select);
             }
-            if (pc_select && cpu->pc == pc_select) {
+            if (0 && pc_select && cpu->pc == pc_select) {
+                /* P81c: HLE-SelectProcess DISABLED. The exit(SelectProcess)
+                 * codegen issue that motivated it turns out to be masked
+                 * by the call chain at boot: natural SelectProcess body
+                 * runs correctly now with CreateProcess native and all
+                 * upstream HLEs off. */
                 uint32_t a6 = cpu->a[6] & 0xFFFFFF;
                 uint32_t a5 = cpu->a[5] & 0xFFFFFF;
                 uint32_t head = (a5 - 1116) & 0xFFFFFF;   /* @fwd_ReadyQ */
