@@ -3166,11 +3166,13 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
          *    plcbRP : relptr;                   { 2 }
          *    var sl_sdbRP : relptr);            { 4 ptr }
          * Total args = 16 bytes. Callee-clean. */
-        if (pc_MM_Setup && cpu->pc == pc_MM_Setup) {
+        /* P81c: MM_Setup HLE bypass DISABLED. "Body touches slocal_sdbRP
+         * chains that aren't set up correctly" was static-link related.
+         * Natural body works with the ABI fix in place. */
+        if (0 && pc_MM_Setup && cpu->pc == pc_MM_Setup) {
             uint32_t sp = cpu->a[7] & 0xFFFFFF;
             uint32_t ret = cpu_read32(cpu, sp);
-            uint32_t varptr = cpu_read32(cpu, sp + 4);  /* VAR sl_sdbRP (last arg, pushed first) */
-            /* Write 0 into the VAR output so caller sees a defined value. */
+            uint32_t varptr = cpu_read32(cpu, sp + 4);
             if (varptr >= 0x400 && varptr < 0xFE0000)
                 cpu_write16(cpu, varptr, 0);
             cpu->a[7] += 4 + 16;
