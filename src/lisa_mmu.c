@@ -399,6 +399,24 @@ void lisa_mem_write8(lisa_mem_t *mem, uint32_t addr, uint8_t val) {
                 if (wbsl_gen != g_emu_generation) {
                     wbsl_count = 0; wbsl_gen = g_emu_generation;
                 }
+                /* DEFAULTPM overrun guard (DEFAULT_PM_GUARD). Our codegen lays
+                 * PMem's DevConfig at offset 22 instead of the source-comment's
+                 * 10 because packed records aren't bit-packed — booleans take
+                 * a full word each. The index-50 devconfig-init loop therefore
+                 * overruns param_mem (64 bytes) and writes four $FF bytes onto
+                 * b_syslocal_ptr, which MAKE_DATASEG later dereferences as a
+                 * pointer. Drop the overrun writes here until we implement
+                 * real packed-record bit-packing (or HLE DEFAULTPM). See the
+                 * NEXT_SESSION notes on packed-record work. */
+                if (g_last_cpu_pc == 0x2FDA) {
+                    static int dpm_dropped = 0;
+                    static int dpm_gen = -1;
+                    if (dpm_gen != g_emu_generation) { dpm_dropped = 0; dpm_gen = g_emu_generation; }
+                    if (dpm_dropped++ < 8)
+                        fprintf(stderr, "DEFAULT_PM_GUARD[%d]: dropped DEFAULTPM overrun byte-write at $%06X val=$%02X\n",
+                                dpm_dropped, addr, val);
+                    return;  /* drop */
+                }
                 if (wbsl_count++ < 64) {
                     /* Read the opcode at PC via the same MMU translation path
                      * the CPU uses, so we see what's ACTUALLY there (the code

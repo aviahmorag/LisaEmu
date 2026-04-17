@@ -1249,11 +1249,28 @@ static int expr_size(codegen_t *cg, ast_node_t *node) {
         case AST_ARRAY_ACCESS: {
             if (node->children[0] && node->children[0]->type == AST_IDENT_EXPR) {
                 cg_symbol_t *arr = find_symbol_any(cg, node->children[0]->name);
-                if (arr && arr->type) {
-                    type_desc_t *at = arr->type;
+                type_desc_t *at = (arr && arr->type) ? arr->type : NULL;
+                /* WITH-field array lookup: arr is a field of an enclosing
+                 * WITH record (e.g. `devconfig[i] := empty` inside
+                 * `With PMRec^ do`), so find_symbol_any misses it. Without
+                 * this fallback, expr_size defaults to 2 and a byte-array
+                 * store emits MOVE.W, stomping past the intended element.
+                 * Scoped to byte elements only — returning a resolved 4 for
+                 * pointer-of-arrays from the WITH path regressed FS_INIT
+                 * with unrelated downstream side-effects. */
+                if (!at && cg->with_depth > 0) {
+                    type_desc_t *wrt = NULL;
+                    int wfld = with_lookup_field(cg, node->children[0]->name, &wrt, NULL);
+                    if (wfld >= 0 && wrt)
+                        at = wrt->fields[wfld].type;
+                }
+                if (at) {
                     if (at->kind == TK_POINTER && at->base_type) at = at->base_type;
-                    if (at->kind == TK_ARRAY && at->element_type)
-                        return type_load_size(at->element_type);
+                    if (at->kind == TK_ARRAY && at->element_type) {
+                        int es = type_load_size(at->element_type);
+                        if (es == 1) return 1;
+                        if (arr) return es;
+                    }
                     if (at->kind == TK_STRING)
                         return 1;  /* string subscript returns a char */
                 }
