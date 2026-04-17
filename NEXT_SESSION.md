@@ -336,6 +336,61 @@ Backed out pending more analysis of Scheduler's loop structure:
 Next-session plan: instrument Launch entry's A7 chain to find
 Scheduler's call site, then trace Scheduler's outer caller.
 
+### Launch caller chain (probed)
+
+At Launch#1 entry:
+```
+[Launch#1 caller chain] ret=$05F792  SP=$CBFF80
+    A6=$CBFF8C → prev_A6=$CC6FFC ret=$FFA20001
+    A6=$CC6FFC → prev_A6=$038000 ret=$1000000
+```
+
+The A6 chain is corrupt (prev_A6=$CC6FFC is b_sysglobal_ptr = A5,
+ret=$FFA20001 is garbage). This suggests Launch was entered from a
+non-Pascal context — likely an interrupt handler that didn't set up
+a Pascal frame.
+
+### env_save_area bytes at Launch entry (probed)
+
+```
+syslocal@CE0000 first 64 bytes:
+  00CE01EE 40000100 00CB0000 00CC0000 00000000 00CCB58E ...
+```
+
+Decoded:
+- offset 0: sl_free_pool_addr = $00CE01EE (points into syslocal's
+  free pool — valid)
+- offset 4: size_slocal = $4000
+- offset 6-9: env_save_area.PC = **$010000CB** (garbage / uninit;
+  should be @Initiate or current instruction pointer)
+- offset 10-11: env_save_area.SR = $0000
+- offset 12-...: D0, D1, ... = various garbage
+
+POP's env_save_area has never been explicitly written with valid
+values. The bytes are either randomized / leftover init memory or
+incidentally-written by unrelated code.
+
+### Strategic options for next session
+
+1. **Populate POP's env_save_area at bootrom_build time** to contain a
+   "safe resume" PC (e.g., INITSYS's current PC or an ExitSys handler
+   that gracefully halts). Since Apple's code doesn't write POP's
+   env_save_area, we have to do it ourselves.
+
+2. **Intercept the INTSON HLE** and defer enabling interrupts until
+   SYS_PROC_INIT has run. Without interrupts, no Scheduler dispatch
+   fires, and boot proceeds sequentially through INITSYS until
+   SYS_PROC_INIT creates real processes with properly-populated
+   env_save_area.
+
+3. **HLE-suppress the first N Launch calls** — skip dispatch until
+   SYS_PROC_INIT milestone fires, then re-enable. This is the
+   cheapest workaround but not structurally correct.
+
+Option 2 is most aligned with Apple's intent: interrupts shouldn't
+dispatch until system processes exist. Look at the INTSON HLE
+implementation and add a "defer until SYS_PROC_INIT reached" gate.
+
 ### Files committed this session (all pushed to origin/main)
 
 - `5b2f848` — main_sdl bundle paths + linker LOADER-yields + P89c prime.
