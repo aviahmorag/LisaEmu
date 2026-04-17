@@ -70,7 +70,55 @@ make audit-linker       # Stage 4: Full pipeline + linker
 cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' build 2>&1 | grep -E "(error:|BUILD)"
 ```
 
-## Current Status (2026-04-18 end — P89d/e: three structural codegen fixes; env_save_area stores now emit; 12 of 13 Build_Stack fields written)
+## Working strategy (2026-04-18 pivot)
+
+The project is now in **multilayer-subsystem-build mode**. Each phase
+replaces one HLE layer with the real emulated subsystem; HLEs come out
+**only in the same commit** that replaces them. No HLE reverts as
+cleanup. See `NEXT_SESSION.md` for the seven-phase arc and the current
+phase, and `docs/HLE_INVENTORY.md` for the complete ledger of active
+HLEs (28 active + 9 disabled as of this session's inventory).
+
+Durable rule in auto-memory: `HLEs are load-bearing layers, not cruft`
+— every bypass/suppression/patch encodes real insight about a missing
+subsystem; removing one without building the replacement is regression.
+
+Phases (see NEXT_SESSION.md for detail):
+
+1. **PMEM + boot-CD** — removes 10738 suppression
+2. **ProFile driver wiring** — removes CALLDRIVER HLE pile
+3. **MDDF / disk-image layout** — removes 10707 suppression
+4. **IRQ-driven I/O completion** — removes Block_Process-on-POP deadlock
+5. **SYS_PROC_INIT + processes** — removes P89i + CreateProcess HLEs
+6. **Cleanup HLEs** (FS/MEM/PR)
+7. **Safety nets** (REG_OPEN_LIST, excep_setup, etc.)
+
+## Current Status (2026-04-18 session 2 — strategic pivot, P89i INTSON-defer added)
+
+22/27 milestones, same as start of session. This session:
+
+- Diagnosed the Scheduler→Launch→garbage-RTE crash at 22/27 and found
+  the previous handoff's "timer IRQ" diagnosis was incomplete — the
+  dispatch is **synchronous** via `Block_Process(self=POP)` during the
+  post-10707-suppression cleanup path (`AlarmRelative`→`TimeStamp`→
+  `Wait_sem`→`Block_Process`), not from a timer IRQ. POP blocks,
+  Scheduler has no other runnable, dispatches POP, Launch RTE reads
+  POP's uninit `env_save_area.PC = $070000CB` → hard_excep → 10204.
+- Added P89i (INTSON deferral until SYS_PROC_INIT reached) — part of
+  the multilayer story. Kept; removed only in Phase 5 (processes)+4
+  (IRQ).
+- Produced `docs/HLE_INVENTORY.md` — comprehensive audit of active
+  HLEs with line numbers, categories, triggers, and what each hides.
+- Saved durable rule to auto-memory.
+
+**Not done this session**: no Phase 1 (PMEM) work yet. That's the
+first coding phase for next session.
+
+(Original P89d/e status section preserved below for reference.)
+
+---
+
+## Previous Status (2026-04-18 end — P89d/e: three structural codegen fixes; env_save_area stores now emit; 12 of 13 Build_Stack fields written)
 
 22/27 milestones reached. Boot now progresses past three previously-silent
 codegen failures (p_linkage record collision, proc_sig-resolution gap,

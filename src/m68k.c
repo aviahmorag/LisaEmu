@@ -3100,20 +3100,23 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
          *
          * BOOT_IO_INIT's `INTSON(0)` at source-STARTUP:1977 enables
          * interrupts before SYS_PROC_INIT has created the real system
-         * processes. The timer-tick IRQ then fires on POP (the pseudo-
-         * outer-process running INITSYS) whose `env_save_area` at
-         * `b_syslocal_ptr+6` was never populated — Apple doesn't call
-         * CreateProcess for POP. Scheduler → Launch → RTE pops a
-         * garbage PC ($010000CB observed) → hard_excep → SYSTEM_ERROR
-         * (10204). Skip INTSON until SYS_PROC_INIT is reached so the
-         * boot sequence can finish creating real processes before any
-         * timer interrupt dispatches.
+         * processes. The timer-tick IRQ would then fire on POP (the
+         * pseudo-outer-process running INITSYS) whose `env_save_area`
+         * at `b_syslocal_ptr+6` was never populated — Apple doesn't
+         * call CreateProcess for POP. Scheduler → Launch → RTE would
+         * pop a garbage PC → hard_excep → SYSTEM_ERROR(10204).
          *
-         * Calling convention: our codegen's call site pushes the 2-byte
-         * arg (MOVE.W D0,-(SP) = $3F00) and emits no post-JSR cleanup,
-         * so INTSON is callee-clean — body would end with a sequence
-         * equivalent to RTS #2. Skip path mirrors that: pop 4-byte
-         * return PC, then skip the 2-byte arg (SP += 6). */
+         * Part of the multilayer boot-up story: stays until (a) real
+         * SYS_PROC_INIT creates proper processes with populated
+         * env_save_areas AND (b) IRQ-driven driver completion is
+         * wired, at which point timer IRQs before SYS_PROC_INIT no
+         * longer threaten POP and this gate is naturally obsolete.
+         *
+         * Calling convention: our codegen's call site pushes the
+         * 2-byte arg (MOVE.W D0,-(SP) = $3F00) and emits no post-JSR
+         * cleanup, so INTSON is callee-clean — body would end with a
+         * sequence equivalent to RTS #2. Skip path mirrors that: pop
+         * 4-byte return PC, then skip the 2-byte arg (SP += 6). */
         {
             static uint32_t pc_INTSON = 0;
             static int intson_gen = -1;
