@@ -2879,8 +2879,11 @@ static bool hle_handle_system_error(lisa_t *lisa __attribute__((unused)), m68k_t
          * until we find a return address outside FS_INIT. FS_INIT is
          * at $0026F4..~$0027D0 per linker map; its caller return is
          * in BOOT_IO_INIT. */
-        uint32_t fs_init_pc = 0x0026F4;
-        uint32_t fs_init_end = 0x002800;
+        /* P85d refresh: FS_INIT moved as codegen evolved. Per current
+         * linker map (lisa_linked.map) FS_INIT = $002C8C, next proc
+         * FADECONERT = $002D4C, so FS_INIT body spans $002C8C..$002D4B. */
+        uint32_t fs_init_pc = 0x002C8C;
+        uint32_t fs_init_end = 0x002D4C;
         cpu->a[7] += 4 + 2;  /* pop SYSTEM_ERROR retPC + err */
         /* Unwind A6 chain until saved retPC is outside FS_INIT. */
         for (int i = 0; i < 8; i++) {
