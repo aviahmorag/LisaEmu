@@ -244,6 +244,15 @@ uint32_t boot_progress_lookup(const char *name) {
     return sym[idx].addr;
 }
 
+bool boot_progress_reached(const char *name) {
+    if (!name) return false;
+    for (int m = 0; m < NUM_MILESTONES; m++) {
+        if (strcasecmp(milestones[m].symbol, name) == 0)
+            return milestones[m].reached;
+    }
+    return false;
+}
+
 void boot_progress_shutdown(void) {
     free(sym); sym = NULL;
     free(pc_to_idx); pc_to_idx = NULL;

@@ -44,4 +44,7 @@ void boot_progress_shutdown(void);
 /* Look up a symbol by name. Returns its address if found, else 0. */
 uint32_t boot_progress_lookup(const char *name);
 
+/* True iff the named milestone has been marked reached. */
+bool boot_progress_reached(const char *name);
+
 #endif
