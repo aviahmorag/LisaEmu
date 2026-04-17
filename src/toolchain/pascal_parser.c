@@ -724,9 +724,30 @@ static ast_node_t *parse_type(parser_t *p) {
              * Parse variant fields so the record gets correct sizing.
              * We collect all fields from all variants — this may overcount
              * (variants overlap in memory) but never undercounts, which is
-             * critical: undercounting causes LINK A6,#0 → stack corruption. */
-
-            /* Skip tag and discriminant type up to OF */
+             * critical: undercounting causes LINK A6,#0 → stack corruption.
+             *
+             * P82b: emit the TAG field as a regular fixed field before the
+             * variant region. Without it, kernel code like
+             * `if next_sdb^.sdbtype = free` compiles to a field lookup that
+             * misses (codesdb has no "sdbtype" field in our record) and
+             * field_off defaults to 0 — silently comparing memchain.fwd_link
+             * bytes against the enum ordinal and sending CLEAR_SPACE's
+             * inner while loop into infinite spin. */
+            if (CURTYPE(p) == TOK_IDENT) {
+                /* Peek one token: tag form is `IDENT COLON TYPE OF`, untagged
+                 * is `TYPE OF` (one IDENT then OF). lexer_peek fills lookahead
+                 * without consuming the current token. */
+                token_t peek = lexer_peek(&p->lex);
+                if (peek.type == TOK_COLON) {
+                    ast_node_t *tag_field = ast_new(AST_FIELD, p->lex.line);
+                    strncpy(tag_field->name, CUR(p).str_val, sizeof(tag_field->name) - 1);
+                    advance(p); /* consume tag ident */
+                    advance(p); /* consume ':' */
+                    ast_add_child(tag_field, parse_type(p));
+                    ast_add_child(n, tag_field);
+                }
+            }
+            /* Skip remaining discriminant type tokens up to OF */
             while (!check(p, TOK_OF) && !check(p, TOK_END) && !check(p, TOK_EOF) && !BAILED(p))
                 advance(p);
             match(p, TOK_OF);

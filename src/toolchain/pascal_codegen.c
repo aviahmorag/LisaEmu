@@ -412,11 +412,29 @@ static type_desc_t *resolve_type(codegen_t *cg, ast_node_t *node) {
                 /* P79f: In Lisa Pascal unpacked records, byte-sized scalar
                  * fields (int1, char, byte) are widened to word size (2 bytes).
                  * Asm code reads these with MOVE.W (e.g., PRIORITY(A1) in PCB).
-                 * Only widen scalars, not records/arrays/strings. */
+                 * Only widen scalars, not records/arrays/strings.
+                 *
+                 * P82c: only widen ISOLATED byte fields — pairs of consecutive
+                 * byte fields stay tight so codesdb's lockcount(1)+sdbtype(1)
+                 * end at offset 14 (= Apple's oset_freechain). Forward-peek
+                 * by looking at the next AST child. */
                 if (fs == 1 && ft && !cg->in_packed &&
                     (ft->kind == TK_BYTE || ft->kind == TK_CHAR ||
-                     ft->kind == TK_SUBRANGE))
-                    fs = 2;
+                     ft->kind == TK_SUBRANGE)) {
+                    int next_is_byte = 0;
+                    for (int j = i + 1; j < node->num_children; j++) {
+                        ast_node_t *nxt = node->children[j];
+                        if (nxt->type != AST_FIELD) continue;
+                        if (nxt->num_children == 0) continue;  /* sentinel */
+                        type_desc_t *nft = resolve_type(cg, nxt->children[0]);
+                        if (nft && nft->size == 1 &&
+                            (nft->kind == TK_BYTE || nft->kind == TK_CHAR ||
+                             nft->kind == TK_SUBRANGE || nft->kind == TK_ENUM))
+                            next_is_byte = 1;
+                        break;
+                    }
+                    if (!next_is_byte) fs = 2;
+                }
                 /* Word-align fields */
                 if (fs >= 2 && (offset % 2)) offset++;
                 if (t->num_fields < 64) {
@@ -541,7 +559,18 @@ static type_desc_t *resolve_type(codegen_t *cg, ast_node_t *node) {
             return find_type(cg, "integer");
 
         case AST_TYPE_ENUM: {
-            type_desc_t *t = add_type(cg, "", TK_ENUM, 2);
+            /* P82c: enums fitting in a byte are 1 byte natively (matches
+             * Apple's layout — Tsdbtype (7 values) is 1 byte so codesdb's
+             * case tag fits between lockcount and freechain at offset 14.
+             * Record resolver still widens isolated byte fields to 2 for
+             * asm-compat MOVE.W reads. */
+            int card = 0;
+            for (int i = 0; i < node->num_children; i++)
+                if (node->children[i]->type == AST_IDENT_EXPR &&
+                    node->children[i]->name[0])
+                    card++;
+            int enum_sz = (card > 0 && card <= 256) ? 1 : 2;
+            type_desc_t *t = add_type(cg, "", TK_ENUM, enum_sz);
             /* P79e: register each enum value as a CONST with its ordinal.
              * Without this, identifiers like dsmake_nf (=1) resolve to 0
              * at call sites, breaking enum parameter passing.

@@ -842,10 +842,21 @@ build_result_t toolchain_build(const char *source_dir,
                     prev_arm = arm;
                     int fs = t->fields[fi].type ? t->fields[fi].type->size : 2;
                     if (t->fields[fi].type && t->fields[fi].type->kind == TK_STRING && (fs % 2)) fs++;
+                    /* P82c: same pair-aware widening as the AST record resolver —
+                     * don't widen a byte field if the NEXT field is also a byte. */
                     if (fs == 1 && t->fields[fi].type &&
                         (t->fields[fi].type->kind == TK_BYTE || t->fields[fi].type->kind == TK_CHAR ||
-                         t->fields[fi].type->kind == TK_SUBRANGE))
-                        fs = 2;
+                         t->fields[fi].type->kind == TK_SUBRANGE)) {
+                        int next_is_byte = 0;
+                        if (fi + 1 < t->num_fields && t->fields[fi + 1].type) {
+                            type_desc_t *nft = t->fields[fi + 1].type;
+                            if (nft->size == 1 &&
+                                (nft->kind == TK_BYTE || nft->kind == TK_CHAR ||
+                                 nft->kind == TK_SUBRANGE || nft->kind == TK_ENUM))
+                                next_is_byte = 1;
+                        }
+                        if (!next_is_byte) fs = 2;
+                    }
                     if (fs >= 2 && (offset % 2)) offset++;
                     t->fields[fi].offset = offset;
                     offset += fs;
