@@ -70,18 +70,91 @@ make audit-linker       # Stage 4: Full pipeline + linker
 cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' build 2>&1 | grep -E "(error:|BUILD)"
 ```
 
-## Current Status (2026-04-17 evening) — P84 codegen fixes unstuck CHECK_DS; FlushNodes is the new blocker
+## Current Status (2026-04-17 night) — P85a fixes FlushNodes spin; QUEUE_PR is the new blocker
 
-Build + audit green. 22/27 milestones. Boot reaches FS_INIT. With the
-new **P84a (boolean-NOT on field access) + P84b (byte-param read
-offset +1)** codegen fixes, MAKE_MRDATA's CHECK_DS loop now exits
-correctly — INIT_SWAPIN → GET_SEG → ALLOC_MEM → SWAP_SEG populates
-the sdb and SWAP_SEG writes `memoryF := true` (word $0001 at
-offset 14) which CHECK_DS's `while not sdbstate.memoryF` properly
-tests. Boot then enters FlushNodes (vmstuff.text line 1369) and
-the `repeat ... until ptrS = ptrHot` buffer-pool walk spins for
-188k+ iterations — the new blocker. Hot pages: `$064E00×24635`
-`$064F00×24634` `$065000×14781` (FlushNodes body range).
+Build + audit green. 22/27 milestones. Boot reaches FS_INIT,
+progresses past the prior FlushNodes buffer-pool spin, runs into
+scheduler code, and halts with SYSTEM_ERROR(10204) (f-line in
+system code) in QUEUE_PR at $06EB20.
+
+The prior handoff's "FlushNodes repeat loop spins forever" was
+actually a downstream effect of MMU programming silently failing
+for the MR-data buffer segment. FlushNodes was walking a buffer
+pool in unmapped RAM (segment 60, $00780000..$0079FFFF), so
+every InitBuf write to `link.f` / `link.b` got dropped by the
+MMU unmapped-write safety net. `ptrS^.link.b` stayed null, the
+`until ptrS = ptrHot` test never hit ptrHot, and the loop spun.
+
+Root cause was in our Pascal codegen — a stale-high-byte bug
+in the byte-subrange load path.
+
+### P85a — AST_IDENT_EXPR byte loads zero-extend D0 (src/toolchain/pascal_codegen.c:1704 / :1732)
+
+For `sz == 1` (byte-subrange or single-byte field), codegen
+emitted `MOVE.B offset(A6),D0` (or `(A0)`, or `(A5)` for globals)
+with no `MOVEQ #0,D0` first. The MOVE.B only updates the LOW
+byte of D0, so the upper 24 bits kept whatever was there from
+the previous operation. Any subsequent `MOVE.W D0,Dn` then
+propagated that stale high byte.
+
+In `MAP_SEGMENT` (source-MMPRIM.TEXT:627), the first body
+instruction is effectively `l_domain := domain`. Our codegen
+emits:
+
+  `MOVE.B $0F(A6),D0  ; domain is a byte-param, read at offset+1`
+  `MOVE.W D0,D2       ; widen to word for index := domain*numbmmus + c_mmu`
+
+With the upper bits of D0 stale (happened to be $00B6 from a
+prior op), D2 became $B600. The PROG_MMU call site later loaded
+l_domain via `MOVE.W -$14(A6),D0` and pushed — and PROG_MMU
+fired TRAP #6 with D2 = $B600 (target domain). Our HLE-TRAP6
+computed `smt_entry = smt_ptr + 46592*512 + …`, walked into
+garbage, and the MMU segment for seg 60 never got programmed.
+MAKE_MRDATA returned addrSpace=$00780000 but InitBuf's writes
+to that range all dropped.
+
+**Fix**: at AST_IDENT_EXPR sz==1 branch (A6/A0 frame load AND
+A5 global load), emit `MOVEQ #0,D0` first. Same pattern P80h2
+applied to `emit_read_a0_to_d0` for (A0)-indirect reads.
+
+Verified via P85 probe walk: InitBuf#1-4 correctly write link
+pointers, FlushNodes's ptrHot chain now loops back to ptrHot
+after 4 hops ($78189C → $781068 → $780834 → $780000 → $78189C).
+
+### New blocker: SYSTEM_ERROR(10204) in QUEUE_PR (scheduler)
+
+Post-fix, boot leaves FlushNodes cleanly and reaches
+scheduler/QUEUE_PR ($06EAF4 in source-starasm1 asm). First
+instructions pop D0/D1/A1 from the stack:
+
+  `MOVE.L (A7)+,D0   ; pop return address into D0`
+  `MOVE.B (A7)+,D1   ; flag byte`
+  `MOVEA.L (A7)+,A1  ; PCB pointer`
+  `MOVEA.L (A1),A0   ; A0 = PCB.link.f`
+  ...
+  `MOVEA.L D0,A0; JMP (A0)  ; return via D0`
+
+D0 arrives as `$00001F` (garbage) and A0 = $00001F → JMP (A0)
+runs the CPU off into address $00001F, where fetching a word
+at an odd address + F-line opcode triggers v=11 → SYSTEM_ERROR.
+
+Likely causes: (a) caller of QUEUE_PR pushed the wrong return
+address, (b) A1's PCB content was corrupted (first longword =
+$2EFFFE making `MOVE.L A2,4(A0)` write to $2F0002 which is
+also unmapped seg 23), (c) another byte-subrange / byte-field
+codegen bug we haven't found yet.
+
+The PCB's `link.f` reading as $2EFFFE suggests the ready-queue
+head itself got scribbled somewhere between scheduler init and
+this point. Probe QUEUE_PR entry + its caller to confirm.
+
+Start here next session: the 4 bytes before the UNMAPPED-WRITE
+at PC=$06EB02 (log=$2F0002 val=$3F00 4EB9...) are "$3F00 4EB9"
+which is `MOVE.W D0,-(A7)` + `JSR` — that's INSTRUCTION bytes
+being written to a data area, suggesting a very confused write
+target. Possibly a PCB that was compiled with a wrong field
+layout and whose "link" offset actually points at the proc's
+own code.
 
 ### P84a — boolean NOT for AST_FIELD_ACCESS (src/toolchain/pascal_codegen.c:1804)
 
