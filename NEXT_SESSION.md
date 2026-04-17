@@ -245,3 +245,87 @@ Paste this prompt to resume:
 > the stack/A6-chain at that point, verify the unwind target is
 > actually INITSYS's FS_INIT call site and not the scheduler. If the
 > unwind RTE/JMP target is wrong, fix the suppression logic.
+
+### END-OF-SESSION ADDENDUM
+
+Added **P89f dynamic FS_INIT/FADECONERT lookup** in lisa.c's 10707
+suppression (the hardcoded range was stale — $002C8C..$002D4C,
+current is $002EEA..$002FAA). After the fix, 10707 unwind lands at
+$005A0A inside BOOT_IO_INIT (correct spot, right after the
+`JSR FS_INIT` call).
+
+But boot still halts at 22/27. Further probing at Scheduler#1 entry
+shows:
+```
+A5=$CC6FFC  A6=$CC6FFC  A7=$CBFF91 (ODD!)  c_pcb=$00CCB58E
+caller ret=$A200011A (invalid)  A6 chain: ret=$1000000 (garbage)
+```
+
+Scheduler is entered with an **odd SP ($CBFF91)** and **garbage A6
+chain**. That means Scheduler was NOT invoked via a clean JSR — the
+stack is already corrupt by the time it fires. Two hypotheses:
+
+1. **Byte-push codegen bug still lurking**. Pascal's standard push
+   is word/long aligned. If some codegen emits `MOVE.B Dn, -(A7)`
+   instead of `MOVE.W Dn, -(A7)` for a byte-sized param, SP ends up
+   odd. We fixed the `c_pcb: ptr_pcb` case via find_proc_sig tiering;
+   another param-size mismatch may be lurking elsewhere on the path
+   through BOOT_IO_INIT's device init loop.
+
+2. **A timer IRQ fires during BOOT_IO_INIT's INTSON with the CPU
+   still in a half-setup state**. The CPU pushes the exception frame
+   onto SSP, dispatches to the handler which calls Scheduler. If the
+   interrupt fires while SP is odd, or if the handler has a bug, the
+   frame may be corrupted.
+
+### Recommended next-session plan
+
+**P89g hunted down the odd-SP source** with a runtime watch and
+found `Block_Process` at $0113CA emitting `LINK A6, #-3`. The
+displacement -3 is odd → A7 lands on an odd byte.
+
+Root cause: `pascal_codegen.c` computes `frame_size` for each proc
+by summing local sizes. When the last local is a 1-byte type (int1,
+boolean with 1-byte packing, etc.) and no subsequent even-sized local
+forces padding, frame_size stays odd.
+
+**Fix:** `if (frame_size & 1) frame_size++;` right before emitting
+the LINK displacement. This rounds up odd frames to even and matches
+Apple Pascal's convention (never emit odd-displacement LINK).
+
+Committed. After the fix, Scheduler#1 A7 is now EVEN ($CBFF90 vs
+$CBFF91). Launch still fires on POP's uninit env_save_area — error
+code shifted from 10201 (illegal-instr) to 10204 (f-line trap),
+same class (hardware exception in system code), just a different
+opcode lands on the odd boundary.
+
+**Remaining work for next session:** the Scheduler→Launch→POP-env
+sequence is still the final blocker. Two approaches:
+
+1. **Populate POP's env_save_area at bootrom time** so if Scheduler
+   dispatches POP, the RTE lands somewhere safe (e.g., an ExitSys
+   trampoline or just the PC where POP was about to be when the
+   scheduler fired).
+
+2. **Suppress premature Scheduler dispatch**. BOOT_IO_INIT enables
+   interrupts via INTSON; a timer IRQ fires, handler runs, Scheduler
+   selects POP and Launches it. We can HLE-guard: if the selected
+   PCB is the current c_pcb, do an RTE-equivalent return without
+   touching env_save_area (since POP is already running and its
+   context is on SSP from the interrupt).
+
+Option 2 is probably the cleaner fix — it matches what Apple's
+Scheduler should actually do for a single-process case.
+
+### Files committed this session (all pushed to origin/main)
+
+- `5b2f848` — main_sdl bundle paths + linker LOADER-yields + P89c prime.
+- `6b4a290` — P89d P80g gate + find_proc_sig tiering.
+- `48d8972` — P89e AST_FIELD_ACCESS in AST_WITH.
+- `d03fd1f` — docs: CLAUDE.md refresh.
+- `8edf2e3` — docs: NEXT_SESSION.md update.
+- `70bcf20` — P89f dynamic FS_INIT lookup for 10707 unwind.
+
+Still at 22/27 milestones (baseline: 23/27). The fixes DO advance
+execution past multiple latent bugs; the remaining 1-milestone gap is
+now a control-flow / stack-corruption issue, not a codegen issue.

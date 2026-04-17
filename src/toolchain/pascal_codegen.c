@@ -4374,6 +4374,16 @@ static void gen_proc_or_func(codegen_t *cg, ast_node_t *node) {
 
     cg_scope_t *sc = current_scope(cg);
     int frame_size = sc ? sc->frame_size : 0;
+    /* P89g: round frame_size up to an even byte count. LINK A6,#-disp pushes
+     * A6 (4 bytes, keeps alignment) then subtracts disp from A7. An odd disp
+     * leaves A7 misaligned, which 68000 word/long memory ops require to be
+     * even. Block_Process had a single int1 (1-byte) local — frame_size=3
+     * (rounded up from 1 to even isn't applied because the local-add code
+     * only pads when the next field is >=2 bytes; a lone odd-sized last
+     * local stays odd). The misaligned A7 propagates: an interrupt fired
+     * on odd SP corrupts the saved exception frame, dispatching Scheduler
+     * with garbage and crashing on POP's uninitialized env_save_area. */
+    if (frame_size & 1) frame_size++;
 
     /* Record the actual entry point AFTER nested procs are emitted.
      * Update the global symbol offset to point here, not to the
