@@ -2290,20 +2290,37 @@ static bool hle_trap6_do_an_mmu(m68k_t *cpu) {
     uint32_t d2 = cpu->d[2] & 0xFFFF;
     uint32_t d3 = cpu->d[3] & 0xFFFF;
 
-    /* smt_base is a fixed assembler symbol inside LDASM — do_an_mmu
-     * references it as `lea smt_base,a1`. Our source-compiled build
-     * resolves it via the linker map; fall back to g_hle_smt_base (set
-     * by the synthetic-loader init path) if the map lookup fails. */
+    /* smt_base: physical address where the SMT (segment mapping table)
+     * data lives at runtime. Two candidates:
+     *   1. The LDASM local label `smt_base` (line 448 of source-LDASM)
+     *      — NOT exported to the linker, so not in the map.
+     *   2. The Pascal VAR `smt_base: absptr` in parms.text — declared as
+     *      a global, so the linker map DOES contain "smt_base" but as
+     *      the VAR's A5-relative offset (negative), not the SMT data's
+     *      physical location. Pre-P86 linker bug: base_addr was added
+     *      to this negative offset, turning it into a coincidental
+     *      positive value in RAM that happened to collide with
+     *      g_hle_smt_base (= os_end from bootrom init) — so the HLE
+     *      "worked" by luck.
+     *   3. g_hle_smt_base: set by bootrom_build to os_end when the
+     *      synthetic bootrom primes the SMT region. Deterministically
+     *      points to the real SMT data location.
+     * Post-P86: use g_hle_smt_base directly. If that's zero (shouldn't
+     * happen in normal boot), fall back to the map lookup but only if
+     * the value looks like a valid physical address. */
     extern uint32_t g_hle_smt_base;
     extern uint32_t boot_progress_lookup(const char *name);
     static uint32_t smt_ptr_cached = 0;
     if (smt_ptr_cached == 0) {
-        /* Source-compiled build: smt_base is an LDASM symbol in the
-         * linker map, and DO_AN_MMU hard-references it. Prefer that
-         * over g_hle_smt_base (which the synthetic-loader init path
-         * sets to os_end — wrong for compile-from-source). */
-        smt_ptr_cached = boot_progress_lookup("smt_base");
-        if (smt_ptr_cached == 0) smt_ptr_cached = g_hle_smt_base;
+        if (g_hle_smt_base != 0 && g_hle_smt_base < 0xFFFFFF) {
+            smt_ptr_cached = g_hle_smt_base;
+        } else {
+            uint32_t map_val = boot_progress_lookup("smt_base");
+            /* Reject A5-relative offsets (high bits set = signed-negative
+             * in 32-bit). Only use if it looks like a real RAM address. */
+            if (map_val != 0 && map_val < 0x01000000)
+                smt_ptr_cached = map_val;
+        }
     }
     uint32_t smt_ptr = smt_ptr_cached;
     if (smt_ptr == 0 || smt_ptr > 0xFFFFFF) return false;
