@@ -1,40 +1,38 @@
-# LisaEmu — Next Session Handoff (2026-04-17 PM — P83a landed)
+# LisaEmu — Next Session Handoff (2026-04-17 PM wrap-up)
 
-## TL;DR
+## Accomplished this session
 
-The `SYSTEM_ERROR(10598)` TAKE_FREE halt from last session is
-**averted** via a new HLE guard on `MERGE_FREE`. Build + audit green,
-still 22/27 milestones. Boot reaches FS_INIT then enters a new
-**infinite CHECK_DS/INIT_SWAPIN loop** on a zero-initialized sdb at
-`$CCBA62` — that's the next investigation target.
+- **P83a HLE guard on MERGE_FREE** (`src/m68k.c` ~line 2986): skip
+  MERGE_FREE body when `c_sdb_ptr.sdbtype != free`. Apple's source
+  lacks a guard against being called on the head_sdb sentinel; the
+  merge body scribbles `head.memsize` with the inserted free sdb's
+  size (via `memsize := memsize + right_sdb^.memsize` inside
+  `with head_sdb^ do`), then TAKE_FREE removes the just-inserted free
+  sdb. Result: empty free chain + head.memsize non-zero → downstream
+  GetFree finds head as "last free", TAKE_FREE asserts SYSTEM_ERROR(10598).
+  Guard averts the halt. Defensively correct per Apple's own
+  documented intent ("merge two adjacent free regions").
 
-Uncommitted work: HLE guard + CHECK_DS probe in `src/m68k.c`. Decide
-whether to commit as-is or revise.
+- **P83b probe on CHECK_DS** (`src/m68k.c` just below P83a guard):
+  logs first 3 entries with c_sdb_ptr contents so the next session
+  can immediately see which sdb is stuck in the swap-in loop.
 
-## What P83a did
+- **CLAUDE.md** refreshed with P83a status + new blocker description
+  replacing the old "SYSTEM_ERROR(10598)" section.
 
-`MERGE_FREE(left_sdb)` inside INSERTSDB's free-chain insert path is
-called with `left_sdb = head_sdb` the very first time MAKE_FREE runs
-(free chain empty → the predecessor walk lands on head_sdb). Apple's
-code has no guard; the merge body evaluates its condition
-successfully and then scribbles `head.memsize` with the inserted
-free region's size, removing that region from both chains. Result:
-free chain empty, head.memsize non-zero → GetFree later walks
-`tail.freechain.bkwd - 14 = head_sdb`, proceeds past the
-"memsize < size" check, calls `TAKE_FREE(head_sdb, true)` which
-asserts `sdbtype <> free` → SYSTEM_ERROR(10598).
+- **NEXT_SESSION.md** (this file) rewritten for the new blocker.
 
-**Guard**: HLE on MERGE_FREE entry — if `c_sdb_ptr.sdbtype != free`,
-return immediately. Defensively correct per Apple's own comment
-("merge two adjacent free regions") — it only makes sense when
-c_sdb_ptr is actually a free region. Code in `src/m68k.c` near the
-`P41` boot_progress_lookup cache block; look for `/* P83a HLE guard`.
+All build + audit still green (22/27 milestones). The `SYSTEM_ERROR(10598)`
+halt from last session is gone.
 
-After P83a: no more SYSTEM_ERROR halt; free chain stays populated
-([head → $B35600 → tail]), head.memsize stays 0. GetFree / TAKE_FREE
-now behave consistently.
+## In progress
 
-## New blocker — CHECK_DS/INIT_SWAPIN spin on zero sdb at $CCBA62
+No code is mid-flight. Everything committed in `540fa7e` is in a
+consistent state; the guard and probe are debug-ready but functional.
+
+## Blocked / open questions
+
+### New blocker: CHECK_DS/INIT_SWAPIN infinite loop on zero sdb at $CCBA62
 
 ```
 [P83b] CHECK_DS#1 entry ret=$01093C c_sdb_ptr=$00CCBA62
@@ -42,94 +40,68 @@ now behave consistently.
 ```
 
 CHECK_DS's `while not sdbstate.memoryF or (newlength <> 0)` spins
-because memoryF=0, newlength=0 → `not false or false = true`. Inside
-the body, `init_in_progress=true` → `INIT_SWAPIN(c_sdb_ptr)` →
-`GET_SEG(error, c_sdb_ptr)`. GET_SEG returns without setting
-memoryF (presumably because memsize=0 = nothing to load), the loop
-repeats forever.
+forever because memoryF=0, newlength=0. In the body,
+`init_in_progress=true` → `INIT_SWAPIN(c_sdb_ptr)` →
+`GET_SEG(error, c_sdb_ptr)`. GET_SEG returns without setting memoryF
+(presumably because memsize=0), loop repeats. Hot pages after 300
+frames: `$045E00×188100` (INIT_SWAPIN), `$043C00×75240` (CHECK_DS),
+`$043D00×37620`. No new milestones fire, no HALT — just spin.
 
-Hot pages after 300 frames: `$045E00×188100` (INIT_SWAPIN region),
-`$043C00×75240` (CHECK_DS), `$043D00×37620`. No new milestones fire.
+**Concrete next steps** (prioritized):
 
-`ret=$01093C` → the caller is in STARTUP or INIT-like code around
-that address. Likely passes an sdb pointer that *should* have been
-populated by an earlier MAKE_REGION / MAKE_DATA / GETSPACE call but
-wasn't. Our guard may have altered an upstream side-effect, or
-there's an independent init gap.
-
-### Concrete next steps
-
-1. **Identify the caller and what sdb `$CCBA62` is supposed to be.**
-   Look at PC `$01093C` — what proc is that, what does it do before
-   calling CHECK_DS. The ret_pc is well past INIT_EC ($01E374) and
-   INIT_EM ($0010A8), closer to INIT_PROCESS ($000B40). Map the
-   symbol range.
-   ```
+1. Map `ret=$01093C` to a symbol and procedure context:
+   ```bash
    grep -E '\$010[0-9A-F]' build/lisa_linked.map | sort
    ```
+   The PC is well past INIT_PROCESS ($000B40) / INIT_EM ($0010A8) /
+   INIT_SCTAB ($002C6A), so likely INIT_EC ($01E374) or something in
+   between. Identify which proc owns $01093C and what sdb it's
+   passing.
 
-2. **Trace upstream**: what CREATES the sdb at $CCBA62, and does it
-   fill in memaddr/memsize/sdbtype? If it's a MAKE_REGION with
-   link_sdb=false, the sdb might be a local struct never persisted
-   properly. If it's from BLD_SEG with a 0-size code/data segment,
-   the init sequence has a gap.
+2. Trace upstream — what CREATES the sdb at $CCBA62. `$CCBA62` is
+   inside the MMRB region (sysglobal pool area). Read bytes around
+   it to see if it's a legitimately-reserved sdb or stale zeros.
+   Compare to known MMRB sdb offsets (head_sdb at $CCB034, tail_sdb
+   at $CCB062, etc.).
 
-3. **Consider reverting the P83a guard temporarily** to confirm the
-   CHECK_DS loop is a genuinely new blocker (exposed by the guard)
-   and not a regression. Git diff should show only m68k.c changes.
+3. Consider: does `GET_SEG` have a bail-out for memsize=0 that skips
+   setting memoryF? Check `source-MMPRIM2.TEXT.unix.txt` for GET_SEG.
+   If yes, the patch could be to make CHECK_DS detect an uninitialized
+   sdb and skip; if no, find who should have initialized the sdb.
 
-4. **Maybe GET_SEG has a bail-out for memsize=0** that skips setting
-   memoryF; that'd be the natural place to patch if we determine
-   this is an edge case.
+### Open question — why Apple's shipped source doesn't need the P83a guard
 
-### Diagnostic state (probes still live)
+Apple's MERGE_FREE has no guard. Our disassembly of MERGE_FREE shows
+correct offsets (sdbtype byte@13, freechain@14, memsize word@10) and
+32-bit compare. The observed runtime state matches exactly what
+Apple's source would produce semantically. Either Apple's real hardware
+DID hit this and nobody noticed the symptom, or Apple's compiler emits
+materially different code for variant-field access under WITH that
+avoids triggering the merge. Left unresolved; P83a is semantically
+correct regardless.
 
-- P83a HLE guard on MERGE_FREE (prints up to 4 skip messages per run).
-- P83b CHECK_DS entry probe (prints up to 3 entry dumps per run).
+### Flagged from prior handoffs (still applicable)
 
-Both are in `src/m68k.c` near the P41 boot_progress_lookup cache
-block. Low overhead, safe to keep or delete.
-
-## Open questions / unresolved
-
-1. **Why Apple's boot doesn't hit the MERGE_FREE-scribbles-head bug.**
-   Apple's source has no guard; our disassembly of MERGE_FREE shows
-   correct offsets and 32-bit compare; the observed state matches
-   exactly what Apple's code would produce. Either Apple's real
-   hardware runs into the same issue and we haven't noticed the
-   visible symptom (there wasn't one on hardware? unlikely), or
-   Apple's compiler emits materially different code for variant-
-   field access under WITH. Left unresolved; our guard is semantically
-   correct regardless.
-
-2. **Whether the CHECK_DS loop is pre-existing or newly exposed.**
-   Baseline (pre-guard) parks at $005E60 after SYSTEM_ERROR HALT with
-   no CHECK_DS activity in hot pages. Post-guard, CHECK_DS dominates.
-   So yes, newly exposed by the guard.
-
-## Build / run commands (unchanged)
-
-```
-make                                                        # build
-make audit                                                  # link audit
-./build/lisaemu --headless Lisa_Source 300 > .claude-tmp/run.log 2>&1
-grep -E "Milestones reached|SYSTEM_ERROR|HALT|P83" .claude-tmp/run.log
-```
+- **Deeper `exit()` fix still parked** — only handles `exit(CurrentProc)`.
+  `exit(EnclosingProc)` still walks too far.
+- **P82b CASE tag shift risk** — any record with `CASE IDENT : TYPE OF`
+  now has the tag emitted as a field. Watch for new regressions in
+  process-management paths using PCB-like records.
 
 ## Pick up here
 
-> Read NEXT_SESSION.md. P83a HLE guard on MERGE_FREE fixed the
-> SYSTEM_ERROR(10598) TAKE_FREE halt by preventing scribble into
-> head_sdb.memsize. Boot now reaches FS_INIT then stalls in a
-> CHECK_DS infinite loop on a zero-initialized sdb at $CCBA62
-> (called from ret=$01093C). No new milestones fire. Start by
-> mapping what symbol owns $01093C, tracing backward to see who
-> constructed the sdb at $CCBA62, and whether it should have had
-> memaddr/memsize populated. Also consider whether to commit the
-> P83a guard as-is or find the "real" reason Apple's boot doesn't
-> need it.
+> Read NEXT_SESSION.md. P83a HLE guard on MERGE_FREE is in `src/m68k.c`
+> and fixed the SYSTEM_ERROR(10598) TAKE_FREE halt. Boot now reaches
+> FS_INIT then stalls in an infinite CHECK_DS/INIT_SWAPIN loop on a
+> zero-initialized sdb at `$00CCBA62` (called from `ret=$01093C`).
+> No new milestones fire. Start by running
+> `grep -E '\$010[0-9A-F]' build/lisa_linked.map | sort` to find what
+> symbol owns `$01093C`, then trace upstream to see who should have
+> populated the sdb at `$CCBA62` (memaddr/memsize/sdbtype are all
+> zero). Also look at `source-MMPRIM2.TEXT.unix.txt` for GET_SEG to
+> see why it returns without setting memoryF for a zero-size sdb.
 >
-> Build: `make && make audit` (both green). Canonical run:
-> `./build/lisaemu --headless Lisa_Source 300 > .claude-tmp/run.log 2>&1`.
-> Currently 22/27 milestones, boot stalls in CHECK_DS loop (no halt,
-> no SYSTEM_ERROR, no new milestones past FS_INIT).
+> Build: `make && make audit` (both green).
+> Canonical run: `./build/lisaemu --headless Lisa_Source 300 > .claude-tmp/run.log 2>&1`.
+> Currently 22/27 milestones. Stall is via spin, not HALT — the run
+> completes cleanly after 300 frames without SYSTEM_ERROR.
