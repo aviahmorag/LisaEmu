@@ -725,36 +725,64 @@ static uint8_t io_read_cb(uint32_t offset) {
         return 0x00;  /* 0 = twiggy (default for Lisa 1) */
     }
 
-    /* COPS parameter memory ($FCC181-$FCC1FF) — read via MOVEP.L in INIT_READ_PM.
-     * MOVEP reads every other byte, so addresses are at odd offsets.
-     * 16 iterations × 4 bytes = 64 bytes of pram data.
-     * Return default/empty pram: all zeros (checksum will fail → DEFAULTPM). */
+    /* COPS parameter memory ($FCC181-$FCC1FF) — read via MOVEP.L in INIT_READ_PM
+     * (see source-STARASM2.TEXT init_read_pm). MOVEP reads every other byte
+     * starting at $FCC181, advancing A2 by 8 per MOVEP.L (16 iterations = 64 bytes).
+     *
+     * Phase 1 (PMEM layer): populate with a valid parameter-memory snapshot
+     * that says "ProFile on parallel port is the sole configured CD". This lets
+     * INIT_CONFIG set pm_good=true, then FIND_PM_IDS in INIT_BOOT_CDS finds a
+     * matching driverID for cd_paraport and returns true — replacing the old
+     * 10738 suppression with an actual PMEM contents layer.
+     *
+     * PM layout (source-PMEM.TEXT pMemRec header):
+     *   [0-1]  pm_version   (big-endian word)  = cd_pm_version = 4
+     *   [2-3]  pm_timestamp
+     *   [4]    pm_BootVol(7-4) / pm_NormCont(3-0)
+     *   [5]    pm_DimCont(7-4) / pm_BeepVol(3-0)
+     *   [6]    bits: mouseOn:1 extendMem:1 scaleMouse:1 pad:1 doubleClick:4
+     *   [7]    pm_FadeDelay(7-4) / pm_BeginRepeat(3-0)
+     *   [8]    pm_SubRepeat(7-4) / pm_pad2(3-0)
+     *   [9]    pm_cdCount
+     *   [10-59] pm_DevConfig — packed CDD entries, terminated by pm_slot=15
+     *   [60-61] pm_MEM_LOSS
+     *   [62-63] pm_Checksum (XOR of all 32 words must equal 0)
+     *
+     * Packed CDD entry (source-CDCONFIGASM.TEXT pack_pm):
+     *   byte 0: [slot:4][chan:3][idsize:1]
+     *   byte 1: [dev:5][nExtWords:2][idHiBit:1]
+     *   byte 2: driverID low 8 bits (for idsize=0, short form)
+     *
+     * For cd_paraport (value 11 per source-syscall.text:80), emptychan, emptydev,
+     * driverID=34, no extension words, short form:
+     *   byte 10 = 0xBE  (slot=11=1011, chan=7=111, idsize=0)
+     *   byte 11 = 0xF8  (dev=31=11111, nExt=0=00, idHi=0)
+     *   byte 12 = 0x22  (driverID=34)
+     *   byte 13 = 0xF0  (terminator: pm_slot=15)
+     */
     if (offset >= 0xC181 && offset <= 0xC1FF) {
-        /* Return valid pram with a ProFile CDD entry.
-         * pram layout: see SOURCE-PMEM.TEXT.
-         * Packed CDD entry format: see SOURCE-CDCONFIGASM.TEXT.
-         * ProFile on parallel port: slot=9(→10), chan=6(→7=empty), dev=30(→31=empty), id=34 */
         static const uint8_t pram[64] = {
-            0x00, 0x04,  /* [0-1] version = 4 (cd_pm_version) */
-            0x00, 0x01,  /* [2-3] timestamp = 1 */
-            0x27,        /* [4] bootVol=2, contrast=7 */
-            0x33,        /* [5] dim=3, beep=3 */
-            0xE3,        /* [6] mouseOn, extMem, scaleMouse, dblClick=3 */
-            0x33,        /* [7] fadeDelay=3, beginRepeat=3 */
-            0x30,        /* [8] subRepeat=3 */
-            0x01,        /* [9] cdCount=1 */
-            0x9C,        /* [10] CDD: [slot=9:4][chan=6:3][idsize=0:1] */
-            0xF0,        /* [11] CDD: [dev=30:5][nExt=0:2][hibit=0:1] */
-            0x22,        /* [12] CDD: driverID=34 byte */
-            0xF0,        /* [13] terminator: slot=15 */
+            0x00, 0x04,  /* [0-1]   version = 4 (cd_pm_version) */
+            0x00, 0x01,  /* [2-3]   timestamp */
+            0x27,        /* [4]     bootVol=2, normCont=7 */
+            0x33,        /* [5]     dimCont=3, beepVol=3 */
+            0xE3,        /* [6]     mouseOn=1, extMem=1, scaleMouse=1, pad=0, doubleClick=3 */
+            0x33,        /* [7]     fadeDelay=3, beginRepeat=3 */
+            0x30,        /* [8]     subRepeat=3, pad=0 */
+            0x01,        /* [9]     cdCount=1 (one CDD entry follows) */
+            0xBE,        /* [10]    CDD[0].byte0 = slot=cd_paraport=11, chan=emptychan=7, idsize=0 */
+            0xF8,        /* [11]    CDD[0].byte1 = dev=emptydev=31, nExt=0, idHi=0 */
+            0x22,        /* [12]    CDD[0].byte2 = driverID=34 (ProFile) */
+            0xF0,        /* [13]    terminator: pm_slot=15 */
             0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, /* [14-29] */
             0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, /* [30-45] */
             0,0,0,0,0,0,0,0,0,0,0,0,0,0,     /* [46-59] */
             0x00, 0x00,  /* [60-61] mem_loss */
-            /* [62-63] checksum: XOR of all 32 words must = 0.
-             * Words: 0004 0001 2733 E333 3001 9CF0 22F0 0000...0000
-             * XOR = 0x4A04. Checksum = 0x4A04 so total XOR = 0. */
-            0x4A, 0x04,
+            /* [62-63] checksum: XOR of all 32 big-endian words must = 0.
+             * Words: 0004 0001 2733 E333 3001 BEF8 22F0 0000..0000 ????
+             * 0x0004 ^ 0x0001 ^ 0x2733 ^ 0xE333 ^ 0x3001 ^ 0xBEF8 ^ 0x22F0 = 0x680C
+             * so checksum word = 0x680C. */
+            0x68, 0x0C,
         };
         int byte_idx = (offset - 0xC181) / 2;
         if (byte_idx >= 0 && byte_idx < 64)
