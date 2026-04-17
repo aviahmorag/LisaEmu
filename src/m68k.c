@@ -3176,6 +3176,125 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             }
         }
 
+        /* P85 probe — FlushNodes buffer-pool spin investigation.
+         * After the P84 CHECK_DS fix, FS_INIT reaches and then spins
+         * in FlushNodes (VMSTUFF:1369) for tens of thousands of iters.
+         * The `until ptrS = ptrHot` loop never hits ptrHot. Either
+         * InitBufPool didn't run, or the circular doubly-linked list
+         * is broken, or link.b is compiled at the wrong offset.
+         *
+         * ptrHot's A5 offset = -$2066 (from disasm of $064EC2:
+         * `202D DF9A` = MOVE.L -$2066(A5),D0). Buffer layout:
+         *   link.f @0 (ptr,4), link.b @4 (ptr,4),
+         *   dirty @8 (1), lock @9 (1), device @10 (int,2),
+         *   page @12 (long,4), sem @16 (record), Data (variable). */
+        {
+            static uint32_t pc_FlushNodes = 0, pc_InitBufPool = 0, pc_InitBuf = 0;
+            static uint32_t pc_MAP_SEGMENT = 0, pc_PROG_MMU = 0;
+            static int pc_gen_p85 = -1;
+            if (pc_gen_p85 != g_emu_generation) {
+                pc_FlushNodes = boot_progress_lookup("FlushNodes");
+                pc_InitBufPool = boot_progress_lookup("InitBufPool");
+                pc_InitBuf = boot_progress_lookup("InitBuf");
+                pc_MAP_SEGMENT = boot_progress_lookup("MAP_SEGMENT");
+                pc_PROG_MMU = boot_progress_lookup("PROG_MMU");
+                pc_gen_p85 = g_emu_generation;
+            }
+            DBGSTATIC(int, p85_initbuf_count, 0);
+            DBGSTATIC(int, p85_flush_count, 0);
+            DBGSTATIC(int, p85_ib_count, 0);
+            DBGSTATIC(int, p85_ms_count, 0);
+            DBGSTATIC(int, p85_pm_count, 0);
+
+            if (pc_MAP_SEGMENT && cpu->pc == pc_MAP_SEGMENT && p85_ms_count < 5) {
+                p85_ms_count++;
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                uint32_t ret = cpu_read32(cpu, sp);
+                uint32_t c_sdb = cpu_read32(cpu, sp + 4);
+                uint16_t c_mmu = cpu_read16(cpu, sp + 8);
+                uint16_t domain = cpu_read16(cpu, sp + 10);
+                uint16_t access = cpu_read16(cpu, sp + 12);
+                uint16_t memsize = c_sdb ? cpu_read16(cpu, c_sdb + 10) : 0;
+                fprintf(stderr, "[P85] MAP_SEGMENT#%d entry ret=$%06X c_sdb=$%08X c_mmu=%d domain=%d access=$%04X sdb.memsize=%d\n",
+                        p85_ms_count, ret, c_sdb, c_mmu, domain, access, memsize);
+            }
+            if (pc_PROG_MMU && cpu->pc == pc_PROG_MMU && p85_pm_count < 40) {
+                p85_pm_count++;
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                uint32_t ret = cpu_read32(cpu, sp);
+                /* PROG_MMU is external asm — args pushed left-to-right
+                 * (index first/deepest, ret_domain last/top). */
+                uint16_t rdom  = cpu_read16(cpu, sp + 4);
+                uint16_t cnt   = cpu_read16(cpu, sp + 6);
+                uint16_t tdom  = cpu_read16(cpu, sp + 8);
+                uint16_t index = cpu_read16(cpu, sp + 10);
+                fprintf(stderr, "[P85] PROG_MMU#%d entry ret=$%06X index=%d tdom=%d count=%d rdom=%d\n",
+                        p85_pm_count, ret, index, tdom, cnt, rdom);
+            }
+
+            if (pc_InitBuf && cpu->pc == pc_InitBuf && p85_ib_count < 5) {
+                p85_ib_count++;
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                uint32_t ret   = cpu_read32(cpu, sp);
+                uint32_t ptrB  = cpu_read32(cpu, sp + 4);
+                uint32_t predB = cpu_read32(cpu, sp + 8);
+                uint32_t succB = cpu_read32(cpu, sp + 12);
+                fprintf(stderr, "[P85] InitBuf#%d entry ret=$%06X ptrB=$%08X predB=$%08X succB=$%08X\n",
+                        p85_ib_count, ret, ptrB, predB, succB);
+            }
+
+            if (pc_InitBufPool && cpu->pc == pc_InitBufPool && p85_initbuf_count < 2) {
+                p85_initbuf_count++;
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                uint32_t ret = cpu_read32(cpu, sp);
+                uint32_t a5 = cpu->a[5] & 0xFFFFFF;
+                uint32_t ptrHot_addr = (a5 + (int32_t)(int16_t)0xDF9A) & 0xFFFFFF;
+                uint32_t ptrHot_val = cpu_read32(cpu, ptrHot_addr);
+                fprintf(stderr, "[P85] InitBufPool#%d entry ret=$%06X A5=$%06X ptrHot@$%06X=$%08X\n",
+                        p85_initbuf_count, ret, a5, ptrHot_addr, ptrHot_val);
+            }
+
+            if (pc_FlushNodes && cpu->pc == pc_FlushNodes && p85_flush_count < 2) {
+                p85_flush_count++;
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                uint32_t ret = cpu_read32(cpu, sp);
+                uint16_t device = cpu_read16(cpu, sp + 4);
+                uint16_t clear  = cpu_read16(cpu, sp + 6);
+                uint32_t ecode_ref = cpu_read32(cpu, sp + 8);
+                uint32_t a5 = cpu->a[5] & 0xFFFFFF;
+                uint32_t ptrHot_addr  = (a5 + (int32_t)(int16_t)0xDF9A) & 0xFFFFFF;
+                uint32_t ptrCold_addr = (a5 + (int32_t)(int16_t)0xDF96) & 0xFFFFFF;
+                uint32_t ptrHot_val  = cpu_read32(cpu, ptrHot_addr);
+                uint32_t ptrCold_val = cpu_read32(cpu, ptrCold_addr);
+                fprintf(stderr, "[P85] FlushNodes#%d entry ret=$%06X device=$%04X clear=$%04X ecode_ref=$%08X A5=$%06X ptrHot=$%08X ptrCold=$%08X\n",
+                        p85_flush_count, ret, device, clear, ecode_ref, a5, ptrHot_val, ptrCold_val);
+                if (ptrHot_val >= 0x000400 && ptrHot_val < 0x00F00000) {
+                    uint32_t cur = ptrHot_val;
+                    for (int hop = 0; hop < 20; hop++) {
+                        if (hop > 0 && cur == ptrHot_val) {
+                            fprintf(stderr, "       *** looped back to ptrHot after %d hops ***\n", hop);
+                            break;
+                        }
+                        uint32_t link_f = cpu_read32(cpu, cur + 0);
+                        uint32_t link_b = cpu_read32(cpu, cur + 4);
+                        uint8_t  dirty  = cpu_read8 (cpu, cur + 8);
+                        uint8_t  lock_  = cpu_read8 (cpu, cur + 9);
+                        uint16_t dev_f  = cpu_read16(cpu, cur + 10);
+                        uint32_t page_f = cpu_read32(cpu, cur + 12);
+                        fprintf(stderr, "       hop %2d @$%06X: f=$%08X b=$%08X dirty=$%02X lock=$%02X dev=$%04X page=$%08X\n",
+                                hop, cur, link_f, link_b, dirty, lock_, dev_f, page_f);
+                        if (link_b < 0x000400 || link_b >= 0x00F00000) {
+                            fprintf(stderr, "       *** link.b out of range, stopping walk ***\n");
+                            break;
+                        }
+                        cur = link_b;
+                    }
+                } else {
+                    fprintf(stderr, "       ptrHot looks unset/invalid — pool probably not initialized\n");
+                }
+            }
+        }
+
         /* P37 HLE bypass: FS_CLEANUP (fsinit.text:136). Fires the
          * milestone on entry then bypasses — its body crashes into
          * $F8xxxx wild-PC space because downstream calls hit a

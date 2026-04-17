@@ -1703,6 +1703,15 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                      * via LINK) start at negative offsets with no padding. */
                     if (sym->is_param && sz == 1 && sym->offset > 0)
                         byte_offset_adj = 1;
+                    /* P85a: for byte-sized loads, zero-extend D0 first via
+                     * MOVEQ #0,D0 so subsequent MOVE.W D0,Dn doesn't pick
+                     * up garbage in the high byte. Same bug class P80h2
+                     * fixed for (A0) indirect — repeat it here for the
+                     * direct (A6)/(A0) param/local load path. MAP_SEGMENT
+                     * was reading `domain` (domainRange 0..3 byte-param)
+                     * and pushing it as a word to PROG_MMU with the high
+                     * byte leaking stale data, making tar_domain=$B600. */
+                    if (sz == 1) emit16(cg, 0x7000);  /* MOVEQ #0,D0 */
                     if (depth > 0) {
                         /* Outer scope: follow static link chain into A0, then use A0 */
                         emit_frame_access(cg, depth);
@@ -1718,6 +1727,8 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                 } else {
                     /* Global: size-aware load from A5 */
                     int sz = type_load_size(sym->type);
+                    /* P85a: zero-extend for byte loads — see comment above. */
+                    if (sz == 1) emit16(cg, 0x7000);  /* MOVEQ #0,D0 */
                     if (sz == 4) {
                         emit16(cg, 0x202D);
                     } else if (sz == 1) {
