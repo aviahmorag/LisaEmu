@@ -70,12 +70,115 @@ make audit-linker       # Stage 4: Full pipeline + linker
 cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' build 2>&1 | grep -E "(error:|BUILD)"
 ```
 
-## Current Status (2026-04-17 PM) — P83a: MERGE_FREE head_sdb guard, CHECK_DS loop is next blocker
+## Current Status (2026-04-17 evening) — P84 codegen fixes unstuck CHECK_DS; FlushNodes is the new blocker
 
 Build + audit green. 22/27 milestones. Boot reaches FS_INIT. With the
-new **P83a MERGE_FREE guard** the `SYSTEM_ERROR(10598)` TAKE_FREE halt
-is averted, but boot then stalls in a **CHECK_DS/INIT_SWAPIN infinite
-loop** on an all-zero sdb at `$00CCBA62` — the new investigation target.
+new **P84a (boolean-NOT on field access) + P84b (byte-param read
+offset +1)** codegen fixes, MAKE_MRDATA's CHECK_DS loop now exits
+correctly — INIT_SWAPIN → GET_SEG → ALLOC_MEM → SWAP_SEG populates
+the sdb and SWAP_SEG writes `memoryF := true` (word $0001 at
+offset 14) which CHECK_DS's `while not sdbstate.memoryF` properly
+tests. Boot then enters FlushNodes (vmstuff.text line 1369) and
+the `repeat ... until ptrS = ptrHot` buffer-pool walk spins for
+188k+ iterations — the new blocker. Hot pages: `$064E00×24635`
+`$064F00×24634` `$065000×14781` (FlushNodes body range).
+
+### P84a — boolean NOT for AST_FIELD_ACCESS (src/toolchain/pascal_codegen.c:1804)
+
+`gen_expression` for `AST_UNARY_OP(TOK_NOT)` detected boolean
+operands only from `AST_FUNC_CALL`, `AST_BINARY_OP`, or
+`AST_IDENT_EXPR`. `AST_FIELD_ACCESS` fell through to bitwise
+`NOT.W D0`, so `not sdbstate.memoryF` compiled as:
+
+  `MOVE.W 14(A0),D0; NOT.W D0; TST.W D0; BEQ exit`
+
+which exits only on D0 = $FFFF. Since `memoryF := true` stores
+the word $0001 (MOVEQ #1,D0 then MOVE.W D0,...), the loop could
+never terminate. Fix: when child is AST_FIELD_ACCESS, call
+`lvalue_field_info` to resolve the field's type and if it's
+TK_BOOLEAN, emit the logical TST/SEQ/ANDI.W #1 sequence.
+
+### P84b — byte-sized parameters read at offset+1 (src/toolchain/pascal_codegen.c:1696)
+
+1-byte params (`Tsdbtype`, int1, byte, char) are pushed as 2-byte
+words for word-alignment. On 68k big-endian the value lives in
+the LOW byte = offset+1, not offset+0. Our codegen emitted
+`MOVE.B offset(A6),D0` which pulled the zero padding byte, so
+`kind` inside BLD_SEG always read as 0. MAKE_MRDATA's call
+`BLD_SEG(data, 0, size, ...)` compiled correctly (caller pushed
+`data=ord 2` as word $0002), but `sdbtype := kind` inside the
+callee wrote $00 instead of $02 at offset 13. Verified via a
+sdb-region write trace — `[P84W] pc=$04238C write1 @$CCBA6F
+<= $00` pre-fix vs. `write1 <= $02` post-fix.
+
+Fix: when emitting a byte read of a param (sym->is_param,
+sz==1, sym->offset > 0), add 1 to the emitted offset. Locals
+(negative A6 offsets) are allocated by our own prologue with
+no padding convention, so they don't need the adjustment.
+
+### New blocker: FlushNodes buffer-pool repeat loop (vmstuff.text:1369)
+
+```pascal
+ptrS := ptrHot;
+repeat
+  if dirty then LisaIO(...,WRITEOP);
+  if clear then { page := REDLIGHT; lock := false };
+  ptrS := ptrS^.link.b;  { backward link }
+until ptrS = ptrHot;
+```
+
+The walk never hits `ptrHot` — ptrS^.link.b must be wrong, or
+the buffer pool's circular doubly-linked list hasn't been
+initialized by the time FS_INIT calls FlushNodes(-1, true, ecode)
+(at fsinit.text:1176 / :1275).
+
+Start here next session:
+
+1. Find who initializes the `ptrHot` buffer-pool. It's probably
+   set up during InitBufPool or similar early VM init. Confirm
+   it's called BEFORE FlushNodes in the init chain.
+
+2. Dump the buffer pool state when FlushNodes enters: walk 10-20
+   `link.b` pointers starting from `ptrHot` and log each `page`,
+   `device`, `dirty`, `link.f/b`. This should reveal whether the
+   list is properly circular.
+
+3. If list isn't initialized, find InitBufPool's path into FS_INIT
+   and see why it's skipped / crashed. The P84 fixes changed the
+   code path — it's possible a previous-HLE-bypassed init now tries
+   to run natively and fails silently.
+
+4. Consider: is `ptrHot` a global, or pointer in a structure? If a
+   field in some record, maybe another codegen bug is reading it
+   at wrong offset.
+
+### P83a (kept) — HLE guard: MERGE_FREE only merges real free regions (src/m68k.c)
+
+`MERGE_FREE(left_sdb)` in `INSERTSDB`'s free-chain insert path is
+called with `left_sdb = head_sdb` the first time MAKE_FREE runs
+(free chain empty → the predecessor walk lands on head_sdb). The
+body then evaluates its condition inside `with head_sdb^ do`:
+
+  `(right_sdb^.sdbtype = free) and
+   (ord(right_sdb) = (ord(freechain.fwd_link) - oset_freechain))`
+
+Both sides are TRUE because P_ENQUEUE just wrote
+`head.freechain.fwd_link = &new_sdb.freechain`. The merge body then
+does `memsize := memsize + right_sdb^.memsize` inside the WITH,
+**scribbling `head_sdb.memsize` with the inserted free sdb's size**
+and then `TAKE_FREE(right_sdb, false)` removes the just-inserted free
+region. Result: free chain empty, `head.memsize = $0CD5` (non-zero).
+
+Downstream `GetFree` walks `tail.freechain.bkwd_link - 14 = head_sdb`,
+checks `if memsize < size then ... else TAKE_FREE(head_sdb, true)`.
+Since memsize ($0CD5) > typical small alloc size, it proceeds to
+`TAKE_FREE(head_sdb, true)` which asserts `sdbtype <> free` →
+SYSTEM_ERROR(10598).
+
+**P83a guard** (HLE on MERGE_FREE entry): if `c_sdb_ptr.sdbtype !=
+free`, return immediately. This is defensively correct per Apple's
+own documented intent ("merge two adjacent free regions"); applying
+the merge when c_sdb_ptr is the head sentinel is obviously wrong.
 
 ### P83a — HLE guard: MERGE_FREE only merges real free regions (src/m68k.c)
 
@@ -109,36 +212,6 @@ Apple's shipped source lacks this guard and in theory the same
 miscompile would fire on real Lisa boot. It's possible Apple's boot
 path avoids it via a different init sequence or their compiler
 emits different code for the variant-field condition — unverified.
-
-### New blocker: CHECK_DS infinite loop on zero sdb at $CCBA62
-
-```
-[P83b] CHECK_DS#1 entry ret=$01093C c_sdb_ptr=$00CCBA62
-      c_sdb: memaddr=$0000 memsize=$0000 sdbtype=$00 sdbstate[0]=$00 newlength=$0000
-```
-
-CHECK_DS's `while not sdbstate.memoryF or (newlength <> 0)` spins
-because the sdb is uninitialized. In the loop body, `init_in_progress`
-is true so it calls `INIT_SWAPIN(c_sdb_ptr)` → which calls
-`GET_SEG(error, c_sdb_ptr)` — GET_SEG presumably tries to swap in the
-segment but can't (memaddr=0, memsize=0 = nothing to load), returns
-without setting memoryF, and the loop repeats forever.
-
-Hot pages after P83a: `$045E00×188100` (INIT_SWAPIN), `$043C00×75240`
-(CHECK_DS), `$043D00×37620`.
-
-Start here next session:
-- Identify who constructs / passes the sdb at `$CCBA62`. The ret_pc
-  = `$01093C` suggests it's called from early init — look up what
-  STARTUP or INIT_PROCESS does around `$01093C`.
-- Dump the bytes at `$CCBA62` with context: is this a leftover zero
-  region in MMRB, or a deliberately-placed sdb that we failed to fill
-  in? Related: compare with `driverCode_sdb` at `c_mmrb+?` or similar
-  known fields.
-- Check GET_SEG: what makes it return without setting memoryF for a
-  zero-sized sdb? Look at `source-MMPRIM2.TEXT.unix.txt` for GET_SEG.
-- Consider whether the upstream caller was supposed to initialize the
-  sdb (via MAKE_REGION or similar) before passing it to CHECK_DS.
 
 ### Previous state (P82b/c) — CASE tag + packed byte pairs, CLEAR_SPACE spin fixed
 
