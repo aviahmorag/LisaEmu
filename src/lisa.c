@@ -2907,23 +2907,21 @@ static bool hle_handle_system_error(lisa_t *lisa __attribute__((unused)), m68k_t
         return true;
     }
 
-    /* P80e: suppress 10101 (Make_SProcess error) during SYS_PROC_INIT.
-     * MAKE_DATASEG fails because CHK_LDSN_FREE or SYS_CALLED rejects
-     * negative LDSNs. The goto fix (P80e) properly returns this error
-     * instead of crashing. Unwind past SYS_PROC_INIT to continue boot. */
+    /* P80e (P86g attempt): 10101 (Make_SProcess error) during
+     * SYS_PROC_INIT — pre-P86 we unwound the whole thing. With the
+     * A5-pin linker fix and smt_base HLE fix in place, Make_SProcess
+     * might actually succeed now. Try letting it run naturally first;
+     * if boot regresses, re-enable the unwind. Log the call site so
+     * we can see what's still failing. */
     {
         extern int g_vec_guard_active;
         if (g_vec_guard_active && err_code == 10101) {
             static int supp_10101 = 0;
-            if (supp_10101++ < 3)
-                fprintf(stderr, "HLE: SYSTEM_ERROR(10101) — unwinding past SYS_PROC_INIT\n");
-            uint32_t boot_sp = 0xCBFFFC;
-            uint32_t ret = cpu_read32(cpu, boot_sp);
-            cpu->a[7] = boot_sp + 4;
-            cpu->pc = ret;
-            cpu->a[6] = 0xF7FFF4; /* STARTUP frame from P80 diag */
-            cpu->cycles += 50;
-            return true;
+            if (supp_10101++ < 3) {
+                fprintf(stderr, "HLE: SYSTEM_ERROR(10101) FIRED (P86g: no longer suppressed) ret=$%06X SP=$%06X\n",
+                        cpu_read32(cpu, cpu->a[7] & 0xFFFFFF), cpu->a[7] & 0xFFFFFF);
+            }
+            /* Fall through — let the natural SYSTEM_ERROR handler run */
         }
     }
 
