@@ -360,23 +360,31 @@ static type_desc_t *resolve_type(codegen_t *cg, ast_node_t *node) {
             int offset = 0;
             int variant_start = -1;   /* offset where variants begin; -1 = not yet */
             int variant_max_end = 0;  /* max end offset across all variant arms */
+            int current_arm = 0;      /* 0 = fixed part, 1..N = variant arm index */
             for (int i = 0; i < node->num_children; i++) {
                 ast_node_t *field = node->children[i];
                 if (field->type != AST_FIELD) continue;
-                /* Variant-region sentinels inserted by the parser */
+                /* Variant-region sentinels inserted by the parser.
+                 * NOTE: str_eq_nocase does 8-char significant-prefix matching,
+                 * so "__variant_begin__", "__variant_arm__", "__variant_end__"
+                 * all match each other via it. Use strcmp for exact match. */
                 if (field->num_children == 0) {
-                    if (str_eq_nocase(field->name, "__variant_begin__")) {
+                    if (strcmp(field->name, "__variant_begin__") == 0) {
                         if (offset % 2) offset++;
                         variant_start = offset;
                         variant_max_end = offset;
-                    } else if (str_eq_nocase(field->name, "__variant_arm__")) {
+                        t->variant_start = offset;
+                        current_arm = 1;  /* fields that follow belong to arm 1 */
+                    } else if (strcmp(field->name, "__variant_arm__") == 0) {
                         /* Track the end of the previous arm, reset to variant start */
                         if (offset > variant_max_end) variant_max_end = offset;
                         offset = variant_start;
-                    } else if (str_eq_nocase(field->name, "__variant_end__")) {
+                        current_arm++;
+                    } else if (strcmp(field->name, "__variant_end__") == 0) {
                         if (offset > variant_max_end) variant_max_end = offset;
                         offset = variant_max_end;
                         variant_start = -1;
+                        current_arm = 0;
                     }
                     continue;
                 }
@@ -421,6 +429,7 @@ static type_desc_t *resolve_type(codegen_t *cg, ast_node_t *node) {
                     t->fields[t->num_fields].type_name[11] = '\0';
                     t->fields[t->num_fields].offset = offset;
                     t->fields[t->num_fields].type = ft;
+                    t->fields[t->num_fields].variant_arm = (signed char)current_arm;
                     /* P80c trace: record layout for freepool fields */
                     if (str_eq_nocase(field->name, "firstfree"))
                         fprintf(stderr, "  [RECORD-LAYOUT] '%s' field '%s' offset=%d fs=%d\n",
@@ -786,6 +795,119 @@ static void gen_ptr_expression(codegen_t *cg, ast_node_t *node) {
      * at source. Together they should cover nearly all pointer loads. */
 }
 
+/* Forward decls */
+static type_desc_t *repair_corrupt_record(codegen_t *cg, type_desc_t *rt);
+static int with_lookup_field(codegen_t *cg, const char *name,
+                             type_desc_t **out_type, int *out_with_idx);
+static type_desc_t *lvalue_record_type(codegen_t *cg, ast_node_t *node);
+
+/* P82: resolve the record/pointer type of an lvalue expression.
+ * Returns the TK_RECORD type that `node` evaluates to (i.e., the type one
+ * would dereference to access fields). Handles IDENT_EXPR, DEREF (p^),
+ * and nested AST_FIELD_ACCESS chains like `rec.sub.subsub`.
+ *
+ * Without this, the AST_FIELD_ACCESS handler in gen_lvalue_addr only knew
+ * how to resolve a field on a plain var or a single dereference — so chains
+ * like `c_mmrb^.head_sdb.freechain.fwd_link` lost the middle offsets,
+ * emitting `ADDA.W #42` (head_sdb offset) but NOT the +14 for freechain,
+ * and reading as MOVE.W (2 bytes) instead of MOVE.L (4 bytes). */
+static type_desc_t *lvalue_record_type(codegen_t *cg, ast_node_t *node) {
+    if (!node) return NULL;
+    if (node->type == AST_IDENT_EXPR) {
+        cg_symbol_t *sym = find_symbol_any(cg, node->name);
+        if (sym && sym->type) {
+            type_desc_t *t = sym->type;
+            if (t->kind == TK_POINTER && t->base_type) t = t->base_type;
+            return (t && t->kind == TK_RECORD) ? t : NULL;
+        }
+        if (cg->with_depth > 0) {
+            type_desc_t *wrt = NULL;
+            int wfld = with_lookup_field(cg, node->name, &wrt, NULL);
+            if (wfld >= 0 && wrt) {
+                type_desc_t *ft = wrt->fields[wfld].type;
+                if (ft && ft->kind == TK_POINTER && ft->base_type) ft = ft->base_type;
+                return (ft && ft->kind == TK_RECORD) ? ft : NULL;
+            }
+        }
+        return NULL;
+    }
+    if (node->type == AST_DEREF) {
+        /* p^ — get pointer's base-type record */
+        ast_node_t *child = node->children[0];
+        if (!child) return NULL;
+        if (child->type == AST_IDENT_EXPR) {
+            cg_symbol_t *psym = find_symbol_any(cg, child->name);
+            if (psym && psym->type && psym->type->kind == TK_POINTER &&
+                psym->type->base_type)
+                return psym->type->base_type->kind == TK_RECORD
+                           ? psym->type->base_type : NULL;
+            if (!psym && cg->with_depth > 0) {
+                type_desc_t *wrt = NULL;
+                int wfld = with_lookup_field(cg, child->name, &wrt, NULL);
+                if (wfld >= 0 && wrt) {
+                    type_desc_t *ft = wrt->fields[wfld].type;
+                    if (ft && ft->kind == TK_POINTER && ft->base_type &&
+                        ft->base_type->kind == TK_RECORD)
+                        return ft->base_type;
+                }
+            }
+            return NULL;
+        }
+        if (child->type == AST_FIELD_ACCESS) {
+            /* (rec.field)^ — resolve rec.field's type, which must be a pointer. */
+            type_desc_t *parent = lvalue_record_type(cg, child->children[0]);
+            if (parent) parent = repair_corrupt_record(cg, parent);
+            if (parent && parent->kind == TK_RECORD) {
+                for (int fi = 0; fi < parent->num_fields; fi++) {
+                    if (str_eq_nocase(parent->fields[fi].name, child->name)) {
+                        type_desc_t *ft = parent->fields[fi].type;
+                        if (ft && ft->kind == TK_POINTER && ft->base_type &&
+                            ft->base_type->kind == TK_RECORD)
+                            return ft->base_type;
+                        break;
+                    }
+                }
+            }
+            return NULL;
+        }
+        return NULL;
+    }
+    if (node->type == AST_FIELD_ACCESS) {
+        type_desc_t *parent = lvalue_record_type(cg, node->children[0]);
+        if (parent) parent = repair_corrupt_record(cg, parent);
+        if (parent && parent->kind == TK_RECORD) {
+            for (int fi = 0; fi < parent->num_fields; fi++) {
+                if (str_eq_nocase(parent->fields[fi].name, node->name)) {
+                    type_desc_t *ft = parent->fields[fi].type;
+                    if (ft && ft->kind == TK_POINTER && ft->base_type)
+                        ft = ft->base_type;
+                    return (ft && ft->kind == TK_RECORD) ? ft : NULL;
+                }
+            }
+        }
+        return NULL;
+    }
+    return NULL;
+}
+
+/* P82: resolve field metadata (offset + type) on an lvalue expression
+ * `parent.field`. Returns true on success. */
+static bool lvalue_field_info(codegen_t *cg, ast_node_t *parent_node,
+                              const char *field_name, int *out_offset,
+                              type_desc_t **out_type) {
+    type_desc_t *parent = lvalue_record_type(cg, parent_node);
+    if (!parent) return false;
+    parent = repair_corrupt_record(cg, parent);
+    for (int fi = 0; fi < parent->num_fields; fi++) {
+        if (str_eq_nocase(parent->fields[fi].name, field_name)) {
+            if (out_offset) *out_offset = parent->fields[fi].offset;
+            if (out_type) *out_type = parent->fields[fi].type;
+            return true;
+        }
+    }
+    return false;
+}
+
 /* P80f: repair a corrupt record type by finding the imported version.
  * Returns the repaired type, or the original if no repair is needed/possible. */
 static type_desc_t *repair_corrupt_record(codegen_t *cg, type_desc_t *rt) {
@@ -956,6 +1078,18 @@ static int expr_size(codegen_t *cg, ast_node_t *node) {
             return 2;
         }
         case AST_FIELD_ACCESS: {
+            /* P82: generic chain-aware size lookup — handles nested field
+             * accesses like `rec.sub.field` where the child is another
+             * AST_FIELD_ACCESS. Without this, expr_size defaulted to 2,
+             * causing MOVE.W instead of MOVE.L on 4-byte pointer fields
+             * in chains — see head_sdb.freechain.fwd_link in FIND_FREE. */
+            {
+                int _off = 0;
+                type_desc_t *_ft = NULL;
+                if (lvalue_field_info(cg, node->children[0], node->name,
+                                      &_off, &_ft) && _ft)
+                    return type_load_size(_ft);
+            }
             /* Look up the field type in the record.
              * Must handle both rec.field (IDENT_EXPR) and ptr^.field (DEREF). */
             type_desc_t *rt = NULL;
@@ -1281,6 +1415,18 @@ static void gen_lvalue_addr(codegen_t *cg, ast_node_t *node) {
         gen_lvalue_addr(cg, node->children[0]); /* record addr in A0 */
         /* Look up the field offset from the record type */
         int field_off = 0;
+        /* P82: generic chain-aware lookup — handles nested field accesses
+         * like c_mmrb^.head_sdb.freechain.fwd_link where the child is
+         * itself AST_FIELD_ACCESS. Falls through to the legacy case-by-case
+         * code below only if the generic resolver can't find the field. */
+        {
+            int off = 0;
+            type_desc_t *ft = NULL;
+            if (lvalue_field_info(cg, node->children[0], node->name, &off, &ft)) {
+                field_off = off;
+                goto emit_field_offset;
+            }
+        }
         if (node->children[0]->type == AST_IDENT_EXPR) {
             cg_symbol_t *rec_sym = find_symbol_any(cg, node->children[0]->name);
             if (rec_sym && rec_sym->type && rec_sym->type->kind == TK_RECORD) {
@@ -1385,6 +1531,7 @@ static void gen_lvalue_addr(codegen_t *cg, ast_node_t *node) {
                 }
             }
         }
+    emit_field_offset:
         /* ADDA.W #offset,A0 */
         if (field_off != 0) {
             emit16(cg, 0xD0FC);  /* ADDA.W #imm,A0 */

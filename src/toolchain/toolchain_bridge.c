@@ -811,9 +811,35 @@ build_result_t toolchain_build(const char *source_dir,
                     }
                 }
                 /* Phase 2: recompute field offsets (even if no NULL types were
-                 * found — a field's type may have changed size since last pass) */
+                 * found — a field's type may have changed size since last pass).
+                 * P82: variant-aware. variant_arm==0 is fixed; 1..N are variant
+                 * arms that overlap at variant_start. Without this, variant
+                 * records like codesdb (memchain + variants) get laid out
+                 * linearly, bloating total size and shifting later field
+                 * offsets (freechain was landing at the wrong offset so
+                 * FIND_FREE returned garbage pointers). */
                 int offset = 0;
+                int variant_start = -1;
+                int variant_max_end = 0;
+                int prev_arm = 0;
                 for (int fi = 0; fi < t->num_fields; fi++) {
+                    int arm = t->fields[fi].variant_arm;
+                    if (arm != 0 && prev_arm == 0) {
+                        /* Entering the variant region at this field */
+                        if (offset % 2) offset++;
+                        variant_start = offset;
+                        variant_max_end = offset;
+                    } else if (arm != 0 && arm != prev_arm) {
+                        /* Crossed an arm boundary — reset to variant_start */
+                        if (offset > variant_max_end) variant_max_end = offset;
+                        offset = variant_start;
+                    } else if (arm == 0 && prev_arm != 0) {
+                        /* Exited the variant region (unusual — fixed after variant) */
+                        if (offset > variant_max_end) variant_max_end = offset;
+                        offset = variant_max_end;
+                        variant_start = -1;
+                    }
+                    prev_arm = arm;
                     int fs = t->fields[fi].type ? t->fields[fi].type->size : 2;
                     if (t->fields[fi].type && t->fields[fi].type->kind == TK_STRING && (fs % 2)) fs++;
                     if (fs == 1 && t->fields[fi].type &&
@@ -823,6 +849,11 @@ build_result_t toolchain_build(const char *source_dir,
                     if (fs >= 2 && (offset % 2)) offset++;
                     t->fields[fi].offset = offset;
                     offset += fs;
+                }
+                /* If we were in a variant region at end, finalize it */
+                if (prev_arm != 0) {
+                    if (offset > variant_max_end) variant_max_end = offset;
+                    offset = variant_max_end;
                 }
                 if (offset % 2) offset++;
                 if (offset != t->size) {

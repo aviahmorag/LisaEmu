@@ -67,8 +67,19 @@ typedef struct type_desc {
         char type_name[12];  /* Original type name for re-resolution (8-char significant) */
         int offset;
         struct type_desc *type;
+        /* P82: variant record tracking.
+         * variant_arm = 0 for fixed fields, 1..N for fields in variant arm N.
+         * Pre-pass Phase-2 layout uses this to reset offset when crossing arm
+         * boundaries so variant arms overlap (Pascal CASE-in-record semantics).
+         * Without this, recomputed layouts lay arms out sequentially and
+         * downstream field offsets in e.g. codesdb.freechain get wrong. */
+        signed char variant_arm;
     } fields[64];
     int num_fields;
+    /* P82: variant layout bookkeeping. variant_start is the offset at which
+     * the variant region begins (i.e. first variant arm's first field offset).
+     * Used during Phase-2 fixup to correctly overlap arms. 0 when no variants. */
+    int variant_start;
 
     /* For pointers */
     struct type_desc *base_type;
