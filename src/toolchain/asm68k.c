@@ -1391,8 +1391,12 @@ static bool assemble_instruction(asm68k_t *as, const char *mnemonic, const char 
     /* ---- DBcc ---- */
     if (base[0] == 'D' && base[1] == 'B') {
         int cc = parse_cc(base + 2);
-        if (cc < 0 && str_eq_nocase(base + 2, "RA")) cc = 0;
-        if (cc < 0 && str_eq_nocase(base + 2, "F")) cc = 1;
+        /* DBRA and DBF are aliases — both encode cc=1 (False), so the loop
+         * continues until D[reg] underflows. Encoding as cc=0 (DBT) causes
+         * the loop to bail after a single iteration because DBT's condition
+         * is always TRUE → fall through to next instruction. */
+        if (cc < 0 && (str_eq_nocase(base + 2, "RA") ||
+                       str_eq_nocase(base + 2, "F"))) cc = 1;
         if (cc >= 0) {
             int32_t target = op2.disp;
             int32_t disp = target - (as->pc + 2);
