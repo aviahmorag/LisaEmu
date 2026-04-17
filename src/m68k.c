@@ -3096,6 +3096,46 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             }
         }
 
+        /* P89i — Defer first INTSON until SYS_PROC_INIT has reached.
+         *
+         * BOOT_IO_INIT's `INTSON(0)` at source-STARTUP:1977 enables
+         * interrupts before SYS_PROC_INIT has created the real system
+         * processes. The timer-tick IRQ then fires on POP (the pseudo-
+         * outer-process running INITSYS) whose `env_save_area` at
+         * `b_syslocal_ptr+6` was never populated — Apple doesn't call
+         * CreateProcess for POP. Scheduler → Launch → RTE pops a
+         * garbage PC ($010000CB observed) → hard_excep → SYSTEM_ERROR
+         * (10204). Skip INTSON until SYS_PROC_INIT is reached so the
+         * boot sequence can finish creating real processes before any
+         * timer interrupt dispatches.
+         *
+         * Calling convention: our codegen's call site pushes the 2-byte
+         * arg (MOVE.W D0,-(SP) = $3F00) and emits no post-JSR cleanup,
+         * so INTSON is callee-clean — body would end with a sequence
+         * equivalent to RTS #2. Skip path mirrors that: pop 4-byte
+         * return PC, then skip the 2-byte arg (SP += 6). */
+        {
+            static uint32_t pc_INTSON = 0;
+            static int intson_gen = -1;
+            if (intson_gen != g_emu_generation) {
+                pc_INTSON = boot_progress_lookup("INTSON");
+                intson_gen = g_emu_generation;
+            }
+            if (pc_INTSON && cpu->pc == pc_INTSON &&
+                !boot_progress_reached("SYS_PROC_INIT")) {
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                uint32_t ret = cpu_read32(cpu, sp);
+                cpu->a[7] = (cpu->a[7] + 6) & 0xFFFFFF;  /* pop 4-byte ret + 2-byte arg */
+                cpu->pc = ret;
+                DBGSTATIC(int, intson_skip_count, 0);
+                if (intson_skip_count++ < 4) {
+                    fprintf(stderr, "[P89i] INTSON deferred (SYS_PROC_INIT not reached) "
+                            "ret=$%06X SP=$%06X\n", ret, sp);
+                }
+                continue;
+            }
+        }
+
         /* P83b probe — CHECK_DS loop investigation. With the P83a guard
          * in place boot gets past FS_INIT then enters an infinite loop
          * between CHECK_DS ($043CAE) and INIT_SWAPIN ($045DFE). Log the
