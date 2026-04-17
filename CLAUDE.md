@@ -70,11 +70,78 @@ make audit-linker       # Stage 4: Full pipeline + linker
 cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' build 2>&1 | grep -E "(error:|BUILD)"
 ```
 
-## Current Status (2026-04-18 late — P89d root-caused to cross-module PCB layout skew)
+## Current Status (2026-04-18 late-late — P89d: two structural codegen bugs fixed, boot progresses past A5-clobbering Launch crash)
 
-22/27 with P89 codegen + 3 new structural fixes (uncommitted); 23/27 baseline.
-P89's regression is a long-latent cross-module field-offset bug newly exposed
-because P89 made MAP_SYSLOCAL's WITH body actually emit writes.
+22/27 milestones reached (same count as pre-session 22/27, but DIFFERENT
+failure mode: previously silent stack corruption in Launch crashed the CPU;
+now boot progresses past that and hits a NEW hard_excep blocker further in).
+Baseline (pre-P89) reaches 23/27 by accident.
+
+Five structural fixes landed this session (uncommitted):
+
+1. **main_sdl.c: fresh bundle artifact paths**. Previously loaded stale
+   `build/lisa_boot.rom`/`lisa_linked.map`/`lisa_profile.image` when the
+   toolchain writes to `build/rom/` and `build/LisaOS.lisa/`. All earlier
+   "22/27" reports were actually running stale code.
+
+2. **linker.c: LOADER-yields-to-non-LOADER rule** for duplicate ENTRY
+   symbols. LOADER and STARTUP both export `SETMMU` with different
+   signatures; kernel callers pass 5 args (STARTUP's signature), so
+   STARTUP's version needs to win the collision.
+
+3. **m68k.c: P89c smt_adr prime** on first SETMMU entry. LOADER's
+   BOOTINIT would have initialized LOADER's `smt_adr` VAR (A5-6112);
+   we skip BOOTINIT, so this lazy prime mimics what BOOTINIT would have
+   done.
+
+4. **pascal_codegen.c: P89d P80g-repair gate** on `fields[1].offset == 0`.
+   The post-creation record repair was matching by first-field-name only,
+   which merged structurally-similar but semantically-distinct records.
+   MMPRIM's `p_linkage` (2 × ptr_p_linkage, 8 bytes) was being overwritten
+   by DRIVERDEFS's `linkage` (2 × relptr, 4 bytes) because both start with
+   fwd_link/bkwd_link. That collapsed sdb's memaddr from offset 8 to
+   offset 4 in MMPRIM's compile. Fix: only apply the repair when the
+   local record's offsets actually look corrupt (fields[1].offset == 0).
+
+5. **pascal_codegen.c: find_proc_sig resolution tiering**. Previously
+   returned the first non-external sig, even if its `param_type[*]`
+   entries were NULL (unresolved). MAP_SYSLOCAL gets registered 4 times
+   in MMPRIM's compile — first with `c_pcb: ptr_pcb` unresolved
+   (param_size=2 fallback), later with ptr_PCB resolved (param_size=4).
+   The caller Scheduler was picking the unresolved sig, pushing c_pcb
+   as a WORD, which truncated the pointer and made MAP_SYSLOCAL's
+   MOVE.L 8(A6), D0 read garbage. New priority:
+   local-resolved > local-partial > imported-resolved > imported-partial
+   > external.
+
+### What the fixes unlocked
+
+Pre-fix: MAP_SYSLOCAL computed c_sysl_sdb = $CC7AB8 (uninitialized) from
+a byte-shifted c_pcb parameter, read memaddr=0, wrote origin=0 to
+SMT[seg 103], zeroing the syslocmmu mapping. Launch's RTE then read
+A5=$3F8 from the "env_save_area" (actually stomped TRAP6 vector in the
+now-unmapped syslocal region) and the CPU walked off into a CRASH TO
+VECTORS loop.
+
+Post-fix: MAP_SYSLOCAL reads c_sysl_sdb=$CCB4FA correctly, writes
+origin=$043B access=$07 limit=$20 to SMT[103]. Syslocmmu mapping is
+preserved. Launch completes. But a later path hits a hardware exception
+(vector 4, illegal instruction at odd PC=$00CC07 in user mode) handled
+by `hard_excep` → SYSTEM_ERROR(10201). SYS_PROC_INIT milestone still
+not reached (22/27 same as pre-fix, but progressed further into boot).
+
+### Next blocker: hard_excep (10201) at PC=$00CC07
+
+The CPU tries to execute at logical $00CC07 — an odd address inside
+seg 0 (in context 0 / start mode). Likely causes:
+- CreateProcess HLE stored wrong start_PC in env_save_area (maybe
+  byte-shifted again like the c_pcb push was).
+- Launch's RTE unwound to a wrong PC because the saved context is
+  still partially corrupted.
+- Some dispatched proc has a broken entry PC.
+
+Trace in `.claude-handoffs/` and NEXT_SESSION.md for the next session's
+plan.
 
 ### This session's structural fixes (uncommitted)
 

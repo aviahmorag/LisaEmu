@@ -977,6 +977,7 @@ build_result_t toolchain_build(const char *source_dir,
     fprintf(stderr, "Types-only pre-pass complete: %d shared types, %d shared globals (constants)\n",
             num_shared_types, num_shared_globals);
 
+
     /* Phase 1: Compile Pascal files — STARTUP last */
     int pascal_count = 0, pascal_ok = 0, pascal_fail = 0;
     for (int i = 0; i < num_files; i++) {

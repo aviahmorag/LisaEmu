@@ -621,12 +621,34 @@ static type_desc_t *resolve_type(codegen_t *cg, ast_node_t *node) {
              * pointer reads), all code using the pointer type gets wrong
              * offsets. Prevent this by COPYING offsets from the imported
              * version into the local record, so both are consistent. */
-            if (t->num_fields > 1 && cg->imported_types) {
-                /* Try to find matching imported record and copy its offsets */
+            if (t->num_fields > 1 && cg->imported_types &&
+                t->fields[1].offset == 0) {
+                /* Try to find matching imported record and copy its offsets.
+                 *
+                 * P89d: ONLY apply when local fields[1].offset == 0, which is
+                 * the corruption signature this repair was designed for.
+                 * Previously the repair fired for any local record with >1
+                 * fields whose first field name matched some imported
+                 * record's first field name, even when the local had valid
+                 * offsets. That merged structurally-similar but semantically-
+                 * distinct records: MMPRIM's `p_linkage` (2 × ptr_p_linkage,
+                 * 8 bytes) collided with DRIVERDEFS's `linkage` (2 × relptr,
+                 * 4 bytes) because both start with fwd_link/bkwd_link. The
+                 * loose match copied `linkage`'s offsets (0,2) over the
+                 * correct `p_linkage` layout (0,4), truncating sdb.memaddr
+                 * from offset 8 to offset 4 in MMPRIM's compile — which
+                 * propagated to MAP_SYSLOCAL reading c_sysl_sdb^.memaddr
+                 * from the wrong byte and writing origin=0 into
+                 * SMT[syslocmmu], zeroing the syslocal MMU mapping at boot
+                 * (1-milestone regression blocking SYS_PROC_INIT).
+                 *
+                 * Records we walked successfully have fields[1].offset > 0
+                 * (the first non-zero layout), so they don't need repair. */
                 for (int it = 0; it < cg->imported_types_count; it++) {
                     type_desc_t *imp = &cg->imported_types[it];
                     if (imp->kind != TK_RECORD || imp->num_fields != t->num_fields) continue;
-                    /* Match by first field name */
+                    /* Match by first field name (local has no name at this
+                     * point — AST_TYPE_DECL sets it after this returns). */
                     if (!str_eq_nocase(imp->fields[0].name, t->fields[0].name)) continue;
                     if (imp->num_fields > 1 && imp->fields[1].offset > 0) {
                         /* Copy offsets from imported to local */
@@ -1090,6 +1112,9 @@ static bool lvalue_field_info_full(codegen_t *cg, ast_node_t *parent_node,
             if (out_type) *out_type = parent->fields[fi].type;
             if (out_bit_offset) *out_bit_offset = parent->fields[fi].bit_offset;
             if (out_bit_width) *out_bit_width = parent->fields[fi].bit_width;
+            /* P89d probe — log every slocal_sdbRP field resolution with the
+             * parent record's name and layout snapshot, to diagnose
+             * cross-module PCB layout skew. */
             return true;
         }
     }
@@ -4539,32 +4564,68 @@ static void register_proc_sig(codegen_t *cg, const char *name, ast_node_t *param
     }
 }
 
+/* Helper — does this sig have all params resolved to non-null types? */
+static bool sig_is_fully_resolved(cg_proc_sig_t *sig) {
+    for (int j = 0; j < sig->num_params; j++) {
+        if (!sig->param_type[j]) return false;
+    }
+    return true;
+}
+
 /* Look up a procedure signature by name.
- * Multiple entries may exist (e.g., an EXTERNAL declaration from one unit
- * plus the body from another unit). Prefer the entry with is_external=false
- * if any — the body is the authoritative definition. */
+ *
+ * Priority (most to least preferred):
+ *   1. Local non-external with all params resolved.
+ *   2. Local non-external (params may be partial).
+ *   3. Imported non-external with all params resolved.
+ *   4. Imported non-external (params may be partial).
+ *   5. Any external declaration (forward decl).
+ *
+ * P89d: added the "fully resolved" tier. Without it, the first non-external
+ * entry wins even if its param_type[*] are NULL (forward-decl parsed before
+ * the param's type was known). For MAP_SYSLOCAL(c_pcb: ptr_pcb) that meant
+ * Scheduler's cross-unit call pushed c_pcb as a WORD (param_size=2 fallback
+ * for unresolved ptype), truncating the pointer and making MAP_SYSLOCAL
+ * read junk via the MMU-mapped frame. With this fix, Scheduler picks the
+ * later registration where ptr_PCB resolved to a 4-byte pointer. */
 static cg_proc_sig_t *find_proc_sig(codegen_t *cg, const char *name) {
+    cg_proc_sig_t *local_partial = NULL;
+    cg_proc_sig_t *imp_resolved = NULL;
+    cg_proc_sig_t *imp_partial = NULL;
     cg_proc_sig_t *fallback = NULL;
     /* Search local signatures */
     if (cg->proc_sigs) {
         for (int i = 0; i < cg->num_proc_sigs; i++) {
-            if (strcasecmp(cg->proc_sigs[i].name, name) == 0) {
-                if (!cg->proc_sigs[i].is_external) return &cg->proc_sigs[i];
-                if (!fallback) fallback = &cg->proc_sigs[i];
+            cg_proc_sig_t *s = &cg->proc_sigs[i];
+            if (strcasecmp(s->name, name) != 0) continue;
+            if (!s->is_external) {
+                if (sig_is_fully_resolved(s)) return s;   /* tier 1 */
+                if (!local_partial) local_partial = s;
+            } else if (!fallback) {
+                fallback = s;
             }
         }
     }
+    if (local_partial) return local_partial;              /* tier 2 */
     /* Search imported signatures */
     if (cg->imported_proc_sigs) {
         for (int i = 0; i < cg->imported_proc_sigs_count; i++) {
-            if (strcasecmp(cg->imported_proc_sigs[i].name, name) == 0) {
-                if (!cg->imported_proc_sigs[i].is_external) return &cg->imported_proc_sigs[i];
-                if (!fallback) fallback = &cg->imported_proc_sigs[i];
+            cg_proc_sig_t *s = &cg->imported_proc_sigs[i];
+            if (strcasecmp(s->name, name) != 0) continue;
+            if (!s->is_external) {
+                if (sig_is_fully_resolved(s)) {
+                    if (!imp_resolved) imp_resolved = s;
+                } else if (!imp_partial) {
+                    imp_partial = s;
+                }
+            } else if (!fallback) {
+                fallback = s;
             }
         }
     }
-    if (fallback) return fallback;
-    return NULL;
+    if (imp_resolved) return imp_resolved;                /* tier 3 */
+    if (imp_partial) return imp_partial;                  /* tier 4 */
+    return fallback;                                      /* tier 5 or NULL */
 }
 
 bool codegen_generate(codegen_t *cg, ast_node_t *ast) {
