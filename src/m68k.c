@@ -2952,6 +2952,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         static uint32_t pc_QUEUE_PR, pc_GETSPACE, pc_Wait_sem, pc_MM_Setup;
         static uint32_t pc_unitio, pc_UNLOCKSEGS, pc_Signal_sem, pc_Make_File;
         static uint32_t pc_SplitPathname, pc_MAKE_SYSDATASEG;
+        static uint32_t pc_MERGE_FREE;
         static int hle_pc_gen = -1;
         if (hle_pc_gen != g_emu_generation) {
             pc_FS_CLEANUP    = boot_progress_lookup("FS_CLEANUP");
@@ -2970,8 +2971,79 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             pc_Make_File     = boot_progress_lookup("Make_File");
             pc_SplitPathname = boot_progress_lookup("SplitPathname");
             pc_MAKE_SYSDATASEG = boot_progress_lookup("MAKE_SYSDATASEG");
+            pc_MERGE_FREE    = boot_progress_lookup("MERGE_FREE");
             hle_pc_gen = g_emu_generation;
         }
+
+        /* P83a HLE guard — MERGE_FREE must only merge when c_sdb_ptr is
+         * itself a free region. Apple's source comment says "merge two
+         * adjacent free regions" but the code has no guard; when
+         * INSERTSDB calls MERGE_FREE(left_sdb) after the first MAKE_FREE
+         * (free chain empty → the walk lands on head_sdb), the loop
+         * condition evaluates TRUE because head.freechain.fwd_link was
+         * just written by P_ENQUEUE to point at the new free sdb. The
+         * body then does `memsize := memsize + right_sdb.memsize` inside
+         * `with head_sdb^ do`, scribbling head.memsize and then TAKE_FREE
+         * removes the just-inserted free sdb. Result: free chain empty,
+         * head.memsize non-zero → downstream GetFree returns head as
+         * "last free sdb", TAKE_FREE assertion fires SYSTEM_ERROR(10598).
+         * Skip MERGE_FREE body whenever c_sdb_ptr.sdbtype != free.
+         * With this guard the SYSTEM_ERROR is averted, but boot then
+         * stalls in a CHECK_DS/INIT_SWAPIN loop — the next blocker. */
+        if (pc_MERGE_FREE && cpu->pc == pc_MERGE_FREE) {
+            uint32_t sp = cpu->a[7] & 0xFFFFFF;
+            uint32_t c_sdb = cpu_read32(cpu, sp + 4);
+            if (c_sdb >= 0x00CC0000 && c_sdb < 0x00E00000) {
+                uint8_t sdbtype = cpu_read8(cpu, c_sdb + 13);
+                if (sdbtype != 0 /* Tsdbtype.free */) {
+                    DBGSTATIC(int, mf_guard_count, 0);
+                    if (mf_guard_count < 4) {
+                        mf_guard_count++;
+                        fprintf(stderr, "[P83a] MERGE_FREE skipped (c_sdb_ptr=$%08X sdbtype=$%02X != free)\n",
+                                c_sdb, sdbtype);
+                    }
+                    uint32_t ret = cpu_read32(cpu, sp);
+                    cpu->a[7] = (cpu->a[7] + 4) & 0xFFFFFF;
+                    cpu->pc = ret;
+                    continue;
+                }
+            }
+        }
+
+        /* P83b probe — CHECK_DS loop investigation. With the P83a guard
+         * in place boot gets past FS_INIT then enters an infinite loop
+         * between CHECK_DS ($043CAE) and INIT_SWAPIN ($045DFE). Log the
+         * first few CHECK_DS entries to see which sdb is being swapped
+         * in and why sdbstate.memoryF isn't becoming true. */
+        {
+            static uint32_t pc_CHECK_DS = 0;
+            static int pc_CHECK_DS_gen = -1;
+            if (pc_CHECK_DS_gen != g_emu_generation) {
+                pc_CHECK_DS = boot_progress_lookup("CHECK_DS");
+                pc_CHECK_DS_gen = g_emu_generation;
+            }
+            DBGSTATIC(int, check_ds_count, 0);
+            if (pc_CHECK_DS && cpu->pc == pc_CHECK_DS && check_ds_count < 3) {
+                check_ds_count++;
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                uint32_t ret_pc = cpu_read32(cpu, sp);
+                uint32_t c_sdb = cpu_read32(cpu, sp + 4);
+                fprintf(stderr, "[P83b] CHECK_DS#%d entry ret=$%06X c_sdb_ptr=$%08X\n",
+                        check_ds_count, ret_pc, c_sdb);
+                if (c_sdb >= 0x00AA0000 && c_sdb < 0x00E00000) {
+                    /* sdbstate is variant-header offset 14. memoryF is
+                     * bit 7 of the first byte (per MMASM: MEMORYF=7). */
+                    uint8_t sdbstate0 = cpu_read8(cpu, c_sdb + 14);
+                    fprintf(stderr, "      c_sdb: memaddr=$%04X memsize=$%04X sdbtype=$%02X sdbstate[0]=$%02X (memoryF=bit7) newlength=$%04X\n",
+                            cpu_read16(cpu, c_sdb + 8),
+                            cpu_read16(cpu, c_sdb + 10),
+                            cpu_read8(cpu,  c_sdb + 13),
+                            sdbstate0,
+                            cpu_read16(cpu, c_sdb + 32));
+                }
+            }
+        }
+
         /* P37 HLE bypass: FS_CLEANUP (fsinit.text:136). Fires the
          * milestone on entry then bypasses — its body crashes into
          * $F8xxxx wild-PC space because downstream calls hit a
