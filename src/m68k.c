@@ -3192,6 +3192,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             static uint32_t pc_FlushNodes = 0, pc_InitBufPool = 0, pc_InitBuf = 0;
             static uint32_t pc_MAP_SEGMENT = 0, pc_PROG_MMU = 0;
             static uint32_t pc_QUEUE_PR = 0;
+            static uint32_t pc_RELSPACE = 0, pc_GETSPACE_p85 = 0;
             static int pc_gen_p85 = -1;
             if (pc_gen_p85 != g_emu_generation) {
                 pc_FlushNodes = boot_progress_lookup("FlushNodes");
@@ -3200,6 +3201,8 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 pc_MAP_SEGMENT = boot_progress_lookup("MAP_SEGMENT");
                 pc_PROG_MMU = boot_progress_lookup("PROG_MMU");
                 pc_QUEUE_PR = boot_progress_lookup("QUEUE_PR");
+                pc_RELSPACE = boot_progress_lookup("RELSPACE");
+                pc_GETSPACE_p85 = boot_progress_lookup("GETSPACE");
                 pc_gen_p85 = g_emu_generation;
             }
             DBGSTATIC(int, p85_initbuf_count, 0);
@@ -3208,6 +3211,65 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             DBGSTATIC(int, p85_ms_count, 0);
             DBGSTATIC(int, p85_pm_count, 0);
             DBGSTATIC(int, p85_qp_count, 0);
+            DBGSTATIC(int, p85_rel_count, 0);
+            DBGSTATIC(int, p85_gs_count, 0);
+
+            /* RELSPACE(ordaddr: absptr; b_area: absptr). Probe fires at LINK
+             * entry before A6 is set up, so read args from SP: sp+0=ret,
+             * sp+4=ordaddr (pushed last by caller), sp+8=b_area.
+             *
+             * P85d HLE GUARD: if ordaddr = badptr1 ($414231), the caller
+             * passed the "no device mounted / not initialized" sentinel —
+             * Apple's def_unmount doesn't guard MDDFdata against badptr1
+             * before calling relspace, which is fine on real HW where mount
+             * always completes before unmount, but not in our init flow
+             * where HLE'd boot-device handling (10738) short-circuits mount.
+             * Skip the call and return cleanly with the 8 bytes of args
+             * still to be popped by the caller's ADDQ #8,A7. */
+            if (pc_RELSPACE && cpu->pc == pc_RELSPACE) {
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                uint32_t ret = cpu_read32(cpu, sp);
+                uint32_t ordaddr = cpu_read32(cpu, sp + 4);
+                uint32_t b_area  = cpu_read32(cpu, sp + 8);
+                if (p85_rel_count < 12) {
+                    p85_rel_count++;
+                    uint32_t c_pool_ptr = 0;
+                    if (b_area >= 0x000400 && b_area < 0x00F00000)
+                        c_pool_ptr = cpu_read32(cpu, b_area);
+                    fprintf(stderr, "[P85] RELSPACE#%d ret=$%06X ordaddr=$%08X b_area=$%08X *b_area=$%08X A5=$%06X\n",
+                            p85_rel_count, ret, ordaddr, b_area, c_pool_ptr,
+                            cpu->a[5] & 0xFFFFFF);
+                }
+                if (ordaddr == 0x00414231u) {
+                    static int p85d_skip_count = 0;
+                    if (p85d_skip_count++ < 4)
+                        fprintf(stderr, "[P85d] RELSPACE guard: skipping ordaddr=badptr1 ret=$%06X\n", ret);
+                    /* Pop ret + restore PC + advance. Leave args on stack for
+                     * caller's ADDQ #8,A7 (both call sites do this). */
+                    cpu->pc = ret;
+                    cpu->a[7] = (cpu->a[7] + 4) & 0xFFFFFF;
+                    continue;
+                }
+            }
+
+            /* GETSPACE(amount: int2; b_area: absptr; VAR ordaddr): boolean.
+             * Pascal convention: caller pushes right-to-left, so amount (2 bytes)
+             * is on top: sp+0=ret, sp+4=amount (int2 word), sp+6=b_area (4),
+             * sp+10=@ordaddr (4). */
+            if (pc_GETSPACE_p85 && cpu->pc == pc_GETSPACE_p85 && p85_gs_count < 12) {
+                p85_gs_count++;
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                uint32_t ret = cpu_read32(cpu, sp);
+                uint16_t amount = cpu_read16(cpu, sp + 4);
+                uint32_t b_area = cpu_read32(cpu, sp + 6);
+                uint32_t pordaddr = cpu_read32(cpu, sp + 10);
+                uint32_t c_pool_ptr = 0;
+                if (b_area >= 0x000400 && b_area < 0x00F00000)
+                    c_pool_ptr = cpu_read32(cpu, b_area);
+                fprintf(stderr, "[P85] GETSPACE#%d ret=$%06X amount=%u b_area=$%08X *b_area=$%08X &ordaddr=$%08X A5=$%06X\n",
+                        p85_gs_count, ret, amount, b_area, c_pool_ptr, pordaddr,
+                        cpu->a[5] & 0xFFFFFF);
+            }
 
             /* QUEUE_PR is an asm proc (source-PROCASM.TEXT) that pops
              * D0=retaddr, D1.B=queue, A1=pcb_ptr from the stack before
