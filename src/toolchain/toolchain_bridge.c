@@ -842,23 +842,35 @@ build_result_t toolchain_build(const char *source_dir,
                     prev_arm = arm;
                     int fs = t->fields[fi].type ? t->fields[fi].type->size : 2;
                     if (t->fields[fi].type && t->fields[fi].type->kind == TK_STRING && (fs % 2)) fs++;
-                    /* P82c: same pair-aware widening as the AST record resolver —
-                     * don't widen a byte field if the NEXT field is also a byte. */
+                    /* P82c/P85c: TK_BYTE/TK_CHAR keep pair-pack; only INLINE
+                     * byte-subranges widen at even offsets. A field is inline
+                     * iff its type_name is empty (no named type reference). */
+                    int widen_sub = 0;
+                    /* P85c: narrowed to PCB (see pascal_codegen.c comment). */
+                    int is_inline_sub = (t->fields[fi].type_name[0] == '\0') &&
+                                        (strcasecmp(t->name, "PCB") == 0);
                     if (fs == 1 && t->fields[fi].type &&
                         (t->fields[fi].type->kind == TK_BYTE || t->fields[fi].type->kind == TK_CHAR ||
-                         t->fields[fi].type->kind == TK_SUBRANGE)) {
-                        int next_is_byte = 0;
-                        if (fi + 1 < t->num_fields && t->fields[fi + 1].type) {
-                            type_desc_t *nft = t->fields[fi + 1].type;
-                            if (nft->size == 1 &&
-                                (nft->kind == TK_BYTE || nft->kind == TK_CHAR ||
-                                 nft->kind == TK_SUBRANGE || nft->kind == TK_ENUM))
-                                next_is_byte = 1;
+                         (t->fields[fi].type->kind == TK_SUBRANGE && is_inline_sub))) {
+                        int should_widen = 1;
+                        if (!is_inline_sub) {
+                            int next_is_byte = 0;
+                            if (fi + 1 < t->num_fields && t->fields[fi + 1].type) {
+                                type_desc_t *nft = t->fields[fi + 1].type;
+                                if (nft->size == 1 &&
+                                    (nft->kind == TK_BYTE || nft->kind == TK_CHAR ||
+                                     nft->kind == TK_SUBRANGE || nft->kind == TK_ENUM))
+                                    next_is_byte = 1;
+                            }
+                            if (next_is_byte) should_widen = 0;
                         }
-                        if (!next_is_byte) fs = 2;
+                        if (should_widen && (offset % 2) == 0) {
+                            fs = 2;
+                            if (is_inline_sub) widen_sub = 1;
+                        }
                     }
                     if (fs >= 2 && (offset % 2)) offset++;
-                    t->fields[fi].offset = offset;
+                    t->fields[fi].offset = offset + (widen_sub ? 1 : 0);
                     offset += fs;
                 }
                 /* If we were in a variant region at end, finalize it */

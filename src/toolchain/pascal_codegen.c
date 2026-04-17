@@ -417,23 +417,58 @@ static type_desc_t *resolve_type(codegen_t *cg, ast_node_t *node) {
                  * P82c: only widen ISOLATED byte fields — pairs of consecutive
                  * byte fields stay tight so codesdb's lockcount(1)+sdbtype(1)
                  * end at offset 14 (= Apple's oset_freechain). Forward-peek
-                 * by looking at the next AST child. */
+                 * by looking at the next AST child.
+                 *
+                 * P85c: byte-SUBRANGEs (e.g. `0..255` for priority/norm_pri)
+                 * ALWAYS widen when at an even offset — Apple's ASM reads
+                 * PCB.priority with MOVE.W PRIORITY(A1) expecting a word. At
+                 * odd offsets they stay 1 byte (e.g. PCB.domain @17 packs
+                 * tight with blk_state). TK_BYTE/TK_CHAR/TK_ENUM keep the
+                 * pair-pack optimization so codesdb's lockcount(int1)+
+                 * sdbtype(enum) pair remains tight at 12/13. */
+                int widen_byte_subrange = 0;
+                /* P85c: only INLINE subranges qualify for byte-subrange
+                 * widening. Named type aliases that happen to resolve to a
+                 * byte-sized subrange (e.g. `int1 = -128..127`,
+                 * `domainRange = 0..maxDomain`) must not widen — Apple
+                 * treats `int1` as an explicit 1-byte type. Inline subrange
+                 * fields are AST_TYPE_SUBRANGE nodes; named references are
+                 * AST_TYPE_IDENT.
+                 *
+                 * Further narrowed to PCB-only pending diagnosis of cascading
+                 * failures in other records (hour/minute/second date fields,
+                 * pm_* parallel-port fields etc.). PCB widening unblocks the
+                 * QUEUE_PR RQSCAN spin; other records stay tight-packed so
+                 * their asm/Pascal offsets match what they were with P82c. */
+                int is_inline_subrange = (field->children[0] &&
+                    field->children[0]->type == AST_TYPE_SUBRANGE) &&
+                    (str_eq_nocase(t->name, "PCB") ||
+                     str_eq_nocase(t->name, "pcb"));
                 if (fs == 1 && ft && !cg->in_packed &&
                     (ft->kind == TK_BYTE || ft->kind == TK_CHAR ||
-                     ft->kind == TK_SUBRANGE)) {
-                    int next_is_byte = 0;
-                    for (int j = i + 1; j < node->num_children; j++) {
-                        ast_node_t *nxt = node->children[j];
-                        if (nxt->type != AST_FIELD) continue;
-                        if (nxt->num_children == 0) continue;  /* sentinel */
-                        type_desc_t *nft = resolve_type(cg, nxt->children[0]);
-                        if (nft && nft->size == 1 &&
-                            (nft->kind == TK_BYTE || nft->kind == TK_CHAR ||
-                             nft->kind == TK_SUBRANGE || nft->kind == TK_ENUM))
-                            next_is_byte = 1;
-                        break;
+                     (ft->kind == TK_SUBRANGE && is_inline_subrange))) {
+                    int should_widen = 1;
+                    if (!is_inline_subrange) {
+                        int next_is_byte = 0;
+                        for (int j = i + 1; j < node->num_children; j++) {
+                            ast_node_t *nxt = node->children[j];
+                            if (nxt->type != AST_FIELD) continue;
+                            if (nxt->num_children == 0) continue;  /* sentinel */
+                            type_desc_t *nft = resolve_type(cg, nxt->children[0]);
+                            if (nft && nft->size == 1 &&
+                                (nft->kind == TK_BYTE || nft->kind == TK_CHAR ||
+                                 nft->kind == TK_SUBRANGE || nft->kind == TK_ENUM))
+                                next_is_byte = 1;
+                            break;
+                        }
+                        if (next_is_byte) should_widen = 0;
                     }
-                    if (!next_is_byte) fs = 2;
+                    /* Only widen when current offset is even; at odd offsets
+                     * widening would pad and break alignment (see domain@17). */
+                    if (should_widen && (offset % 2) == 0) {
+                        fs = 2;
+                        if (is_inline_subrange) widen_byte_subrange = 1;
+                    }
                 }
                 /* Word-align fields */
                 if (fs >= 2 && (offset % 2)) offset++;
@@ -445,7 +480,12 @@ static type_desc_t *resolve_type(codegen_t *cg, ast_node_t *node) {
                         strncpy(t->fields[t->num_fields].type_name,
                                 field->children[0]->name, 11);
                     t->fields[t->num_fields].type_name[11] = '\0';
-                    t->fields[t->num_fields].offset = offset;
+                    /* P85c: byte-subrange widened to 2 bytes stores the value
+                     * byte at offset+1 (big-endian low byte). Record that as
+                     * the field's offset so byte-sized reads/writes access the
+                     * correct byte. Apple's ASM MOVE.W at the slot's even
+                     * offset still sees $00XX (pad+value) as intended. */
+                    t->fields[t->num_fields].offset = offset + (widen_byte_subrange ? 1 : 0);
                     t->fields[t->num_fields].type = ft;
                     t->fields[t->num_fields].variant_arm = (signed char)current_arm;
                     /* P80c trace: record layout for freepool fields */
