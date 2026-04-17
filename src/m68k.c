@@ -3848,23 +3848,9 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
          * Signature: procedure Make_File(var ecode: error; var path:
          * pathname; label_size: integer) — Pascal callee-clean.
          * Stack: retPC(4) + label_size(2) + path_ptr(4) + ecode_ptr(4). */
-        if (pc_Make_File && cpu->pc == pc_Make_File) {
-            uint32_t sp = cpu->a[7] & 0xFFFFFF;
-            uint32_t ret = cpu_read32(cpu, sp);
-            /* ecode_ptr is the deepest arg (pushed first, leftmost param).
-             * Stack layout: retPC, label_size(2), path_ptr(4), ecode_ptr(4) */
-            uint32_t ecode_ptr = cpu_read32(cpu, sp + 10) & 0xFFFFFF;
-            /* P79: validate pointer before writing */
-            if (ecode_ptr >= 0x1000 && ecode_ptr < 0x240000)
-                cpu_write16(cpu, ecode_ptr, 0);  /* ecode = 0 = success */
-            cpu->a[7] += 4 + 2 + 4 + 4;  /* pop retPC + all args */
-            cpu->pc = ret;
-            DBGSTATIC(int, mf_count, 0);
-            if (mf_count++ < 5)
-                fprintf(stderr, "[HLE-Make_File #%d] bypassed, ecode_ptr=$%06X → 0\n",
-                        mf_count, ecode_ptr);
-            continue;
-        }
+        /* P81c: Make_File HLE bypass DISABLED. The DecompPath/SplitPathname
+         * garbage-write path that motivated it was a static-link symptom;
+         * natural body works now. */
         /* P81a: Signal_sem HLE bypass DISABLED. The "garbage wait_queue
          * (code addresses like BUS_ERR)" was likely a downstream symptom
          * of the static-link bug corrupting semaphore initialization.
