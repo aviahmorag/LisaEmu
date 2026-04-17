@@ -70,7 +70,67 @@ make audit-linker       # Stage 4: Full pipeline + linker
 cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' build 2>&1 | grep -E "(error:|BUILD)"
 ```
 
-## Current Status (2026-04-17 night) — P85a fixes FlushNodes spin; QUEUE_PR is the new blocker
+## Current Status (2026-04-17 late) — P85c fixes QUEUE_PR spin; FS_INIT body fails
+
+Build + audit green. 22/27 milestones. Boot reaches FS_INIT, the
+scheduler now dispatches (QUEUE_PR RQSCAN exits correctly), but
+FS_INIT's body then hits SYSTEM_ERROR(10707) suppressed and
+SYSTEM_ERROR(10701) fatal — "nospace during Startup". Path: GETSPACE
+via RELSPACE hits UNMAPPED writes to seg 32 ($414000..$41FFFF).
+
+### P85c — inline byte-subrange fields widen to 2 bytes (src/toolchain/pascal_codegen.c:421, toolchain_bridge.c:845)
+
+Apple's PASCALDEFS insists PRIORITY=12, DOMAIN=17, GLOB_ID=20 in
+PCB. That layout only fits if `priority: 0..255` and `norm_pri:
+0..255` each occupy a 2-byte slot with the value byte at the low
+(big-endian +1) byte; `blk_state: blk_type` + `domain: domainRange`
+then pack 1+1 at offsets 16/17. Before P85c, our tight byte-packing
+put priority at offset 12 (high byte) and norm_pri at 13 — so
+QUEUE_PR's `MOVE.W PRIORITY(A0),D1` read $FF00 (-256 signed), BLE.S
+RQSCAN always took, scheduler spun forever at PC=$06EB46.
+
+Fix: widen INLINE byte-subranges (AST_TYPE_SUBRANGE, empty type_name)
+to 2 bytes at even offsets, and record the field offset as slot+1 so
+our byte reads/writes access the value byte while Apple's MOVE.W
+still sees $00XX. Named subrange aliases (e.g. `int1 = -128..127`,
+`domainRange = 0..maxDomain`) keep the prior pair-pack behavior — int1
+is Apple's explicit 1-byte type, so codesdb's lockcount(int1)+
+sdbtype(Tsdbtype) still pack tight at 12/13 and oset_freechain=14 holds.
+
+Currently narrowed to records named `PCB` only. Generalizing to
+all inline subranges produced the same cascading FS_INIT failure
+as last session's P85b attempt, suggesting the cascade is NOT caused
+by widening other records — it's a latent bug that's newly reachable
+once the scheduler dispatches. See next-session notes.
+
+### Current blocker: SYSTEM_ERROR(10701) via FS_INIT → RELSPACE
+
+Post-P85c boot runs:
+1. QUEUE_PR#1..#8 fire with PCB=$CCB58E (Signal_sem waking up FS).
+2. HLE SYSTEM_ERROR(10707) at ret=$002D0C suppressed (FS init failed).
+3. HLE SYSTEM_ERROR(10701) at ret=$005506 fatal (nospace in STARTUP
+   / BOOT_IO_INIT).
+
+Between (1)–(2), RELSPACE emits 14 UNMAPPED-WRITEs targeting
+$41422F..$414234 (seg 32). Addresses suggest c_pool_ptr resolves to
+$414230-ish, but seg 32 was never programmed via PROG_MMU during
+init — PROG_MMU#1..#20 cover indices 85-100 / 125 (init-time
+segments), #21 is seg 60 (FlushNodes buffer pool). Nothing maps seg 32.
+
+Start next session:
+- Trace RELSPACE entry: what ordaddr/b_area is passed when the bad
+  writes start? A probe in lisa_bridge or an HLE stub that dumps
+  args on first RELSPACE call will show the caller intent.
+- Is seg 32 supposed to be mapped? Check what domain/LDSN the FS
+  init code expects for its syslocal/sysglobal free pools, and
+  whether PROG_MMU should have been called for seg 32 earlier.
+- If FS_INIT needs a specific domain/LDSN and our scheduler
+  dispatched with wrong env_save_area, fix CreateProcess or the
+  initial PCB/syslocal setup.
+
+---
+
+## Previous status (2026-04-17 night) — P85a fixes FlushNodes spin; QUEUE_PR WAS the blocker
 
 Build + audit green. 22/27 milestones. Boot reaches FS_INIT,
 progresses past the prior FlushNodes buffer-pool spin, runs into
