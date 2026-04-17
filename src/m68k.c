@@ -3341,10 +3341,14 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 uint32_t sp = cpu->a[7] & 0xFFFFFF;
                 uint32_t ret = cpu_read32(cpu, sp);
                 uint32_t a5 = cpu->a[5] & 0xFFFFFF;
-                uint32_t ptrHot_addr = (a5 + (int32_t)(int16_t)0xDF9A) & 0xFFFFFF;
-                uint32_t ptrHot_val = cpu_read32(cpu, ptrHot_addr);
-                fprintf(stderr, "[P85] InitBufPool#%d entry ret=$%06X A5=$%06X ptrHot@$%06X=$%08X\n",
-                        p85_initbuf_count, ret, a5, ptrHot_addr, ptrHot_val);
+                /* Post-P86 linker fix: ptrCold at -8296, ptrHot at -8292. */
+                uint32_t ptrHot_addr  = (a5 - 8292) & 0xFFFFFF;
+                uint32_t ptrCold_addr = (a5 - 8296) & 0xFFFFFF;
+                uint32_t ptrHot_val  = cpu_read32(cpu, ptrHot_addr);
+                uint32_t ptrCold_val = cpu_read32(cpu, ptrCold_addr);
+                fprintf(stderr, "[P85] InitBufPool#%d entry ret=$%06X A5=$%06X ptrHot@$%06X=$%08X ptrCold@$%06X=$%08X\n",
+                        p85_initbuf_count, ret, a5,
+                        ptrHot_addr, ptrHot_val, ptrCold_addr, ptrCold_val);
             }
 
             if (pc_FlushNodes && cpu->pc == pc_FlushNodes && p85_flush_count < 2) {
@@ -3355,8 +3359,9 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 uint16_t clear  = cpu_read16(cpu, sp + 6);
                 uint32_t ecode_ref = cpu_read32(cpu, sp + 8);
                 uint32_t a5 = cpu->a[5] & 0xFFFFFF;
-                uint32_t ptrHot_addr  = (a5 + (int32_t)(int16_t)0xDF9A) & 0xFFFFFF;
-                uint32_t ptrCold_addr = (a5 + (int32_t)(int16_t)0xDF96) & 0xFFFFFF;
+                /* Post-P86 linker fix: ptrCold at -8296, ptrHot at -8292. */
+                uint32_t ptrHot_addr  = (a5 - 8292) & 0xFFFFFF;
+                uint32_t ptrCold_addr = (a5 - 8296) & 0xFFFFFF;
                 uint32_t ptrHot_val  = cpu_read32(cpu, ptrHot_addr);
                 uint32_t ptrCold_val = cpu_read32(cpu, ptrCold_addr);
                 fprintf(stderr, "[P85] FlushNodes#%d entry ret=$%06X device=$%04X clear=$%04X ecode_ref=$%08X A5=$%06X ptrHot=$%08X ptrCold=$%08X\n",
@@ -3385,6 +3390,93 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 } else {
                     fprintf(stderr, "       ptrHot looks unset/invalid — pool probably not initialized\n");
                 }
+            }
+        }
+
+        /* P86 — probes for post-FS_INIT flow. The boot now runs 300 frames
+         * cleanly but never reaches SYS_PROC_INIT. Execution ends up at
+         * user-space PCs ($0118xxxx) spinning on F-line traps. Three
+         * possibilities:
+         *   (a) BOOT_IO_INIT never returns to INITSYS (for-loop hangs)
+         *   (b) INITSYS returns but doesn't call SYS_PROC_INIT (codegen
+         *       skipped the call, or took a different path)
+         *   (c) Scheduler dispatches a garbage process whose env_save_area
+         *       is corrupt (c_pcb_ptr or b_syslocal_ptr points wrong)
+         * Probe at INITSYS-body-post-BOOT_IO_INIT, Sys_Proc_Init entry,
+         * Scheduler entry, and Launch entry to localize. */
+        {
+            static uint32_t pc_Scheduler = 0, pc_Launch = 0, pc_Sys_Proc_Init = 0;
+            static uint32_t pc_INITSYS = 0;
+            static int pc_gen_p86 = -1;
+            if (pc_gen_p86 != g_emu_generation) {
+                pc_Scheduler     = boot_progress_lookup("Scheduler");
+                pc_Launch        = boot_progress_lookup("Launch");
+                pc_Sys_Proc_Init = boot_progress_lookup("Sys_Proc_Init");
+                pc_INITSYS       = boot_progress_lookup("INITSYS");
+                pc_gen_p86 = g_emu_generation;
+            }
+            DBGSTATIC(int, p86_sched_count, 0);
+            DBGSTATIC(int, p86_launch_count, 0);
+            DBGSTATIC(int, p86_spi_count, 0);
+
+            /* Scheduler entry — log c_pcb_ptr, b_syslocal_ptr, invoke_sched.
+             * Scheduler is at $05DAE8 per map. It saves caller state, calls
+             * SelectProcess, then Launch. */
+            if (pc_Scheduler && cpu->pc == pc_Scheduler && p86_sched_count < 6) {
+                p86_sched_count++;
+                uint32_t a5 = cpu->a[5] & 0xFFFFFF;
+                uint32_t cpcb = cpu_read32(cpu, (a5 - 24617) & 0xFFFFFF);
+                uint32_t bsl  = cpu_read32(cpu, (a5 - 24785) & 0xFFFFFF);
+                uint8_t  isch = cpu_read8 (cpu, (a5 - 24786) & 0xFFFFFF);
+                fprintf(stderr, "[P86] Scheduler#%d entry A5=$%06X A6=$%06X A7=$%06X c_pcb=$%08X b_syslocal=$%08X inv_sched=$%02X\n",
+                        p86_sched_count, a5, cpu->a[6]&0xFFFFFF, cpu->a[7]&0xFFFFFF,
+                        cpcb, bsl, isch);
+            }
+
+            /* Launch entry — $06EAB0. Dump everything that SETREGS reads,
+             * especially b_syslocal_ptr and env_save_area. */
+            if (pc_Launch && cpu->pc == pc_Launch && p86_launch_count < 4) {
+                p86_launch_count++;
+                uint32_t a5 = cpu->a[5] & 0xFFFFFF;
+                uint32_t sglobal = cpu_read32(cpu, 0x200);
+                /* b_syslocal_ptr is at A5-24785, but Launch actually reads it
+                 * via SGLOBAL+B_SYSLOC offset. SGLOBAL = b_sysglobal_ptr. */
+                uint32_t bsl = cpu_read32(cpu, (a5 - 24785) & 0xFFFFFF);
+                uint32_t cpcb = cpu_read32(cpu, (a5 - 24617) & 0xFFFFFF);
+                fprintf(stderr, "[P86] Launch#%d entry A6=$%06X A5=$%06X SGLOBAL=$%08X b_syslocal=$%08X c_pcb=$%08X\n",
+                        p86_launch_count, cpu->a[6]&0xFFFFFF, a5, sglobal, bsl, cpcb);
+                /* If b_syslocal is valid, dump env_save_area. ENV_SAVE offset
+                 * in syslocal record depends on PASCALDEFS. Dump first 64 bytes
+                 * of syslocal so we can see what's there. */
+                if (bsl >= 0x400 && bsl < 0x00F00000) {
+                    fprintf(stderr, "       syslocal@%06X first 64 bytes:\n       ", bsl);
+                    for (int i = 0; i < 64; i++) {
+                        fprintf(stderr, "%02X", cpu_read8(cpu, (bsl + i) & 0xFFFFFF));
+                        if ((i & 3) == 3) fprintf(stderr, " ");
+                    }
+                    fprintf(stderr, "\n");
+                }
+                /* Dump PCB to see if c_pcb_ptr is valid and what its
+                 * slocal_sdbRP / domain is. */
+                if (cpcb >= 0x400 && cpcb < 0x00F00000) {
+                    fprintf(stderr, "       c_pcb@%06X first 32 bytes:\n       ", cpcb);
+                    for (int i = 0; i < 32; i++) {
+                        fprintf(stderr, "%02X", cpu_read8(cpu, (cpcb + i) & 0xFFFFFF));
+                        if ((i & 3) == 3) fprintf(stderr, " ");
+                    }
+                    fprintf(stderr, "\n");
+                }
+            }
+
+            /* Sys_Proc_Init entry — $0057CC. If this fires, INITSYS IS
+             * reaching it, so the issue is in its body. If not, we never
+             * return from BOOT_IO_INIT. */
+            if (pc_Sys_Proc_Init && cpu->pc == pc_Sys_Proc_Init && p86_spi_count < 2) {
+                p86_spi_count++;
+                fprintf(stderr, "[P86] Sys_Proc_Init#%d ENTERED from ret=$%08X A6=$%06X A5=$%06X\n",
+                        p86_spi_count,
+                        cpu_read32(cpu, cpu->a[7] & 0xFFFFFF),
+                        cpu->a[6]&0xFFFFFF, cpu->a[5]&0xFFFFFF);
             }
         }
 

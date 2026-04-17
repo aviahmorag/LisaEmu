@@ -491,14 +491,28 @@ bool linker_link(linker_t *lk) {
     /* Phase 2: Resolve symbols — update entry point addresses with base offsets.
      * Only resolve symbols from kernel modules (which are placed in the output).
      * Non-kernel modules have base_addr=0, so their raw offsets would collide
-     * with kernel code. Those symbols go to the stub in Phase 4 instead. */
+     * with kernel code. Those symbols go to the stub in Phase 4 instead.
+     *
+     * P86: A5-relative global VARs (data symbols declared in Pascal UNITS and
+     * pinned via PASCALDEFS — b_syslocal_ptr at -24785, c_pcb_ptr at -24617,
+     * etc.) are represented as NEGATIVE offsets. Code entry-point addresses
+     * are non-negative (module offsets). Only add the module base_addr to
+     * the positive (code) symbols — A5-relative data offsets must stay at
+     * their pinned value so hand-coded asm (Launch, SCHDTRAP, etc.) reads
+     * them at the hardwired PASCALDEFS offsets. Before this fix, Launch
+     * read b_syslocal_ptr at -24785 from A5 but the compiler had relocated
+     * the VAR's storage to (-24785 + SYSGLOBAL.base_addr) = -953; the slot
+     * at -24785 was uninitialized ($FFFFFFFF) and Launch dereferenced
+     * garbage. */
     for (int i = 0; i < lk->num_symbols; i++) {
         link_symbol_t *sym = &lk->symbols[i];
         if (sym->type == LSYM_ENTRY && sym->module_idx >= 0 &&
             sym->module_idx < lk->num_modules) {
             link_module_t *mod = lk->modules[sym->module_idx];
             if (mod->is_kernel) {
-                sym->value += mod->base_addr;
+                if (sym->value >= 0) {
+                    sym->value += mod->base_addr;
+                }
                 sym->resolved = true;
             }
             /* Non-kernel symbols remain unresolved → stub in Phase 4 */
