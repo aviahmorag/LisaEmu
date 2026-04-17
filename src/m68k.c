@@ -40,8 +40,8 @@ int g_p84_trace = 0;
 static inline void p84_log_write(m68k_t *cpu, uint32_t addr, uint32_t val, int width) {
     if (!g_p84_trace) return;
     uint32_t a = mask_24(addr);
-    if (a < 0x00CCBA60 || a > 0x00CCBA90) return;
-    static int budget = 60;
+    if (a < 0x00CCBA40 || a > 0x00CCBA90) return;
+    static int budget = 80;
     if (budget-- <= 0) return;
     fprintf(stderr, "[P84W] pc=$%06X write%d @$%06X <= $%0*X\n",
             cpu->pc & 0xFFFFFF, width, a, width * 2, val);
@@ -3038,12 +3038,57 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
          * the sdb the MAKE_MRDATA loop later calls CHECK_DS with. */
         {
             static uint32_t pc_CHECK_DS = 0, pc_MAKE_MRDATA = 0, pc_BLD_SEG = 0;
+            static uint32_t pc_ALLOC_MEM = 0, pc_SWAP_SEG = 0, pc_INIT_SWAPIN = 0, pc_GET_SEG = 0;
             static int pc_gen = -1;
             if (pc_gen != g_emu_generation) {
                 pc_CHECK_DS    = boot_progress_lookup("CHECK_DS");
                 pc_MAKE_MRDATA = boot_progress_lookup("MAKE_MRDATA");
                 pc_BLD_SEG     = boot_progress_lookup("BLD_SEG");
+                pc_ALLOC_MEM   = boot_progress_lookup("ALLOC_MEM");
+                pc_SWAP_SEG    = boot_progress_lookup("SWAP_SEG");
+                pc_INIT_SWAPIN = boot_progress_lookup("INIT_SWAPIN");
+                pc_GET_SEG     = boot_progress_lookup("GET_SEG");
                 pc_gen = g_emu_generation;
+            }
+            DBGSTATIC(int, alloc_count, 0);
+            DBGSTATIC(int, swap_count, 0);
+            DBGSTATIC(int, initswap_count, 0);
+            DBGSTATIC(int, getseg_count, 0);
+            if (pc_ALLOC_MEM && cpu->pc == pc_ALLOC_MEM && alloc_count < 3) {
+                alloc_count++;
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                uint32_t sdb = cpu_read32(cpu, sp + 8); /* sig: var err; aSeg_sdb_ptr (by-val 4 bytes after err var ref) */
+                uint32_t err_ref = cpu_read32(cpu, sp + 4);
+                fprintf(stderr, "[P84b] ALLOC_MEM#%d ret=$%06X err_ref=$%08X sdb=$%08X\n",
+                        alloc_count, cpu_read32(cpu, sp), err_ref, sdb);
+            }
+            if (pc_SWAP_SEG && cpu->pc == pc_SWAP_SEG && swap_count < 3) {
+                swap_count++;
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                /* sig: var error; aSeg_sdb_ptr; func (readop|writeop) */
+                uint32_t err_ref = cpu_read32(cpu, sp + 4);
+                uint32_t sdb = cpu_read32(cpu, sp + 8);
+                uint32_t func_word = cpu_read16(cpu, sp + 12);
+                fprintf(stderr, "[P84b] SWAP_SEG#%d ret=$%06X err_ref=$%08X sdb=$%08X func=$%04X\n",
+                        swap_count, cpu_read32(cpu, sp), err_ref, sdb, func_word);
+            }
+            if (pc_INIT_SWAPIN && cpu->pc == pc_INIT_SWAPIN && initswap_count < 3) {
+                initswap_count++;
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                uint32_t sdb = cpu_read32(cpu, sp + 4);
+                fprintf(stderr, "[P84b] INIT_SWAPIN#%d ret=$%06X sdb=$%08X sdbtype=$%02X memoryF_byte=$%02X newlength=$%04X\n",
+                        initswap_count, cpu_read32(cpu, sp), sdb,
+                        cpu_read8(cpu, sdb + 13), cpu_read8(cpu, sdb + 14),
+                        cpu_read16(cpu, sdb + 46));
+                /* g_p84_trace = 1; */  /* uncomment to dump sdb-region writes */
+            }
+            if (pc_GET_SEG && cpu->pc == pc_GET_SEG && getseg_count < 3) {
+                getseg_count++;
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                uint32_t err_ref = cpu_read32(cpu, sp + 4);
+                uint32_t sdb = cpu_read32(cpu, sp + 8);
+                fprintf(stderr, "[P84b] GET_SEG#%d ret=$%06X err_ref=$%08X sdb=$%08X\n",
+                        getseg_count, cpu_read32(cpu, sp), err_ref, sdb);
             }
             DBGSTATIC(int, check_ds_count, 0);
             DBGSTATIC(int, make_mrd_count, 0);
