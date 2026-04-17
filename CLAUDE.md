@@ -70,7 +70,74 @@ make audit-linker       # Stage 4: Full pipeline + linker
 cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' build 2>&1 | grep -E "(error:|BUILD)"
 ```
 
-## Current Status (2026-04-17) — STATIC-LINK ABI FIXED, BOOT CLEAN TO IDLE
+## Current Status (2026-04-17) — P82 codegen fixes land; FS_INIT runs clean, CLEAR_SPACE is next blocker
+
+Build + audit green. 22/27 milestones reached. Boot now runs cleanly
+past FS_INIT without crashing — the UNMAPPED-WRITE at `$F23204` from
+`P_DEQUEUE` is gone. Kernel now spins inside CLEAR_SPACE (called from
+ALLOC_MEM after FIND_FREE returns false); that's the next bug to
+chase. Net: milestone count unchanged but *crash class eliminated*.
+
+### P82 — variant records + chained field access (commit `3ad488c`)
+
+Three related codegen bugs compounded into FIND_FREE returning a
+bogus `free_sdb = $00F7F2` (inside the compiled GROW_SPACE code!).
+TAKE_FREE → REMOVESDB → P_DEQUEUE then dereferenced the trashed
+`fwd_link/bkwd_link` fields of that "sdb" and wrote to `$F23204`
+(seg 121, unmapped).
+
+1. **Variant-record Phase-2 layout ignored arms.** The pre-pass
+   fixup in `toolchain_bridge.c` recomputes record offsets after
+   late type resolution. It laid all fields sequentially, so
+   codesdb's `freechain` (variant arm `free`) ended up at offset
+   22 after the `code` arm's `sdbstate…numbopen` fields — instead
+   of overlapping at offset 14 (= Apple's `oset_freechain`).
+   Fix: plumb per-field `variant_arm` index through AST_TYPE_RECORD
+   (1..N per arm, 0 for fixed part) + `variant_start` on the record;
+   Phase 2 resets offset to `variant_start` at each arm boundary.
+
+2. **Sentinel matching was ambiguous.** `str_eq_nocase` does 8-char
+   significant-prefix matching — so `__variant_begin__`,
+   `__variant_arm__`, `__variant_end__` all matched each other.
+   `current_arm` never advanced past 1, so every variant field got
+   lumped into arm 1 (defeating the per-arm offset reset above).
+   Fix: use exact `strcmp` for sentinel checks.
+
+3. **Chained AST_FIELD_ACCESS resolution missing.** Both
+   `gen_lvalue_addr` and `expr_size` only knew how to resolve the
+   parent type when the child was `AST_IDENT_EXPR` or `AST_DEREF`,
+   not another `AST_FIELD_ACCESS`. Chains like
+   `c_mmrb^.head_sdb.freechain.fwd_link` computed the head_sdb
+   offset (42) but dropped the `freechain` +14 and read as MOVE.W
+   (2 bytes) instead of MOVE.L (4). Fix: new
+   `lvalue_record_type()` / `lvalue_field_info()` helpers walk
+   nested FIELD_ACCESS chains recursively; used by both
+   `gen_lvalue_addr` and `expr_size` at the top of their
+   AST_FIELD_ACCESS handlers.
+
+Post-fix: FIND_FREE now correctly computes
+`head_sdb.freechain.fwd_link − oset_freechain` with the right
+offset and width. It returns false legitimately (no free sdbs on
+the chain — matches kernel expectation). ALLOC_MEM then enters
+CLEAR_SPACE, which loops forever — that's the new blocker.
+
+### Next (open blocker)
+
+**CLEAR_SPACE infinite loop.** Hot PC pages `$043000`/`$042F00`
+spin for 1000+ frames. CLEAR_SPACE is at `$042EE0` (per linkmap).
+The Pascal body walks sdbs trying to shuffle memory and create a
+hole of sufficient size. Likely causes:
+- Another chained-field-access width bug somewhere CLEAR_SPACE
+  touches (SET_INMOTION_SEG / CLR_INMOTION_SEG / MOVE_SEG).
+- Bad `clock_ptr` (MMRB+$C2) making the walk never terminate.
+- Freechain.bkwd_link walk in the opposite direction that still
+  hits the same stale offset we just fixed.
+
+Start by disassembling `$042EE0` through `$0430FF`, correlate to
+`source-MM2.TEXT.unix.txt:296` (CLEAR_SPACE body), and add probes
+to ALLOC_MEM entry / CLEAR_SPACE entry / SET_INMOTION_SEG entry.
+
+### Previous state (pre-P82) — STATIC-LINK ABI FIXED, BOOT CLEAN TO IDLE
 
 Build + audit green. 25/27 milestones reached. Kernel boots cleanly
 INIT → PR_CLEANUP → scheduler → MemMgr → scheduler idle loop. 1000
