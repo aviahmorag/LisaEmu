@@ -3191,6 +3191,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         {
             static uint32_t pc_FlushNodes = 0, pc_InitBufPool = 0, pc_InitBuf = 0;
             static uint32_t pc_MAP_SEGMENT = 0, pc_PROG_MMU = 0;
+            static uint32_t pc_QUEUE_PR = 0;
             static int pc_gen_p85 = -1;
             if (pc_gen_p85 != g_emu_generation) {
                 pc_FlushNodes = boot_progress_lookup("FlushNodes");
@@ -3198,6 +3199,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 pc_InitBuf = boot_progress_lookup("InitBuf");
                 pc_MAP_SEGMENT = boot_progress_lookup("MAP_SEGMENT");
                 pc_PROG_MMU = boot_progress_lookup("PROG_MMU");
+                pc_QUEUE_PR = boot_progress_lookup("QUEUE_PR");
                 pc_gen_p85 = g_emu_generation;
             }
             DBGSTATIC(int, p85_initbuf_count, 0);
@@ -3205,6 +3207,35 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             DBGSTATIC(int, p85_ib_count, 0);
             DBGSTATIC(int, p85_ms_count, 0);
             DBGSTATIC(int, p85_pm_count, 0);
+            DBGSTATIC(int, p85_qp_count, 0);
+
+            /* QUEUE_PR is an asm proc (source-PROCASM.TEXT) that pops
+             * D0=retaddr, D1.B=queue, A1=pcb_ptr from the stack before
+             * running. At PC=entry A7 still holds all three. PCB layout:
+             *   @0: next_schedPtr (4), @4: prev_schedPtr (4),
+             *   @8: semwait_queue (4), @12: priority (1), @13: norm_pri (1). */
+            if (pc_QUEUE_PR && cpu->pc == pc_QUEUE_PR && p85_qp_count < 8) {
+                p85_qp_count++;
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                uint32_t ret = cpu_read32(cpu, sp);
+                uint16_t queue_w = cpu_read16(cpu, sp + 4);  /* byte in low half */
+                uint32_t pcb = cpu_read32(cpu, sp + 6);
+                fprintf(stderr, "[P85] QUEUE_PR#%d ret=$%06X queue=$%04X pcb=$%08X",
+                        p85_qp_count, ret, queue_w, pcb);
+                if (pcb >= 0x000400 && pcb < 0x00F00000) {
+                    uint32_t next_sch = cpu_read32(cpu, pcb + 0);
+                    uint32_t prev_sch = cpu_read32(cpu, pcb + 4);
+                    uint16_t w12      = cpu_read16(cpu, pcb + 12);  /* asm reads this */
+                    uint8_t  b12      = cpu_read8 (cpu, pcb + 12);
+                    uint8_t  b13      = cpu_read8 (cpu, pcb + 13);
+                    uint8_t  b14      = cpu_read8 (cpu, pcb + 14);
+                    uint8_t  b15      = cpu_read8 (cpu, pcb + 15);
+                    fprintf(stderr, " next=$%08X prev=$%08X W@12=$%04X b[12..15]=%02X %02X %02X %02X\n",
+                            next_sch, prev_sch, w12, b12, b13, b14, b15);
+                } else {
+                    fprintf(stderr, " (pcb out of range)\n");
+                }
+            }
 
             if (pc_MAP_SEGMENT && cpu->pc == pc_MAP_SEGMENT && p85_ms_count < 5) {
                 p85_ms_count++;
