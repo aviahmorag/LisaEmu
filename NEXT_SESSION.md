@@ -317,6 +317,25 @@ sequence is still the final blocker. Two approaches:
 Option 2 is probably the cleaner fix — it matches what Apple's
 Scheduler should actually do for a single-process case.
 
+### P89h experiment (backed out)
+
+Tried adding an HLE guard at Launch entry: detect env_save_area.PC is
+zero/odd/out-of-range → skip the env_save_area RTE, do a clean
+`return to caller` instead. Guard fires 4 times (budget capped), but
+boot still halts at 22/27 — Scheduler keeps re-calling Launch in a
+loop. The "return to caller" goes back to Scheduler's next instruction,
+but Scheduler may loop back to SelectProcess/Launch instead of RTS'ing.
+
+Backed out pending more analysis of Scheduler's loop structure:
+- Is Scheduler inside an interrupt handler? Then the right fix is
+  for the handler itself to RTE when candidate == current c_pcb.
+- Is Scheduler inside a Pascal body that loops? Then we need to
+  RTS back to Scheduler's *caller*, not to Launch's immediate
+  caller within Scheduler.
+
+Next-session plan: instrument Launch entry's A7 chain to find
+Scheduler's call site, then trace Scheduler's outer caller.
+
 ### Files committed this session (all pushed to origin/main)
 
 - `5b2f848` — main_sdl bundle paths + linker LOADER-yields + P89c prime.
