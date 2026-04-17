@@ -3177,16 +3177,20 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             cpu->pc = ret;
             continue;
         }
-        if (pc_Wait_sem && cpu->pc == pc_Wait_sem) {
+        /* P81a: Wait_sem HLE bypass DISABLED. The "byte-subrange MOVE.B
+         * leaves stale D0 upper bits" was fixed in P80h2 (zero-extend).
+         * The semaphore's priority/norm_pri layout is now consistent
+         * (byte-packed priority in both CreateProcess HLE and RQSCAN).
+         * Let the real body run. */
+        if (0 && pc_Wait_sem && cpu->pc == pc_Wait_sem) {
             uint32_t sp = cpu->a[7] & 0xFFFFFF;
             uint32_t ret = cpu_read32(cpu, sp);
             uint32_t this_sem = cpu_read32(cpu, sp + 4);
-            /* semaphore.sem_count is int2 at offset 0 */
             if (this_sem >= 0x400 && this_sem < 0xFE0000) {
                 int16_t cnt = (int16_t)cpu_read16(cpu, this_sem);
                 cpu_write16(cpu, this_sem, (uint16_t)(cnt - 1));
             }
-            cpu->a[7] += 4 + 4 + 2;  /* retPC + this_sem_ptr + control */
+            cpu->a[7] += 4 + 4 + 2;
             cpu->pc = ret;
             continue;
         }
@@ -3527,54 +3531,13 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             }
             wp_prev_a6 = a6;
         }
-        /* P80e: bypass CHK_LDSN_FREE for negative (system) LDSNs.
-         * System LDSNs (-1=syslocal, -2=stack) are ABSOLUTE segment IDs
-         * shared between processes. CHK_LDSN_FREE rejects them as "in use"
-         * because the boot process already bound them. On a real Lisa, each
-         * process has its own MMU domain with separate LDSN bindings.
-         * HLE: return e_ldsnfree (=1) for ldsn < 0. */
-        {
-            static uint32_t pc_clf = 0;
-            static int clf_probed = 0;
-            if (!clf_probed) {
-                clf_probed = 1;
-                pc_clf = boot_progress_lookup("CHK_LDSN_FREE");
-                if (!pc_clf) pc_clf = boot_progress_lookup("CHK_LDSN");
-                if (pc_clf) fprintf(stderr, "  DEBUG: CHK_LDSN_FREE at $%06X\n", pc_clf);
-                else fprintf(stderr, "  DEBUG: CHK_LDSN_FREE NOT FOUND\n");
-            }
-            if (pc_clf && (cpu->pc == pc_clf || cpu->pc == 0x01834A)) {
-                uint32_t sp = cpu->a[7] & 0xFFFFFF;
-                /* CHK_LDSN_FREE(var errnum: int2; ldsn: int2; numb: int2)
-                 * Compiled pushes: numb(2), ldsn(2), errnum_ptr(4)
-                 * After JSR: SP+4=errnum_ptr(4), SP+8=ldsn(2), SP+10=numb(2) */
-                int16_t ldsn = (int16_t)cpu_read16(cpu, (sp + 8) & 0xFFFFFF);
-                int16_t numb = (int16_t)cpu_read16(cpu, (sp + 10) & 0xFFFFFF);
-                DBGSTATIC(int, clf_all, 0);
-                if (clf_all++ < 10)
-                    fprintf(stderr, "[CHK_LDSN_FREE #%d] ldsn=%d numb=%d\n", clf_all, ldsn, numb);
-                if (ldsn < 0) {
-                    uint32_t errnum_ptr = cpu_read32(cpu, (sp + 4) & 0xFFFFFF);
-                    fprintf(stderr, "  errnum_ptr=$%08X (raw from SP+4)\n", errnum_ptr);
-                    errnum_ptr &= 0xFFFFFF;
-                    /* Expand valid range to include sysglobal/syslocal addresses.
-                     * P80f: the compiled code compares errnum against 3, not 1
-                     * for e_ldsnfree — the constant value resolution is off.
-                     * Write 3 to match the compiled comparison. */
-                    if (errnum_ptr >= 0x1000) {
-                        cpu_write16(cpu, errnum_ptr, 3);  /* compiled e_ldsnfree = 3 */
-                        fprintf(stderr, "  wrote errnum=3 to $%06X\n", errnum_ptr);
-                    }
-                    uint32_t ret = cpu_read32(cpu, sp);
-                    cpu->a[7] += 4;  /* pop return address only — caller's ADDQ.L #8 cleans args */
-                    cpu->pc = ret;
-                    DBGSTATIC(int, clf_count, 0);
-                    if (clf_count++ < 5)
-                        fprintf(stderr, "[HLE-CHK_LDSN_FREE] ldsn=%d → e_ldsnfree (bypassed)\n", ldsn);
-                    continue;
-                }
-            }
-        }
+        /* P81a: CHK_LDSN_FREE HLE bypass DISABLED after the static-link ABI
+         * fix. The "errnum compared against 3, not 1" behavior that
+         * motivated the bypass was a symptom of the static-link bug —
+         * CHK_LDSN_FREE reads an enclosing proc's e_ldsnfree constant,
+         * and the dynamic-link walk returned the wrong frame so the
+         * comparison used a neighboring local's value. With the proper
+         * static-link ABI, let the natural body run. */
         /* P80e: trace MAKE_DATASEG RECOVER to find failure cause */
         {
             static uint32_t pc_recover = 0;
@@ -3647,7 +3610,10 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 if (!pc_mp) pc_mp = 0x04EF12;  /* from map */
                 if (!pc_fc) pc_fc = 0x04E3CA;  /* from map */
             }
-            if (pc_cp && cpu->pc == pc_cp) {
+            if (0 && pc_cp && cpu->pc == pc_cp) {
+                /* P81a: CreateProcess HLE DISABLED. With static-link ABI and
+                 * natural MAKE_SYSDATASEG, the native CreateProcess body
+                 * should populate PCB/syslocal/env_save_area correctly. */
                 /* P80h: HLE CreateProcess — initialize minimum PCB fields.
                  * Stack: ret(4), pcb_ptr(4), sloc_addr(4), stk_addr(4),
                  * stk_info_addr(4), jt_ptr(4), unit_list_addr(4),
@@ -3757,15 +3723,20 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 cpu->pc = ret;
                 continue;
             }
-            if (pc_cp && cpu->pc == pc_mp) {
-                /* ModifyProcess: just bypass */
+            if (0 && pc_cp && cpu->pc == pc_mp) {
+                /* P81a: ModifyProcess HLE DISABLED alongside CreateProcess. */
                 uint32_t sp = cpu->a[7] & 0xFFFFFF;
                 uint32_t ret = cpu_read32(cpu, sp);
                 cpu->a[7] += 4;
                 cpu->pc = ret;
                 continue;
             }
-            if (pc_cp && cpu->pc == pc_fc) {
+            if (0 && pc_cp && cpu->pc == pc_fc) {
+                /* P81a: FinishCreate HLE DISABLED. The priority-sorted queue
+                 * insert is Pascal Queue_Process (PROCASM.TEXT:174); its
+                 * original body accesses an outer-scope state via a sibling
+                 * call, which was the static-link bug. Let it run natively. */
+                /* (original HLE kept below for reference, unreachable) */
                 /* P80h2: HLE FinishCreate — priority-sorted insert into ready
                  * queue. Mirrors Queue_Process (PROCASM.TEXT:174): walk from
                  * @fwd_ReadyQ following next_schedPtr until we find a node
@@ -3813,35 +3784,18 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 continue;
             }
         }
-        /* P80d: bypass Move_MemMgr. This function moves the MemMgr process
-         * to the end of memory to reduce fragmentation. The move involves
-         * complex segment operations (SEG_IO, SWAP_SEG, BLD_SEG) that
-         * crash due to a frame pointer corruption during the move.
-         * Skipping the move is safe — it's a boot-time optimization. */
-        {
-            static uint32_t pc_mmove = 0;
-            static int mmove_probed = 0;
-            if (!mmove_probed) {
-                mmove_probed = 1;
-                pc_mmove = boot_progress_lookup("MOVE_MEMMGR");
-                if (!pc_mmove) pc_mmove = boot_progress_lookup("Move_MemMgr");
-                if (!pc_mmove) pc_mmove = boot_progress_lookup("Move_Mem");
-                fprintf(stderr, "  DEBUG: MOVE_MEMMGR lookup → $%06X\n", pc_mmove);
-            }
-            if (pc_mmove && cpu->pc == pc_mmove) {
-                uint32_t sp = cpu->a[7] & 0xFFFFFF;
-                uint32_t ret = cpu_read32(cpu, sp);
-                cpu->a[7] += 4;
-                cpu->pc = ret;
-                fprintf(stderr, "[HLE-Move_MemMgr] bypassed\n");
-                continue;
-            }
-        }
-        /* P79 HLE: MAKE_SYSDATASEG — bypass non-resident (discsize>0)
-         * calls, returning error 134 to trigger STARTUP's resident retry.
-         * Currently both calls are discsize=0 (resident), so this doesn't
-         * fire. Kept for when the calling code is fixed to pass discsize>0. */
-        if (pc_MAKE_SYSDATASEG && cpu->pc == pc_MAKE_SYSDATASEG) {
+        /* P81a: Move_MemMgr HLE bypass DISABLED. With natural MAKE_SYSDATASEG
+         * running, the Pascal MM's free-space bookkeeping reflects real
+         * allocations, so GetFree finds room for MemMgr's stack/syslocal
+         * move. */
+        /* P81a: MAKE_SYSDATASEG HLE bypass DISABLED. Its motivating issues
+         * ("exit(Make_SProcess) from nested Recover doesn't write errnum",
+         * "corrupt WITH block reading segHandle at wrong offsets") are
+         * classic symptoms of the static-link bug — Make_SProcess and the
+         * Recover it calls are nested procs accessing outer-scope locals
+         * via sibling calls. With the static-link ABI fix, let the
+         * natural DS_OPEN / GetFree / MMU-program path run. */
+        if (0 && pc_MAKE_SYSDATASEG && cpu->pc == pc_MAKE_SYSDATASEG) {
             uint32_t sp = cpu->a[7] & 0xFFFFFF;
             /* Stack layout verified from compiled code:
              * errnum_ptr(4), progname_ptr(4), memsize(4), discsize(4),
@@ -3941,15 +3895,12 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                         mf_count, ecode_ptr);
             continue;
         }
-        /* P78 HLE bypass: Signal_sem — when the semaphore's sem_count
-         * is >= 0 before incrementing, there are no real waiters. The
-         * full Signal_sem body reads wait_queue^.semwait_queue which
-         * may contain garbage (code addresses like BUS_ERR) if the
-         * semaphore was embedded in a zero-filled or uninitialized
-         * record. HLE: increment sem_count, clear owner, return.
-         * Signature: procedure Signal_sem(var this_sem: semaphore)
-         * — Pascal callee-clean, stack: retPC(4) + sem_ptr(4). */
-        if (pc_Signal_sem && cpu->pc == pc_Signal_sem) {
+        /* P81a: Signal_sem HLE bypass DISABLED. The "garbage wait_queue
+         * (code addresses like BUS_ERR)" was likely a downstream symptom
+         * of the static-link bug corrupting semaphore initialization.
+         * With the ABI fix and MAKE_SYSDATASEG running natively, let
+         * the real Signal_sem body run. */
+        if (0 && pc_Signal_sem && cpu->pc == pc_Signal_sem) {
             uint32_t sp = cpu->a[7] & 0xFFFFFF;
             uint32_t sem_ptr = cpu_read32(cpu, sp + 4);
             /* P79e: validate sem_ptr — bogus values like $000012 (in vector
