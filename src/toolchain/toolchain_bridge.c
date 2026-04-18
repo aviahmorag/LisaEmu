@@ -1359,8 +1359,19 @@ build_result_t toolchain_build(const char *source_dir,
                         cd_code_size);
                 cd_code_size = 32759 - 8;
             }
+            /* code_block_size = TOTAL bytes of the codeblock, which INCLUDES
+             * the 4-byte codeblock header (type, counter, blocksize word) AND
+             * the 4-byte reloffset AND the payload. LOADCD advances
+             * search_ptr by the value in the blocksize field. So the
+             * endblock MUST start at obj + code_block_size, not
+             * obj + 4 + code_block_size. P96 fix: was off by 4, so LOADCD
+             * seeked to byte 13510 (correct endblock offset) but the
+             * endblock bytes had been written at 13514 instead. Reading
+             * zeros there made the endblock test fail; LOADCD looped,
+             * fillbuf'd more empty space, returned false, and LOADEM
+             * raised SYSTEM_ERROR(stup_load_boot = 10739). */
             uint32_t code_block_size = 8 + cd_code_size;
-            uint32_t obj_size = 4 + code_block_size + 4;  /* codeblock hdr + body + endblock hdr */
+            uint32_t obj_size = code_block_size + 4;  /* codeblock (includes its header) + endblock hdr */
             uint8_t *obj = (uint8_t *)calloc(1, obj_size);
             if (obj) {
                 /* codeblock header */
@@ -1372,8 +1383,8 @@ build_result_t toolchain_build(const char *source_dir,
                 obj[4] = obj[5] = obj[6] = obj[7] = 0;
                 /* code payload */
                 memcpy(obj + 8, cd_code, cd_code_size);
-                /* endblock header */
-                uint8_t *end = obj + 4 + code_block_size;
+                /* endblock header — must start at obj + code_block_size */
+                uint8_t *end = obj + code_block_size;
                 end[0] = 0x81;                              /* endblock = -127 */
                 end[1] = 0x00;                              /* counter */
                 end[2] = 0x00;                              /* size = 4 */

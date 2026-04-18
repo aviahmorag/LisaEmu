@@ -621,13 +621,17 @@ bool lisa_hle_enter_loader(m68k_t *cpu) {
         case 2: { /* call_byte = LD_GETBYTE */
             uint8_t b = ldr_getbyte(lisa);
             lisa_mem_write8(&lisa->mem, params_ptr + 28, b);
+            if (log)
+                fprintf(stderr, "HLE ENTER_LOADER call_byte -> $%02X\n", b);
             break;
         }
         case 3: { /* call_word = LD_GETWORD */
             uint8_t hi = ldr_getbyte(lisa);
             uint8_t lo = ldr_getbyte(lisa);
-            lisa_mem_write16(&lisa->mem, params_ptr + 26,
-                             (uint16_t)((hi << 8) | lo));
+            uint16_t w = (uint16_t)((hi << 8) | lo);
+            lisa_mem_write16(&lisa->mem, params_ptr + 26, w);
+            if (log)
+                fprintf(stderr, "HLE ENTER_LOADER call_word -> $%04X\n", w);
             break;
         }
         case 4: { /* call_long = LD_GETLONG */
@@ -635,6 +639,8 @@ bool lisa_hle_enter_loader(m68k_t *cpu) {
             for (int i = 0; i < 4; i++)
                 v = (v << 8) | ldr_getbyte(lisa);
             lisa_mem_write32(&lisa->mem, params_ptr + 22, v);
+            if (log)
+                fprintf(stderr, "HLE ENTER_LOADER call_long -> $%08X\n", v);
             break;
         }
         case 5: { /* call_move = LD_MOVEMULTIPLE */
