@@ -142,6 +142,8 @@ typedef struct {
     int param_size[CODEGEN_MAX_PARAMS];     /* Parameter size in bytes (2 or 4) */
     char param_name[CODEGEN_MAX_PARAMS][64]; /* Parameter names for forward-decl matching */
     struct type_desc *param_type[CODEGEN_MAX_PARAMS]; /* Parameter types (for IMPL body reconstruction) */
+    char param_type_name[CODEGEN_MAX_PARAMS][64]; /* P102: stable type name for call-site re-resolution */
+    int  param_type_kind[CODEGEN_MAX_PARAMS]; /* P102: snapshot of type kind at registration */
     bool is_external;                       /* true = assembly/external (callee-clean) */
     bool is_function;                       /* true = function (returns value), false = procedure */
     /* P81 static-link ABI. nest_depth = Pascal lexical depth of the proc

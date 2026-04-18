@@ -125,10 +125,31 @@ static void patch16(codegen_t *cg, uint32_t offset, uint16_t val) {
 
 static type_desc_t *find_type(codegen_t *cg, const char *name) {
     type_desc_t *local = NULL;
+    /* P101: prefer an EXACT case-insensitive full-string match over the
+     * 8-char-significant fallback. Apple Pascal's 8-char significance
+     * rule is for identifiers at the source-language level, but our
+     * implementation of str_eq_nocase treats `LogicalAddress` and
+     * `logicaladr` as equal — and when a local type inside one proc
+     * (e.g. `logicaladr` inside SOURCE-EXCEPRES's `showregs`) pollutes
+     * the global type table, it can mask an unrelated global type of
+     * longer name (e.g. `LogicalAddress = LongInt` in HWINT). That
+     * collision caused `ord(@PARAMEM_WRITE)`'s param type to resolve
+     * as TK_RECORD → ARG_BY_REF true → AlarmAssign's routine arg
+     * got pushed as @routine instead of routine-value. Search for the
+     * exact full-string match first, then fall back to significant-
+     * match for the legitimate 8-char truncation case. */
     for (int i = 0; i < cg->num_types; i++) {
-        if (str_eq_nocase(cg->types[i].name, name)) {
+        if (strcasecmp(cg->types[i].name, name) == 0) {
             local = &cg->types[i];
             break;
+        }
+    }
+    if (!local) {
+        for (int i = 0; i < cg->num_types; i++) {
+            if (str_eq_nocase(cg->types[i].name, name)) {
+                local = &cg->types[i];
+                break;
+            }
         }
     }
     /* P80g: for RECORD types, prefer imported version if the local has
@@ -147,8 +168,12 @@ static type_desc_t *find_type(codegen_t *cg, const char *name) {
         }
     }
     if (local) return local;
-    /* Also search imported types from previously compiled units */
+    /* Also search imported types — exact match first, then 8-char significant. */
     if (cg->imported_types) {
+        for (int i = 0; i < cg->imported_types_count; i++) {
+            if (strcasecmp(cg->imported_types[i].name, name) == 0)
+                return &cg->imported_types[i];
+        }
         for (int i = 0; i < cg->imported_types_count; i++) {
             if (str_eq_nocase(cg->imported_types[i].name, name))
                 return &cg->imported_types[i];
@@ -220,13 +245,29 @@ static void register_proc_sig(codegen_t *cg, const char *name, ast_node_t *param
 static cg_proc_sig_t *find_proc_sig(codegen_t *cg, const char *name);
 
 /* Non-primitive value param (record/string/array): P16 passes by reference
- * as a 4-byte pointer. Caller must push @arg via LEA, not the arg value. */
-static inline bool ARG_BY_REF(cg_proc_sig_t *sig, int a) {
+ * as a 4-byte pointer. Caller must push @arg via LEA, not the arg value.
+ * P102: if the cached param_type pointer was recorded in a unit whose
+ * local type table has since been overwritten, the recorded kind can
+ * lie. Re-resolve by recorded type name against the current type tables
+ * when possible. */
+static type_desc_t *find_type(codegen_t *cg, const char *name);
+static inline bool ARG_BY_REF(codegen_t *cg, cg_proc_sig_t *sig, int a) {
     if (!sig || a >= sig->num_params) return false;
     if (sig->param_is_var[a]) return false;
-    type_desc_t *t = sig->param_type[a];
-    if (!t) return false;
-    return t->kind == TK_RECORD || t->kind == TK_STRING || t->kind == TK_ARRAY;
+    /* P102: prefer the registration-time snapshot of the kind. Across
+     * compilation units the cached pointer can be mutated by unrelated
+     * code; the snapshot captured at register_proc_sig is authoritative. */
+    int kind = sig->param_type_kind[a];
+    if (kind == 0) {
+        /* Fallback: re-resolve by name, then by cached pointer. */
+        type_desc_t *t = NULL;
+        if (cg && sig->param_type_name[a][0])
+            t = find_type(cg, sig->param_type_name[a]);
+        if (!t) t = sig->param_type[a];
+        if (!t) return false;
+        kind = (int)t->kind;
+    }
+    return kind == TK_RECORD || kind == TK_STRING || kind == TK_ARRAY;
 }
 
 
@@ -2935,7 +2976,7 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
             if (is_callee_clean) {
                 for (int i = 0; i < node->num_children; i++) {
                     bool is_var_arg = (sig && i < sig->num_params && sig->param_is_var[i]);
-                    bool by_ref = ARG_BY_REF(sig, i);
+                    bool by_ref = ARG_BY_REF(cg, sig, i);
                     int psize = (sig && i < sig->num_params) ? sig->param_size[i] : 4;
                     if (is_var_arg || by_ref) {
                         gen_lvalue_addr(cg, node->children[i]);
@@ -2951,7 +2992,7 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
             } else {
                 for (int i = node->num_children - 1; i >= 0; i--) {
                     bool is_var_arg = (sig && i < sig->num_params && sig->param_is_var[i]);
-                    bool by_ref = ARG_BY_REF(sig, i);
+                    bool by_ref = ARG_BY_REF(cg, sig, i);
                     int psize = (sig && i < sig->num_params) ? sig->param_size[i] : 4;
                     if (is_var_arg || by_ref) {
                         gen_lvalue_addr(cg, node->children[i]);
@@ -3477,7 +3518,7 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                 if (call_callee_clean) {
                     for (int a = 0; a < node->num_children; a++) {
                         bool is_var_arg = (call_sig && a < call_sig->num_params && call_sig->param_is_var[a]);
-                        bool by_ref = ARG_BY_REF(call_sig, a);
+                        bool by_ref = ARG_BY_REF(cg, call_sig, a);
                         int psize = (call_sig && a < call_sig->num_params) ? call_sig->param_size[a] : 4;
                         if (is_var_arg || by_ref) {
                             gen_lvalue_addr(cg, node->children[a]);
@@ -3493,7 +3534,7 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                 } else {
                     for (int a = node->num_children - 1; a >= 0; a--) {
                         bool is_var_arg = (call_sig && a < call_sig->num_params && call_sig->param_is_var[a]);
-                        bool by_ref = ARG_BY_REF(call_sig, a);
+                        bool by_ref = ARG_BY_REF(cg, call_sig, a);
                         int psize = (call_sig && a < call_sig->num_params) ? call_sig->param_size[a] : 4;
                         if (is_var_arg || by_ref) {
                             gen_lvalue_addr(cg, node->children[a]);
@@ -4859,6 +4900,26 @@ static void register_proc_sig(codegen_t *cg, const char *name, ast_node_t *param
         if (params[i]->num_children > 0)
             ptype = resolve_type(cg, params[i]->children[0]);
         sig->param_type[i] = ptype;
+        /* P102: snapshot the type name (if any) at registration time so
+         * callers can re-resolve by name if the pointer becomes stale
+         * across compilation-unit boundaries. Also capture from the AST
+         * directly when the type node is a plain identifier — even if
+         * resolve_type returned NULL or an entry with a different name
+         * (e.g. 8-char collision mapping LogicalAddress → logicaladr). */
+        sig->param_type_name[i][0] = '\0';
+        if (params[i]->num_children > 0) {
+            ast_node_t *tn = params[i]->children[0];
+            if (tn && tn->type == AST_TYPE_IDENT && tn->name[0])
+                strncpy(sig->param_type_name[i], tn->name, 63);
+        }
+        if (!sig->param_type_name[i][0] && ptype && ptype->name[0])
+            strncpy(sig->param_type_name[i], ptype->name, 63);
+        /* Snapshot the kind at registration time. The ptype pointer can go
+         * stale across compilation units because shared_types entries get
+         * re-used for unrelated types with 8-char-colliding names (e.g.
+         * HWINT's LogicalAddress and EXCEPRES's local logicaladr record).
+         * This captures the correct kind so ARG_BY_REF doesn't flip. */
+        sig->param_type_kind[i] = ptype ? (int)ptype->kind : 0;
         if (sig->param_is_var[i]) {
             sig->param_size[i] = 4;  /* VAR params are always pointers */
         } else if (!ptype) {
