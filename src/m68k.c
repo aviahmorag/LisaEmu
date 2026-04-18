@@ -4915,28 +4915,15 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             }
             /* After PARAMEMINIT, count GETSPACE calls to see if for-loop runs. */
             /* Trace AlarmAssign internals */
-            /* P102a scaffold: block the buggy TrapTable copy loop at $7150A
-             * from overwriting the vector table. Some caller (in BOOT_IO_INIT
-             * at $5CF4) passes A1=nil to the routine at $714FC, which then
-             * copies 93 words from TrapTable ($71512) to (A1)+. With A1=0
-             * that wipes the entire exception/trap vector table at $0-$BB,
-             * including TRAP5 at $94. The next ALARMASSIGN call's TRAP #5
-             * then fetches a corrupted vector and CPU jumps to garbage.
-             * Detect and short-circuit the loop when A1 is nil or inside
-             * the vector table. Investigate and properly fix next session.
-             *
-             * Symptom: PARAMEMINIT's 2nd ALARMASSIGN(unblk_alarm,
-             * ord(@TIMER_UNBLK)) never returns, for-loop at
-             * STARTUP.TEXT:1950 never starts, FS_INIT never called. */
-            if (cpu->pc == 0x7150A && cpu->a[1] < 0x100) {
-                DBGSTATIC(int, tbk, 0);
-                if (tbk++ < 2)
-                    fprintf(stderr, "[P102a] blocking TrapTable copy to nil (A1=$%08X)\n",
-                            cpu->a[1]);
-                /* Skip the loop — jump past DBRA to JMP (A0) at $71510 */
-                cpu->pc = 0x71510;
-                continue;
-            }
+            /* P102b replaced P102a: the nil-A1 TrapTable copy came from a
+             * call at BOOT_IO_INIT:$5CF4 that mis-resolved INIT_TWIGGGLOB
+             * (3 Gs, 14 chars, from STARTUP.TEXT:1906) to INIT_TWIG_TABLE
+             * (asm, same 8-char prefix INIT_TWI). find_proc_sig/linker
+             * now pick the longest-common-prefix ENTRY on 8-char collisions,
+             * so INIT_TWIGGGLOB resolves to INIT_TWIGGLOB (Pascal, LCP=10)
+             * over INIT_TWIG_TABLE (LCP=9). With the right callee, the
+             * error VAR param pushes @error, INIT_TWIG_TABLE is never
+             * called from $5CF4, and the nil-copy scaffold is dead. */
             if (after_parameminit) {
                 static uint32_t getspace_addr = 0;
                 static int gs_probe_gen = -1;

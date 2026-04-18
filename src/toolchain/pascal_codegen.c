@@ -5020,7 +5020,58 @@ static cg_proc_sig_t *find_proc_sig(codegen_t *cg, const char *name) {
     }
     if (imp_resolved) return imp_resolved;                /* tier 3 */
     if (imp_partial) return imp_partial;                  /* tier 4 */
-    return fallback;                                      /* tier 5 or NULL */
+    if (fallback) return fallback;                        /* tier 5 */
+
+    /* P102b: 8-char-significant fallback, mirroring the linker.
+     * STARTUP calls INIT_TWIGGGLOB (3 Gs, 14 chars); the decl is
+     * INIT_TWIGGLOB (2 Gs, 13 chars). No exact strcasecmp match —
+     * but under Apple's 8-char rule they're the same identifier.
+     * Without this, the caller gets NULL sig, emits generic 4-byte
+     * value pushes, and misses the VAR parameter — so err passes
+     * as value (zero) instead of @err. The linker then further
+     * resolves the call to INIT_TWIG_TABLE (also prefix INIT_TWI),
+     * which pops (retAddr, A1=0) and wipes the vector table.
+     * Pick the candidate with the longest common prefix (LCP) so
+     * INIT_TWIGGGLOB → INIT_TWIGGLOB (LCP 10) beats
+     * INIT_TWIGGGLOB → INIT_TWIG_TABLE (LCP 9). */
+    size_t rlen = strlen(name);
+    size_t mlen = (rlen <= 8) ? rlen : 8;
+    if (mlen < 3) return NULL;
+    cg_proc_sig_t *best_local = NULL,   *best_imp = NULL,   *best_fb = NULL;
+    size_t best_local_lcp = 0,          best_imp_lcp = 0,   best_fb_lcp = 0;
+    #define LCP_UPDATE(cand, best, best_lcp) do {                          \
+        const char *a = (cand)->name; const char *b = name; size_t l = 0; \
+        while (a[l] && b[l] &&                                             \
+               toupper((unsigned char)a[l]) == toupper((unsigned char)b[l])) \
+            l++;                                                           \
+        if (!(best) || l > (best_lcp)) { (best) = (cand); (best_lcp) = l; } \
+    } while (0)
+    if (cg->proc_sigs) {
+        for (int i = 0; i < cg->num_proc_sigs; i++) {
+            cg_proc_sig_t *s = &cg->proc_sigs[i];
+            if (strncasecmp(s->name, name, mlen) != 0) continue;
+            if (!s->is_external && sig_is_fully_resolved(s)) {
+                LCP_UPDATE(s, best_local, best_local_lcp);
+            } else if (s->is_external) {
+                LCP_UPDATE(s, best_fb, best_fb_lcp);
+            }
+        }
+    }
+    if (best_local) return best_local;
+    if (cg->imported_proc_sigs) {
+        for (int i = 0; i < cg->imported_proc_sigs_count; i++) {
+            cg_proc_sig_t *s = &cg->imported_proc_sigs[i];
+            if (strncasecmp(s->name, name, mlen) != 0) continue;
+            if (!s->is_external && sig_is_fully_resolved(s)) {
+                LCP_UPDATE(s, best_imp, best_imp_lcp);
+            } else if (s->is_external) {
+                LCP_UPDATE(s, best_fb, best_fb_lcp);
+            }
+        }
+    }
+    #undef LCP_UPDATE
+    if (best_imp) return best_imp;
+    return best_fb;
 }
 
 bool codegen_generate(codegen_t *cg, ast_node_t *ast) {

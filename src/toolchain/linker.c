@@ -53,15 +53,31 @@ static int find_global_symbol(linker_t *lk, const char *name) {
     /* 8-char prefix match — Lisa assembler truncates symbols to 8 significant
      * characters. Match in both directions:
      * - Short ref (ENTER_SC) matches long def (ENTER_SCHEDULER): prefix of def
-     * - Long ref (ENTER_SCHEDULER) matches short def (ENTER_SC): truncate ref to 8 */
+     * - Long ref (ENTER_SCHEDULER) matches short def (ENTER_SC): truncate ref to 8
+     *
+     * P102b: when multiple ENTRY symbols share the first 8 chars with the
+     * reference (e.g. STARTUP calls INIT_TWIGGGLOB which 8-prefix-matches
+     * BOTH INIT_TWIGGLOB and INIT_TWIG_TABLE), pick the one whose full
+     * name has the longest case-insensitive common prefix with the
+     * reference. INIT_TWIGGGLOB shares 10 chars with INIT_TWIGGLOB but
+     * only 9 with INIT_TWIG_TABLE, so the Pascal proc wins over the asm. */
     size_t len = strlen(name);
     size_t match_len = (len <= 8) ? len : 8;
     if (match_len >= 3) {
+        int best_i = -1;
+        size_t best_lcp = 0;
         for (int i = 0; i < lk->num_symbols; i++) {
-            if (strncasecmp(lk->symbols[i].name, name, match_len) == 0 &&
-                lk->symbols[i].type == LSYM_ENTRY)
-                return i;
+            if (lk->symbols[i].type != LSYM_ENTRY) continue;
+            if (strncasecmp(lk->symbols[i].name, name, match_len) != 0) continue;
+            const char *a = lk->symbols[i].name;
+            const char *b = name;
+            size_t lcp = 0;
+            while (a[lcp] && b[lcp] &&
+                   toupper((unsigned char)a[lcp]) == toupper((unsigned char)b[lcp]))
+                lcp++;
+            if (best_i < 0 || lcp > best_lcp) { best_i = i; best_lcp = lcp; }
         }
+        if (best_i >= 0) return best_i;
     }
     /* Lisa Pascal compiler intrinsic name mappings.
      * The compiler emits human-readable names but the runtime uses
