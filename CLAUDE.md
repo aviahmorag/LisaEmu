@@ -189,15 +189,90 @@ commit as the real replacement.
 | 11 | **Shell (APDM)** | full desktop | Not started |
 | 12 | **Apps** | LisaWrite, LisaCalc, etc. | Not started |
 
-## Current Status (2026-04-18 post-P103/P104)
+## Current Status (2026-04-19 post-P105)
 
 **Milestones**: **23/27** kernel checkpoints reached natively, last
-checkpoint `SYS_PROC_INIT`. This session added P103 (structural
-codegen fix) and P104 (MDDF_IO HLE scaffold) — both advance the
-execution chain but the boot still halts at the pre-existing 10707
-(FS_Master_Init returns E_FS_VERSION after MDDF_IO returns
-success, because our disk image's MDDF bytes don't line up with
-Apple's MDDFdb record layout).
+checkpoint `SYS_PROC_INIT`. The 2026-04-19 session landed **P105** —
+three structural Pascal-codegen fixes that let `real_mount`'s MDDF
+sanity check actually pass. The boot now runs past all three MDDF
+checks (fsversion, MDDFaddr, length(volname)) into `drivercall(dcontrol,
+dcode=20)`, which returns zeroed spare-table state via our scaffold
+CALLDRIVER HLE; that fails the next guard and fires
+`E_SPARES_DAMAGED (1054)` instead of the prior
+`E_FS_VERSION (866)`. Both errors still bucket to `SYSTEM_ERROR(10707)
+stup_fsinit` which our existing unwind suppresses, so the milestone
+count is unchanged but the execution chain is genuinely longer.
+
+**P105 is three related codegen fixes** (committed as
+`600863b ... auto: claude-turbo checkpoint` + docs follow-up):
+
+1. **Nested WITH with pointer-deref of outer-WITH field**
+   (`AST_WITH` case in `gen_expression`): `with mounttable[device]^ do
+   ... with MDDFdata^ do ...` — inner WITH's `rec_expr =
+   AST_DEREF(AST_IDENT_EXPR(MDDFdata))`, where `MDDFdata` is a
+   FIELD of the outer WITH's record, not a standalone global. Pre-P105
+   the AST_DEREF branch only called `find_symbol_any(MDDFdata)` which
+   returned NULL, so the inner WITH's `record_type` stayed NULL and
+   all field lookups inside it fell through to `find_symbol_any`. Fix:
+   when the ident-based lookup misses and we're already inside a WITH,
+   resolve the pointer via `with_lookup_field` and deref its base type.
+
+2. **AST_IDENT_EXPR: WITH fields shadow globals even when global is
+   a CONST** (gen_expression read path): Apple's
+   `terror = (fsversion, fserror, ...)` enum in `source-LDUTIL.TEXT`
+   registered `fsversion` as a global CONST=0. Pre-P105,
+   `gen_expression` checked `find_symbol_any` BEFORE the WITH context,
+   so `fsversion` inside `with MDDFdata^ do` compiled as `MOVEQ #0,D0`
+   (the enum-ordinal CONST) instead of loading the MDDFdb field. P93
+   had already fixed this for `gen_lvalue_addr` and `expr_size`; P105
+   extends the same rule to the read path in `gen_expression`.
+
+3. **Comma-separated record fields split into individual fields**
+   (record-layout pass): The parser collapses
+   `a, b, c : type` into ONE `AST_FIELD` node with name="a,b,c".
+   Pre-P105 codegen registered that as a single field of size
+   `sizeof(type)`, so `UID = record a,b: longint end;` came out as
+   4 bytes instead of 8. This shifted `MDDFdb.MDDFaddr` from its
+   canonical +130 offset to +126, and `(MDDFaddr <> 0)` in real_mount
+   read `datasize=512` from +126 as if it were MDDFaddr, firing
+   `E_FS_VERSION`. Fix: split `field->name` on commas and emit one
+   entry per sub-name, each advancing `offset` by the type size.
+
+4. **LENGTH() on non-pointer strings uses address-of**
+   (`fn == "LENGTH"` case in gen_expression): pre-P105 LENGTH called
+   `gen_ptr_expression` which evaluated the WITH-field string's
+   CONTENT (first 4 bytes) and treated it as a pointer. For
+   `length(volname)` in `with MDDFdata^` that loaded `$064C6973`
+   (length byte + "Lis") and dereferenced it as address $00649736,
+   reading a garbage length byte. Fix: if the operand resolves to a
+   direct `TK_STRING` (via size > 4 or direct symbol-lookup), use
+   `gen_lvalue_addr` to load `&string` into A0; otherwise keep the
+   pointer-deref path.
+
+**Next blocker**: `drivercall(@dparm)` with `dcode=20` (real_mount's
+spare-table health check, sfileio2.text:340-371). Apple returns:
+`cparm.ar10[0] = SPARES_INTACT (=4)`, `cparm.ar10[2] = spares
+available`, `cparm.ar10[3] = SPARE_TABLES_OK (=0)`. Our CALLDRIVER
+HLE zeros everything, so `ar10[0] <> SPARES_INTACT` is true and
+real_mount fires `E_SPARES_DAMAGED`. Either (a) extend the CALLDRIVER
+HLE to recognize `dcode=20` and fill healthy spare-table values, or
+(b) proceed to Phase 3 (compile SYSTEM.CD_PROFILE so the real driver
+handles this). (a) is ~5 lines, (b) is the Phase 2 step 4b/9-11 arc.
+
+**P104 state (unchanged)**: MDDF_IO HLE bypasses psio→LisaIO→UltraIO
+and reads the MDDF block directly from the ProFile image. Returns
+`ecode=0` on success. MDDF layout on disk is correct; what was
+broken pre-P105 was our compiler's reading-side layout of the
+in-memory `MDDFdb` record.
+
+**Previous session milestones (historical)**: The original
+description of the P104 blocker (CLAUDE.md pre-P105) said *"our disk
+image's MDDF bytes don't line up with Apple's MDDFdb"* — that was
+partially wrong. The DISK bytes match Apple's MDDFdb byte-for-byte;
+what didn't line up was our COMPILER's in-memory layout of MDDFdb
+(4 bytes short due to `UID = record a,b: longint end;` being
+laid out as 4 bytes). P105 fixes the compiler side; the on-disk
+layout was already correct.
 
 After SYS_PROC_INIT boot hits the 10707 suppression and halts
 cleanly via STOP instruction.
