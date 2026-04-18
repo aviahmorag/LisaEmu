@@ -189,18 +189,17 @@ commit as the real replacement.
 | 11 | **Shell (APDM)** | full desktop | Not started |
 | 12 | **Apps** | LisaWrite, LisaCalc, etc. | Not started |
 
-## Current Status (2026-04-18, Phase 2 scoping)
+## Current Status (2026-04-18 night, Phase 2 scoping)
 
 **Milestones**: 21/27 kernel checkpoints reached natively, last checkpoint
-`BOOT_IO_INIT`. After BOOT_IO_INIT, boot falls through INIT_JTDRIVER
-cleanly (P92 fixed that), reaches INIT_BOOT_CDS → LOADEM, and LOADEM
-raises `SYSTEM_ERROR(10738) stup_find_boot` because
-`CONCAT('SYSTEM.CD_', cdd_stuff.drvr_name)` yields an effectively
-empty filename (cdd_stuff never gets populated — FIND_CDDS walks an
-on-disk CDD table we don't have and never matches `pm_id`). The 10738
-plus follow-on 10739/10740/10741 are already suppressed by the
-pre-existing HLE at `src/lisa.c:2886`, so boot continues into the
-scheduler idle loop — no new milestones tick after BOOT_IO_INIT.
+`BOOT_IO_INIT`. Post-P97/P98, UP()→CALLDRIVER(dinit) now **actually
+succeeds** via our existing HLE — 10740 no longer fires at all. The
+remaining suppressions are 10741 (blockstructured=FALSE — a different
+codegen bug keeps the NEW_DEVICE field store from writing true) and
+10758 x2 (MAKE_BUILTIN's FIND_EMPTYSLOT fails because the bitbucket-
+init for-loop at STARTUP.TEXT:1936-1937 only populates configinfo[0]).
+Both are scaffolding HLE suppressions, removable when the underlying
+codegen bugs are fixed. Boot enters scheduler idle loop cleanly.
 
 **Important debugging correction (today):** A `SYSTEM_ERROR code=0`
 message that appeared right after BOOT_IO_INIT was a **false positive**
@@ -494,6 +493,66 @@ emits `MOVE.L #addr,D0; MOVE.L D0,-(SP); ...; ADDA.W #2,A0; MOVE.L
 (SP)+,D0; MOVE.L D0,(A0)` — correct push size, correct store size,
 and correct +2 field offset for `.routine`.
 
+### P97 codegen fix (2026-04-18 night, commit `d98ebfc`): WITH `arr[i]^` record_type
+
+`src/toolchain/pascal_codegen.c` AST_WITH handler: when the WITH
+expression is `AST_DEREF(AST_ARRAY_ACCESS(...))` — e.g.
+`with configinfo[config_index]^ do` in NEW_CONFIG — the handler
+previously only recognized `AST_IDENT_EXPR` or nested `AST_DEREF`
+under the outer deref. With an array access inside, `record_type`
+fell through to NULL, and every field reference inside the WITH body
+(read OR write) missed `with_lookup_field` and emitted
+`MOVE.W #0,D0` + placeholder (line 2185 "Unknown symbol" branch).
+
+In NEW_CONFIG this silently dropped THREE field writes:
+- `required_drvr := configinfo[parent]`
+- `workptr := pointer(drvrec_ptr)`   (workptr ended up reading
+  uninitialized stack memory; subsequent `workptr^.kres_addr :=
+  cd_adr` stored to a random stack address)
+- `permanent := true`
+
+So UP() got a drvrec with garbage kres_addr and all-zero device
+state → immediate 10740. Fix resolves the array element's pointer
+base type for the record_type, so field lookups inside the nested
+WITH work. UP() now reaches `CALLDRIVER(dinit)` → our HLE returns
+error=0 → 10740 gone for good. First real forward motion past the
+driver-init gate.
+
+Scaffold HLE (`src/m68k.c` UP entry): the 3-iteration
+INIT_BOOT_CDS loop still lands `required_drvr := self` on the last
+config because FIND_EMPTYSLOT keeps returning the same slot (see
+P98 — string compare is a separate bug). Left unchecked, UP()
+recurses infinitely and blows the stack. Scaffold clears
+`required_drvr == cfg_ptr` on UP entry so the compiled code can
+advance. Remove when the bitbucket-init for-loop codegen is fixed.
+
+### P98 codegen fix (2026-04-18 night, commit `d77c49a`): string-compare branches off-by-2
+
+`src/toolchain/pascal_codegen.c` AST_BINARY_OP string-compare inline:
+all three conditional branches in the byte-loop template had the
+wrong displacement — they landed on the subsequent `BRA.S +2`
+instruction instead of on `MOVEQ #1,D0` / `MOVEQ #0,D0`. D0 then
+held whatever value was there before the compare (typically the
+literal address loaded at `MOVE.L A0,D0`), so `TST.W D0` was
+almost always nonzero and `str = 'literal'` returned TRUE
+unconditionally.
+
+- BNE after length CMP:  was $660E → fixed $6610
+- BEQ after length TST:  was $670A → fixed $6708
+- BNE inside char loop:  was $6606 → fixed $6608
+
+Concrete symptom: `configinfo[i]^.devname = 'BITBKT'` in
+FIND_EMPTYSLOT matched the first iteration unconditionally, so
+NEW_CONFIG kept getting the same config_index each loop iteration,
+producing the self-referential required_drvr that UP's scaffold is
+currently masking. Post-P98, the compare returns the right
+boolean — but surfaces the next bug: the bitbucket-init for-loop
+doesn't populate all configinfo slots, so no slot ever has
+'BITBKT' devname, FIND_EMPTYSLOT returns FALSE, and MAKE_BUILTIN
+fires `SYSTEM_ERROR(sys_err_base+cdtoomany)` = 10758. Added to
+the suppression list at `src/lisa.c:3090` until that codegen is
+fixed.
+
 ## Reference: previous session history
 
 Full per-session history lives in `.claude-handoffs/` (one file per
@@ -558,7 +617,14 @@ Key session highlights for quick reference:
 - **P42** Dynamic HLE lookup via `boot_progress_lookup` (cached per `g_emu_generation`)
 - **P78** Signal_sem HLE guard + RELSPACE guard
 - **ENTER_LOADER** (`src/m68k.c:4846`) — pops args + RTS; no real loader runs
-- **10738..10741 suppression** (`src/lisa.c:2886`) — masks `LD_OPENINPUT` garbage return
+- **10738..10741 + 10758 suppression** (`src/lisa.c:3090`) — masks LD_OPENINPUT
+  garbage return (10738/10739), unsuccessful UP in INIT_BOOT_CDS (10740 —
+  dead post-P97), blockstructured=FALSE (10741 — NEW_DEVICE codegen bug),
+  and MAKE_BUILTIN's FIND_EMPTYSLOT failure (10758 — bitbucket init-loop
+  codegen bug)
+- **Self-ref required_drvr scaffold** (`src/m68k.c` UP entry) — clears
+  `req_drvr == cfg_ptr` to break infinite UP recursion until FIND_EMPTYSLOT
+  returns distinct config_indexes per iteration
 - **10707 suppression** (`src/lisa.c`) — masks FS_MASTER_INIT failure
 - `$234` fetch bypass: IPL=7→RTE (DB_INIT skip), IPL=0→execute (Lisabug)
 - `$4FBC` NOP-skip: illegal opcode in Workshop init loop
