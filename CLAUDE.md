@@ -93,7 +93,108 @@ Phases (see NEXT_SESSION.md for detail):
 6. **Cleanup HLEs** (FS/MEM/PR)
 7. **Safety nets** (REG_OPEN_LIST, excep_setup, etc.)
 
-## Current Status (2026-04-18 session 3 — Phase 1 PMEM: DBRA asm bug fixed, PRAM stub now valid)
+## Current Status (2026-04-18 session 4 — Phase 1 PMEM COMPLETE; five structural Pascal-codegen fixes)
+
+21/27 milestones (same as start of session; no regression). **Phase 1
+PMEM is now running natively**: `FIND_PM_IDS` returns true for the
+ProFile-on-parallel-port PRAM stub. The 10738 suppression at
+`src/lisa.c:2886` is no longer load-bearing at the INIT_BOOT_CDS level
+— it now fires from LOADEM (the next layer, Phase 2 / driver loading).
+
+This session — 5 structural Pascal codegen fixes (P90):
+
+1. **Signed byte-subrange sign-extension** (`pascal_codegen.c`).
+   `pmbyte = -128..127` is signed. After `chan := 0 - 1 = -1` stored
+   as byte `$FF`, the re-read emitted `MOVEQ #0,D0; MOVE.B (A0),D0`
+   (zero-extend) → word `$00FF`. Literal `-1` via `MOVEQ #$FF,D0` =
+   `$FFFFFFFF` → word `$FFFF`. `$00FF != $FFFF`, so `if chan = empty`
+   never fired. Result: `chan` stayed `$FF` instead of becoming
+   `emptychan = 7`, and the FIND_PM_IDS match compared 7 against
+   255 every iteration. Fix: new `type_is_signed_byte(t)` helper +
+   `emit_sign_ext_byte(cg)` (EXT.W/EXT.L); called after every
+   byte-subrange read at AST_IDENT_EXPR (local/param/global/VAR),
+   AST_FIELD_ACCESS, and WITH-field-lookup paths.
+
+2. **Packed variant records with `boolean` had mis-sized arms**
+   (`pascal_codegen.c` + mirror in `toolchain_bridge.c`). `c_ne =
+   packed record case boolean of true:(b:boolean; p:pmbyte; o:integer);
+   false:(l:longint)`. P87c's boolean-in-packed rule only fired if
+   the record had a Tnibble; without one, boolean stayed 2 bytes.
+   That made the true arm 2+1+2=5 bytes while `l:longint` is 4; the
+   arms didn't overlap, and `l := NextEntry` wrote bytes 0-3 but
+   `offset` lived at byte 3 so reading it pulled a stale byte 4.
+   GetNxtConfig's `if offset <= 8` then took the wrong branch and
+   always returned e_badnext. Fix: add `record_has_variant` pre-scan
+   (finds `__variant_begin__` sentinel), and collapse boolean to 1
+   byte when either nibble OR variant is present in a packed record.
+
+3. **Packed-record `offset` tracked placed_byte_offset, not
+   end-of-field** (`pascal_codegen.c`). In the whole-byte branch of
+   the record resolver, `bit_cursor` advanced but `offset` didn't:
+   ```c
+   placed_byte_offset = offset;
+   bit_cursor = (offset + fs) * 8;
+   // offset NOT advanced — variant_max_end & t->size miss the size
+   ```
+   `c_ne` ended up size=2 instead of 4. `process_var_decl` allocated
+   2 bytes for `cracked_ne`; LINK A6,#-22 was 2 bytes short; the
+   4-byte `cracked_ne.l := NextEntry` stomped the saved A6. UNLK
+   restored a corrupt A6 ($01FEA4 instead of $CBFEA4) and the entire
+   caller ran with blown frame pointer. Fix: in the packed whole-byte
+   path, advance `offset += fs` (mirroring the bit-packed and unpacked
+   branches).
+
+4. **Aggregate (record/array) assignment didn't exist**
+   (`pascal_codegen.c`). `mypmem := pmptr^` where `pmemrec` is 64
+   bytes compiled as `MOVE.W (A0),D0; MOVE.L D0,-68(A6)` — 2-byte
+   load, 4-byte store, 62 bytes lost. `booter[i] := booter[devcd]`
+   likewise lost 88 bytes. Fix: at AST_ASSIGN entry, detect
+   `expr_size(lhs) > 4 || expr_size(rhs) > 4` and emit a
+   `MOVE.B (A0)+,(A1)+ / DBRA D0,-4` block-copy loop for
+   `max(lhs_sz, rhs_sz)` bytes. Source addr via gen_ptr_expression
+   (AST_DEREF) or gen_lvalue_addr (field/array lvalues).
+
+5. **`gen_lvalue_addr` for AST_ARRAY_ACCESS clobbered A0 across the
+   index expression** (`pascal_codegen.c`). `PMRec[offset]` compiled
+   to `MOVEA.L 16(A6),A0 ; LEA -4(A6),A0 ; …` — the second LEA (for
+   the WITH-field `offset`) stomped the base. CRAK_PM got called
+   with a pointer into cracked_ne instead of into mypmem. Fix: push
+   A0 before `gen_expression(index)`, pop back into A0 after.
+
+Also:
+
+- **PRAM stub uses internal cd_paraport=10** (`src/lisa.c`).
+  Previous stub used external (syscall.text:80) cd_paraport=11, but
+  STARTUP's find_boot uses the DRIVERDEFS internal form (cd_paraport=10).
+  GetNxtConfig converts packed `pm_slot → pos.slot = pm_slot+1`
+  (external), so the packed byte must encode `pm_slot = 10`.
+  Byte 10: `$BE` → `$AE`. Checksum: `$680C` → `$780C`.
+
+**Verification**: FIND_PM_IDS return D0.W = $0001 (probed at pre-UNLK);
+INIT_BOOT_CDS skips the `if not FIND_PM_IDS` body; boot proceeds to
+FIND_CDDS → LOADEM, where LOADEM's `LD_OPENINPUT('SYSTEM.CD_PROFILE')`
+returns false (no driver file) and fires the next-layer SYSTEM_ERROR.
+
+**10738 suppression status**: Still present (`src/lisa.c:2886`), still
+firing, but the firing site has shifted:
+- Was: INIT_BOOT_CDS line 1632 (`bootdev > 2` after FIND_PM_IDS false).
+- Now: LOADEM line 1539 (`not LD_OPENINPUT` — Phase 2 issue).
+Remove only in the same commit as Phase 2's real driver-load path.
+
+**Previous session 3 context** (for context on the DBRA fix this
+session builds on):
+
+- **Cross-assembler DBRA encoding bug fixed** (`src/toolchain/asm68k.c:1391-1403`).
+  DBRA was encoding as `cc=0` (DBT — condition TRUE, always exits) instead
+  of `cc=1` (DBF, the correct alias). Every DBRA loop in Apple's asm
+  sources (14 total: source-LDASM, source-LDPROF, source-LDTWIG,
+  source-STARASM2) was silently running exactly one iteration. The most
+  visible victim was `INIT_READ_PM`'s `MOVEP.L` loop: it completed only
+  one 4-byte MOVEP instead of 16, so `pm_image` stayed mostly garbage
+  and `pm_good` never became true.
+
+<!-- retain for deep history -->
+## Previous Status (2026-04-18 session 3 — Phase 1 PMEM: DBRA asm bug fixed, PRAM stub now valid)
 
 21/27 milestones. Regressed 1 from prior session because a major asm
 assembler bug (DBRA → DBT miscompile) was fixed, and the fix unmasks
