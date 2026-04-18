@@ -4520,7 +4520,19 @@ static void gen_proc_or_func(codegen_t *cg, ast_node_t *node) {
      * P81b: register a sig for EVERY proc/func body, including parameterless
      * ones. Without this, nested parameterless procs (e.g. SET_INMOTION_SEG)
      * had no sig, so callers didn't pass the static link — the callee's
-     * prologue then saved stale A2 into -4(A6), poisoning the static chain. */
+     * prologue then saved stale A2 into -4(A6), poisoning the static chain.
+     *
+     * P103: IMPLEMENTATION bodies declared with `(* var x:T *)` asterisk-
+     * comment args (Apple Pascal convention to avoid repeating signature)
+     * arrive here with NO PARAM_LIST child — the lexer ate the entire
+     * `( ... )` as a comment. The INTERFACE pre-pass already registered
+     * the real signature (e.g. sfileio's def_mount/real_mount/fs_mount
+     * with `var ecode: error; device: integer`). Re-registering with 0
+     * params would create a duplicate sig that fs_mount's callers could
+     * find first — pushing (value, value) instead of (@ecode, device),
+     * passing a nil ecode pointer into def_mount and aborting FS_Mount
+     * with error>0 → SYSTEM_ERROR(10707). So only create a new sig when
+     * the body genuinely has no prior-registered sig. */
     {
         bool had_params = false;
         for (int i = 0; i < node->num_children; i++) {
@@ -4533,7 +4545,15 @@ static void gen_proc_or_func(codegen_t *cg, ast_node_t *node) {
             }
         }
         if (!had_params) {
-            register_proc_sig(cg, node->name, NULL, 0, cg->scope_depth);
+            cg_proc_sig_t *existing = find_proc_sig(cg, node->name);
+            if (!existing || existing->num_params == 0) {
+                register_proc_sig(cg, node->name, NULL, 0, cg->scope_depth);
+            } else if (existing) {
+                /* Body for an INTERFACE-declared proc. Keep the real sig;
+                 * just refresh its nest_depth to the body's scope. */
+                existing->nest_depth = cg->scope_depth;
+                existing->takes_static_link = (cg->scope_depth >= 2);
+            }
         }
     }
 

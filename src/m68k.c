@@ -4890,8 +4890,14 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 {"SET_PREFERENCES",0}, {"DiskSync",       0},
                 {"PARAMEM_WRITE",  0}, {"TIMER_UNBLK",    0},
                 {"ALRM",           0},
+                /* P103 FS_Master_Init subcall trace */
+                {"FS_Master_Init", 0}, {"InitQVM",        0},
+                {"InitBufPool",    0}, {"InitFS",         0},
+                {"fs_mount",       0}, {"real_mount",     0},
+                {"def_mount",      0}, {"MDDF_IO",        0},
+                {"UltraIO",        0},
             };
-            static uint32_t pcs_cache[16];
+            static uint32_t pcs_cache[24];
             static int pci_gen = -1;
             if (pci_gen != g_emu_generation) {
                 pci_gen = g_emu_generation;
