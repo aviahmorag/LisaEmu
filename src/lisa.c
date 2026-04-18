@@ -520,6 +520,171 @@ static bool ldr_open_file(lisa_t *lisa, const char *name) {
 }
 
 /* ========================================================================
+ * Step 4a: smart ENTER_LOADER HLE
+ *
+ * The compiled bridge in source-STARASM2.TEXT:enter_loader performs a
+ * user<->supervisor mode swap and JSRs [$204]=loader_link. We don't
+ * yet run the real compiled LOADER at a non-conflicting RAM address
+ * (BT_PROFILE's linked blob overlaps SYSTEM.OS at $0..$74000). Until
+ * that relink happens, this HLE intercepts ENTER_LOADER at its
+ * proc-entry PC and performs the requested loader operation natively
+ * by routing through ldr_fs (which already walks our real Lisa
+ * filesystem on disk per phase-2 step 3d).
+ *
+ * Stack at intercept (after caller's MOVE.L's):
+ *    SP+0   retaddr
+ *    SP+4   ldr_a5    (loader's A5 — ignored here)
+ *    SP+8   params    (pointer to caller's `fake_parms` record)
+ *
+ * `fake_parms` layout (source-ldlfs.text:30, SOURCE-CD.TEXT:242):
+ *    @0   error:     int2
+ *    @2   opcode:    int2  (0=open,1=fill,2=byte,3=word,4=long,5=move,6=read)
+ *    @4   addr:      int4
+ *    @8   header:    int4
+ *    @12  blok:      int4
+ *    @16  count:     int4
+ *    @20  result:    boolean (1 byte, 1 byte pad to align next field)
+ *    @22  longvalue: int4
+ *    @26  wordvalue: int2
+ *    @28  bytevalue: byte (1), 1 pad
+ *    @30  path:      e_name = string[32] = 34 bytes
+ *    total: 64 bytes (confirming with mem reads is probably wise if
+ *    things break; the record isn't declared packed). */
+bool lisa_hle_enter_loader(m68k_t *cpu) {
+    lisa_t *lisa = g_lisa;
+    if (!lisa) return false;
+    if (!ldr_fs.initialized && !ldr_fs_init(lisa)) return false;
+
+    uint32_t sp = cpu->a[7];
+    uint32_t retaddr    = lisa_mem_read32(&lisa->mem, sp);
+    uint32_t ldr_a5     = lisa_mem_read32(&lisa->mem, sp + 4);
+    uint32_t params_ptr = lisa_mem_read32(&lisa->mem, sp + 8);
+    (void)ldr_a5;
+
+    int16_t opcode = (int16_t)lisa_mem_read16(&lisa->mem, params_ptr + 2);
+
+    /* Default: error=0 (success) */
+    lisa_mem_write16(&lisa->mem, params_ptr + 0, 0);
+
+    DBGSTATIC(int, el_log, 0);
+    bool log = (el_log++ < 30);
+
+    switch (opcode) {
+        case 0: { /* call_open = LD_OPENINPUT */
+            uint8_t nlen = lisa_mem_read8(&lisa->mem, params_ptr + 30);
+            if (nlen > 32) nlen = 32;
+            char name[33] = {0};
+            for (int i = 0; i < nlen; i++)
+                name[i] = (char)lisa_mem_read8(&lisa->mem, params_ptr + 31 + i);
+            bool ok = ldr_open_file(lisa, name);
+            lisa_mem_write8(&lisa->mem, params_ptr + 20, ok ? 1 : 0);
+            if (log)
+                fprintf(stderr, "HLE ENTER_LOADER call_open('%s') -> %s\n",
+                        name, ok ? "OK" : "NOT_FOUND");
+            break;
+        }
+        case 1: { /* call_fill = LD_FILLBUF */
+            uint32_t byteadr = lisa_mem_read32(&lisa->mem, params_ptr + 4);
+            bool ok = ldr_fillbuf(lisa, (int32_t)byteadr);
+            if (!ok) lisa_mem_write16(&lisa->mem, params_ptr + 0, -1);
+            if (log)
+                fprintf(stderr, "HLE ENTER_LOADER call_fill(%u) -> %s\n",
+                        byteadr, ok ? "OK" : "ERR");
+            break;
+        }
+        case 2: { /* call_byte = LD_GETBYTE */
+            uint8_t b = ldr_getbyte(lisa);
+            lisa_mem_write8(&lisa->mem, params_ptr + 28, b);
+            break;
+        }
+        case 3: { /* call_word = LD_GETWORD */
+            uint8_t hi = ldr_getbyte(lisa);
+            uint8_t lo = ldr_getbyte(lisa);
+            lisa_mem_write16(&lisa->mem, params_ptr + 26,
+                             (uint16_t)((hi << 8) | lo));
+            break;
+        }
+        case 4: { /* call_long = LD_GETLONG */
+            uint32_t v = 0;
+            for (int i = 0; i < 4; i++)
+                v = (v << 8) | ldr_getbyte(lisa);
+            lisa_mem_write32(&lisa->mem, params_ptr + 22, v);
+            break;
+        }
+        case 5: { /* call_move = LD_MOVEMULTIPLE */
+            uint32_t count = lisa_mem_read32(&lisa->mem, params_ptr + 16);
+            uint32_t dest  = lisa_mem_read32(&lisa->mem, params_ptr + 4);
+            ldr_movemultiple(lisa, (int32_t)count, dest);
+            if (log)
+                fprintf(stderr, "HLE ENTER_LOADER call_move(%u bytes -> $%06X)\n",
+                        count, dest);
+            break;
+        }
+        case 6: { /* call_read = LD_READSEQ(block, destination, pages).
+                    source-ldlfs.text:794 does
+                    READ_SEQ(err, driveselect, block0+blok, count,
+                             ptr1^=data, ptr2^=pagelabel). block0 is
+                    the MDDF disk block = BOOT_TRACK_BLOCKS for us. */
+            uint32_t dest  = lisa_mem_read32(&lisa->mem, params_ptr + 4);
+            uint32_t hdr   = lisa_mem_read32(&lisa->mem, params_ptr + 8);
+            uint32_t blok  = lisa_mem_read32(&lisa->mem, params_ptr + 12);
+            uint32_t count = lisa_mem_read32(&lisa->mem, params_ptr + 16);
+
+            if (!lisa->profile.mounted || !lisa->profile.data) {
+                lisa_mem_write16(&lisa->mem, params_ptr + 0, -1);
+                break;
+            }
+            uint32_t disk_start = BOOT_TRACK_BLOCKS + blok;
+            uint32_t last_tag_off = 0;
+            uint32_t bytes_copied = 0;
+            for (uint32_t p = 0; p < count; p++) {
+                uint32_t block = disk_start + p;
+                size_t off = (size_t)block * PROFILE_BLOCK_SIZE;
+                if (off + PROFILE_BLOCK_SIZE > lisa->profile.data_size) {
+                    lisa_mem_write16(&lisa->mem, params_ptr + 0, -1);
+                    break;
+                }
+                /* Copy 512-byte data portion. */
+                for (uint32_t i = 0; i < PROFILE_DATA_SIZE; i++) {
+                    lisa_mem_write8(&lisa->mem, dest + bytes_copied + i,
+                                    lisa->profile.data[off + PROFILE_TAG_SIZE + i]);
+                }
+                bytes_copied += PROFILE_DATA_SIZE;
+                last_tag_off = (uint32_t)off;
+            }
+            /* Write last block's 20-byte tag into caller's 24-byte
+             * pagelabel buffer, zero-padding the trailing 4 bytes
+             * (bkwdlink — absent from the physical 20-byte tag). */
+            if (hdr != 0) {
+                for (int i = 0; i < PROFILE_TAG_SIZE; i++)
+                    lisa_mem_write8(&lisa->mem, hdr + i,
+                                    lisa->profile.data[last_tag_off + i]);
+                for (int i = PROFILE_TAG_SIZE; i < 24; i++)
+                    lisa_mem_write8(&lisa->mem, hdr + i, 0);
+            }
+            if (log)
+                fprintf(stderr,
+                        "HLE ENTER_LOADER call_read(blok=%u count=%u -> $%06X, hdr=$%06X)\n",
+                        blok, count, dest, hdr);
+            break;
+        }
+        default:
+            /* Unknown opcode — signal error. */
+            lisa_mem_write16(&lisa->mem, params_ptr + 0, -1);
+            if (log)
+                fprintf(stderr, "HLE ENTER_LOADER unknown opcode=%d (marking error)\n",
+                        opcode);
+            break;
+    }
+
+    /* Pop retaddr + 8 bytes of args, return as the compiled bridge would. */
+    cpu->a[7] += 12;
+    cpu->pc = retaddr;
+    cpu->cycles += 40;
+    return true;
+}
+
+/* ========================================================================
  * COPS queue management
  * ======================================================================== */
 

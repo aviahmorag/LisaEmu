@@ -163,4 +163,18 @@ void lisa_hle_set_addresses(lisa_t *lisa, uint32_t calldriver, uint32_t call_hdi
                             uint32_t system_error, uint32_t badcall,
                             uint32_t parallel, uint32_t use_hdisk);
 
+/* Step 4a HLE: decode the `fake_parms` pointed at by the top-of-stack
+ * args of an ENTER_LOADER call and service the requested loader
+ * operation (call_open/fill/byte/word/long/move) natively against
+ * ldr_fs. Writes error=0 + result/value fields back into the VAR
+ * record, pops retaddr+8 bytes of args, and sets cpu->pc to retaddr.
+ *
+ * Returns true if handled (caller should `continue` the CPU loop).
+ * This is a scaffolding HLE pending the BT_PROFILE relink work that
+ * will put the real compiled LOADER at a non-conflicting RAM
+ * address; it encodes real LD_OPENINPUT/LD_FILLBUF/etc. semantics
+ * so LOADEM and downstream code see the same contract the compiled
+ * Pascal would eventually honor. */
+bool lisa_hle_enter_loader(m68k_t *cpu);
+
 #endif /* LISA_H */
