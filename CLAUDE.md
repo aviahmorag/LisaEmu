@@ -189,16 +189,33 @@ commit as the real replacement.
 | 11 | **Shell (APDM)** | full desktop | Not started |
 | 12 | **Apps** | LisaWrite, LisaCalc, etc. | Not started |
 
-## Current Status (2026-04-18 very late night, Phase 2 scoping)
+## Current Status (2026-04-18 post-P102b)
 
-**Milestones**: **23/27** kernel checkpoints reached natively, last
-checkpoint `SYS_PROC_INIT`. P101–P102 + a P102a scaffold (block nil
-TrapTable copy) advanced boot past BOOT_IO_INIT — FS_INIT and
-Sys_Proc_Init both ✅ for the first time in real execution (earlier
-24/27 with PR_CLEANUP was a phantom from PC-drift in corrupted state;
-today's 23/27 is legitimate and reproducible). After SYS_PROC_INIT
-boot hits the pre-existing 10707 (FS_MASTER_INIT fail) suppression
-and halts cleanly via STOP instruction.
+**Milestones**: **22/27** kernel checkpoints reached natively, last
+checkpoint `FS_INIT`. P102b landed a structural fix for 8-char-
+significant proc resolution (`find_proc_sig` and linker both prefer
+longest-common-prefix on collisions) and retired the P102a nil-
+TrapTable scaffold. The prior 23/27 was premised on a mis-resolved
+`INIT_TWIGGGLOB` call mapping to `INIT_TWIG_TABLE` + the scaffold
+blocking its nil-A1 copy; with `INIT_TWIGGLOB` now really running,
+downstream state shifts enough that RELSPACE hits a corrupted
+sysglobal free-list fwdlink and loops, never reaching
+SYS_PROC_INIT. Still halts cleanly via STOP once 10707 suppression
+hits, just one milestone short.
+
+**P102b details**: `INIT_TWIGGGLOB` (3 Gs, STARTUP.TEXT:1906) and
+`INIT_TWIGGLOB` (2 Gs, the real decl in source-twiggy.text) share
+the 8-char prefix `INIT_TWI`. `INIT_TWIG_TABLE` (asm, in source-
+LDTWIG.TEXT) also shares it. Pre-fix, strcasecmp-only lookup
+failed for the 14-char caller vs 13-char decl, so the call fell
+through to a generic 4-byte-arg signature and the linker's first-
+match prefix picked the asm `INIT_TWIG_TABLE`. That routine
+popped retAddr into A0 + error=0 into A1, then (at $7150A in the
+prior build) attempted a 93-word copy from TrapTable to (A1)+.
+P102a blocked the copy; P102b resolves the call properly to the
+Pascal `INIT_TWIGGLOB` by LCP (10 vs 9), so the VAR err argument
+pushes `@error` via LEA+MOVE.L and the JSR never reaches the
+`INIT_TWIG_TABLE` body.
 
 **Previous (pre-P101/102)**: 21/27 at BOOT_IO_INIT. The P97/P98/P99/P100
 chain + CALLDRIVER DATTACH no-op had already cleared the internal
@@ -213,17 +230,40 @@ state:
 - Post-INIT_BOOT_CDS flow advances through CONFIG_DOWN, LD_DISABLE,
   MAKE_BUILTIN(cd_scc), MAKE_BUILTIN(cd_console), PARAMEMINIT
 
-Next blocker: `SYSTEM_ERROR(10707)` stup_fsinit — FS_MASTER_INIT fails
-inside FS_INIT because our emulator doesn't have real disk filesystem
-content the kernel expects. The existing suppression at src/lisa.c
-handles the error code but boot halts via STOP. Will need real
-FS_MASTER_INIT data (either compiled+loaded disk image, or a richer
-HLE that satisfies FS_MASTER_INIT's reads).
+Next blocker: **RELSPACE loop after 10707 suppression**. Once
+`SYSTEM_ERROR(10707)` fires (FS_MASTER_INIT fail — no real disk
+FS content), the existing suppression unwinds to BOOT_IO_INIT's
+FS_INIT caller and boot continues. Post-P102b, the next RELSPACE
+call reads `*b_area = $00663029` (a pointer *into code*) instead
+of the benign garbage ($2442528A) it read pre-P102b. RELSPACE
+walks that fwdlink, loops forever in its own body at ~$7160 (168
+bytes into RELSPACE at $70B8). Pre-P102b that loop never surfaced
+because PARAMEMINIT → Sys_Proc_Init ran before RELSPACE had the
+chance to walk a corrupted link.
 
-Also outstanding: the P102a scaffold blocks a nil-pointer TrapTable
-copy at $7150A that would overwrite the vector table. Need to find
-who (in BOOT_IO_INIT at $5CF4) passes A1=$00000000 to the $714FC
-copy routine and fix that caller.
+Investigate: the `find_proc_sig` LCP fallback shifted a handful of
+cross-unit proc resolutions (other `INIT_*`, `DO_*` prefix procs
+maybe); one of those shifts likely mutates what gets stored into
+the free-list head before RELSPACE runs. Start by diffing JSR
+targets between pre-P102b (`85f129a`) and post-P102b (`10b8c71`)
+linked.bin for every reloc that now has a different LCP winner,
+then trace sysglobal writes in the boot ROM → kernel transition.
+
+Secondary / deferred: `SYSTEM_ERROR(10707)` stup_fsinit itself.
+Real FS_MASTER_INIT data (compiled FS modules or enriched LD_FS
+HLE) is needed to satisfy the read chain instead of suppressing.
+
+Also outstanding: `INT1V` ($64) / `INT2V` ($68) interrupt vectors
+point at the linker's `$3F8` RTE stub because LIBHW's `DriverInit`
+is linked in but never called — its `Drivers` preamble procedure
+at $6B8FA has zero callers. Apple's LOS 3.1 expects the `Drivers`
+preamble to execute at library-load time (via DRIVERS.OBJ /
+SYSTEM.LLD loading machinery we don't emulate). On real Lisa
+this installs Level1/Level2 handlers at $64/$68, programs VIA1/
+VIA2 IER, and sets up Trap5. Not currently load-bearing on the
+ProFile-paraport boot path (no twiggy IRQs actually fire), but
+will matter when we wire the real ProFile driver and its level-1
+interrupt handler.
 
 **Important debugging correction (today):** A `SYSTEM_ERROR code=0`
 message that appeared right after BOOT_IO_INIT was a **false positive**
@@ -601,6 +641,54 @@ doesn't populate all configinfo slots, so no slot ever has
 fires `SYSTEM_ERROR(sys_err_base+cdtoomany)` = 10758. Added to
 the suppression list at `src/lisa.c:3090` until that codegen is
 fixed.
+
+### P102b proc-resolution fix (2026-04-18 post-23/27, commit `10b8c71`): longest-common-prefix on 8-char-significant collisions
+
+Both `find_proc_sig` (in `src/toolchain/pascal_codegen.c`) and the
+linker's `find_global_symbol` (in `src/toolchain/linker.c`) used to
+fall back to a first-match-wins 8-char prefix scan on strcasecmp
+miss. That made Apple's 8-char-significant identifier rule go
+wrong when multiple procs shared the first 8 chars: the compiler
+emitted the caller with no signature (so all args pushed as 4-byte
+values), and the linker resolved the reloc to whichever symbol
+appeared first in its table — which was arbitrary across builds.
+
+The concrete victim: `INIT_TWIGGGLOB(error, index)` at
+STARTUP.TEXT:1906. The declared proc is `INIT_TWIGGLOB(var err,
+driv)` (in source-twiggy.text). Both truncate to `INIT_TWI`. The
+asm `INIT_TWIG_TABLE(adr: absptr)` (in source-LDTWIG.TEXT) also
+starts `INIT_TWI`. Pre-fix, find_proc_sig returned NULL (no
+strcasecmp match) and the linker picked `INIT_TWIG_TABLE`. Callers
+pushed two 4-byte values (`error=0`, `index`) and JSR'd into the
+asm, which popped A0=retAddr, A1=0, then attempted a 93-word
+table-copy to (A1)+ — wiping the vector table. The P102a scaffold
+short-circuited this copy at $7150A.
+
+Fix: when the exact-match tier misses, score every same-8-prefix
+candidate by case-insensitive longest common prefix with the
+reference name, and pick the highest-scoring one. For
+`INIT_TWIGGGLOB`:
+- vs `INIT_TWIGGLOB`  → LCP 10 ✓ (wins)
+- vs `INIT_TWIG_TABLE` → LCP 9
+
+Applied symmetrically in codegen + linker. find_proc_sig now
+returns the right signature so the VAR err param pushes `@error`
+via LEA+MOVE.L, index pushes as a 2-byte WORD, 6-byte cleanup.
+The linker resolves the reloc to `INIT_TWIGGLOB` at $696DA, not
+`INIT_TWIG_TABLE` at $71460. P102a scaffold retired in the same
+commit — it never fires anymore.
+
+Milestone effect: 23/27 → 22/27. The prior 23 was premised on
+`INIT_TWIG_TABLE` being called (then no-op'd by the scaffold)
+instead of `INIT_TWIGGLOB`. With `INIT_TWIGGLOB` now really
+running, `*b_area` read by RELSPACE post-10707-suppression is
+`$00663029` (a code-area pointer) instead of the benign-garbage
+`$2442528A` it read before, and RELSPACE walks that fwdlink into
+an infinite loop at $7160 (168 bytes into RELSPACE at $70B8),
+never reaching `PARAMEM_WRITE` → `SYS_PROC_INIT`. Root cause of
+the corrupted free-list fwdlink is the next investigation target:
+likely another cross-unit proc now resolves to a different LCP
+winner than before, mutating sysglobal state upstream.
 
 ## Reference: previous session history
 
