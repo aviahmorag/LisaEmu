@@ -33,7 +33,11 @@ typedef struct {
 #define PROFILE_BLOCK_SIZE   532
 #endif
 #define PROFILE_MAX_BLOCKS   19456  /* ~10MB ProFile */
-#define BOOT_TRACK_BLOCKS    24
+/* Keep in sync with diskimage.h — bumped 24 -> 64 in phase2 step3c
+ * to carry SYSTEM.BT_PROFILE's linked blob on the boot track. The
+ * is_real_image heuristic in lisa.c depends on this matching the
+ * disk's fs_block0 for cross-compiled images. */
+#define BOOT_TRACK_BLOCKS    64
 
 typedef struct {
     uint8_t *data;          /* Disk image data */

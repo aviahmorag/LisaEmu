@@ -1176,6 +1176,7 @@ static uint8_t via2_portb_read(void *ctx) {
 }
 
 static void via2_porta_write(uint8_t val, uint8_t ddr, void *ctx) {
+    (void)ddr;
     lisa_t *lisa = (lisa_t *)ctx;
 
     /* COPS command protocol (from LisaEm reference):
