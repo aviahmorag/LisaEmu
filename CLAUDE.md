@@ -191,9 +191,17 @@ commit as the real replacement.
 
 ## Current Status (2026-04-18, Phase 2 scoping)
 
-**Milestones**: 21/27 kernel checkpoints reached natively (peak baseline
-is 27/27 with more HLEs in place; post-P90 the peak trades milestones
-for native Phase-1 correctness).
+**Milestones**: 21/27 kernel checkpoints reached natively, last checkpoint
+`BOOT_IO_INIT`. The boot then hits a real `SYSTEM_ERROR code=204` — that
+is the next real blocker to investigate.
+
+**Earlier sessions showed 24/27 with `PR_CLEANUP` as the last checkpoint,
+but that was FAKE progress**: the `count := pages` codegen bug (P91
+below) meant LD_READSEQ's `count` arrived at ENTER_LOADER as `65739`
+instead of `1`, triggering a catastrophic 33 MB over-read that
+corrupted ~everything and let the PC wander through random addresses
+that happened to collide with milestone symbols. The 21 we reach now
+are genuine forward motion.
 
 **Phase 1 complete (P90 session):** Five structural Pascal codegen
 fixes landed, making `FIND_PM_IDS` return `true` natively for the
@@ -366,6 +374,38 @@ pagelabel. Verify in Phase 3 when implementing layout.
 Steps 1–8a complete. Remaining Phase-2 work: step 4b (real LOADER
 via BT_PROFILE relink) and 9-11 (SYSTEM.CD_PROFILE driver).
 
+### P91 codegen fix (2026-04-18, commit `94903b9`): integer-param sign extension
+
+Structural fix in `src/toolchain/pascal_codegen.c` at the `AST_IDENT_EXPR`
+load path. When the callee reads a `TK_INTEGER` param (size=2) at a
+POSITIVE frame offset (= arg slot, pushed by the caller), emit
+`EXT.L D0` immediately after the `MOVE.W disp(A6),D0`. Without this:
+
+- The caller pushes integer args as 2-byte `MOVE.W D0,-(SP)`
+  (per-arg-size push, line 3332 of pascal_codegen.c).
+- A later post-hoc "widening" pass (line 3054-3062) saw the MOVE.W
+  and LHS=4-byte longint, and "widened" the load by patching the
+  MOVE.W opcode to MOVE.L. But a 4-byte read from a 2-byte arg
+  slot pulls in 2 bytes of stack junk above the slot.
+- LD_READSEQ's `count := pages` then stored `$0001_00CB` into
+  `fake_parms.count` instead of `1` — triggering a 65,739-page
+  (33 MB) over-read in the smart ENTER_LOADER HLE's call_read
+  handler, corrupting sysglobal, syslocal, the vector table, and
+  SYSTEM.OS code at $002600+. Post-corruption, random PC
+  wandering hit milestone symbols and made boot appear to
+  reach PR_CLEANUP (the "24/27" fake number).
+
+With the fix, `count` reads as `1` correctly, the smart HLE reads
+only the requested 1 block, no corruption, and the boot reaches
+BOOT_IO_INIT with real state. Next real blocker: `SYSTEM_ERROR code=204`
+triggered after BOOT_IO_INIT.
+
+Also in `94903b9`: `src/m68k.c` ENTER_LOADER PC intercept now resets
+`enter_loader_addr` on each `g_emu_generation` change (previously a
+plain `static int el_probed = 0` which stayed set across emu power
+cycles — would have been a sticky-state bug in the lisaOS macOS app
+across run/stop cycles, even though headless-per-process was fine).
+
 ## Reference: previous session history
 
 Full per-session history lives in `.claude-handoffs/` (one file per
@@ -409,6 +449,14 @@ Key session highlights for quick reference:
   24 runtime milestones (INIT_DRIVER_SPACE, SYS_PROC_INIT,
   PR_CLEANUP). 10738 dead. Layered scaffolding HLE — pending
   BT_PROFILE relink for real LOADER integration.
+- **P91 codegen fix (`94903b9`, 2026-04-18 PM):** integer params
+  at positive frame offsets now get `EXT.L D0` sign-extension
+  after the `MOVE.W` load. Fixes the `count := pages` bug in
+  LD_READSEQ that was causing `count=$000100CB` instead of `1`.
+  Milestone count is now 21/27 (real) vs the prior 24/27 (fake,
+  from PC wandering through corrupted state after a 33 MB
+  over-read). Last real checkpoint: BOOT_IO_INIT. Next real
+  blocker: `SYSTEM_ERROR code=204` — investigate in next session.
 
 ## Active HLE bypasses (to remove as phases land)
 
