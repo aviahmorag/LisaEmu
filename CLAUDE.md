@@ -189,33 +189,49 @@ commit as the real replacement.
 | 11 | **Shell (APDM)** | full desktop | Not started |
 | 12 | **Apps** | LisaWrite, LisaCalc, etc. | Not started |
 
-## Current Status (2026-04-18 post-P102b)
+## Current Status (2026-04-18 post-P102c)
 
-**Milestones**: **22/27** kernel checkpoints reached natively, last
-checkpoint `FS_INIT`. P102b landed a structural fix for 8-char-
-significant proc resolution (`find_proc_sig` and linker both prefer
-longest-common-prefix on collisions) and retired the P102a nil-
-TrapTable scaffold. The prior 23/27 was premised on a mis-resolved
-`INIT_TWIGGGLOB` call mapping to `INIT_TWIG_TABLE` + the scaffold
-blocking its nil-A1 copy; with `INIT_TWIGGLOB` now really running,
-downstream state shifts enough that RELSPACE hits a corrupted
-sysglobal free-list fwdlink and loops, never reaching
-SYS_PROC_INIT. Still halts cleanly via STOP once 10707 suppression
-hits, just one milestone short.
+**Milestones**: **23/27** kernel checkpoints reached natively, last
+checkpoint `SYS_PROC_INIT`. P102b + P102c landed structural fixes
+for 8-char-significant proc resolution and retired the P102a nil-
+TrapTable scaffold. The boot now reaches the same milestone count
+as the pre-P102b "23/27 via scaffold" state, but on a correctly
+compiled foundation: `INIT_TWIGGGLOB` resolves to the Pascal
+`INIT_TWIGGLOB` proc instead of the asm `INIT_TWIG_TABLE`, and
+`Dimcont` (a WITH-block field name) no longer collides with
+`DimContrast` (a LIBHW global). After SYS_PROC_INIT boot hits the
+pre-existing 10707 (FS_MASTER_INIT fail) suppression and halts
+cleanly via STOP instruction.
 
-**P102b details**: `INIT_TWIGGGLOB` (3 Gs, STARTUP.TEXT:1906) and
-`INIT_TWIGGLOB` (2 Gs, the real decl in source-twiggy.text) share
-the 8-char prefix `INIT_TWI`. `INIT_TWIG_TABLE` (asm, in source-
-LDTWIG.TEXT) also shares it. Pre-fix, strcasecmp-only lookup
-failed for the 14-char caller vs 13-char decl, so the call fell
-through to a generic 4-byte-arg signature and the linker's first-
-match prefix picked the asm `INIT_TWIG_TABLE`. That routine
-popped retAddr into A0 + error=0 into A1, then (at $7150A in the
-prior build) attempted a 93-word copy from TrapTable to (A1)+.
-P102a blocked the copy; P102b resolves the call properly to the
-Pascal `INIT_TWIGGLOB` by LCP (10 vs 9), so the VAR err argument
-pushes `@error` via LEA+MOVE.L and the JSR never reaches the
-`INIT_TWIG_TABLE` body.
+**P102b (commit `10b8c71`)**: `INIT_TWIGGGLOB` (3 Gs,
+STARTUP.TEXT:1906) and `INIT_TWIGGLOB` (2 Gs, the real decl in
+source-twiggy.text) share the 8-char prefix `INIT_TWI`.
+`INIT_TWIG_TABLE` (asm, in source-LDTWIG.TEXT) also shares it.
+Pre-fix, strcasecmp-only lookup failed for the 14-char caller vs
+13-char decl, so the call fell through to a generic 4-byte-arg
+signature and the linker's first-match prefix picked the asm
+`INIT_TWIG_TABLE`. That routine popped retAddr into A0 + error=0
+into A1, then (at $7150A in the prior build) attempted a 93-word
+copy from TrapTable to (A1)+. P102a blocked the copy; P102b
+resolves the call properly to the Pascal `INIT_TWIGGLOB` by LCP
+(10 vs 9), so the VAR err argument pushes `@error` via LEA+MOVE.L
+and the JSR never reaches the `INIT_TWIG_TABLE` body.
+
+**P102c (commit `27df41d`)**: P102b's LCP fallback used
+`mlen = min(name_len, 8)`, so short names like `Dimcont` (7 chars,
+a WITH-record field in SET_PREFERENCES) scanned for same-7-char
+prefix and LCP-matched `DimContrast` (11 chars, LIBHW global).
+SET_PREFERENCES' `SETDIMCONTRAST(DimConert(Dimcont))` was then
+compiled with a spurious `JSR DimContrast` wedged between the
+field-load and the real `JSR DIMCONERT`. The bogus call corrupted
+the stack and — two frames later via some chain of mutations —
+the sysglobal free-list fwdlink that RELSPACE walks after 10707
+suppression. RELSPACE looped forever at ~$7160 and
+Sys_Proc_Init was never reached, dropping milestones to 22/27.
+P102c requires BOTH names to be >= 8 chars before the LCP
+fallback applies. Apple's 8-char-significance rule: short names
+(< 8 chars) match only via exact strcasecmp — they are distinct
+identifiers from any longer name, regardless of shared prefix.
 
 **Previous (pre-P101/102)**: 21/27 at BOOT_IO_INIT. The P97/P98/P99/P100
 chain + CALLDRIVER DATTACH no-op had already cleared the internal
@@ -230,28 +246,15 @@ state:
 - Post-INIT_BOOT_CDS flow advances through CONFIG_DOWN, LD_DISABLE,
   MAKE_BUILTIN(cd_scc), MAKE_BUILTIN(cd_console), PARAMEMINIT
 
-Next blocker: **RELSPACE loop after 10707 suppression**. Once
-`SYSTEM_ERROR(10707)` fires (FS_MASTER_INIT fail — no real disk
-FS content), the existing suppression unwinds to BOOT_IO_INIT's
-FS_INIT caller and boot continues. Post-P102b, the next RELSPACE
-call reads `*b_area = $00663029` (a pointer *into code*) instead
-of the benign garbage ($2442528A) it read pre-P102b. RELSPACE
-walks that fwdlink, loops forever in its own body at ~$7160 (168
-bytes into RELSPACE at $70B8). Pre-P102b that loop never surfaced
-because PARAMEMINIT → Sys_Proc_Init ran before RELSPACE had the
-chance to walk a corrupted link.
-
-Investigate: the `find_proc_sig` LCP fallback shifted a handful of
-cross-unit proc resolutions (other `INIT_*`, `DO_*` prefix procs
-maybe); one of those shifts likely mutates what gets stored into
-the free-list head before RELSPACE runs. Start by diffing JSR
-targets between pre-P102b (`85f129a`) and post-P102b (`10b8c71`)
-linked.bin for every reloc that now has a different LCP winner,
-then trace sysglobal writes in the boot ROM → kernel transition.
-
-Secondary / deferred: `SYSTEM_ERROR(10707)` stup_fsinit itself.
-Real FS_MASTER_INIT data (compiled FS modules or enriched LD_FS
-HLE) is needed to satisfy the read chain instead of suppressing.
+Next blocker: **`SYSTEM_ERROR(10707)` stup_fsinit** — FS_MASTER_INIT
+fails inside FS_INIT because our emulator doesn't have real disk
+filesystem content the kernel expects. The existing suppression
+at src/lisa.c handles the error code but boot halts via STOP
+after SYS_PROC_INIT. Will need real FS_MASTER_INIT data (either
+compiled+loaded disk image, or a richer HLE that satisfies
+FS_MASTER_INIT's reads). Same as pre-P102b; the P102b/c cycle
+preserved this as the ongoing blocker while fixing a real
+resolution bug underneath.
 
 Also outstanding: `INT1V` ($64) / `INT2V` ($68) interrupt vectors
 point at the linker's `$3F8` RTE stub because LIBHW's `DriverInit`
@@ -678,17 +681,39 @@ The linker resolves the reloc to `INIT_TWIGGLOB` at $696DA, not
 `INIT_TWIG_TABLE` at $71460. P102a scaffold retired in the same
 commit — it never fires anymore.
 
-Milestone effect: 23/27 → 22/27. The prior 23 was premised on
-`INIT_TWIG_TABLE` being called (then no-op'd by the scaffold)
-instead of `INIT_TWIGGLOB`. With `INIT_TWIGGLOB` now really
-running, `*b_area` read by RELSPACE post-10707-suppression is
-`$00663029` (a code-area pointer) instead of the benign-garbage
-`$2442528A` it read before, and RELSPACE walks that fwdlink into
-an infinite loop at $7160 (168 bytes into RELSPACE at $70B8),
-never reaching `PARAMEM_WRITE` → `SYS_PROC_INIT`. Root cause of
-the corrupted free-list fwdlink is the next investigation target:
-likely another cross-unit proc now resolves to a different LCP
-winner than before, mutating sysglobal state upstream.
+Milestone effect: initially regressed 23/27 → 22/27 because the
+LCP fallback was over-permissive (see P102c below). Post-P102c,
+fully recovered to 23/27 with no downstream collateral.
+
+### P102c proc-resolution scope fix (2026-04-18 post-P102b, commit `27df41d`): require both names ≥ 8 chars for LCP
+
+P102b's LCP fallback used `mlen = min(len(name), 8)`, so a short
+reference name like `Dimcont` (7 chars, a WITH-block field in
+SET_PREFERENCES) would scan for candidates matching its full
+7-char prefix and LCP-pick the best. That swept in
+`DimContrast` (11 chars, a LIBHW global) because its first 7
+chars match `Dimcont`. Pascal's SET_PREFERENCES
+`SETDIMCONTRAST(DimConert(Dimcont))` (STARTUP.TEXT:1086) then
+compiled to an injected `JSR DimContrast` between the field load
+and the real `JSR DIMCONERT` — corrupting the stack and, via a
+chain of mutations on the sysglobal free-list head, deadlocking
+RELSPACE at ~$7160 after the 10707 suppression. Boot dropped
+from 23/27 → 22/27.
+
+Fix: require BOTH the reference AND the candidate to be >= 8
+chars before the 8-char-significance prefix rule applies. This
+matches Apple Pascal exactly: two identifiers are equal iff their
+first-8 truncations are equal, and a name shorter than 8 chars
+can only equal another name via full exact strcasecmp — never a
+longer name's prefix. `Dimcont` (7 chars) thus falls through the
+LCP tier entirely, find_proc_sig returns NULL for it, and the
+call site emits a plain field load + no-arg call dispatch; the
+spurious JSR disappears.
+
+Triple-diff verification: the only symbol count changes between
+pre-P102b (`85f129a`) and P102c (`27df41d`) are the two
+intentional shifts (INIT_TWIG_TABLE −1, INIT_TWIGGLOB +1). Zero
+collateral.
 
 ## Reference: previous session history
 
