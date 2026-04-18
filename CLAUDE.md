@@ -192,11 +192,23 @@ commit as the real replacement.
 ## Current Status (2026-04-18, Phase 2 scoping)
 
 **Milestones**: 21/27 kernel checkpoints reached natively, last checkpoint
-`BOOT_IO_INIT`. After it, the boot hits `SYSTEM_ERROR code=0` while
-still inside INIT_JTDRIVER's first loop (or immediately after). Pre-P92
-this was `code=204` — the change is because P92 fixed the specific
-"dispatch through jt[i] with truncated address" trigger, but a related
-issue still fails. Next real blocker to investigate.
+`BOOT_IO_INIT`. After BOOT_IO_INIT, boot falls through INIT_JTDRIVER
+cleanly (P92 fixed that), reaches INIT_BOOT_CDS → LOADEM, and LOADEM
+raises `SYSTEM_ERROR(10738) stup_find_boot` because
+`CONCAT('SYSTEM.CD_', cdd_stuff.drvr_name)` yields an effectively
+empty filename (cdd_stuff never gets populated — FIND_CDDS walks an
+on-disk CDD table we don't have and never matches `pm_id`). The 10738
+plus follow-on 10739/10740/10741 are already suppressed by the
+pre-existing HLE at `src/lisa.c:2886`, so boot continues into the
+scheduler idle loop — no new milestones tick after BOOT_IO_INIT.
+
+**Important debugging correction (today):** A `SYSTEM_ERROR code=0`
+message that appeared right after BOOT_IO_INIT was a **false positive**
+from a hardcoded diagnostic at `cpu->pc == 0x5380` in `src/m68k.c`.
+Pre-P91, $5380 was SYSTEM_ERROR's entry. Post-P91/P92 codegen shifts
+moved SYSTEM_ERROR to $6802 and left $5380 inside INIT_JTDRIVER's
+first loop. The intercept now keys on live `hle_addr_system_error`
+(commit `37fe6e9`) — no more phantom errors.
 
 **Earlier sessions showed 24/27 with `PR_CLEANUP` as the last checkpoint,
 but that was FAKE progress**: the `count := pages` codegen bug (P91
