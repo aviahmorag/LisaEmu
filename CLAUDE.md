@@ -192,8 +192,11 @@ commit as the real replacement.
 ## Current Status (2026-04-18, Phase 2 scoping)
 
 **Milestones**: 21/27 kernel checkpoints reached natively, last checkpoint
-`BOOT_IO_INIT`. The boot then hits a real `SYSTEM_ERROR code=204` — that
-is the next real blocker to investigate.
+`BOOT_IO_INIT`. After it, the boot hits `SYSTEM_ERROR code=0` while
+still inside INIT_JTDRIVER's first loop (or immediately after). Pre-P92
+this was `code=204` — the change is because P92 fixed the specific
+"dispatch through jt[i] with truncated address" trigger, but a related
+issue still fails. Next real blocker to investigate.
 
 **Earlier sessions showed 24/27 with `PR_CLEANUP` as the last checkpoint,
 but that was FAKE progress**: the `count := pages` codegen bug (P91
@@ -405,6 +408,32 @@ Also in `94903b9`: `src/m68k.c` ENTER_LOADER PC intercept now resets
 plain `static int el_probed = 0` which stayed set across emu power
 cycles — would have been a sticky-state bug in the lisaOS macOS app
 across run/stop cycles, even though headless-per-process was fine).
+
+### P92 codegen fix (2026-04-18, commit `ae89418`): array-of-record field sizing
+
+`src/toolchain/pascal_codegen.c:lvalue_record_type` now handles
+`AST_ARRAY_ACCESS` as its left child. Before: `arr[i].field` couldn't
+find its type, so `expr_size` fell back to 2 bytes and
+`lvalue_field_info` missed the field offset. After: array-element
+records are walked, fields resolve to their real types/sizes.
+
+Concrete impact: STARTUP's `INIT_JTDRIVER` does
+```pascal
+jt: array[0..maxdtable] of record jmpinstr: integer; routine: ^integer end;
+for i := 0 to maxdtable do jt[i].jmpinstr := $4EF9;
+jt[0].routine := @CANCEL_REQ;   { was: MOVE.W @ +0 — overwrote jmpinstr with low 16 bits
+                                   of @CANCEL_REQ ($7EA2), lost upper half }
+jt[1].routine := @ENQUEUE;      { same bug, 36 times }
+```
+Pre-P92, the driver jump table had jmpinstr zero'd by routine stores
+and routine left uninitialized — every dispatch through `jt[i]` was
+a JMP to a garbage 2-byte address. Root of `SYSTEM_ERROR code=204`
+after BOOT_IO_INIT.
+
+Post-P92, verified via disassembly: `jt[i].routine := @FUNC` now
+emits `MOVE.L #addr,D0; MOVE.L D0,-(SP); ...; ADDA.W #2,A0; MOVE.L
+(SP)+,D0; MOVE.L D0,(A0)` — correct push size, correct store size,
+and correct +2 field offset for `.routine`.
 
 ## Reference: previous session history
 
