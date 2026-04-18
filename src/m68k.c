@@ -4905,6 +4905,47 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             }
         }
 
+        /* Diagnostic: on entry to FIND_EMPTYSLOT, dump the first few configinfo[]
+         * entries and their devnames so we can see why the scan doesn't find a
+         * 'BITBKT' slot. configinfo lives at A5-$A0 (signed 32-bit global offset
+         * per the map), 40 slots × 4 bytes. devname is at devrec+16 (Pascal
+         * string: length byte + chars). */
+        {
+            extern uint32_t boot_progress_lookup(const char *name);
+            static uint32_t fes_addr = 0;
+            static int fes_probe_gen = -1;
+            DBGSTATIC(int, fes_trace, 0);
+            if (fes_probe_gen != g_emu_generation) {
+                fes_probe_gen = g_emu_generation;
+                fes_addr = boot_progress_lookup("FIND_EMPTYSLOT");
+            }
+            if (fes_addr && cpu->pc == fes_addr && fes_trace < 3) {
+                fes_trace++;
+                uint32_t a5 = cpu->a[5];
+                uint32_t base = a5 - 0xA0;
+                fprintf(stderr, "HLE FIND_EMPTYSLOT entry #%d: A5=$%08X configinfo@$%08X\n",
+                        fes_trace, a5, base);
+                /* Print slots 0..15 and maxdev-7..maxdev */
+                for (int i = 0; i < 40; i++) {
+                    if (i >= 4 && i < 32) continue;  /* skip middle to reduce noise */
+                    uint32_t slot_addr = base + i * 4;
+                    uint32_t dr = cpu_read32(cpu, slot_addr);
+                    char name[8] = {0};
+                    int nlen = 0;
+                    if (dr && dr < 0x01000000) {
+                        nlen = cpu_read8(cpu, dr + 16);  /* string length byte */
+                        if (nlen > 7) nlen = 7;
+                        for (int k = 0; k < nlen; k++) {
+                            uint8_t ch = cpu_read8(cpu, dr + 17 + k);
+                            name[k] = (ch >= 32 && ch < 127) ? ch : '?';
+                        }
+                    }
+                    fprintf(stderr, "  [%2d] ptr=$%06X devname.len=%d \"%s\"\n",
+                            i, dr, nlen, name);
+                }
+            }
+        }
+
         /* Jump-only ring: records (src_pc, dst_pc) pairs when PC changes
          * discontinuously (JSR, JMP, RTS, BRA, BSR with distance > 8). */
         static struct { uint32_t src, dst; } jmp_ring[128];

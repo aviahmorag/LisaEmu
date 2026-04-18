@@ -1114,6 +1114,35 @@ static type_desc_t *lvalue_record_type(codegen_t *cg, ast_node_t *node) {
             }
             return NULL;
         }
+        if (child->type == AST_ARRAY_ACCESS) {
+            /* P100: arr[i]^ — element type is a pointer, deref gives its
+             * record base. Same pattern as P97 in AST_WITH, surfaces here
+             * for `configinfo[i]^.devname` in FIND_EMPTYSLOT — without this,
+             * the field offset for devname resolves to 0, so the byte compare
+             * reads devrec's entry_pt bytes instead of devname, every slot
+             * compares unequal to 'BITBKT', and FIND_EMPTYSLOT returns
+             * config_index=0 unconditionally. Every INIT_BOOT_CDS iteration
+             * then reuses slot 0, producing the self-referential required_drvr
+             * that needs the P97 scaffold. */
+            ast_node_t *arr = child->children[0];
+            type_desc_t *at = NULL;
+            if (arr && arr->type == AST_IDENT_EXPR) {
+                cg_symbol_t *sym = find_symbol_any(cg, arr->name);
+                if (sym && sym->type) at = sym->type;
+                else if (cg->with_depth > 0) {
+                    type_desc_t *wrt = NULL;
+                    int wfld = with_lookup_field(cg, arr->name, &wrt, NULL);
+                    if (wfld >= 0 && wrt) at = wrt->fields[wfld].type;
+                }
+            }
+            if (at && at->kind == TK_POINTER && at->base_type) at = at->base_type;
+            if (at && at->kind == TK_ARRAY && at->element_type) {
+                type_desc_t *et = at->element_type;
+                if (et && et->kind == TK_POINTER && et->base_type) et = et->base_type;
+                return (et && et->kind == TK_RECORD) ? et : NULL;
+            }
+            return NULL;
+        }
         return NULL;
     }
     if (node->type == AST_FIELD_ACCESS) {
@@ -3081,9 +3110,21 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                     gen_lvalue_addr(cg, lhs_a);
                     emit16(cg, 0x2F08);  /* MOVE.L A0,-(SP) */
                     /* RHS address into A0 — AST_DEREF uses the evaluated
-                     * pointer, otherwise use lvalue_addr. */
+                     * pointer, AST_STRING_LITERAL and any address-returning
+                     * expression run as a value expression and move D0→A0,
+                     * otherwise use lvalue_addr.
+                     * P99: without the STRING_LITERAL branch, gen_lvalue_addr
+                     * did nothing (no case for literals) and A0 kept its LHS
+                     * value, so aggregate assignments like
+                     * `devname := 'BITBKT'` silently copied the LHS onto
+                     * itself. That left the BITBKT devrec's devname empty —
+                     * FIND_EMPTYSLOT then couldn't find any BITBKT slot and
+                     * MAKE_BUILTIN fired 10758 (cdtoomany). */
                     if (rhs_a->type == AST_DEREF && rhs_a->num_children > 0) {
                         gen_ptr_expression(cg, rhs_a->children[0]);
+                        emit16(cg, 0x2040);  /* MOVEA.L D0,A0 */
+                    } else if (rhs_a->type == AST_STRING_LITERAL) {
+                        gen_expression(cg, rhs_a);
                         emit16(cg, 0x2040);  /* MOVEA.L D0,A0 */
                     } else {
                         gen_lvalue_addr(cg, rhs_a);
