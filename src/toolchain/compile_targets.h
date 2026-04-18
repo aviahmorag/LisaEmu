@@ -1,6 +1,8 @@
 #ifndef COMPILE_TARGETS_H
 #define COMPILE_TARGETS_H
 
+#include <stdbool.h>
+
 /* Compile targets matching Apple's real Lisa OS link structure.
  *
  * Reference: _inspiration/LisaSourceCompilation-main/src/LINK/
@@ -29,6 +31,12 @@ typedef struct {
     const char *out_path;   /* e.g. "OBJECT/SYSTEM.OS" on target disk */
     const char *const *modules; /* NULL-terminated list of module basenames */
     const char *const *search_dirs; /* NULL-terminated list of source dirs */
+    bool strict;            /* true = compile only files matching `modules[]`;
+                             * false = walk search_dirs and compile every
+                             * source found (LOOSE mode — legacy behavior
+                             * for SYSTEM.OS while its module list
+                             * stabilizes). New targets should default to
+                             * strict so their linked blobs stay minimal. */
 } compile_target_t;
 
 /* Get the target by name (case-insensitive). */

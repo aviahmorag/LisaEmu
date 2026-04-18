@@ -85,6 +85,12 @@ static const compile_target_t TARGET_SYSTEM_OS = {
     .out_path = "OBJECT/SYSTEM.OS",
     .modules = SYSTEM_OS_MODULES,
     .search_dirs = SYSTEM_OS_DIRS,
+    /* Loose mode: walk search_dirs and compile every source found.
+     * The kernel pulls in dozens of $I-included helper files whose
+     * names don't appear in SYSTEM_OS_MODULES; flipping to strict
+     * regresses the kernel build until the module list + $I audit
+     * is finished. Tracked as pre-existing tech debt. */
+    .strict = false,
 };
 
 /* ---- SYSTEM.BT_PROFILE boot-track binary (Phase 2 target) ----
@@ -146,6 +152,14 @@ static const compile_target_t TARGET_BT_PROFILE = {
     .out_path = "system.bt_Profile",   /* on-disk filename (lowercase per Apple) */
     .modules = BT_PROFILE_MODULES,
     .search_dirs = SYSTEM_OS_DIRS,     /* all 9 sources live in LISA_OS/OS */
+    /* Strict mode: only the 9 modules listed above get compiled +
+     * linked into this blob. The boot-track binary must be small and
+     * contain exactly the loader chain — Apple's linked boot blob is
+     * ~30-50 KB, not the full kernel. Shared type/symbol definitions
+     * from the SYSTEM.OS compile pass remain resolvable via the
+     * shared_types / shared_globals tables (see toolchain_bridge
+     * comment above the ALL_TARGETS loop). */
+    .strict = true,
 };
 
 /* Registry. New targets (SYS1LIB, LIBQD, Shell, apps...) go here as

@@ -689,9 +689,12 @@ build_result_t toolchain_build(const char *source_dir,
                                        MAX_SOURCE_FILES - num_cand);
     }
 
-    /* Check env var: LISAEMU_STRICT_MODULES=1 enforces module filter. */
+    /* Strict mode = compile only files matching target->modules[].
+     * Comes from either the compile_target_t's .strict field (set
+     * per target in compile_targets.c) or the env var
+     * LISAEMU_STRICT_MODULES=1 (global override for debugging). */
     const char *strict_env = getenv("LISAEMU_STRICT_MODULES");
-    bool strict = strict_env && strict_env[0] == '1';
+    bool strict = target->strict || (strict_env && strict_env[0] == '1');
 
     int modules_requested = 0;
     while (target->modules[modules_requested]) modules_requested++;
