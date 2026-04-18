@@ -43,10 +43,16 @@ $(TARGET): $(OBJECTS) $(TOOL_OBJECTS)
 	$(CC) $(CFLAGS) -o $@ $^ $(SDL_LIBS)
 
 $(BUILDDIR)/%.o: $(SRCDIR)/%.c | $(BUILDDIR)
-	$(CC) $(CFLAGS) $(SDL_CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) $(SDL_CFLAGS) -c -MMD -MP -o $@ $<
 
 $(BUILDDIR)/%.o: $(TOOLDIR)/%.c | $(BUILDDIR)
-	$(CC) $(CFLAGS) $(SDL_CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) $(SDL_CFLAGS) -c -MMD -MP -o $@ $<
+
+# Auto-generated header dependencies (from -MMD). Without these, `make`
+# doesn't know that editing e.g. src/toolchain/diskimage.h should
+# recompile every .c that includes it. -MP emits phony targets for
+# headers so a renamed/deleted header doesn't stall the build.
+-include $(OBJECTS:.o=.d) $(TOOL_OBJECTS:.o=.d)
 
 $(BUILDDIR):
 	mkdir -p $(BUILDDIR)

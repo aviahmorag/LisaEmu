@@ -666,6 +666,7 @@ build_result_t toolchain_build(const char *source_dir,
      * past the loop for disk-image assembly; non-primary linker_t's
      * are freed at end-of-iteration. */
     linker_t *primary_lk = NULL;
+    linker_t *bt_profile_lk = NULL;   /* saved across loop for boot-track + disk file */
     const compile_target_t *const *all_targets = compile_targets_all();
     for (int ti = 0; all_targets[ti]; ti++) {
     const compile_target_t *target = all_targets[ti];
@@ -1241,14 +1242,18 @@ build_result_t toolchain_build(const char *source_dir,
         }
     }
 
-    /* End-of-target: save primary linker for disk assembly below;
-     * free non-primary linkers immediately since we don't place them
-     * on disk yet (Phase 2 Step 3). */
+    /* End-of-target: retain linkers that feed the disk-image phase;
+     * free ones that don't. */
     if (is_primary) {
         primary_lk = lk;
+    } else if (strcasecmp(target->name, "SYSTEM.BT_PROFILE") == 0) {
+        /* Keep BT_PROFILE's linker alive — its linked blob feeds the
+         * boot track (block 0 = LDPROF entry + tag 0xAAAA) and gets
+         * placed on disk as the system.bt_Profile file below. */
+        bt_profile_lk = lk;
     } else {
-        fprintf(stderr, "TARGET '%s' linker retained per-target dir; not yet on disk "
-                "(awaiting Phase 2 Step 3).\n", target->name);
+        fprintf(stderr, "TARGET '%s' linker retained per-target dir; not yet on disk.\n",
+                target->name);
         linker_free(lk);
         free(lk);
     }
@@ -1272,11 +1277,41 @@ build_result_t toolchain_build(const char *source_dir,
     disk_init(db, PROFILE_5MB_BLOCKS);
     disk_set_volume_name(db, "LisaOS");
 
-    /* Add linked output as system.os and write to boot track */
+    /* Phase-2 Step 3c: BOOT TRACK now carries SYSTEM.BT_PROFILE's
+     * linked blob (not SYSTEM.OS). SYSTEM.BT_PROFILE is the real
+     * boot-track binary — LDPROF at offset $400 of its linked.bin
+     * will end up at block 0 with tag 0xAAAA. If BT_PROFILE didn't
+     * build (older bundles / some error), fall back to writing
+     * SYSTEM.OS there (preserves legacy pre-Phase-2 behavior so
+     * HLE'd boot paths keep working). */
+    if (bt_profile_lk) {
+        uint32_t bt_size = 0;
+        const uint8_t *bt_raw = linker_get_output(bt_profile_lk, &bt_size);
+        if (bt_raw && bt_size > 0x400) {
+            /* Skip the zero-filled vector area ($0..$3FF) so the first
+             * byte the ROM reads from block 0 is LDPROF's entry. */
+            const uint8_t *bt_code = bt_raw + 0x400;
+            uint32_t bt_code_size = bt_size - 0x400;
+            disk_write_boot_track(db, bt_code, bt_code_size);
+            fprintf(stderr, "Boot track: SYSTEM.BT_PROFILE code at +$400 (%u bytes, %u blocks)\n",
+                    bt_code_size, (bt_code_size + PROFILE_DATA_SIZE - 1) / PROFILE_DATA_SIZE);
+            /* Also place the full BT_PROFILE blob on disk as a named
+             * file — matches Apple's disk layout (ALEX-MAKE-DISK1.TEXT
+             * places system.bt_Profile alongside system.os on disk). */
+            disk_add_file(db, "system.bt_Profile", FTYPE_CODE, bt_raw, bt_size);
+        } else {
+            fprintf(stderr, "WARN: SYSTEM.BT_PROFILE linker output empty; no boot track written\n");
+        }
+    }
+
+    /* SYSTEM.OS: placed on disk as a named file (the real LOADER will
+     * find it by name via MDDF + catalog — Step 3d). Currently also
+     * serves as boot-track content fallback if BT_PROFILE is missing,
+     * to keep HLE'd boot working during the transition. */
     uint32_t link_size;
     const uint8_t *link_data = linker_get_output(lk, &link_size);
     if (link_data && link_size > 0) {
-        disk_write_boot_track(db, link_data, link_size);
+        if (!bt_profile_lk) disk_write_boot_track(db, link_data, link_size);
         disk_add_file(db, "system.os", FTYPE_CODE, link_data, link_size);
 
         /* Save raw linked output for offline disassembly */
@@ -1385,6 +1420,10 @@ build_result_t toolchain_build(const char *source_dir,
     free(db);
     linker_free(lk);
     free(lk);
+    if (bt_profile_lk) {
+        linker_free(bt_profile_lk);
+        free(bt_profile_lk);
+    }
     free(files);
 
     result.success = (result.files_compiled > 0);

@@ -27,8 +27,15 @@
 #define PROFILE_5MB_BLOCKS    9728   /* 5MB ProFile */
 #define PROFILE_10MB_BLOCKS   19456  /* 10MB ProFile */
 
-/* Boot track */
-#define BOOT_TRACK_BLOCKS     24
+/* Boot track capacity: sized for SYSTEM.BT_PROFILE's linked blob.
+ * Apple's real Lisa boot track is bigger than the 24-block (12 KB)
+ * value we used when SYSTEM.OS was being mis-written as boot code —
+ * 64 blocks (32 KB) comfortably holds a minimal BT_PROFILE (~24 KB
+ * today, may grow as module filtering tightens). Block 0 carries
+ * the LDPROF entry + tag 0xAAAA; subsequent boot blocks carry the
+ * rest of the boot-track binary that LDPROF loads into RAM before
+ * the Pascal loader takes over. */
+#define BOOT_TRACK_BLOCKS     64
 
 /* File types */
 #define FTYPE_NONE      0
