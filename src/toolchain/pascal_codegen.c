@@ -1120,6 +1120,36 @@ static type_desc_t *lvalue_record_type(codegen_t *cg, ast_node_t *node) {
         }
         return NULL;
     }
+    /* P92: array element lookup. `arr[i]` for `arr: array[..] of record {..}`
+     * must resolve to the element RECORD type so `arr[i].field` can find
+     * `field` and its size. Without this, `jt[i].routine := @CANCEL_REQ`
+     * in INIT_JTDRIVER's `with jtpointer^^ do` WITH block took expr_size's
+     * default of 2 for the 4-byte `routine: ^integer` field — compiling
+     * the store as MOVE.W instead of MOVE.L, truncating each driver-jump-
+     * table routine pointer to its low 16 bits. When the OS later
+     * dispatched through jt[0], it jumped to $00007EA2 (low word of
+     * $00037EA2 = @CANCEL_REQ) and faulted with SYSTEM_ERROR code=204. */
+    if (node->type == AST_ARRAY_ACCESS) {
+        ast_node_t *arr = node->children[0];
+        if (!arr) return NULL;
+        type_desc_t *at = NULL;
+        if (arr->type == AST_IDENT_EXPR) {
+            cg_symbol_t *sym = find_symbol_any(cg, arr->name);
+            if (sym && sym->type) at = sym->type;
+            else if (cg->with_depth > 0) {
+                type_desc_t *wrt = NULL;
+                int wfld = with_lookup_field(cg, arr->name, &wrt, NULL);
+                if (wfld >= 0 && wrt) at = wrt->fields[wfld].type;
+            }
+        }
+        if (at && at->kind == TK_POINTER && at->base_type) at = at->base_type;
+        if (at && at->kind == TK_ARRAY && at->element_type) {
+            type_desc_t *et = at->element_type;
+            if (et->kind == TK_POINTER && et->base_type) et = et->base_type;
+            return (et && et->kind == TK_RECORD) ? et : NULL;
+        }
+        return NULL;
+    }
     return NULL;
 }
 
