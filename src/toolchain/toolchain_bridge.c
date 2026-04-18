@@ -667,6 +667,7 @@ build_result_t toolchain_build(const char *source_dir,
      * are freed at end-of-iteration. */
     linker_t *primary_lk = NULL;
     linker_t *bt_profile_lk = NULL;   /* saved across loop for boot-track + disk file */
+    linker_t *cd_profile_lk = NULL;   /* saved across loop for SYSTEM.CD_PROFILE disk file */
     const compile_target_t *const *all_targets = compile_targets_all();
     for (int ti = 0; all_targets[ti]; ti++) {
     const compile_target_t *target = all_targets[ti];
@@ -1175,11 +1176,19 @@ build_result_t toolchain_build(const char *source_dir,
                 if (idx >= 0) {
                     fprintf(hle_f, "%s 0x%X\n", hle_syms[h].label, lk->symbols[idx].value);
                     fprintf(stderr, "HLE: %s = $%X\n", hle_syms[h].label, lk->symbols[idx].value);
-                    /* Store in globals for direct use by lisa.c */
-                    if (strcmp(hle_syms[h].label, "CALLDRIVER") == 0)
-                        hle_addr_calldriver = lk->symbols[idx].value;
-                    else if (strcmp(hle_syms[h].label, "SYSTEM_ERROR") == 0)
-                        hle_addr_system_error = lk->symbols[idx].value;
+                    /* Store in globals for direct use by lisa.c — but
+                     * only for the primary target (SYSTEM.OS). Later
+                     * targets like SYSTEM.CD_PROFILE re-define these
+                     * symbols at low addresses in their own linked
+                     * blob, and overwriting the globals from those
+                     * would point the HLE at stubs that don't exist
+                     * in the OS's runtime memory. */
+                    if (is_primary) {
+                        if (strcmp(hle_syms[h].label, "CALLDRIVER") == 0)
+                            hle_addr_calldriver = lk->symbols[idx].value;
+                        else if (strcmp(hle_syms[h].label, "SYSTEM_ERROR") == 0)
+                            hle_addr_system_error = lk->symbols[idx].value;
+                    }
                 } else {
                     fprintf(stderr, "HLE: %s NOT FOUND\n", hle_syms[h].name);
                 }
@@ -1251,6 +1260,12 @@ build_result_t toolchain_build(const char *source_dir,
          * boot track (block 0 = LDPROF entry + tag 0xAAAA) and gets
          * placed on disk as the system.bt_Profile file below. */
         bt_profile_lk = lk;
+    } else if (strcasecmp(target->name, "SYSTEM.CD_PROFILE") == 0) {
+        /* Keep CD_PROFILE's linker alive — LOADEM opens this file
+         * during INIT_BOOT_CDS and LOADCD parses its codeblock/
+         * endblock frames, so we need to wrap + place it on disk
+         * after the ALL_TARGETS loop. */
+        cd_profile_lk = lk;
     } else {
         fprintf(stderr, "TARGET '%s' linker retained per-target dir; not yet on disk.\n",
                 target->name);
@@ -1301,6 +1316,77 @@ build_result_t toolchain_build(const char *source_dir,
             disk_add_file(db, "system.bt_Profile", FTYPE_CODE, bt_raw, bt_size);
         } else {
             fprintf(stderr, "WARN: SYSTEM.BT_PROFILE linker output empty; no boot track written\n");
+        }
+    }
+
+    /* SYSTEM.CD_PROFILE: place on disk as a named file so LOADEM's
+     * `LD_OPENINPUT('SYSTEM.CD_PROFILE')` succeeds and LOADCD can
+     * parse it. LOADCD (source-STARTUP.TEXT:1207) expects the file
+     * to be a sequence of codeblock/endblock records:
+     *
+     *   byte    $85 (codeblock = -123 signed)
+     *   byte    $00 (counter)
+     *   word BE blocksize (including 4-byte header + 4-byte reloffset
+     *                      + code bytes)
+     *   long BE reloffset
+     *   bytes   code (blocksize - 8 bytes)
+     *   ... (more codeblocks) ...
+     *   byte    $81 (endblock = -127)
+     *   byte    $00 (counter)
+     *   word BE 4 (endblock size)
+     *
+     * Our linker produces raw linked.bin. Wrap it as ONE codeblock
+     * followed by ONE endblock. reloffset=0 (driver loader applies
+     * its own relocation via the dispatch table). The 2-byte
+     * blocksize is a Pascal int16 which LOADCD returns via
+     * LD_GETWORD (signed) — so the wrapped code must be at most
+     * 32767 - 8 = 32759 bytes. SYSTEM.CD_PROFILE is a single
+     * driver (a few KB), well within that. */
+    if (cd_profile_lk) {
+        uint32_t cd_size = 0;
+        const uint8_t *cd_raw = linker_get_output(cd_profile_lk, &cd_size);
+        if (cd_raw && cd_size > 0x400) {
+            /* Skip the zero-filled $0..$3FF (vector-area padding)
+             * so the code-proper starts at offset 0 of the wrapped
+             * payload — matches how BT_PROFILE is trimmed for the
+             * boot track. */
+            const uint8_t *cd_code = cd_raw + 0x400;
+            uint32_t cd_code_size = cd_size - 0x400;
+            if (cd_code_size + 8 > 32759) {
+                fprintf(stderr,
+                        "WARN: SYSTEM.CD_PROFILE code %u bytes > 32759 — "
+                        "truncating to fit Pascal int16 blocksize\n",
+                        cd_code_size);
+                cd_code_size = 32759 - 8;
+            }
+            uint32_t code_block_size = 8 + cd_code_size;
+            uint32_t obj_size = 4 + code_block_size + 4;  /* codeblock hdr + body + endblock hdr */
+            uint8_t *obj = (uint8_t *)calloc(1, obj_size);
+            if (obj) {
+                /* codeblock header */
+                obj[0] = 0x85;                              /* codeblock = -123 */
+                obj[1] = 0x00;                              /* counter */
+                obj[2] = (uint8_t)((code_block_size >> 8) & 0xFF);
+                obj[3] = (uint8_t)(code_block_size & 0xFF);
+                /* reloffset = 0 */
+                obj[4] = obj[5] = obj[6] = obj[7] = 0;
+                /* code payload */
+                memcpy(obj + 8, cd_code, cd_code_size);
+                /* endblock header */
+                uint8_t *end = obj + 4 + code_block_size;
+                end[0] = 0x81;                              /* endblock = -127 */
+                end[1] = 0x00;                              /* counter */
+                end[2] = 0x00;                              /* size = 4 */
+                end[3] = 0x04;
+
+                disk_add_file(db, "system.cd_profile", FTYPE_OBJ, obj, obj_size);
+                fprintf(stderr,
+                        "Disk: system.cd_profile (OBJ-wrapped, %u code + 12 hdr = %u bytes)\n",
+                        cd_code_size, obj_size);
+                free(obj);
+            }
+        } else {
+            fprintf(stderr, "WARN: SYSTEM.CD_PROFILE linker output empty\n");
         }
     }
 
@@ -1423,6 +1509,10 @@ build_result_t toolchain_build(const char *source_dir,
     if (bt_profile_lk) {
         linker_free(bt_profile_lk);
         free(bt_profile_lk);
+    }
+    if (cd_profile_lk) {
+        linker_free(cd_profile_lk);
+        free(cd_profile_lk);
     }
     free(files);
 

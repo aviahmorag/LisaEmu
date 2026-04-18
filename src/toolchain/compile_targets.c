@@ -164,14 +164,65 @@ static const compile_target_t TARGET_BT_PROFILE = {
     .boot_entry = "LDPROF",
 };
 
+/* ---- SYSTEM.CD_PROFILE driver (Phase 2 step 9+10) ----
+ *
+ * Apple's ProFile device-driver file, loaded on demand by LOADEM
+ * during INIT_BOOT_CDS via `LD_OPENINPUT('SYSTEM.CD_PROFILE')` ->
+ * LOADCD. Source:
+ *   _inspiration/LisaSourceCompilation-main/src/MAKE/ALEX-MAKE-CDPROFILE.TEXT
+ *
+ * Apple's link order:
+ *   DRIVERASM    (shared driver asm)
+ *   PROFILEASM   (ProFile-specific asm)
+ *   DRIVERMAIN   (Pascal driver entrypoint)
+ *   PROFILE      (Pascal ProFile logic)
+ *   OSINTPASLIB  (Pascal runtime bridge)
+ *
+ * All five sources live in LISA_OS/OS. The driver is POSITION-
+ * DEPENDENT on the runtime-allocated base GET_BOOTSPACE returns —
+ * Apple's OBJ-format wrapper carries a reloffset that downstream
+ * code applies. Our toolchain_bridge wraps the linked.bin in a
+ * minimal codeblock+endblock frame before disk_add_file. */
+static const char *const CD_PROFILE_MODULES[] = {
+    /* Pascal runtime */
+    "OSINTPASLIB",
+    /* Driver body (Pascal) */
+    "PROFILE",
+    /* Main driver entrypoint (Pascal) */
+    "DRIVERMAIN",
+    /* Device-specific asm */
+    "PROFILEASM",
+    /* Shared driver asm — first module (lowest address) per Apple's
+     * link order. DRIVERASM exports the driver dispatch conventions
+     * that DRIVERMAIN / PROFILE use. */
+    "DRIVERASM",
+    NULL
+};
+
+static const compile_target_t TARGET_CD_PROFILE = {
+    .name = "SYSTEM.CD_PROFILE",
+    .out_path = "system.cd_profile",   /* on-disk filename (lowercase) */
+    .modules = CD_PROFILE_MODULES,
+    .search_dirs = SYSTEM_OS_DIRS,
+    /* Strict mode: only the 5 listed modules; sharing type/symbol
+     * resolution with SYSTEM.OS happens through the shared_types /
+     * shared_globals tables set up in toolchain_bridge. */
+    .strict = true,
+    /* DRIVERASM's first entry-point ends up at the start of the
+     * linked blob. LOADCD reads our OBJ wrapper and copies from
+     * offset 8 (past the 4-byte header + 4-byte reloffset). */
+    .boot_entry = "DRIVERASM",
+};
+
 /* Registry. New targets (SYS1LIB, LIBQD, Shell, apps...) go here as
  * each ships. */
 static const compile_target_t *const ALL_TARGETS[] = {
     &TARGET_SYSTEM_OS,
     &TARGET_BT_PROFILE,
-    /* TODO: SYSTEM.CD_PROFILE (Phase 3), SYS1LIB, SYS2LIB, LIBQD,
-     * LIBTK, LIBPL, LIBHW (as standalone), LIBOS, APBG, APDM, APIM,
-     * APLC, APLD, APLL, APLP, APLT, APLW, APPW, Shell, Desktop. */
+    &TARGET_CD_PROFILE,
+    /* TODO: SYS1LIB, SYS2LIB, LIBQD, LIBTK, LIBPL, LIBHW (as
+     * standalone), LIBOS, APBG, APDM, APIM, APLC, APLD, APLL,
+     * APLP, APLT, APLW, APPW, Shell, Desktop. */
     NULL
 };
 
