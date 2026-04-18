@@ -1,20 +1,67 @@
-# LisaEmu - Apple Lisa Emulator
+# LisaEmu — Apple Lisa Emulator
 
 ## Project Vision
 
-A native macOS app that takes Apple's officially released Lisa OS source code (`Lisa_Source/`) as input, compiles/assembles it into runnable binaries, and runs a complete Apple Lisa system — like Parallels, but for the Lisa.
+**This is a real emulator, not a toy.** Like Parallels, but for the 1983
+Apple Lisa. It takes Apple's officially-released Lisa OS 3.1 source code
+(`Lisa_Source/`, released by Apple via the Computer History Museum in 2018
+under Academic License — not redistributable, user-supplied) and:
 
-The source code (Lisa OS version 3.1) was released by Apple in 2018 via the Computer History Museum:
-https://info.computerhistory.org/apple-lisa-code
+1. Compiles it with our built-from-scratch 68000 cross-assembler + Lisa
+   Pascal cross-compiler + linker.
+2. Lays out the resulting binaries on real ProFile-format disk images
+   (MDDF + slist + catalog + per-file filemap + 24-byte pagelabels).
+3. Runs those images on our 68000 + Lisa-hardware emulator **exactly the
+   way a real Lisa would** — full bootloader chain, real driver loading
+   at runtime, real filesystem access, real process scheduling, real
+   desktop UI.
 
-It is freely available under an Apple Academic License but **cannot be redistributed**. Users supply their own copy.
+The endgame is booting Apple's compiled code into a working Lisa desktop
+with no shortcuts. Every component Apple released source for must end
+up running as compiled Pascal/asm, not as a C reimplementation.
+
+## Architectural Invariants (NON-NEGOTIABLE)
+
+These rules constrain every design decision. They exist in durable memory
+(`.claude/memory/`) for a reason — don't ask to relax them.
+
+1. **Real bootloader chain.** The canonical boot path is
+   `boot ROM → boot-track code (LDPROF / LDTWIG / LDSONY) → LOADER → SYSTEM.OS
+   → SYSTEM.CD_PROFILE → ... → APDM (desktop)`. Every link must ultimately
+   run as compiled source. Skipping a link is scaffolding, not a solution.
+
+2. **No semantic HLEs.** If Apple has source for it, we compile it. Do
+   *not* "just reimplement OPENINPUT in C" or "replace MMU programming
+   with a C function" when the Pascal/asm source is sitting in
+   `Lisa_Source/`. Ephemeral HLEs to scaffold past a not-yet-built
+   subsystem are fine; keeping an HLE when the source is compilable is
+   architectural regression.
+
+3. **HLEs are load-bearing layers, not cruft.** Each active HLE encodes
+   real insight about a missing subsystem. Never remove one "as cleanup."
+   Remove only in the same commit that compiles + wires up the replacement.
+   See `feedback_hle_layers_load_bearing.md`.
+
+4. **Do the real fix, not the workaround.** MMU write-guards, address-
+   based bypasses, suppression ranges, placeholder return values — all
+   symptom-masking. When a structural bug surfaces (codegen, linker,
+   record-layout mismatch), fix the structure. See
+   `feedback_do_the_real_fix.md`.
+
+5. **Acceptable HLEs, total list:** hardware surfaces with no source
+   (specific VIA/COPS/ProFile chip behaviors we cannot literally emulate),
+   host-OS interactions (timer, IRQ scheduling on macOS), scaffolding to
+   reach a new subsystem *while we build its replacement*.
 
 ## Architecture
 
-### Two layers:
+### Two layers
 
-1. **Toolchain** — Cross-assembler (68000) + Lisa Pascal cross-compiler + linker that processes `Lisa_Source/` into bootable disk images and ROM
-2. **Emulator** — Motorola 68000 CPU + Lisa hardware emulation (memory, VIAs, display, keyboard, mouse, disks)
+1. **Toolchain** — 68000 cross-assembler + Lisa Pascal cross-compiler +
+   linker + disk-image builder + boot-ROM generator. Everything needed
+   to turn `Lisa_Source/` into bootable disk+ROM artifacts.
+2. **Emulator** — Motorola 68000 CPU + Lisa MMU + VIAs + COPS + ProFile
+   + video + keyboard + mouse. Runs the toolchain's output.
 
 ### Directory Structure
 
@@ -25,9 +72,9 @@ It is freely available under an Apple Academic License but **cannot be redistrib
 │   ├── m68k.h/c           # Motorola 68000 CPU emulator
 │   ├── lisa_mmu.h/c       # Memory controller + MMU
 │   ├── via6522.h/c        # VIA 6522 chip emulation (x2)
-│   ├── lisa.h/c           # Main machine integration
+│   ├── lisa.h/c           # Main machine integration + HLE intercepts
 │   ├── lisa_bridge.h/c    # C-to-Swift bridge API
-│   ├── main_sdl.c         # Standalone SDL2 frontend (for testing)
+│   ├── main_sdl.c         # Standalone SDL2 frontend (headless tests)
 │   └── toolchain/         # Cross-compilation pipeline
 │       ├── pascal_lexer.h/c      # Lisa Pascal tokenizer
 │       ├── pascal_parser.h/c     # Recursive descent parser → AST
@@ -35,22 +82,25 @@ It is freely available under an Apple Academic License but **cannot be redistrib
 │       ├── asm68k.h/c            # Two-pass 68000 cross-assembler
 │       ├── linker.h/c            # Multi-module linker
 │       ├── bootrom.c             # Boot ROM generator
-│       ├── diskimage.h/c         # Disk image builder
-│       ├── toolchain_bridge.h/c  # Orchestrates full compile pipeline
-│       ├── audit_toolchain.c     # Diagnostic tool (make audit)
+│       ├── diskimage.h/c         # Disk image builder (MDDF + catalog)
+│       ├── compile_targets.c     # Per-target module lists (SYSTEM.OS, ...)
+│       ├── toolchain_bridge.h/c  # Orchestrates the full compile pipeline
+│       ├── audit_toolchain.c     # make audit diagnostic tool
 │       └── test_*.c              # Per-component test tools
 ├── lisaOS/                # Xcode macOS app (SwiftUI, Swift 6)
 │   └── lisaOS/
-│       ├── Emulator/      # SYMLINKS to src/ (not copies!)
+│       ├── Emulator/      # SYMLINKS to src/ (never copy!)
 │       ├── ContentView.swift
 │       ├── EmulatorViewModel.swift
 │       ├── LisaDisplayView.swift
 │       └── lisaOSApp.swift
-├── docs/                  # Documentation (Lisa_Source reference, hardware specs)
+├── docs/                  # Reference (Lisa_Source map, hardware specs, HLE inventory)
+├── _inspiration/          # Reference projects (LisaSourceCompilation, lisaem-master)
+├── .claude-handoffs/      # Archived NEXT_SESSION.md files — full project history
 ├── build/                 # Build output (gitignored)
 ├── Makefile               # Standalone SDL2 build + audit targets
 ├── CLAUDE.md              # This file
-└── NEXT_SESSION.md        # Current status and prioritized fix list
+└── NEXT_SESSION.md        # Handoff for the next session (created at /wrap-up)
 ```
 
 ## Key Commands
@@ -59,1449 +109,208 @@ It is freely available under an Apple Academic License but **cannot be redistrib
 # Build standalone emulator (SDL2)
 make
 
-# Run toolchain audit — the primary diagnostic tool
+# Run toolchain audit — primary diagnostic tool
 make audit              # Full report (all 4 stages)
-make audit-parser       # Stage 1: Parser only
-make audit-codegen      # Stage 2: Codegen only
-make audit-asm          # Stage 3: Assembler only
-make audit-linker       # Stage 4: Full pipeline + linker
+make audit-parser       # Stage 1
+make audit-codegen      # Stage 2
+make audit-asm          # Stage 3
+make audit-linker       # Stage 4: full pipeline + linker
+
+# Headless boot test (1000 frames)
+./build/lisaemu --headless Lisa_Source 1000
 
 # Xcode build (or just open in Xcode)
 cd lisaOS && xcodebuild -scheme lisaOS -destination 'generic/platform=macOS' build 2>&1 | grep -E "(error:|BUILD)"
 ```
 
-## Working strategy (2026-04-18 pivot)
-
-The project is now in **multilayer-subsystem-build mode**. Each phase
-replaces one HLE layer with the real emulated subsystem; HLEs come out
-**only in the same commit** that replaces them. No HLE reverts as
-cleanup. See `NEXT_SESSION.md` for the seven-phase arc and the current
-phase, and `docs/HLE_INVENTORY.md` for the complete ledger of active
-HLEs (28 active + 9 disabled as of this session's inventory).
-
-Durable rule in auto-memory: `HLEs are load-bearing layers, not cruft`
-— every bypass/suppression/patch encodes real insight about a missing
-subsystem; removing one without building the replacement is regression.
-
-Phases (see NEXT_SESSION.md for detail):
-
-1. **PMEM + boot-CD** — removes 10738 suppression
-2. **ProFile driver wiring** — removes CALLDRIVER HLE pile
-3. **MDDF / disk-image layout** — removes 10707 suppression
-4. **IRQ-driven I/O completion** — removes Block_Process-on-POP deadlock
-5. **SYS_PROC_INIT + processes** — removes P89i + CreateProcess HLEs
-6. **Cleanup HLEs** (FS/MEM/PR)
-7. **Safety nets** (REG_OPEN_LIST, excep_setup, etc.)
-
-## Current Status (2026-04-18 session 4 — Phase 1 PMEM COMPLETE; five structural Pascal-codegen fixes)
-
-21/27 milestones (same as start of session; no regression). **Phase 1
-PMEM is now running natively**: `FIND_PM_IDS` returns true for the
-ProFile-on-parallel-port PRAM stub. The 10738 suppression at
-`src/lisa.c:2886` is no longer load-bearing at the INIT_BOOT_CDS level
-— it now fires from LOADEM (the next layer, Phase 2 / driver loading).
-
-This session — 5 structural Pascal codegen fixes (P90):
-
-1. **Signed byte-subrange sign-extension** (`pascal_codegen.c`).
-   `pmbyte = -128..127` is signed. After `chan := 0 - 1 = -1` stored
-   as byte `$FF`, the re-read emitted `MOVEQ #0,D0; MOVE.B (A0),D0`
-   (zero-extend) → word `$00FF`. Literal `-1` via `MOVEQ #$FF,D0` =
-   `$FFFFFFFF` → word `$FFFF`. `$00FF != $FFFF`, so `if chan = empty`
-   never fired. Result: `chan` stayed `$FF` instead of becoming
-   `emptychan = 7`, and the FIND_PM_IDS match compared 7 against
-   255 every iteration. Fix: new `type_is_signed_byte(t)` helper +
-   `emit_sign_ext_byte(cg)` (EXT.W/EXT.L); called after every
-   byte-subrange read at AST_IDENT_EXPR (local/param/global/VAR),
-   AST_FIELD_ACCESS, and WITH-field-lookup paths.
-
-2. **Packed variant records with `boolean` had mis-sized arms**
-   (`pascal_codegen.c` + mirror in `toolchain_bridge.c`). `c_ne =
-   packed record case boolean of true:(b:boolean; p:pmbyte; o:integer);
-   false:(l:longint)`. P87c's boolean-in-packed rule only fired if
-   the record had a Tnibble; without one, boolean stayed 2 bytes.
-   That made the true arm 2+1+2=5 bytes while `l:longint` is 4; the
-   arms didn't overlap, and `l := NextEntry` wrote bytes 0-3 but
-   `offset` lived at byte 3 so reading it pulled a stale byte 4.
-   GetNxtConfig's `if offset <= 8` then took the wrong branch and
-   always returned e_badnext. Fix: add `record_has_variant` pre-scan
-   (finds `__variant_begin__` sentinel), and collapse boolean to 1
-   byte when either nibble OR variant is present in a packed record.
-
-3. **Packed-record `offset` tracked placed_byte_offset, not
-   end-of-field** (`pascal_codegen.c`). In the whole-byte branch of
-   the record resolver, `bit_cursor` advanced but `offset` didn't:
-   ```c
-   placed_byte_offset = offset;
-   bit_cursor = (offset + fs) * 8;
-   // offset NOT advanced — variant_max_end & t->size miss the size
-   ```
-   `c_ne` ended up size=2 instead of 4. `process_var_decl` allocated
-   2 bytes for `cracked_ne`; LINK A6,#-22 was 2 bytes short; the
-   4-byte `cracked_ne.l := NextEntry` stomped the saved A6. UNLK
-   restored a corrupt A6 ($01FEA4 instead of $CBFEA4) and the entire
-   caller ran with blown frame pointer. Fix: in the packed whole-byte
-   path, advance `offset += fs` (mirroring the bit-packed and unpacked
-   branches).
-
-4. **Aggregate (record/array) assignment didn't exist**
-   (`pascal_codegen.c`). `mypmem := pmptr^` where `pmemrec` is 64
-   bytes compiled as `MOVE.W (A0),D0; MOVE.L D0,-68(A6)` — 2-byte
-   load, 4-byte store, 62 bytes lost. `booter[i] := booter[devcd]`
-   likewise lost 88 bytes. Fix: at AST_ASSIGN entry, detect
-   `expr_size(lhs) > 4 || expr_size(rhs) > 4` and emit a
-   `MOVE.B (A0)+,(A1)+ / DBRA D0,-4` block-copy loop for
-   `max(lhs_sz, rhs_sz)` bytes. Source addr via gen_ptr_expression
-   (AST_DEREF) or gen_lvalue_addr (field/array lvalues).
-
-5. **`gen_lvalue_addr` for AST_ARRAY_ACCESS clobbered A0 across the
-   index expression** (`pascal_codegen.c`). `PMRec[offset]` compiled
-   to `MOVEA.L 16(A6),A0 ; LEA -4(A6),A0 ; …` — the second LEA (for
-   the WITH-field `offset`) stomped the base. CRAK_PM got called
-   with a pointer into cracked_ne instead of into mypmem. Fix: push
-   A0 before `gen_expression(index)`, pop back into A0 after.
-
-Also:
-
-- **PRAM stub uses internal cd_paraport=10** (`src/lisa.c`).
-  Previous stub used external (syscall.text:80) cd_paraport=11, but
-  STARTUP's find_boot uses the DRIVERDEFS internal form (cd_paraport=10).
-  GetNxtConfig converts packed `pm_slot → pos.slot = pm_slot+1`
-  (external), so the packed byte must encode `pm_slot = 10`.
-  Byte 10: `$BE` → `$AE`. Checksum: `$680C` → `$780C`.
-
-**Verification**: FIND_PM_IDS return D0.W = $0001 (probed at pre-UNLK);
-INIT_BOOT_CDS skips the `if not FIND_PM_IDS` body; boot proceeds to
-FIND_CDDS → LOADEM, where LOADEM's `LD_OPENINPUT('SYSTEM.CD_PROFILE')`
-returns false (no driver file) and fires the next-layer SYSTEM_ERROR.
-
-**10738 suppression status**: Still present (`src/lisa.c:2886`), still
-firing, but the firing site has shifted:
-- Was: INIT_BOOT_CDS line 1632 (`bootdev > 2` after FIND_PM_IDS false).
-- Now: LOADEM line 1539 (`not LD_OPENINPUT` — Phase 2 issue).
-Remove only in the same commit as Phase 2's real driver-load path.
-
-**Previous session 3 context** (for context on the DBRA fix this
-session builds on):
-
-- **Cross-assembler DBRA encoding bug fixed** (`src/toolchain/asm68k.c:1391-1403`).
-  DBRA was encoding as `cc=0` (DBT — condition TRUE, always exits) instead
-  of `cc=1` (DBF, the correct alias). Every DBRA loop in Apple's asm
-  sources (14 total: source-LDASM, source-LDPROF, source-LDTWIG,
-  source-STARASM2) was silently running exactly one iteration. The most
-  visible victim was `INIT_READ_PM`'s `MOVEP.L` loop: it completed only
-  one 4-byte MOVEP instead of 16, so `pm_image` stayed mostly garbage
-  and `pm_good` never became true.
-
-<!-- retain for deep history -->
-## Previous Status (2026-04-18 session 3 — Phase 1 PMEM: DBRA asm bug fixed, PRAM stub now valid)
-
-21/27 milestones. Regressed 1 from prior session because a major asm
-assembler bug (DBRA → DBT miscompile) was fixed, and the fix unmasks
-downstream bugs in other DBRA-dependent asm loops. This session:
-
-- **Cross-assembler DBRA encoding bug fixed** (`src/toolchain/asm68k.c:1391-1403`).
-  DBRA was encoding as `cc=0` (DBT — condition TRUE, always exits) instead
-  of `cc=1` (DBF, the correct alias). Every DBRA loop in Apple's asm
-  sources (14 total: source-LDASM, source-LDPROF, source-LDTWIG,
-  source-STARASM2) was silently running exactly one iteration. The most
-  visible victim was `INIT_READ_PM`'s `MOVEP.L` loop: it completed only
-  one 4-byte MOVEP instead of 16, so `pm_image` stayed mostly garbage
-  and `pm_good` never became true.
-
-- **PRAM stub now encodes a correct `cd_paraport` CD entry**
-  (`src/lisa.c` `io_read_cb` at `$FCC181`). Previous stub had `pm_slot=9`
-  (decodes to `cd_scc`) despite a comment claiming ProFile. Now
-  `pm_slot=11 = cd_paraport`, `pm_chan=7` (emptychan), `pm_dev=31`
-  (emptydev), `driverID=34`, short form. Checksum recomputed to `0x680C`
-  so the 32-word XOR is 0 (required by VERIFY_CKSUM for `pm_good := true`).
-
-- **Result**: INIT_CONFIG → INIT_READ_PM → VERIFY_CKSUM → `pm_good = 1` ✓.
-  FIND_PM_IDS's `if snap_good or pm_good` branch correctly calls
-  INIT_READ_PM a second time to populate `param_mem.parm_mem[]`. Verified
-  via probes that the valid cd_paraport entry reaches param_mem.
-
-- **Still open**: FIND_PM_IDS still returns false despite having valid
-  input. The inner match test `(boot_slot = pos.slot) and
-  (boot_chan = pos.chan) and (boot_dev = pos.dev)` doesn't fire on any
-  GetNxtConfig iteration. 10738 suppression still load-bearing.
-
-- **Saved**: `.claude/memory/project_dbra_asm_bug.md` durable rule about
-  DBRA miscompile, so any future "Apple-asm loop runs once then bails"
-  symptom points straight back to `asm68k.c` DBcc encoding.
-
-Commits this session: `268ca31` (DBRA fix), `0c5f668` (PRAM stub fix),
-`69dace3` (NEXT_SESSION.md handoff).
-
-## Previous Status (2026-04-18 session 2 — strategic pivot, P89i INTSON-defer added)
-
-22/27 milestones, same as start of session. This session:
-
-- Diagnosed the Scheduler→Launch→garbage-RTE crash at 22/27 and found
-  the previous handoff's "timer IRQ" diagnosis was incomplete — the
-  dispatch is **synchronous** via `Block_Process(self=POP)` during the
-  post-10707-suppression cleanup path (`AlarmRelative`→`TimeStamp`→
-  `Wait_sem`→`Block_Process`), not from a timer IRQ. POP blocks,
-  Scheduler has no other runnable, dispatches POP, Launch RTE reads
-  POP's uninit `env_save_area.PC = $070000CB` → hard_excep → 10204.
-- Added P89i (INTSON deferral until SYS_PROC_INIT reached) — part of
-  the multilayer story. Kept; removed only in Phase 5 (processes)+4
-  (IRQ).
-- Produced `docs/HLE_INVENTORY.md` — comprehensive audit of active
-  HLEs with line numbers, categories, triggers, and what each hides.
-- Saved durable rule to auto-memory.
-
-**Not done this session**: no Phase 1 (PMEM) work yet. That's the
-first coding phase for next session.
-
-(Original P89d/e status section preserved below for reference.)
-
----
-
-## Previous Status (2026-04-18 end — P89d/e: three structural codegen fixes; env_save_area stores now emit; 12 of 13 Build_Stack fields written)
-
-22/27 milestones reached. Boot now progresses past three previously-silent
-codegen failures (p_linkage record collision, proc_sig-resolution gap,
-AST_FIELD_ACCESS-in-AST_WITH). Build_Stack emits 12 of the expected 13
-record-field stores (was 8); one A6 field still drops (the complex
-MMU_Base/seg_size subtraction expression). Boot halts with hard_excep
-(SYSTEM_ERROR 10201) because the RTE in Launch pops an odd PC from the
-partially-written env_save_area.
-
-Baseline (pre-P89) still reaches 23/27 by accident.
-
-### Structural fixes this session (all committed, pushed)
-
-Six fixes total (see commits 5b2f848, 6b4a290, 48d8972):
-
-1. **main_sdl.c: fresh bundle artifact paths**. Previously loaded stale
-   `build/lisa_boot.rom`/`lisa_linked.map`/`lisa_profile.image` when the
-   toolchain writes to `build/rom/` and `build/LisaOS.lisa/`. All earlier
-   "22/27" reports were actually running stale code.
-
-2. **linker.c: LOADER-yields-to-non-LOADER rule** for duplicate ENTRY
-   symbols. LOADER and STARTUP both export `SETMMU` with different
-   signatures; kernel callers pass 5 args (STARTUP's signature), so
-   STARTUP's version needs to win the collision.
-
-3. **m68k.c: P89c smt_adr prime** on first SETMMU entry. LOADER's
-   BOOTINIT would have initialized LOADER's `smt_adr` VAR (A5-6112);
-   we skip BOOTINIT, so this lazy prime mimics what BOOTINIT would have
-   done.
-
-4. **pascal_codegen.c: P89d P80g-repair gate** on `fields[1].offset == 0`.
-   The post-creation record repair was matching by first-field-name only,
-   which merged structurally-similar but semantically-distinct records.
-   MMPRIM's `p_linkage` (2 × ptr_p_linkage, 8 bytes) was being overwritten
-   by DRIVERDEFS's `linkage` (2 × relptr, 4 bytes) because both start with
-   fwd_link/bkwd_link. That collapsed sdb's memaddr from offset 8 to
-   offset 4 in MMPRIM's compile. Fix: only apply the repair when the
-   local record's offsets actually look corrupt (fields[1].offset == 0).
-
-5. **pascal_codegen.c: find_proc_sig resolution tiering**. Previously
-   returned the first non-external sig, even if its `param_type[*]`
-   entries were NULL (unresolved). MAP_SYSLOCAL gets registered 4 times
-   in MMPRIM's compile — first with `c_pcb: ptr_pcb` unresolved
-   (param_size=2 fallback), later with ptr_PCB resolved (param_size=4).
-   The caller Scheduler was picking the unresolved sig, pushing c_pcb
-   as a WORD, which truncated the pointer and made MAP_SYSLOCAL's
-   MOVE.L 8(A6), D0 read garbage. New priority:
-   local-resolved > local-partial > imported-resolved > imported-partial
-   > external.
-
-6. **P89e: AST_WITH handles AST_FIELD_ACCESS record expression**
-   (`pascal_codegen.c`). The `with sloc_ptr^.env_save_area, stk_handle
-   do begin SR := 0; PC := ord(@Initiate) end` in Build_Stack had its
-   first WITH expression as AST_FIELD_ACCESS. AST_WITH's type
-   resolver had that case as a stub ("type resolution is complex; push
-   NULL and hope for the best"), so record_type stayed NULL and the
-   body's field stores silently no-op'd. Fix: walk the field-access
-   chain via `lvalue_record_type` and look up the named field in the
-   parent record. Net effect: Build_Stack now emits 12 of 13
-   record-field stores (was 8); env_save_area.PC actually gets
-   assigned `ord(@Initiate) = $0004FD7C` instead of staying zero.
-
-### What the fixes unlocked (cumulative)
-
-- Linker resolves STARTUP's 5-arg SETMMU (not LOADER's 4-arg) → callers
-  push the right number of args.
-- Scheduler finds the correctly-resolved Map_Syslocal sig → pushes
-  c_pcb as LONG (4 bytes), not WORD.
-- MMPRIM's p_linkage record isn't clobbered by DRIVERDEFS's linkage →
-  sdb memaddr at correct offset 8 (not offset 4).
-- MAP_SYSLOCAL writes correct origin=$043B/access=$07/limit=$20 into
-  SMT[seg 103]. Syslocmmu mapping survives.
-- Build_Stack's env_save_area assignments actually emit stores.
-
-### Remaining blocker: partial env_save_area causes odd-PC RTE
-
-Boot halts with `hard_excep` → SYSTEM_ERROR(10201) because Launch's RTE
-pops an odd PC (observed: $CC25, was $CC07 pre-P89e). Build_Stack now
-emits 12 stores but one A6 field still seems to drop. The assignment
-`A6 := MMU_Base(stackmmu+1) - (seg_size - (ord(@stk_base^.start_addr)
-- seg_ptr))` has a nested expression with multiple function calls and
-record-field address-of that may not codegen cleanly. Next session:
-disassemble Build_Stack at its new address (`$050F4E` or whatever the
-post-P89e link places it) and find the missing store. Expected stores
-in order: start_addr, glob_base, In_buffptr, Out_buffptr, units_size,
-OSorMonitor, C_parms, V_parms, A5, A6, A7, SR, PC = 13 total.
-
-### This session's structural fixes (uncommitted)
-
-1. **Stale-artifact bug in `main_sdl.c`**. Headless runner was loading
-   `build/lisa_boot.rom` / `build/lisa_linked.map` / `build/lisa_profile.image`
-   (stale, written by an earlier build) instead of the fresh bundle paths
-   `build/rom/lisa_boot.rom` / `build/LisaOS.lisa/{linked.map,profile.image}`.
-   With stale artifacts, HLE PC addresses from `boot_progress_lookup` didn't
-   match the current binary's addresses — so hooks like P89c (which look up
-   `SETMMU`) resolved to wrong addresses. Fix: load bundle paths first, fall
-   back to legacy flat paths only for `--image` mode.
-
-2. **Linker LOADER-yields-to-non-LOADER rule** (`src/toolchain/linker.c`).
-   LOADER.TEXT and STARTUP.TEXT both export `SETMMU` with different signatures
-   (4-param vs 5-param). Previous "first ENTRY wins" kept LOADER's, but the
-   kernel's call sites pass 5 args (STARTUP's signature). Added a rule in
-   `add_global_symbol`: if existing is from LOADER.TEXT and new is not, new
-   replaces existing. Matches the existing DRIVERASM-yields-to-real rule
-   pattern. After this, `$000404 SETMMU` is STARTUP's 5-param version.
-
-3. **P89c: prime `smt_adr` on first SETMMU entry** (`src/m68k.c`). LOADER's
-   BOOTINIT would have done `smt_adr := pointer(smt_base)`, but we skip
-   BOOTINIT. Hook: when PC first hits SETMMU and A5 is in $CC0000-$CE0000
-   (PASCALINIT has moved A5 to sysglobal), write A5-6112 = `g_hle_smt_base`.
-   Redundant after fix #2 lands (STARTUP uses `smt_addr` at A5-24887, not
-   `smt_adr`), but kept as belt-and-suspenders in case any code still
-   references LOADER's `smt_adr`.
-
-### Where we landed
-
-After the three fixes above: SETMMU (STARTUP's 5-param version) runs
-correctly for all 16 realmemmmu segs (85–100) + 4 screen segs (125 domains
-0–3), writing real `origin = base/512`, `access = $07`, `limit = length/512`
-values to SMT at `$073154 .. $07318F`. HLE PROG_MMU TRAP6 reads these and
-programs the MMU context properly.
-
-### The 1-milestone regression (22/27 vs baseline 23/27)
-
-**Root cause: PCB record-layout disagreement between STARTUP and MMPRIM.**
-
-Ruled out (and useful to know):
-- MAKE_REGION args arrive correct: memaddr=$087600, memsize=$4000 for the
-  syslocal call.
-- The sdb MAKE_REGION creates IS populated correctly — at $CCB4FA with
-  fwd/bkwd links valid, memaddr=$043B ($87600/$200), memsize=$0020
-  ($4000/$200), lockcount=1, sdbtype=data.
-- INIT_PROCESS writes `slocal_sdbRP` at the correct PCB offset +48:
-  `c_pcb@+48 = $000044FE` (= $CCB4FA − $CC6FFC ✓).
-
-The actual bug: **MAP_SYSLOCAL reads slocal_sdbRP at PCB offset +20**,
-which is glob_id's offset (holding Apple's magic $ABC). MAP_SYSLOCAL
-computes `c_sysl_sdb := pointer($ABC + b_sysglobal_ptr)` = $CC7AB8 — an
-uninitialized area with zeros. Then its `with c_smt^[syslocmmu] do`
-block writes origin=0 / limit=0 into SMT[seg 103]. Our HLE PROG_MMU
-reads that and zeros `mem->segments[1][103].sor`. Logical $CE0000
-(syslocal) now maps to physical $0 (vector table). Launch later reads
-A5 from the env_save_area (actually stomped TRAP6 vector), loads
-A5=$3F8, CRASH TO VECTORS loop.
-
-**Why baseline (pre-P89) works by accident:** P89 fixed a codegen bug
-where `with ptr^[N] do` field assignments emitted no-op writes. Before
-P89, MAP_SYSLOCAL's whole body was silent, so the offset-skew was
-harmless — no writes made it to SMT[103], and our bootrom's
-pre-programmed mapping stood. P89 made the body functional; the skew
-is what the body now exposes.
-
-### Likely cause of the layout skew
-
-Cross-module record type propagation. MMPRIM imports the PCB type
-through some chain of `unit`/`interface`/`type` declarations. Some
-field between `glob_id` (offset 20) and `slocal_sdbRP` (offset 48) is
-being sized differently in MMPRIM's compile than in STARTUP's — either
-a missing field, a different-sized field, or a missing pre-pass fixup
-for PCB in MMPRIM.
-
-Same class as the long series of field-offset bugs already fixed
-(P80b iterative record pre-pass, P82 variant records, P87a/d packed
-bit-packing). PCB is a complex record with nested semaphore + variant
-arms and hasn't been fully stabilized across modules.
-
-### Next step
-
-Instrument `pascal_codegen.c` or `toolchain_bridge` Phase 2 fixup to
-dump PCB record layout per module. Compare STARTUP.compile vs
-MMPRIM.compile. The field between glob_id and slocal_sdbRP that has
-different sizes across modules is the culprit. Fix the pre-pass to
-propagate consistent offsets. See NEXT_SESSION.md for full plan.
-
-## Previous Status (2026-04-17 night — post-P88) — Linker CONST relocation fixed; post-SYS_PROC_INIT ILLEGAL still blocks on MMU programming
-
-**P88 — Linker preserves Pascal CONST literal values**
-(`src/toolchain/linker.{h,c}`, `src/m68k.c`). Phase-2 symbol
-relocation was adding `mod->base_addr` to any non-negative exported
-symbol value. That was the correct behavior for code entry points,
-but WRONG for Pascal CONSTs whose "value" is the literal constant,
-not a module-relative offset. With the fix: `logrealmem` in
-`linked.map` resolves to `$AA0000` (was `$AAE466`), `hmempgsize` to
-`$00000100`, `mempgsize` to `$00000200`, `maxmmusize` to `$00020000`.
-Same class of bug as P86 (A5-relative pins), but for positive CONST
-literals.
-
-Implementation:
-- `link_symbol_t.is_const` bool flag.
-- `link_module_t.symbols[]` gets a parallel byte flag, propagated
-  from `cg_symbol_t.is_const` in `linker_load_codegen`.
-- `add_global_symbol` callers capture the returned global-symbol
-  index and copy `is_const` into the global table.
-- Phase-2 sentinel skips `sym->value += mod->base_addr` when
-  `is_const` is true.
-
-**P88-followup (the `$019400` ILLEGAL)** — still unresolved at the
-conceptual level: the realmemmmu segs (85-100) get collapsed to
-SOR=0 because the PROG_MMU TRAP6 HLE reads the SMT entry as
-`$00000000`. P89 found WHY the SMT read returns zero (SETMMU body
-was a no-op) and fixed the codegen, but the two stacked downstream
-issues above still need to be resolved before SMT entries get
-real values and the `$019400` ILLEGAL class goes away.
-
-## Previous Status (2026-04-17 very late) — Kernel boots past SYS_PROC_INIT, packed-record bit-packing in place
-
-**Boot now runs cleanly past SYS_PROC_INIT** (23/27 milestones reached,
-including SYS_PROC_INIT ✅) with no SYSTEM_ERROR halt. 1000 headless
-frames complete; the kernel enters the scheduler idle loop. Next
-kernel milestone (INIT_DRIVER_SPACE) is not yet reached but nothing
-halts — needs investigation of why the driver allocator isn't being
-invoked after SYS_PROC_INIT succeeds.
-
-### Session 2026-04-17 very late — DEFAULTPM corruption fixed via packed bit-packing
-
-Two root causes stacked on top of each other corrupted `b_syslocal_ptr`
-at A5-24785 during DEFAULTPM init, crashing Make_SProcess later:
-
-**P87a — `expr_size` resolves WITH-field byte arrays** (`src/toolchain/pascal_codegen.c`).
-`expr_size(AST_ARRAY_ACCESS)` only handled globally-findable arrays. For
-`devconfig[i]` inside `With PMRec^ do`, `find_symbol_any` missed it and
-expr_size defaulted to 2, emitting `MOVE.W D0,(A0)` on a 1-byte-stride
-loop. Now falls back to `with_lookup_field` when no global matches, but
-only returns the corrected size for byte elements (pointer-array paths
-still default to 2 because widening there broke MMPRIM code that
-depended on the prior-2-byte default).
-
-**P87d — packed-record bit-packing for Tnibble and boolean fields**
-(`src/toolchain/pascal_codegen.{h,c}`, `src/toolchain/toolchain_bridge.c`).
-Apple's `pmem = packed record` has Tnibble (0..15, 4-bit) fields paired
-into bytes and booleans bit-packed, so `DevConfig` lands at byte 10.
-Our codegen previously gave booleans 2 bytes and Tnibbles 1 byte each,
-so DevConfig landed at offset 22, overrunning the 64-byte
-`param_mem` backing store by 8 bytes and clobbering `b_syslocal_ptr`.
-Fix:
-
-- `type_desc_t.fields[].bit_offset` / `bit_width` added; `bit_width > 0`
-  marks a bit-packed field.
-- Resolver (AST_TYPE_RECORD) maintains a parallel `bit_cursor` when
-  `cg->in_packed`. TK_BOOLEAN → 1 bit, TK_SUBRANGE 0..15 → 4 bits.
-  First-declared field gets the HIGH bits, matching Apple's comments.
-- Phase-2 fixup in toolchain_bridge mirrors the resolver.
-- Scope: only activates when the packed record contains at least one
-  Tnibble. Boolean-only packed records (`segstates` = nine booleans,
-  referenced at specific byte offsets by hand-coded asm pins) keep
-  their existing 2-byte-per-boolean layout — broader activation
-  desynchronised PASCALDEFS offsets and regressed FS_INIT.
-- Codegen:
-  - `emit_read_a0_to_d0_bit`: `MOVE.B (A0),D0; LSR.B #off,D0; ANDI.B #mask`.
-  - `emit_write_d0_to_a0_bit`: read-modify-write that preserves neighbor
-    bits (`MOVE.B (A0),D1; pop D0; mask+shift; ANDI.B #~mask,D1; OR.B; MOVE.B`).
-  - AST_IDENT_EXPR in WITH, AST_FIELD_ACCESS read, AST_ASSIGN WITH
-    write, and AST_ASSIGN complex-LHS FIELD write each dispatch to the
-    bit-field emitters when `bit_width > 0`.
-- `lvalue_field_info_full` returns bit info; the old
-  `lvalue_field_info` wraps it.
-
-Verified: `pmem.DevConfig` now emits `ADDA.W #$0A,A0` (offset 10); the
-devconfig init loop stays inside `param_mem`; no more b_syslocal_ptr
-corruption; boot reaches SYS_PROC_INIT ✅. The earlier
-`DEFAULT_PM_GUARD` MMU-level write guard (P87b) was a workaround for
-exactly this corruption and has been **removed** now that the layout
-is correct.
-
-### Earlier this evening — App-path parity with SDL (kept below for context)
-
-### Session 2026-04-17 late evening — finishing the plumbing
-
-Beyond the sandbox-off / no-bookmarks / bundle-format work documented in the
-next section, this session closed two remaining gaps that made the app path
-diverge from SDL:
-
-1. **HLE intercepts wired from app path**. `lisa_bridge.c` now exposes
-   `emu_load_hle_addrs(const char *path)` which parses `hle_addrs.txt`
-   (produced by the build, stored inside the `.lisa` bundle) and calls
-   `lisa_hle_set_addresses(...)`. Without this, the kernel's CALLDRIVER /
-   SYSTEM_ERROR / loader-trap intercepts were dead and the CPU walked off
-   during boot. The stub-ROM fallback had been masking this; once the
-   real ROM loaded, the crash surfaced.
-2. **Boot-progress symbol map loaded from app path**. New bridge API
-   `emu_load_symbol_map(const char *path)` wraps `boot_progress_init()`.
-   Used both for milestone instrumentation AND for the dynamic HLE
-   lookups (`boot_progress_lookup`) that resolve CreateProcess,
-   Make_SProcess etc. by name. Without this, lookups failed and the HLE
-   fell back to hardcoded addresses, causing downstream crashes.
-
-Both are called from `EmulatorViewModel.startEmulation()` right after
-`emu_mount_profile`. The SDL `main_sdl.c` has always done the equivalent.
-
-### Halt + boot-progress surfacing (app UX)
-
-- `lisa->halted` sticky flag in `lisa_t` (set in `hle_system_error`,
-  cleared by `lisa_init`). Survives CPU wake-up on interrupt.
-- `emu_is_halted()` / `emu_get_boot_progress_report(buf, size)` bridge
-  APIs. Report capture uses `open_memstream` to convert the
-  `boot_progress_report(FILE*)` API into a string.
-- Swift `runFrame` checks halt each frame; on halt, calls
-  `haltAndReport()` which stops the timer and logs the milestone table
-  line-by-line to the app log panel.
-- `emu_run_frame` short-circuits to 0 cycles when halted — no more per-
-  frame `SYSTEM_ERROR: HALTING CPU` spam in the Xcode console.
-- `hle_system_error` now prints the `HALTING CPU` line only once per
-  halt (guarded by `reported_once`).
-
-### `emu_has_rom()` fixed — false-negative bug
-
-Previous implementation peeked at `lisa.mem.rom[0]` and `rom[4]`, returning
-`false` when both were zero. This was **exactly backwards**: every valid
-Lisa boot ROM has reset vectors in 24-bit address space (e.g. SSP=$000FFFFE,
-PC=$00FE0400), so the first byte of each vector IS always `$00`. The test
-flagged every loaded ROM as missing. Now tracks a `static bool rom_loaded`
-flag set by `emu_load_rom` on success, cleared by `emu_init`.
-
-### Kernel bug — isolated, NOT yet fixed
-
-Boot halts at `SYSTEM_ERROR(10101)` because `b_syslocal_ptr` (A5-relative
-global at `A5-24785`, phys $CC0F2B) gets corrupted from `$00CE0000` (set
-correctly by POOL_INIT) to `$FFFFFFFF` before `SYS_PROC_INIT` runs. Then
-`Make_SProcess → MAKE_DATASEG → CHK_LDSN_FREE` dereferences the junk
-pointer, fails with error 20083, recovery propagates three times, and
-SYS_PROC_INIT calls SYSTEM_ERROR(10101).
-
-**Traced to a Pascal codegen stride bug** at PC=$002FDA, in the
-`INIT_SCTAB` region of STARTUP (matches memory entry
-`project_apple_codegen_splits`: Apple split sctab1/sctab2 to dodge their
-own Pascal codegen bugs; ours fails same class on SCTAB2):
+## Bootloader Chain (real target)
 
 ```
-$2FD0: 3200           MOVE.W D0,D1
-$2FD2: C2FC 0001      MULU.W #$0001,D1       ← elem_size = 1 !!
-$2FD6: D1C1           ADDA.L D1,A0
-$2FD8: 301F           MOVE.W (A7)+,D0        ← D0 = $FFFF
-$2FDA: 3080           MOVE.W D0,(A0)         ← 2-byte store at 1-byte stride
-$2FDC: 526E FFFA      ADDQ.W #1,-6(A6)
-$2FE0: 6000 FFC6      BRA.W back
+[Power On]
+  │
+  ▼
+Boot ROM ($FE0000, 16 KB)
+  • Self-test, set up VIAs, initialize RAM
+  • Read boot-track block 0 from ProFile (or Sony/Twiggy)
+  • Jump into boot-track code
+  │
+  ▼
+Boot-track code (source-LDPROF.TEXT / LDTWIG / LDSONY — asm)
+  • Read MDDF at block 24 (ProFile) or block 0 (floppy)
+  • Walk slist/catalog to find LOADER file
+  • Load LOADER into low RAM
+  • Set [$204] = @LOADER.ldrtrap so OS can trap into it
+  • Jump into LOADER main entry
+  │
+  ▼
+LOADER (source-LOADER.TEXT + source-ldlfs.text + source-LDUTIL + source-LDEQU + source-LDASM)
+  • Read MDDF → bufsize, slist_addr, catentries, fsversion, root_page
+  • Walk catalog to find SYSTEM.OS
+  • Load SYSTEM.OS code segments via codeblock/endblock format (see LOADCD)
+  • Jump into INITSYS
+  │
+  ▼
+SYSTEM.OS kernel (27 milestones: PASCALINIT → ... → PR_CLEANUP)
+  • MMU, process scheduler, memory manager, filesystem, IPC
+  • When a driver is needed: LD_OPENINPUT('SYSTEM.CD_PROFILE')
+    → ENTER_LOADER (mode switch) → LOADER.OPENINPUT → read file from disk
+  • Install driver, call its init, register in configinfo
+  │
+  ▼
+APDM (Desktop Manager)
+  • Via LIBQD (QuickDraw), LIBTK (Toolkit)
+  • Shell, file manager, app launcher
+  │
+  ▼
+Apps (LisaWrite, LisaCalc, LisaDraw, LisaProject, ...)
 ```
 
-Array element size compiled as 1 (byte) but the assignment emits a word
-store. Consecutive iterations write overlapping WORDs at byte-stepped
-addresses. Five iterations stepping $CC0F2A..$CC0F2E produce the exact
-8 byte-writes the watchpoint captured (each non-endpoint address written
-twice).
+Every arrow above is a real compile target. The toolchain today produces
+SYSTEM.OS only; the rest is Phase 2+ work.
 
-**Watchpoints added** in `src/lisa_mmu.c`:
-- `WATCH-B_SLOC` on `$CC0F2B..$CC0F2E` — logs PC + runtime opcodes at PC.
-- `WATCH-CODE2FDA` on logical `$002FDA..$002FDF` — never triggered
-  (code is original, not overwritten; the apparent "wrong opcodes"
-  finding earlier was a disassembly alignment error on my part:
-  `linked.bin` has 0x400 bytes of vector/padding at the start, so the
-  file is PC-indexed directly, not module-offset indexed).
+## Phases (the multilayer-subsystem-build arc)
 
-**Next-session task**: find the offending Pascal array declaration in
-`Lisa_Source/LISA_OS/OS/source-sctabs.text` (or SCTAB init in
-SOURCE-STARTUP.TEXT) and fix the codegen in `src/toolchain/pascal_codegen.c`
-array-store path. Decide based on the declared element type whether to
-emit `MULU #2` (fix stride) or `MOVE.B` (fix store width). See
-`NEXT_SESSION.md` for the resume prompt.
+Each phase compiles the next real component and removes whatever HLE
+was scaffolding the gap. HLE removals happen **only** in the same
+commit as the real replacement.
 
----
+| # | Phase | Target Real Component | Current Status |
+|---|---|---|---|
+| 1 | **PMEM + boot-CD selection** | Native `FIND_PM_IDS` via PRAM stub | ✅ Complete (2026-04-18 P90) |
+| 2 | **Real LOADER + filesystem** | source-LOADER.TEXT + source-ldlfs.text + real MDDF/slist/catalog/filemap on profile.image | In progress — started 2026-04-18 |
+| 3 | **First driver file (SYSTEM.CD_PROFILE)** | source-PROFILE.TEXT compiled as .OBJ, placed on disk with catalog entry | Not started |
+| 4 | **MDDF / disk-image full FS** | removes 10707 suppression; real FS_INIT / FS_MASTER_INIT | Not started |
+| 5 | **IRQ-driven I/O completion** | removes Block_Process-on-POP deadlock | Not started |
+| 6 | **SYS_PROC_INIT + real processes** | removes P89i + CreateProcess HLE pile | Not started |
+| 7 | **Cleanup HLEs** (FS/MEM/PR_CLEANUP) | real cleanup bodies | Not started |
+| 8 | **Safety-net HLEs** (REG_OPEN_LIST, excep_setup) | remove | Not started |
+| 9 | **System libraries** (SYS1LIB, SYS2LIB) | new compile targets | Not started |
+| 10 | **Graphics** (LIBQD, LIBTK) | new compile targets | Not started |
+| 11 | **Shell (APDM)** | full desktop | Not started |
+| 12 | **Apps** | LisaWrite, LisaCalc, etc. | Not started |
 
-## Current Status (2026-04-17 evening) — App-layer rewrite: sandbox off, no bookmarks, pure path derivation
+## Current Status (2026-04-18, Phase 2 scoping)
 
-Kernel milestones unchanged (still 27/27 — see next section). This session
-rewrote the lisaOS app's file-access story end-to-end. Two converging
-forces drove the design:
+**Milestones**: 21/27 kernel checkpoints reached natively (peak baseline
+is 27/27 with more HLEs in place; post-P90 the peak trades milestones
+for native Phase-1 correctness).
 
-1. **The user repeatedly said: no bookmarks, no auto-restore, no
-   "remember from last time."** Logged durably as
-   `feedback_no_auto_restore.md`.
-2. **The macOS sandbox made "no bookmarks + fixed paths" impossible to
-   satisfy simultaneously** — bookmarks were the only cross-session
-   mechanism to reach user-chosen paths.
+**Phase 1 complete (P90 session):** Five structural Pascal codegen
+fixes landed, making `FIND_PM_IDS` return `true` natively for the
+PRAM-configured ProFile-on-parallel-port boot device. The 10738
+suppression no longer load-bears at INIT_BOOT_CDS. See commits
+`72eb79f`, `8a254b1`, `fb17f53` and `.claude-handoffs/2026-04-18-P90-complete-NEXT_SESSION.md`
+for the line-by-line detail of:
 
-Resolution: **sandbox turned off**
-(`ENABLE_APP_SANDBOX = NO` for the lisaOS target in `project.pbxproj`,
-Debug + Release). With the sandbox gone, any path the user hands us via
-`.fileImporter` is just a plain path string usable by `fopen()`, and no
-bookmark machinery is needed.
+1. Signed byte-subrange sign-extension after byte reads.
+2. Packed variant records: boolean packs to 1 byte when variant or
+   Tnibble is present, so arms align.
+3. Packed whole-byte fields: `offset += fs` so `variant_max_end` + final
+   `t->size` don't miss the last field.
+4. Aggregate record/array assignment via `MOVE.B (A0)+,(A1)+ / DBRA`
+   block-copy loop when either side > 4 bytes.
+5. `gen_lvalue_addr` saves A0 across the index expression in
+   AST_ARRAY_ACCESS so WITH-field indices don't stomp the base.
+6. PRAM stub now encodes `pm_slot=10` (internal `cd_paraport`) with
+   corrected 32-word XOR checksum.
 
-### C-side changes (`src/lisa_bridge.[ch]`)
+**Phase 2 in progress:** Current blocker is `LOADEM`'s
+`LD_OPENINPUT('SYSTEM.CD_PROFILE')` call firing 10738 because:
 
-- `emu_reset()` no longer auto-generates a stub ROM. If no ROM is loaded,
-  it prints to stderr and returns without resetting. The previous
-  fallback silently booted against a bare `bootrom_generate()` result
-  with none of the symbol-pinning / patch-site wiring that
-  `toolchain_bridge` applies around the same generator during a real
-  build — a footgun masquerading as convenience.
-- New `emu_has_rom()` accessor — used by Swift to hard-gate Power On.
-- `bootrom_generate()` is still used by `main_sdl.c` (headless tests)
-  and `toolchain_bridge.c` (writes the real `lisa_boot.rom` during a
-  build). Those paths are unchanged.
+- Our `ENTER_LOADER` HLE in `src/m68k.c:4846` pops args and RTSes —
+  `fake_parms.result` is uninitialized stack garbage.
+- `diskimage.c` writes `fsversion=17` (forces B-tree lookup) but only a
+  flat catalog (which only works with `fsversion<16`). Even if the real
+  loader ran, it would find nothing.
+- We don't compile source-LOADER.TEXT or source-ldlfs.text as a target.
 
-### Swift-side changes (`lisaOS/lisaOS/EmulatorViewModel.swift` + ContentView)
+**The on-disk format the real loader expects** (from `source-ldlfs.text.unix.txt`):
 
-- **No bookmarks at all.** `activeScopes`, `activateScope`,
-  `deactivateAllScopes`, every `startAccessingSecurityScopedResource` —
-  gone. `UserDefaults` holds no path/bookmark keys for the app. `init()`
-  purges any stale keys from the sandbox era.
-- **No auto-restore.** `checkForLastImage` removed entirely; nothing
-  reopens on launch. See `feedback_no_auto_restore.md`.
-- **Honest logging.** Every `emu_load_rom` / `emu_mount_profile` call
-  logs its return value (success AND failure). The old code logged
-  "Mounted image: ..." unconditionally.
-- **Hard ROM gate.** Power On aborts with an explicit message if no
-  real ROM is loaded, instead of silently falling through to
-  `emu_reset()`'s old stub fallback.
-- **Pure path derivation.** When the user opens a `.lisa` bundle, the
-  ROM path is computed as `<bundleParent>/rom/lisa_boot.rom` directly
-  from the picked URL. Nothing is remembered; everything is derived
-  from the user's most recent click.
+- **MDDF at `firstblock`** with `mddfaddr=0`, `datasize`, `slist_addr`,
+  `slist_packing`, `rootmaxentries`, `map_offset`, `smallmap_offset`,
+  `fsversion`, `tree_depth`, `root_page`, `rootsnum`.
+- **S-file descriptors** (`s_entry`) packed in the slist area — holds
+  `filesize`, `hintaddr`, `fileaddr` per file.
+- **Catalog**:
+  - `fsversion < 16`: flat, LDHASH-probed (Fibonacci-ish), `centry`
+    records with `name` / `cetype` / `sfile`.
+  - `fsversion >= 16`: B-tree with `Make_Key` + `Search_Node`.
+- **Per-file filemap** at `hintaddr + map_offset`: array of
+  `(address, cpages)` tuples describing which blocks hold each page.
+- **Each block read** returns 512 data bytes + a 24-byte pagelabel (hdr)
+  carrying `fwdlink` for filemap chaining.
 
-The canonical ROM story: `lisa_boot.rom` is a file the toolchain writes
-at `<output>/rom/lisa_boot.rom`. Any `.lisa` bundle in `<output>/` can
-find it as a sibling. It must exist and it must load — no stub, no fake,
-no fallback.
+**The on-disk format of a driver file** (from `source-STARTUP.TEXT:1207`
+LOADCD):
 
-### Build output layout — `.lisa` system bundle
-
-A successful Build from Source writes this structure into the user's
-chosen output folder:
-
+Repeating block structure, each block:
 ```
-<output>/
-├── LisaOS.lisa/          # macOS bundle package — appears as one file
-│   ├── profile.image     # the bootable Lisa disk
-│   ├── linked.bin        # raw linker output (offline disassembly)
-│   ├── linked.map        # symbol map
-│   └── hle_addrs.txt     # HLE wiring addresses
-└── rom/
-    └── lisa_boot.rom     # shared boot ROM — outside the bundle so any
-                          # .lisa bundle in <output> can reuse it
+  byte:   block type (codeblock=$FF85, endblock=$FF81, others skipped)
+  byte:   counter (must be 0)
+  word:   blocksize (BE)
+  [if codeblock]:
+    long:  reloffset
+    bytes: blocksize - 8 bytes of code
 ```
-
-The `.lisa` extension is filtered in the Open dialog via the app's
-exported UTI `com.aviahmorag.lisaOS.system` (declared in
-`lisaOS/Info.plist` via `UTExportedTypeDeclarations`, conforming to
-`com.apple.package`). The project.pbxproj now points at that Info.plist
-(`GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = "lisaOS/Info.plist";`)
-for both the lisaOS Debug and Release configs; the test targets are
-unchanged. With the UTI registered, Finder will treat `.lisa` folders
-as single-file packages (double-click opens in the app instead of
-drilling in).
-
-The ROM assumption is explicit: a `.lisa` bundle opened on a machine
-without a local `<output>/rom/lisa_boot.rom` won't boot. That's correct
-— Apple's license prohibits ROM redistribution, so every user needs to
-compile their own from their licensed Lisa source.
-
-Both user flows end at the same state:
-- **Build from Source**: bundle + ROM produced together. `builtImagePath`
-  and `builtRomPath` point at `<output>/LisaOS.lisa/profile.image` and
-  `<output>/rom/lisa_boot.rom` respectively.
-- **Open System** (prebuilt `.lisa`): `builtImagePath` = picked bundle's
-  `profile.image`; `builtRomPath` = `<bundleParent>/rom/lisa_boot.rom`.
-  All derived from the URL the user just clicked — no persistence.
-
-## Current Status (2026-04-17 very late) — 🎉 27/27 KERNEL MILESTONES, full boot sequence complete
-
-Build + audit green. **27/27 kernel milestones reached.** Boot now
-runs the complete Lisa OS kernel init sequence cleanly:
-
-PASCALINIT → INITSYS → GETLDMAP → REG_TO_MAPPED → POOL_INIT →
-INIT_PE → MM_INIT → INSERTSDB → MAKE_FREE → BLD_SEG →
-MAKE_REGION → INIT_TRAPV → DB_INIT → AVAIL_INIT → INIT_PROCESS
-→ INIT_EM → EXCEP_SETUP → INIT_EC → INIT_SCTAB → INIT_MEASINFO
-→ BOOT_IO_INIT → FS_INIT → SYS_PROC_INIT → INIT_DRIVER_SPACE →
-FS_CLEANUP → MEM_CLEANUP → PR_CLEANUP ✅
-
-Remaining unreached: **SHELL** and **WS_MAIN** — these are
-post-kernel application milestones that depend on entire new
-subsystems not yet built (intrinsic library loading, SYSTEM.SHELL
-compile target, APDM desktop manager, Lisa filesystem catalog
-infrastructure with MDDF). See roadmap below for what's needed to
-go from "kernel boots" to "desktop visible."
-
-### P86 — Linker phase-2 must not add base_addr to A5-relative pins (src/toolchain/linker.c:509)
-
-The PASCALDEFS pin table in pascal_codegen.c (~29 entries) assigns
-specific A5-relative offsets to globals that hand-coded asm
-references at hardcoded positions — `b_syslocal_ptr=-24785`,
-`c_pcb_ptr=-24617`, `Invoke_sched=-24786`, `smt_addr=-24887`, etc.
-These offsets MUST match what Apple's asm (LAUNCH, SCHDTRAP,
-PROCASM, MMASM) reads.
-
-Linker Phase 2 was blindly adding `mod->base_addr` to every
-exported symbol's value, including negative A5-relative ones. So
-`b_syslocal_ptr = -24785` in SYSGLOBAL became `-24785 +
-SYSGLOBAL.base_addr = -953`. Pascal `POOL_INIT` still wrote to
-the emitted-code offset (-24785 is baked into instruction bytes
-at compile time), so the actual storage sat at A5-24785 =
-$CC0F2B. But Apple's LAUNCH read `B_SYSLOC(A6) = -24785` and
-expected the VAR to be there — which was uninitialized
-($FFFFFFFF). Launch dereferenced garbage and dispatched into
-$00010C46 on first scheduler firing.
-
-Fix: in Phase 2, only add `mod->base_addr` when `sym->value >= 0`.
-Code entry points have non-negative offsets (bytes into module
-code); A5-relative data always has negative offsets. The sign test
-cleanly separates them.
-
-### P86 TRAP6 HLE fix — use `g_hle_smt_base`, not map `smt_base` (src/m68k.c:2293)
-
-`DO_AN_MMU`'s TRAP #6 HLE needs the physical SMT data address.
-It was looking up `smt_base` in the linker map. Two symbols share
-that name: (1) a local LDASM label (NOT exported) and (2) a Pascal
-VAR declared in source-parms.text. The Pascal VAR's linker value
-is the A5-relative offset of its STORAGE SLOT (negative), not the
-SMT data's physical location.
-
-Pre-P86-linker-fix, `mod->base_addr` was added to the VAR's
-negative offset, producing a positive value that coincidentally
-landed near `os_end` where bootrom_build primes the SMT region.
-So the HLE "worked" by accident. Post-P86-linker-fix, the negative
-value resolved correctly, and the HLE read garbage from RAM,
-programming bogus segment mappings — seg 60 writes (buffer pool at
-$0078xxxx) got dropped, FlushNodes walked zeros, boot stalled.
-
-Fix: prefer `g_hle_smt_base` (deterministically set by
-bootrom_build to `os_end`). Fall back to map lookup only when it
-looks like a real physical address.
-
-### P86e — DEL_MMLIST HLE guard for empty SRB lists (src/m68k.c)
-
-MEM_CLEANUP calls `Del_SRB(shrseg_sdb, c_pcb)` and `Del_SRB(IUDsdb,
-c_pcb)` to unlink the pseudo-outer process from shared-resource
-lists. Both SDBs have `srbRP = 0` (no SRBs) because nothing in our
-boot path ever calls `ADDTO_SRB` for them. `Del_SRB` computes
-`c_mmlist = srbRP + b_sysglobal_ptr = b_sysglobal_ptr`, then
-`DEL_MMLIST` walks the repeat-until loop reading
-`chain.fwd_link + b_sysglobal_ptr`, never terminating because
-fwd_link is 0 and the loop target is never reached.
-
-Apple's code doesn't guard against this because on real hardware
-the SRB lists are populated by process-setup paths that our boot
-doesn't fully execute (we HLE-bypass or no-op several process
-creation flows).
-
-Fix: HLE on DEL_MMLIST entry — return immediately if
-`c_mmlist == b_sysglobal_ptr` OR if `chain.fwd_link` at c_mmlist
-is 0. Both cases mean "empty SRB list, nothing to delete."
-
-### Post-kernel blocker: Launch STOP at $06EAAA
-
-After PR_CLEANUP, the idle-loop scheduler runs Launch and
-eventually executes STOP (opcode $4E72) at $06EAAA — this is the
-expected `Pause` primitive in source-PROCASM.TEXT that halts the
-CPU waiting for an interrupt. `CRASH TO VECTORS` fires because
-our emulator treats a STOP-then-interrupt as an anomalous PC
-transition, but this is actually the normal idle-loop behavior.
-The boot report shows 27/27 milestones and the kernel is running
-correctly.
-
----
-
-## Roadmap to bootable Lisa desktop
-
-Completing the kernel (PR_CLEANUP reached) is **~30%** of the way
-to a bootable desktop. The kernel provides process scheduling,
-MMU, memory manager, filesystem, and I/O. What's still needed:
-
-| Layer | Status | Est. effort | What's needed |
-|-------|--------|-------------|---------------|
-| OS Kernel (SYSTEM.OS) | ✅ **100%** — 27/27 checkpoints | — | Done |
-| System Libraries (SYS1LIB, SYS2LIB) | 0% | Medium | New compile targets + linking |
-| Graphics (LIBQD / QuickDraw, LIBTK / Toolkit) | 0% | Large | New compile targets; LIBQD is ~50 source files |
-| Drivers (SYSTEM.LLD, CD_\*) | 0% | Medium | 13 new binaries; configinfo wiring |
-| Shell (APDM = Desktop Manager) | 0% | Large | Separate compile target; depends on LIBQD + LIBTK |
-| Intrinsic library loading | 0% | Medium | Dynamic linking — loader reads `.LIB` files at runtime |
-| Lisa filesystem (MDDF, catalog) | 0% | Medium | Build a bootable volume image with MDDF + catalog entries |
-| Boot ROM / bootloaders (BT_Sony, BT_Profile) | Partial | Small | Already partially HLE'd |
-| Apps (LisaWrite, LisaCalc, etc.) | 0% | Very large | 14 app targets, each with its own UI code |
-
-The compiler/linker (parser 100%, assembler 100%, linker
-working, 95.3% JSR resolution) can handle additional targets —
-the remaining work is systematic but large: define 26+ compile
-targets, fix per-target codegen issues, build the disk layout.
-
-The P86 fixes (linker A5-pin bug, smt_base HLE) were the last
-major *structural* issues. Remaining work is mostly additive —
-compile more targets, load them correctly, and populate the
-filesystem. No more foundational rewrites expected.
-
-### P85c — inline byte-subrange fields widen to 2 bytes (src/toolchain/pascal_codegen.c:421, toolchain_bridge.c:845)
-
-Apple's PASCALDEFS insists PRIORITY=12, DOMAIN=17, GLOB_ID=20 in
-PCB. That layout only fits if `priority: 0..255` and `norm_pri:
-0..255` each occupy a 2-byte slot with the value byte at the low
-(big-endian +1) byte; `blk_state: blk_type` + `domain: domainRange`
-then pack 1+1 at offsets 16/17. Before P85c, our tight byte-packing
-put priority at offset 12 (high byte) and norm_pri at 13 — so
-QUEUE_PR's `MOVE.W PRIORITY(A0),D1` read $FF00 (-256 signed), BLE.S
-RQSCAN always took, scheduler spun forever at PC=$06EB46.
-
-Fix: widen INLINE byte-subranges (AST_TYPE_SUBRANGE, empty type_name)
-to 2 bytes at even offsets, and record the field offset as slot+1 so
-our byte reads/writes access the value byte while Apple's MOVE.W
-still sees $00XX. Named subrange aliases (e.g. `int1 = -128..127`,
-`domainRange = 0..maxDomain`) keep the prior pair-pack behavior — int1
-is Apple's explicit 1-byte type, so codesdb's lockcount(int1)+
-sdbtype(Tsdbtype) still pack tight at 12/13 and oset_freechain=14 holds.
-
-Currently narrowed to records named `PCB` only. Generalizing to
-all inline subranges produced the same cascading FS_INIT failure
-as last session's P85b attempt, suggesting the cascade is NOT caused
-by widening other records — it's a latent bug that's newly reachable
-once the scheduler dispatches. See next-session notes.
-
-### Current blocker: SYSTEM_ERROR(10701) via FS_INIT → RELSPACE
-
-Post-P85c boot runs:
-1. QUEUE_PR#1..#8 fire with PCB=$CCB58E (Signal_sem waking up FS).
-2. HLE SYSTEM_ERROR(10707) at ret=$002D0C suppressed (FS init failed).
-3. HLE SYSTEM_ERROR(10701) at ret=$005506 fatal (nospace in STARTUP
-   / BOOT_IO_INIT).
-
-Between (1)–(2), RELSPACE emits 14 UNMAPPED-WRITEs targeting
-$41422F..$414234 (seg 32). Addresses suggest c_pool_ptr resolves to
-$414230-ish, but seg 32 was never programmed via PROG_MMU during
-init — PROG_MMU#1..#20 cover indices 85-100 / 125 (init-time
-segments), #21 is seg 60 (FlushNodes buffer pool). Nothing maps seg 32.
-
-Start next session:
-- Trace RELSPACE entry: what ordaddr/b_area is passed when the bad
-  writes start? A probe in lisa_bridge or an HLE stub that dumps
-  args on first RELSPACE call will show the caller intent.
-- Is seg 32 supposed to be mapped? Check what domain/LDSN the FS
-  init code expects for its syslocal/sysglobal free pools, and
-  whether PROG_MMU should have been called for seg 32 earlier.
-- If FS_INIT needs a specific domain/LDSN and our scheduler
-  dispatched with wrong env_save_area, fix CreateProcess or the
-  initial PCB/syslocal setup.
-
----
-
-## Previous status (2026-04-17 night) — P85a fixes FlushNodes spin; QUEUE_PR WAS the blocker
-
-Build + audit green. 22/27 milestones. Boot reaches FS_INIT,
-progresses past the prior FlushNodes buffer-pool spin, runs into
-scheduler code, and halts with SYSTEM_ERROR(10204) (f-line in
-system code) in QUEUE_PR at $06EB20.
-
-The prior handoff's "FlushNodes repeat loop spins forever" was
-actually a downstream effect of MMU programming silently failing
-for the MR-data buffer segment. FlushNodes was walking a buffer
-pool in unmapped RAM (segment 60, $00780000..$0079FFFF), so
-every InitBuf write to `link.f` / `link.b` got dropped by the
-MMU unmapped-write safety net. `ptrS^.link.b` stayed null, the
-`until ptrS = ptrHot` test never hit ptrHot, and the loop spun.
-
-Root cause was in our Pascal codegen — a stale-high-byte bug
-in the byte-subrange load path.
-
-### P85a — AST_IDENT_EXPR byte loads zero-extend D0 (src/toolchain/pascal_codegen.c:1704 / :1732)
-
-For `sz == 1` (byte-subrange or single-byte field), codegen
-emitted `MOVE.B offset(A6),D0` (or `(A0)`, or `(A5)` for globals)
-with no `MOVEQ #0,D0` first. The MOVE.B only updates the LOW
-byte of D0, so the upper 24 bits kept whatever was there from
-the previous operation. Any subsequent `MOVE.W D0,Dn` then
-propagated that stale high byte.
-
-In `MAP_SEGMENT` (source-MMPRIM.TEXT:627), the first body
-instruction is effectively `l_domain := domain`. Our codegen
-emits:
-
-  `MOVE.B $0F(A6),D0  ; domain is a byte-param, read at offset+1`
-  `MOVE.W D0,D2       ; widen to word for index := domain*numbmmus + c_mmu`
-
-With the upper bits of D0 stale (happened to be $00B6 from a
-prior op), D2 became $B600. The PROG_MMU call site later loaded
-l_domain via `MOVE.W -$14(A6),D0` and pushed — and PROG_MMU
-fired TRAP #6 with D2 = $B600 (target domain). Our HLE-TRAP6
-computed `smt_entry = smt_ptr + 46592*512 + …`, walked into
-garbage, and the MMU segment for seg 60 never got programmed.
-MAKE_MRDATA returned addrSpace=$00780000 but InitBuf's writes
-to that range all dropped.
-
-**Fix**: at AST_IDENT_EXPR sz==1 branch (A6/A0 frame load AND
-A5 global load), emit `MOVEQ #0,D0` first. Same pattern P80h2
-applied to `emit_read_a0_to_d0` for (A0)-indirect reads.
-
-Verified via P85 probe walk: InitBuf#1-4 correctly write link
-pointers, FlushNodes's ptrHot chain now loops back to ptrHot
-after 4 hops ($78189C → $781068 → $780834 → $780000 → $78189C).
-
-### New blocker: SYSTEM_ERROR(10204) in QUEUE_PR (scheduler)
-
-Post-fix, boot leaves FlushNodes cleanly and reaches
-scheduler/QUEUE_PR ($06EAF4 in source-starasm1 asm). First
-instructions pop D0/D1/A1 from the stack:
-
-  `MOVE.L (A7)+,D0   ; pop return address into D0`
-  `MOVE.B (A7)+,D1   ; flag byte`
-  `MOVEA.L (A7)+,A1  ; PCB pointer`
-  `MOVEA.L (A1),A0   ; A0 = PCB.link.f`
-  ...
-  `MOVEA.L D0,A0; JMP (A0)  ; return via D0`
-
-D0 arrives as `$00001F` (garbage) and A0 = $00001F → JMP (A0)
-runs the CPU off into address $00001F, where fetching a word
-at an odd address + F-line opcode triggers v=11 → SYSTEM_ERROR.
-
-Likely causes: (a) caller of QUEUE_PR pushed the wrong return
-address, (b) A1's PCB content was corrupted (first longword =
-$2EFFFE making `MOVE.L A2,4(A0)` write to $2F0002 which is
-also unmapped seg 23), (c) another byte-subrange / byte-field
-codegen bug we haven't found yet.
-
-The PCB's `link.f` reading as $2EFFFE suggests the ready-queue
-head itself got scribbled somewhere between scheduler init and
-this point. Probe QUEUE_PR entry + its caller to confirm.
-
-Start here next session: the 4 bytes before the UNMAPPED-WRITE
-at PC=$06EB02 (log=$2F0002 val=$3F00 4EB9...) are "$3F00 4EB9"
-which is `MOVE.W D0,-(A7)` + `JSR` — that's INSTRUCTION bytes
-being written to a data area, suggesting a very confused write
-target. Possibly a PCB that was compiled with a wrong field
-layout and whose "link" offset actually points at the proc's
-own code.
-
-### P84a — boolean NOT for AST_FIELD_ACCESS (src/toolchain/pascal_codegen.c:1804)
-
-`gen_expression` for `AST_UNARY_OP(TOK_NOT)` detected boolean
-operands only from `AST_FUNC_CALL`, `AST_BINARY_OP`, or
-`AST_IDENT_EXPR`. `AST_FIELD_ACCESS` fell through to bitwise
-`NOT.W D0`, so `not sdbstate.memoryF` compiled as:
-
-  `MOVE.W 14(A0),D0; NOT.W D0; TST.W D0; BEQ exit`
-
-which exits only on D0 = $FFFF. Since `memoryF := true` stores
-the word $0001 (MOVEQ #1,D0 then MOVE.W D0,...), the loop could
-never terminate. Fix: when child is AST_FIELD_ACCESS, call
-`lvalue_field_info` to resolve the field's type and if it's
-TK_BOOLEAN, emit the logical TST/SEQ/ANDI.W #1 sequence.
-
-### P84b — byte-sized parameters read at offset+1 (src/toolchain/pascal_codegen.c:1696)
-
-1-byte params (`Tsdbtype`, int1, byte, char) are pushed as 2-byte
-words for word-alignment. On 68k big-endian the value lives in
-the LOW byte = offset+1, not offset+0. Our codegen emitted
-`MOVE.B offset(A6),D0` which pulled the zero padding byte, so
-`kind` inside BLD_SEG always read as 0. MAKE_MRDATA's call
-`BLD_SEG(data, 0, size, ...)` compiled correctly (caller pushed
-`data=ord 2` as word $0002), but `sdbtype := kind` inside the
-callee wrote $00 instead of $02 at offset 13. Verified via a
-sdb-region write trace — `[P84W] pc=$04238C write1 @$CCBA6F
-<= $00` pre-fix vs. `write1 <= $02` post-fix.
-
-Fix: when emitting a byte read of a param (sym->is_param,
-sz==1, sym->offset > 0), add 1 to the emitted offset. Locals
-(negative A6 offsets) are allocated by our own prologue with
-no padding convention, so they don't need the adjustment.
-
-### New blocker: FlushNodes buffer-pool repeat loop (vmstuff.text:1369)
-
-```pascal
-ptrS := ptrHot;
-repeat
-  if dirty then LisaIO(...,WRITEOP);
-  if clear then { page := REDLIGHT; lock := false };
-  ptrS := ptrS^.link.b;  { backward link }
-until ptrS = ptrHot;
-```
-
-The walk never hits `ptrHot` — ptrS^.link.b must be wrong, or
-the buffer pool's circular doubly-linked list hasn't been
-initialized by the time FS_INIT calls FlushNodes(-1, true, ecode)
-(at fsinit.text:1176 / :1275).
-
-Start here next session:
-
-1. Find who initializes the `ptrHot` buffer-pool. It's probably
-   set up during InitBufPool or similar early VM init. Confirm
-   it's called BEFORE FlushNodes in the init chain.
-
-2. Dump the buffer pool state when FlushNodes enters: walk 10-20
-   `link.b` pointers starting from `ptrHot` and log each `page`,
-   `device`, `dirty`, `link.f/b`. This should reveal whether the
-   list is properly circular.
-
-3. If list isn't initialized, find InitBufPool's path into FS_INIT
-   and see why it's skipped / crashed. The P84 fixes changed the
-   code path — it's possible a previous-HLE-bypassed init now tries
-   to run natively and fails silently.
-
-4. Consider: is `ptrHot` a global, or pointer in a structure? If a
-   field in some record, maybe another codegen bug is reading it
-   at wrong offset.
-
-### P83a (kept) — HLE guard: MERGE_FREE only merges real free regions (src/m68k.c)
-
-`MERGE_FREE(left_sdb)` in `INSERTSDB`'s free-chain insert path is
-called with `left_sdb = head_sdb` the first time MAKE_FREE runs
-(free chain empty → the predecessor walk lands on head_sdb). The
-body then evaluates its condition inside `with head_sdb^ do`:
-
-  `(right_sdb^.sdbtype = free) and
-   (ord(right_sdb) = (ord(freechain.fwd_link) - oset_freechain))`
-
-Both sides are TRUE because P_ENQUEUE just wrote
-`head.freechain.fwd_link = &new_sdb.freechain`. The merge body then
-does `memsize := memsize + right_sdb^.memsize` inside the WITH,
-**scribbling `head_sdb.memsize` with the inserted free sdb's size**
-and then `TAKE_FREE(right_sdb, false)` removes the just-inserted free
-region. Result: free chain empty, `head.memsize = $0CD5` (non-zero).
-
-Downstream `GetFree` walks `tail.freechain.bkwd_link - 14 = head_sdb`,
-checks `if memsize < size then ... else TAKE_FREE(head_sdb, true)`.
-Since memsize ($0CD5) > typical small alloc size, it proceeds to
-`TAKE_FREE(head_sdb, true)` which asserts `sdbtype <> free` →
-SYSTEM_ERROR(10598).
-
-**P83a guard** (HLE on MERGE_FREE entry): if `c_sdb_ptr.sdbtype !=
-free`, return immediately. This is defensively correct per Apple's
-own documented intent ("merge two adjacent free regions"); applying
-the merge when c_sdb_ptr is the head sentinel is obviously wrong.
-
-### P83a — HLE guard: MERGE_FREE only merges real free regions (src/m68k.c)
-
-`MERGE_FREE(left_sdb)` in `INSERTSDB`'s free-chain insert path is
-called with `left_sdb = head_sdb` the first time MAKE_FREE runs
-(free chain empty → the predecessor walk lands on head_sdb). The
-body then evaluates its condition inside `with head_sdb^ do`:
-
-  `(right_sdb^.sdbtype = free) and
-   (ord(right_sdb) = (ord(freechain.fwd_link) - oset_freechain))`
-
-Both sides are TRUE because P_ENQUEUE just wrote
-`head.freechain.fwd_link = &new_sdb.freechain`. The merge body then
-does `memsize := memsize + right_sdb^.memsize` inside the WITH,
-**scribbling `head_sdb.memsize` with the inserted free sdb's size**
-and then `TAKE_FREE(right_sdb, false)` removes the just-inserted free
-region. Result: free chain empty, `head.memsize = $0CD5` (non-zero).
-
-Downstream `GetFree` walks `tail.freechain.bkwd_link - 14 = head_sdb`,
-checks `if memsize < size then ... else TAKE_FREE(head_sdb, true)`.
-Since memsize ($0CD5) > typical small alloc size, it proceeds to
-`TAKE_FREE(head_sdb, true)` which asserts `sdbtype <> free` →
-SYSTEM_ERROR(10598).
-
-**P83a guard** (HLE on MERGE_FREE entry): if `c_sdb_ptr.sdbtype !=
-free`, return immediately. This is defensively correct per Apple's
-own documented intent ("merge two adjacent free regions"); applying
-the merge when c_sdb_ptr is the head sentinel is obviously wrong.
-
-Apple's shipped source lacks this guard and in theory the same
-miscompile would fire on real Lisa boot. It's possible Apple's boot
-path avoids it via a different init sequence or their compiler
-emits different code for the variant-field condition — unverified.
-
-### Previous state (P82b/c) — CASE tag + packed byte pairs, CLEAR_SPACE spin fixed
-
-### P82b — parser emits CASE tag as a field (commit `1571efa`)
-
-`case sdbtype: Tsdbtype of ...` was being skipped entirely by the
-parser, so references to `sdbtype` everywhere compiled as offset 0
-(memchain.fwd_link's high word). Result: `if next_sdb^.sdbtype =
-free` was always true (high byte of a 24-bit pointer = 0), sending
-CLEAR_SPACE's inner while into infinite spin. Fix: when
-`CASE IDENT : TYPE OF` is detected via `lexer_peek` for the colon,
-emit the IDENT as a normal fixed field before `__variant_begin__`.
-
-### P82c — 1-byte enums + pair-aware byte widening
-
-Apple's hardcoded `oset_freechain = 14` in MMPRIM assumes codesdb
-packs lockcount(1) + sdbtype(1) tight. Two changes to match:
-
-- Enum types with ≤256 values default to 1 byte (was 2). `Tsdbtype`
-  (7 values) is now 1 byte natively.
-- The P79f "widen int1 to 2 bytes in unpacked records" rule now
-  peeks at the NEXT field — if it's also a byte-sized scalar, don't
-  widen, so consecutive 1-byte fields pack tight. Isolated bytes
-  still widen for asm-compat MOVE.W reads. Both the AST record
-  resolver and the pre-pass Phase-2 fixup honor the rule.
-
-Post-fix codesdb: memchain(8)@0, memaddr(2)@8, memsize(2)@10,
-lockcount(1)@12, sdbtype(1)@13, variant_start=14 — freechain@14
-matches `oset_freechain = 14`. ✓
-
-### Open blocker: SYSTEM_ERROR(10598) — TAKE_FREE asserts sdb not free
-
-```
-HLE SYSTEM_ERROR(10598) at ret=$040D0A SP=$00CBFD6B A6=$00CBFD75
-SYSTEM_ERROR(10598): HALTING CPU
-```
-
-Call chain (from probes): ALLOC_MEM → FIND_FREE returns false →
-CLEAR_SPACE's inner while walks free_sdb around the ring → reaches
-head_sdb (sdbtype=header) → MOVE_SEG → TAKE_FREE → assert fails.
-
-The free chain is **empty at FS_INIT time**:
-```
-head_sdb=$CCB034 fwd_link=$00CCB5CE bkwd_link=$00CCB062 memaddr=$0000 memsize=$0CD5 sdbtype=$05
-head_sdb.freechain.fwd_link=$00CCB070 bkwd_link=$00CCB070
-first_free_sdb=$CCB062 (= tail_sdb) memsize=$0000 sdbtype=$05
-```
-
-Two weird signals:
-1. **head_sdb.memsize=$0CD5** — but head_sdb is a sentinel, should
-   be 0. The value $0CD5 matches MAKE_FREE's `msize` arg, suggesting
-   MAKE_FREE wrote to head_sdb (or an overlapping address).
-2. **first_free_sdb = tail_sdb**, i.e. the freechain is empty. So
-   MAKE_FREE either didn't run or didn't insert properly.
-
-Start here next session:
-- Probe MAKE_FREE entry + exit, dump new_sdb address (`ord4(maddr)*
-  hmempgsize*2 + logrealmem`), memsize, sdbtype, and the freechain
-  state after INSERTSDB.
-- Verify INSERTSDB's linkage writes: memchain.fwd_link writes at
-  offset 0, bkwd_link at +4, plus freechain at +14..+21. With the
-  variant-arm-aware layout, those offsets should now be correct,
-  but confirm via disasm.
-- Check whether head_sdb is being overwritten by *where new_sdb
-  lands*. `logrealmem` is the base — if it collides with the MMRB
-  region, MAKE_FREE stomps on head_sdb. Unlikely but worth ruling
-  out.
-
-Memory layout-wise, this may also be a sign that BLD_SEG is
-computing codesdb size wrong in one place and sdb size wrong in
-another — cross-record size mismatch. Check `sdb_ptr` vs
-`codesdb_ptr` dereference widths.
-
-### P82 — variant records + chained field access (commit `3ad488c`)
-
-Three related codegen bugs compounded into FIND_FREE returning a
-bogus `free_sdb = $00F7F2` (inside the compiled GROW_SPACE code!).
-TAKE_FREE → REMOVESDB → P_DEQUEUE then dereferenced the trashed
-`fwd_link/bkwd_link` fields of that "sdb" and wrote to `$F23204`
-(seg 121, unmapped).
-
-1. **Variant-record Phase-2 layout ignored arms.** The pre-pass
-   fixup in `toolchain_bridge.c` recomputes record offsets after
-   late type resolution. It laid all fields sequentially, so
-   codesdb's `freechain` (variant arm `free`) ended up at offset
-   22 after the `code` arm's `sdbstate…numbopen` fields — instead
-   of overlapping at offset 14 (= Apple's `oset_freechain`).
-   Fix: plumb per-field `variant_arm` index through AST_TYPE_RECORD
-   (1..N per arm, 0 for fixed part) + `variant_start` on the record;
-   Phase 2 resets offset to `variant_start` at each arm boundary.
-
-2. **Sentinel matching was ambiguous.** `str_eq_nocase` does 8-char
-   significant-prefix matching — so `__variant_begin__`,
-   `__variant_arm__`, `__variant_end__` all matched each other.
-   `current_arm` never advanced past 1, so every variant field got
-   lumped into arm 1 (defeating the per-arm offset reset above).
-   Fix: use exact `strcmp` for sentinel checks.
-
-3. **Chained AST_FIELD_ACCESS resolution missing.** Both
-   `gen_lvalue_addr` and `expr_size` only knew how to resolve the
-   parent type when the child was `AST_IDENT_EXPR` or `AST_DEREF`,
-   not another `AST_FIELD_ACCESS`. Chains like
-   `c_mmrb^.head_sdb.freechain.fwd_link` computed the head_sdb
-   offset (42) but dropped the `freechain` +14 and read as MOVE.W
-   (2 bytes) instead of MOVE.L (4). Fix: new
-   `lvalue_record_type()` / `lvalue_field_info()` helpers walk
-   nested FIELD_ACCESS chains recursively; used by both
-   `gen_lvalue_addr` and `expr_size` at the top of their
-   AST_FIELD_ACCESS handlers.
-
-Post-fix: FIND_FREE now correctly computes
-`head_sdb.freechain.fwd_link − oset_freechain` with the right
-offset and width. It returns false legitimately (no free sdbs on
-the chain — matches kernel expectation). ALLOC_MEM then enters
-CLEAR_SPACE, which loops forever — that's the new blocker.
-
-### Next (open blocker)
-
-**CLEAR_SPACE infinite loop.** Hot PC pages `$043000`/`$042F00`
-spin for 1000+ frames. CLEAR_SPACE is at `$042EE0` (per linkmap).
-The Pascal body walks sdbs trying to shuffle memory and create a
-hole of sufficient size. Likely causes:
-- Another chained-field-access width bug somewhere CLEAR_SPACE
-  touches (SET_INMOTION_SEG / CLR_INMOTION_SEG / MOVE_SEG).
-- Bad `clock_ptr` (MMRB+$C2) making the walk never terminate.
-- Freechain.bkwd_link walk in the opposite direction that still
-  hits the same stale offset we just fixed.
-
-Start by disassembling `$042EE0` through `$0430FF`, correlate to
-`source-MM2.TEXT.unix.txt:296` (CLEAR_SPACE body), and add probes
-to ALLOC_MEM entry / CLEAR_SPACE entry / SET_INMOTION_SEG entry.
-
-### Previous state (pre-P82) — STATIC-LINK ABI FIXED, BOOT CLEAN TO IDLE
-
-Build + audit green. 25/27 milestones reached. Kernel boots cleanly
-INIT → PR_CLEANUP → scheduler → MemMgr → scheduler idle loop. 1000
-headless frames run without a single SYSTEM_ERROR halt (v=4/v=11
-faults that previously blocked progress are gone).
-
-**P81 fix — Pascal static-link ABI for sibling-nested procedure calls.**
-The handoff's "MMU mapping" hypothesis was incorrect. MemMgr's first
-16 user-mode instructions at $04413C ran fine; the real bug was in
-the Pascal code generator. When a proc nested inside a top-level proc
-calls a *sibling* nested proc (e.g., MOVE_SEG → SET_INMOTION_SEG, both
-nested in CLEAR_SPACE), `emit_frame_access` walked the *dynamic* link
-(saved A6 from LINK) to reach outer-scope locals. But dynamic link =
-caller's A6 ≠ static parent's A6 for sibling calls: SET_INMOTION_SEG's
-MOVEA.L (A6),A0 returned MOVE_SEG's A6 instead of CLEAR_SPACE's,
-then MOVE.L disp(A0),D0 at disp=-14 straddled MOVE_SEG's saved-A6 and
-return-PC bytes, loading garbage ($DD980004) that got stuffed into A0
-via MOVEA.L D0,A0 → JMP (A0) → vector 4 crash.
-
-**Fix (src/toolchain/pascal_codegen.[ch]):**
-- Each `cg_proc_sig_t` now carries `nest_depth` + `takes_static_link`.
-- Procs at depth ≥ 2 reserve a static-link slot at `-4(A6)`; locals
-  start below that. After `LINK A6,#-N` the prologue emits
-  `MOVE.L A2,-4(A6)` to save the caller-provided static link.
-- Each call site emits `emit_static_link_load(cg, sig)` right before
-  the JSR. Walk count = caller_depth − callee_depth + 1:
-    - 0 → `MOVEA.L A6,A2` (caller is direct static parent)
-    - 1 → `MOVEA.L -4(A6),A2` (caller is sibling)
-    - N → first hop then (N-1) `MOVEA.L -4(A2),A2` hops
-- `emit_frame_access` walks the static chain via -4(A6) / -4(A0), not
-  (A6) / (A0).
-- A2 is used as the caller-saved static-link register (no prior use).
-- Applied at three call sites: AST_IDENT_EXPR (zero-arg call),
-  AST_FUNC_CALL, AST_CALL. Indirect calls via procedure params are
-  not yet static-link-aware (uncommon enough to defer).
-
-### P81a — trimmed 6 of 7 HLE bypasses the static-link fix made redundant
-
-Commit `6b6d9b0`. With the static-link ABI in, natural kernel code
-now runs cleanly through the paths these HLEs were substituting.
-Removed:
-
-- CHK_LDSN_FREE (P80e) — natural errnum resolution works now
-- MAKE_SYSDATASEG (P79/P80f/g) — natural DS_OPEN / GetFree / MMU-program
-- Move_MemMgr (P80d) — MM free-space bookkeeping now coherent
-- Wait_sem (P43) — byte-subrange D0 fix (P80h2) had the real cause
-- Signal_sem (P78) — corrupt wait_queue was a static-link downstream
-- CreateProcess + ModifyProcess + FinishCreate (P80g/h2) — natural
-  body populates PCB / syslocal / env_save_area correctly now
-
-Boot: 50 boot_progress checkpoints reached in 200 frames, clean through
-PR_CLEANUP into the scheduler idle loop. No SYSTEM_ERROR halts, no
-vector 4 / vector 11 faults.
-
-### P81b — parameterless nested procs now get sigs registered
-
-Commit landed alongside the exit() investigation. Previously
-`gen_proc_or_func` only called `register_proc_sig` when the proc had
-an AST_PARAM_LIST child. That left every parameterless nested proc
-(e.g. `SET_INMOTION_SEG`) without a sig entry, so callers couldn't
-look it up and didn't emit `emit_static_link_load` — A2 stayed stale,
-the callee's prologue saved that stale A2 to -4(A6), and the static
-chain was poisoned.
-
-Result: **26/27 milestones** (up from 25/27). INITSYS is now reached.
-
-### P81c — all remaining process/memory/FS HLEs trimmed (one commit each)
-
-Each removal verified individually with `make && ./build/lisaemu
---headless Lisa_Source 200` staying at 26/27 resolved milestones.
-Commits `1cd425f` through `c8dc5d4`:
-
-- **MM_Setup** (`1cd425f`) — syslocal setup; natural body works now.
-- **excep_setup** (`ae641a9`) — wild b_sloc_ptr was a CreateProcess
-  static-link symptom.
-- **MEM_CLEANUP** (`2fa0f3c`) — SYS_PROC_INIT's args are properly
-  initialized now.
-- **REG_OPEN_LIST** (`743f01f`) — sentinel-init was static-link.
-- **Make_File** (`be0d4bf`) — DecompPath/SplitPathname garbage-write
-  path was static-link.
-- **PR_CLEANUP** (`9505ada`) — natural body unlinks c_pcb_ptr and
-  enters scheduler correctly.
-- **HLE-SelectProcess** (`c8dc5d4`) — earlier removal attempts failed
-  because other HLEs upstream were still poisoning state; natural
-  body runs cleanly now.
-
-### P81d — exit(CurrentProc) codegen fix (`f010d4f`)
-
-`EXIT(init_boot_cds)` inside INIT_BOOT_CDS (nested depth 2) was
-unwinding its caller BOOT_IO_INIT too, because our `exit()` codegen
-walked `scope_depth-1` hops of the dynamic link unconditionally.
-That hit `MOVEA.L (A6),A6` once, landing on BOOT_IO_INIT's frame,
-then UNLK+RTS blew BOOT_IO_INIT away along with INIT_BOOT_CDS —
-skipping BOOT_IO_INIT's for-loop and its `case 4:` dispatch to
-FS_INIT.
-
-Fix: when `exit(Name)` target matches the current scope's proc_name,
-emit UNLK+RTS with **no walk**. For `exit(Named)` where the target
-is an enclosing proc, keep the old walk-to-outermost behavior —
-lexically not perfectly correct but changing it cascades regressions
-via the name-collision / flat-find_proc_sig issues.
-
-**Result: FS_INIT now reached** for the first time (27th resolved
-milestone visible). But FS_INIT's natural body crashes downstream
-(writes to `$F23204` from P_DEQUEUE with an unmapped segment), so
-SYS_PROC_INIT etc. no longer fire — boot stops at 22/27.
-
-### Still kept: FS_CLEANUP (was 26/27's holdout)
-
-Unchanged: natural body still regresses boot, needs FS infrastructure
-work (mounttable / catalog state) before it can run. Currently
-subsumed by the bigger FS_INIT-crashes issue above — fixing FS_INIT
-likely also unblocks FS_CLEANUP since both depend on the same FS
-state machinery.
-
-### Next
-
-The big remaining kernel blocker: **FS_MASTER_INIT fails with
-unmapped writes at `$F23204` from P_DEQUEUE** (part of the FS's
-sysglobal queue manipulation). Almost certainly a memory-manager
-bookkeeping mismatch — natural FS_INIT calls FS_MASTER_INIT which
-walks/updates queue structures that our current state doesn't
-populate with valid pointers. Needs diagnosis of P_DEQUEUE's caller
-and the syslocal/sysglobal fields it reads.
-
-After that, remaining work to a booting Lisa:
-
-1. **FS state population** (MDDF / mounttable / catalog entries in
-   the disk image, so FS_MASTER_INIT finds what it needs).
-
-2. **SYSTEM.SHELL as second compile target** (multi-target build +
-   intrinsic-library loader + disk-image catalog entries). Unlocks
-   SHELL and WS_MAIN milestones and the actual Lisa desktop.
-
-### P80h2 session fixes (scheduler dispatch plumbing)
-
-- **Byte-subrange loads zero-extend** (`src/toolchain/pascal_codegen.c:1067`):
-  `emit_read_a0_to_d0` now emits `MOVEQ #0,D0; MOVE.B (A0),D0` instead
-  of bare `MOVE.B (A0),D0`. Without the zero-extend, D0's upper 24 bits
-  retained whatever was there (often a PCB pointer). A subsequent
-  `MOVE.W D0,D2` then `CMP.W D1(0),D0` looked at the polluted low word
-  — for priority=250 with a candidate pointer $CCB880, `SGT` saw a
-  negative 16-bit value and `candidate^.priority > 0` evaluated FALSE,
-  causing SelectProcess to always return nil. This was the reason the
-  scheduler dispatched nothing after Launch. Keep an eye on byte-load
-  sites — this is a general codegen fix, not scoped to the scheduler.
-- **Priority fields are 1-byte in PCB** (`src/m68k.c:3546`): CreateProcess
-  HLE now writes `priority`/`norm_pri` as bytes at offsets 12/13, not
-  16-bit words. Matches the compiler's layout for `0..255` subranges.
-- **HLE-SelectProcess**: our Pascal codegen for `exit(SelectProcess)` emits
-  a buggy `MOVEA.L (A6),A6; UNLK A6; RTS` sequence that walks the static
-  link when it shouldn't — clobbers A7 and crashes. Tried fixing the
-  codegen (NOP or walk-target-aware), both caused early-boot regressions
-  the OS depended on. Chose instead to bypass the whole proc: at
-  `$05B59A` the emulator picks the highest-priority PCB in the ready
-  queue, writes it to Scheduler's `candidate` local at `-6(A6)`, sets
-  `b_syslocal_ptr ← candidate's syslocal` (so Launch's SETREGS reads
-  the right env_save_area), then RTSes. (`src/m68k.c:3069`)
-- **PCB → syslocal tracking**: CreateProcess HLE now stores (pcb, sloc)
-  pairs so SelectProcess can resolve which syslocal to point
-  b_syslocal_ptr at for the dispatched process.
-
-
-- **ord(@proc) emits proc-address relocation**: `AST_ADDR_OF` now detects
-  procedure identifiers via `find_proc_sig` and emits `MOVE.L #imm32,D0`
-  with a linker relocation, instead of falling through to
-  `gen_lvalue_addr` which emitted a bogus `LEA offset(A5),A0`. MemMgr's
-  start_PC now resolves to `$043FB4` (the real code entry) instead of
-  `$CCB802` (a stale A5-relative global slot).
-  (`src/toolchain/pascal_codegen.c:2262`)
-- **Proc-sig registration for all decls**: parameterless Pascal bodies
-  like `procedure MEMMGR;` are now registered in `proc_sigs`, not only
-  external ones. Without this, `find_proc_sig` returned NULL for all
-  body-decl procs and `@MEMMGR` fell back to variable-lookup.
-  (`src/toolchain/pascal_codegen.c:3320`)
-- **CreateProcess HLE populates env_save_area**: writes PC=start_PC,
-  SR=0, A5=sysA5, A6=A7=stack top, plus SCB fields and
-  sl_free_pool_addr, so the scheduler's SETREGS/RTE launches into a
-  runnable register state.  (`src/m68k.c:3515`)
-- **FinishCreate HLE does priority-sorted queue insert**: doubly-linked
-  walk from `@fwd_ReadyQ` finds the insertion point, maintains both
-  next/prev pointers.  (`src/m68k.c:3632`)
-- **PR_CLEANUP HLE unlinks stale PCBs and redirects to Scheduler**:
-  walks the ready queue, unlinks any PCB with priority&lt;0 or ≥255
-  (covers STARTUP's pseudo c_pcb whose priority got garbled), then jumps
-  directly to the Scheduler body at `$05B832`.  (`src/m68k.c:2978`)
-
-### P80 session fixes (20+ structural codegen + HLE fixes)
-
-**Structural codegen:**
-1. **8-char significant identifiers** (P80): Lisa Pascal truncation rule
-2. **Iterative pre-pass record fixup** (P80b): 27 records corrected
-3. **Imported type preservation** (P80c): prevents full-pass offset corruption
-4. **Non-local goto A6 restore** (P80e): follows static link chain
-5. **Non-local exit() A6 restore** (P80g): same fix for exit(proc) calls
-6. **Boolean NOT for function calls** (P80e): TST/SEQ instead of NOT.W
-7. **Enum/const priority** (P80f): enum ordinals don't overwrite CONSTs
-8. **Generalized record repair** (P80f): auto-detect/replace corrupt records
-9. **Anonymous record repair** (P80f): match by first field name
-10. **find_type imported preference** (P80g): prefer imported records with valid offsets
-11. **Post-creation record repair** (P80g): copy offsets from imported at resolve_type
-
-**HLE mechanisms:**
-12. **MAKE_SYSDATASEG bypass** (P80f/g): all segment creation as resident
-13. **CreateProcess/ModifyProcess/FinishCreate bypass** (P80g)
-14. **CHK_LDSN_FREE bypass** (P80e): system LDSNs allowed
-15. **Move_MemMgr bypass** (P80d)
-16. **INIT_FREEPOOL pool repair** (P80c)
-17. **SYS_PROC_INIT crash unwind** (P80d)
-
-### P79 session fixes (6 structural codegen improvements)
-
-1. **Record layouts** (P79): string word-padding, CONST pre-pass export
-2. **Push direction** (P79c): prefer sig's is_external
-3. **Proc sig pre-pass** (P79d): export during types pre-pass
-4. **Enum constants** (P79e): register ordinal values
-5. **Byte-subrange sizing** (P79f): range<=255 → size=1
-6. **Record-field array stride** (P79f): resolve element type for field arrays
-
-### Next: fix process environment for dispatch
-
-Scheduler dispatches but processes crash immediately. Two issues:
-1. **ord(@proc) codegen**: `ord(@MemMgr)` generates $CCB802 (global var
-   offset) instead of $043F56 (code address). Need to fix address-of
-   for procedure identifiers.
-2. **Environment save area**: CreateProcess HLE needs to set up the
-   syslocal's env_save_area with correct A5, PC, A6, A7, SR values
-   so Launch can restore registers and jump to the entry point.
-
-### Roadmap to fully bootable Lisa desktop
-
-**Current: Kernel 90% complete, full desktop ~25-30%**
-
-| Layer | Status | What's needed |
-|-------|--------|---------------|
-| OS Kernel (SYSTEM.OS) | 90% — 27/27 checkpoints | Fix SYS_PROC_INIT body |
-| System Libraries (SYS1LIB, SYS2LIB) | 0% | New compile targets + linking |
-| Graphics (LIBQD, LIBTK) | 0% | New compile targets |
-| Drivers (SYSTEM.LLD, CD_*) | 0% | 13 new binaries |
-| Shell (APDM = Desktop Manager) | 0% | Separate compile target |
-| Apps (LisaWrite, LisaCalc, etc.) | 0% | 14 app targets |
-| Intrinsic library loading | 0% | Dynamic linking support |
-| Lisa filesystem (MDDF, catalog) | 0% | Disk image infrastructure |
-| Boot ROM / bootloaders | Partial | BT_Profile, BT_Sony |
-
-Full source code is available for ALL components. The toolchain (parser 100%, assembler 100%, linker working) can handle additional targets — the remaining work is systematic: define 26+ compile targets, fix per-target codegen issues, build the disk layout.
-
-### Key structural codegen fixes (cumulative, P4–P78)
-
-These are durable improvements to the Pascal cross-compiler, not one-off patches. All are in git history. Major classes:
-
-- **Field layout**: subrange default word-size in unpacked records, variant records, PACKED propagation, PASCALDEFS pin table (29 A5-relative globals)
-- **Pointer arithmetic**: EXT.L skip for wide operands (`rhs_has_wide_operand()`), narrow→wide sign-extension on stores
-- **Type resolution**: two-pass compile (types pre-pass), cross-unit type propagation, proc-local TYPE/CONST registration
-- **Control flow**: goto/numeric-label support, case multi-labels + selector preservation
-- **String ops**: byte-compare for string equality
-- **WITH blocks**: nested WITH field bases, double-deref, address-of fields, true/false/nil inside WITH
-- **Calling conventions**: non-primitive value params as by-ref, prefer Pascal body sig over external, proc-sig type remap by name
-
-### Active HLE bypasses
-
+Loop until `header == endblock`.
+
+**Phase 2 plan (in order):**
+
+1. Add `LOADER` as a second compile target in `compile_targets.c` —
+   module list = source-LOADER.TEXT + source-ldlfs.text +
+   source-LDUTIL + source-LDEQU + source-LDASM + whatever unit deps
+   they declare via `$U` / `$I`.
+2. Teach `toolchain_bridge.c` to iterate `ALL_TARGETS[]` — compile,
+   link, and emit each as its own output artifact.
+3. Bootrom-time placement: load LOADER into low RAM at boot, set
+   `[$204] = @ldrtrap` so `ENTER_LOADER` lands in the real loader.
+4. Extend `diskimage.c` to lay out a complete filesystem:
+   - Pick an `fsversion` and commit to that catalog format (likely
+     start with < 16 flat-hash for simplicity, B-tree later).
+   - Real slist with s-entry records.
+   - Real catalog entries produced by `LDHASH`.
+   - Per-file filemap pages with correct header layout.
+   - 24-byte pagelabels on every data block.
+5. Remove the `ENTER_LOADER` HLE in `src/m68k.c:4846` in the same
+   commit that does step 4.
+6. Add SYSTEM.CD_PROFILE as a third compile target (source-PROFILE.TEXT +
+   source-PROFILEASM + PROF_INIT + PROF_DOWN).
+7. Place the linked driver `.OBJ` on disk via `disk_add_file(db, "system.cd_profile", ...)`.
+8. Remove the 10738 suppression in `src/lisa.c:2886` in the same
+   commit as step 7.
+
+Steps 1–5 are the heavy lift. Steps 6–8 are pattern-matching after that.
+
+## Reference: previous session history
+
+Full per-session history lives in `.claude-handoffs/` (one file per
+handoff, archived at session start). If you need the reasoning behind
+a specific HLE, codegen fix, linker rule, or structural Pascal bug —
+search by date or topic there, not here. CLAUDE.md is a living
+architectural doc, not an engineering log.
+
+Key session highlights for quick reference:
+
+- **P4–P78**: cumulative Pascal-codegen structural fixes (record
+  layout, variant records, packed bit-packing, WITH blocks, goto,
+  CASE multi-labels, strings, calling conventions, cross-unit type
+  resolution, two-pass types pre-pass).
+- **P80–P83**: static-link ABI for sibling-nested proc calls (major
+  ABI fix); 8-char significant identifiers; iterative record pre-pass;
+  packed boolean bit-packing; MERGE_FREE guard.
+- **P84–P88**: boolean NOT for AST_FIELD_ACCESS; byte-sized params at
+  offset+1; P86 linker-CONST and A5-pin relocation fix; DEL_MMLIST empty-
+  list HLE guard.
+- **P89**: P89d/e scheduler static-link dispatch fixes; linker LOADER-
+  yields-to-non-LOADER rule for duplicate ENTRY symbols; find_proc_sig
+  resolution tiering; AST_WITH handles AST_FIELD_ACCESS record
+  expression.
+- **P90 (this session, 2026-04-18):** Phase 1 PMEM complete — five
+  structural codegen fixes above.
+
+## Active HLE bypasses (to remove as phases land)
+
+- **P27** Unmapped segment writes dropped (generic MMU safety net)
 - **P33** REG_OPEN_LIST: mounttable chain walk
 - **P34** excep_setup: wild `b_sloc_ptr`
 - **P35** SYS_PROC_INIT: full system-process creation
@@ -1510,46 +319,57 @@ These are durable improvements to the Pascal cross-compiler, not one-off patches
 - **P38** PR_CLEANUP: fires milestone, bypasses body
 - **P42** Dynamic HLE lookup via `boot_progress_lookup` (cached per `g_emu_generation`)
 - **P78** Signal_sem HLE guard + RELSPACE guard
-
-### Key HLE mechanisms
-
+- **ENTER_LOADER** (`src/m68k.c:4846`) — pops args + RTS; no real loader runs
+- **10738..10741 suppression** (`src/lisa.c:2886`) — masks `LD_OPENINPUT` garbage return
+- **10707 suppression** (`src/lisa.c`) — masks FS_MASTER_INIT failure
 - `$234` fetch bypass: IPL=7→RTE (DB_INIT skip), IPL=0→execute (Lisabug)
 - `$4FBC` NOP-skip: illegal opcode in Workshop init loop
-- ProFile HLE: intercepts CALLDRIVER, reads from disk image
-- INTSON/INTSOFF: manages IPL for compiled OS code
-- Loader TRAP HLE: MMU-translated reads/writes for fake_parms
-- ENTER_LOADER HLE: mode-switch bypass (supervisor→user A7 swap issue)
-- Setup_IUInfo HLE: skips INTRINSIC.LIB read loop
-- GETSPACE: zero-fills allocated blocks (calloc semantics)
-- Unmapped segment writes dropped (P27 generic MMU safety net)
+- **ProFile HLE**: intercepts CALLDRIVER, reads from disk image
+- **INTSON/INTSOFF**: manages IPL for compiled OS code
+- **Loader TRAP HLE**: MMU-translated reads/writes for `fake_parms`
+- **Setup_IUInfo HLE**: skips INTRINSIC.LIB read loop
+- **GETSPACE**: zero-fills allocated blocks (calloc semantics)
 
-### Debug infrastructure
+See `docs/HLE_INVENTORY.md` for the complete ledger.
 
-- `DBGSTATIC` macro + `g_emu_generation`: all debug statics reset on power cycle
-- Bounded print budgets on all diagnostic output
-- `VEC-FIRST` per-vector first-fire trace, periodic DIAG frame dumps
-- 256-entry PC ring for crash analysis
-- `boot_progress_lookup(name)` public accessor for linker symbol table
+## Debug infrastructure
 
-### Inspiration projects
+- `DBGSTATIC` macro + `g_emu_generation`: all debug statics reset on power cycle.
+- Bounded print budgets on all diagnostic output.
+- `VEC-FIRST` per-vector first-fire trace, periodic DIAG frame dumps.
+- 256-entry PC ring for crash analysis.
+- `boot_progress_lookup(name)` public accessor for linker symbol table —
+  cached per generation; used by HLE intercepts that need to find
+  compiled Pascal entry points by name (since addresses shift with
+  every codegen change).
 
-- `_inspiration/LisaSourceCompilation-main/`: 2025 working compilation of LOS 3.0 on real Lisa hardware. `scripts/patch_files.py` catalogs source patches.
-- `_inspiration/lisaem-master/`: Reference for SCC/VIA/COPS/ProFile/floppy emulation.
+## Inspiration projects
+
+- `_inspiration/LisaSourceCompilation-main/` — 2025 working compilation
+  of LOS 3.0 on real Lisa hardware. `scripts/patch_files.py` catalogs
+  the source patches needed to make Apple's source cross-compile. Our
+  toolchain aims to avoid needing these patches (by fixing the
+  structural Pascal-codegen bugs the patches work around).
+- `_inspiration/lisaem-master/` — Reference for SCC/VIA/COPS/ProFile/
+  floppy emulation.
 
 ## Lisa_Source Reference
 
-See `docs/LISA_SOURCE_MAP.md` for the complete catalog (~1,280 files).
-See `docs/HARDWARE_SPECS.md` for hardware specifications derived from source.
-See `docs/TOOLCHAIN.md` for the compilation pipeline needed to build from source.
+See also:
+- `docs/LISA_SOURCE_MAP.md` — complete catalog (~1,280 files)
+- `docs/HARDWARE_SPECS.md` — hardware spec derived from source
+- `docs/TOOLCHAIN.md` — compilation pipeline doc
+- `docs/HLE_INVENTORY.md` — complete HLE ledger
 
 Key facts:
-- **Version**: Lisa OS 3.1 (Office System), circa 1983-1984
-- **Languages**: Motorola 68000 assembly + Lisa Pascal (Apple's custom Pascal dialect)
+
+- **Version**: Lisa OS 3.1 (Office System), circa 1983–1984
+- **Languages**: Motorola 68000 assembly + Lisa Pascal (Apple's custom dialect)
 - **~1,280 files** across OS kernel, 21 libraries, 13 applications, fonts, toolkit
-- Contains 8 pre-compiled .OBJ files (68000 binaries) and 57 binary font files
+- Contains 8 pre-compiled `.OBJ` files (68000 binaries) and 57 binary font files
 - Build scripts in `LISA_OS/BUILD/` and `LISA_OS/OS exec files/` describe the full build process
 - Linkmaps in `LISA_OS/Linkmaps 3.0/` show exact segment layout of every linked binary
-- No pre-built ROM images or bootable disk images — everything must be compiled from source
+- No pre-built ROM images or bootable disk images — everything compiles from source
 
 ## Hardware Specs (from source analysis)
 
@@ -1557,7 +377,7 @@ Key facts:
 |-----------|---------------|
 | CPU | Motorola 68000, 5 MHz |
 | RAM | 1 MB (24-bit address bus) |
-| Display | 720 x 364, monochrome bitmap |
+| Display | 720 × 364, monochrome bitmap |
 | ROM | 16 KB at $FE0000 |
 | I/O Base | $FC0000 |
 | VIA1 | $FCD801 — Parallel port / ProFile hard disk |
@@ -1573,10 +393,12 @@ Key facts:
 - **Swift**: Swift 6, `@Observable` (not ObservableObject), `@State` (not @StateObject), modern SwiftUI APIs (`.foregroundStyle`, `fileImporter`, etc.)
 - **C**: C17, `-Wall -Wextra`, no external dependencies beyond SDL2 (standalone) or AppKit (Xcode)
 - **Target**: Apple Silicon (arm64-apple-darwin), macOS 15+
-- **Emulator/ files are SYMLINKS**: `lisaOS/lisaOS/Emulator/` contains symlinks to `src/`. No copying needed — edit `src/` and Xcode picks it up automatically.
+- **`lisaOS/lisaOS/Emulator/` files are SYMLINKS** to `src/`. No copying — edit `src/` and Xcode picks it up automatically.
 
 ## Git Conventions
 
-- No Claude attribution in commit messages
-- Lisa_Source/ is gitignored (Apple license prohibits redistribution)
-- .claude/ directory is gitignored
+- No Claude attribution in commit messages.
+- `Lisa_Source/` is gitignored (Apple license prohibits redistribution).
+- `.claude/` is gitignored.
+- Push after every commit unless told otherwise.
+- No destructive git ops without explicit user permission.
