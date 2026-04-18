@@ -2049,6 +2049,21 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                     }
                     emit16(cg, (uint16_t)(int16_t)(sym->offset + byte_offset_adj));
                     if (sz == 1 && type_is_signed_byte(sym->type)) emit_sign_ext_byte(cg);
+                    /* P91: for integer params (TK_INTEGER size=2) at POSITIVE
+                     * frame offset (= arg slot), emit EXT.L D0 to sign-extend.
+                     * The caller pushes these as MOVE.W (2-byte slot); the
+                     * callee's MOVE.W read gets the right 16 bits, but any
+                     * subsequent use as a 32-bit value (longint store, pointer
+                     * arithmetic) needs sign-extension — OR the post-hoc
+                     * widening patches will turn MOVE.W into MOVE.L and read
+                     * 2 bytes of stack garbage above the slot. See LD_READSEQ
+                     * `count := pages` in SOURCE-CD.TEXT — the original bug
+                     * gave count=$0001_00CB (pages=1 in high half + stack
+                     * junk in low half) instead of count=1. */
+                    if (sym->is_param && sz == 2 && sym->offset > 0 &&
+                        sym->type && sym->type->kind == TK_INTEGER) {
+                        emit16(cg, 0x48C0); /* EXT.L D0 */
+                    }
                 } else {
                     /* Global: size-aware load from A5 */
                     int sz = type_load_size(sym->type);
@@ -3023,7 +3038,12 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
             /* P3 post-hoc: if the LHS is pointer-sized (4 bytes) but the RHS
              * emitted MOVE.W (A0),D0 or MOVE.W disp(An),D0, patch it to
              * MOVE.L. This handles ptr := ptr^.field where the field type
-             * couldn't be resolved through the type chain. */
+             * couldn't be resolved through the type chain. Note: this does
+             * NOT apply to TK_INTEGER params at positive frame offsets —
+             * those emit MOVE.W + EXT.L at the load site (see P91 in the
+             * AST_IDENT_EXPR load path) so they already present a 32-bit
+             * D0 here and the MOVE.L-detector at the earlier post-hoc
+             * bumps rhs_sz to 4. */
             {
                 ast_node_t *lhs = node->children[0];
                 int lhs_sz = expr_size(cg, lhs);

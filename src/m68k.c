@@ -4842,8 +4842,11 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             extern uint32_t boot_progress_lookup(const char *name);
             extern bool lisa_hle_enter_loader(m68k_t *cpu);
             static uint32_t enter_loader_addr = 0;
-            static int el_probed = 0;
-            if (!el_probed) { el_probed = 1; enter_loader_addr = boot_progress_lookup("ENTER_LOADER"); }
+            static int el_probe_gen = -1;
+            if (el_probe_gen != g_emu_generation) {
+                el_probe_gen = g_emu_generation;
+                enter_loader_addr = boot_progress_lookup("ENTER_LOADER");
+            }
             if (enter_loader_addr && cpu->pc == enter_loader_addr) {
                 if (lisa_hle_enter_loader(cpu))
                     continue;
