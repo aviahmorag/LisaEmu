@@ -214,15 +214,17 @@ for the line-by-line detail of:
 6. PRAM stub now encodes `pm_slot=10` (internal `cd_paraport`) with
    corrected 32-word XOR checksum.
 
-**Phase 2 in progress:** Current blocker is `LOADEM`'s
-`LD_OPENINPUT('SYSTEM.CD_PROFILE')` call firing 10738 because:
+**Phase 2 in progress:** Step 3d (disk layout) complete as of
+`9b3afa4` — the disk image now carries a real Lisa filesystem the
+compiled LOADER can walk. Current blocker is now purely step 4:
 
 - Our `ENTER_LOADER` HLE in `src/m68k.c:4846` pops args and RTSes —
-  `fake_parms.result` is uninitialized stack garbage.
-- `diskimage.c` writes `fsversion=17` (forces B-tree lookup) but only a
-  flat catalog (which only works with `fsversion<16`). Even if the real
-  loader ran, it would find nothing.
-- We don't compile source-LOADER.TEXT or source-ldlfs.text as a target.
+  `fake_parms.result` is uninitialized stack garbage. Until this HLE
+  comes out and the compiled LOADER actually takes over, LD_OPENINPUT
+  still short-circuits.
+- We don't yet compile source-LOADER.TEXT or source-ldlfs.text as the
+  active boot-track loader (SYSTEM.BT_PROFILE links them but
+  LOADER.ldrtrap isn't wired to $204 at runtime).
 
 **The on-disk format the real loader expects** (from `source-ldlfs.text.unix.txt`):
 
@@ -316,26 +318,34 @@ pagelabel. Verify in Phase 3 when implementing layout.
    Both targets currently produce identical linked.bin because we're
    in LOOSE compile mode — strict module filtering is a Step 3-era
    concern. No boot regression (same 27/29 milestones).
-3. Bootrom-time placement: load LOADER into low RAM at boot, set
-   `[$204] = @ldrtrap` so `ENTER_LOADER` lands in the real loader.
-   Requires switching SYSTEM.BT_PROFILE's compile to strict mode so
-   it links only its 9 modules (not all 97 from LISA_OS/OS).
-4. Extend `diskimage.c` to lay out a complete filesystem:
-   - Pick an `fsversion` and commit to that catalog format (likely
-     start with < 16 flat-hash for simplicity, B-tree later).
-   - Real slist with s-entry records.
-   - Real catalog entries produced by `LDHASH`.
-   - Per-file filemap pages with correct header layout.
-   - 24-byte pagelabels on every data block.
-5. Remove the `ENTER_LOADER` HLE in `src/m68k.c:4846` in the same
-   commit that does step 4.
-6. Add SYSTEM.CD_PROFILE as a third compile target (source-PROFILE.TEXT +
+3. ✅ **Step 3a–3c**: strict module filter, boot_entry placement,
+   boot track carries the BT_PROFILE blob. Commits `f9388e5`,
+   `84550ef`, `4764d4c`.
+4. ✅ **Step 3d1**: MDDF fsversion 17 → 15 (flat-hash catalog
+   path). Commit `5b082e3`.
+5. ✅ **Step 3d2**: real slist (14-byte s_entry records, two
+   packed 512-byte pages, sfiles 0..71). Commit `f0be36b`.
+6. ✅ **Step 3d3+3d4**: LDHASH-indexed centry catalog + per-file
+   filemap pages. sfile 3 = rootcat; sfiles 4+ = user files.
+   Filemap format matches `source-sfileio.text:66-71`. Commit
+   `6d97cda`.
+7. ✅ **Step 3d5**: on-disk 20-byte tag = first 20 bytes of the
+   24-byte pagelabel (`source-DRIVERDEFS.TEXT.unix.txt:207`); real
+   fwdlink chaining now encoded for all multi-block extents
+   (slist, rootcat, file data). Commit `9b3afa4`.
+8. **Step 4** (next): bootrom-time placement — load LOADER into
+   low RAM at boot, set `[$204] = @ldrtrap` so `ENTER_LOADER`
+   lands in the real compiled LOADER instead of the C HLE. Remove
+   the `ENTER_LOADER` HLE in `src/m68k.c:4846` in the same commit.
+9. Add SYSTEM.CD_PROFILE as a third compile target (source-PROFILE.TEXT +
    source-PROFILEASM + PROF_INIT + PROF_DOWN).
-7. Place the linked driver `.OBJ` on disk via `disk_add_file(db, "system.cd_profile", ...)`.
-8. Remove the 10738 suppression in `src/lisa.c:2886` in the same
-   commit as step 7.
+10. Place the linked driver `.OBJ` on disk via `disk_add_file(db,
+    "system.cd_profile", ...)`.
+11. Remove the 10738 suppression in `src/lisa.c:2886` in the same
+    commit as step 10.
 
-Steps 1–5 are the heavy lift. Steps 6–8 are pattern-matching after that.
+Steps 1–8 are the heavy lift; Phase 2 is mostly done. Steps 9–11
+are pattern-matching after that.
 
 ## Reference: previous session history
 
@@ -361,8 +371,17 @@ Key session highlights for quick reference:
   yields-to-non-LOADER rule for duplicate ENTRY symbols; find_proc_sig
   resolution tiering; AST_WITH handles AST_FIELD_ACCESS record
   expression.
-- **P90 (this session, 2026-04-18):** Phase 1 PMEM complete — five
-  structural codegen fixes above.
+- **P90 (2026-04-18):** Phase 1 PMEM complete — five structural
+  codegen fixes above.
+- **Phase 2 Step 3d (2026-04-18 PM, commits `5b082e3`..`9b3afa4`):**
+  full real Lisa filesystem now written by `diskimage.c` —
+  fsversion 15 (flat hash), 14-byte s_entry records in 2 slist
+  blocks, 64-slot LDHASH-placed centry catalog across 7 pages,
+  per-file filemap pages, and 20-byte on-disk tags matching the
+  first 20 bytes of the real 24-byte pagelabel (with fwdlink
+  chaining). Headless test still at 27/29 milestones — blockers
+  are now all in step 4 (remove ENTER_LOADER HLE and wire the
+  compiled LOADER).
 
 ## Active HLE bypasses (to remove as phases land)
 
