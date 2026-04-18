@@ -1336,6 +1336,19 @@ static int expr_size(codegen_t *cg, ast_node_t *node) {
         case AST_ADDR_OF:
             return 4; /* pointer */
         case AST_IDENT_EXPR: {
+            /* P93: same scope rule as gen_lvalue_addr — WITH-record fields
+             * shadow same-named globals inside a WITH block. Check WITH
+             * context BEFORE falling through to find_symbol_any, or
+             * e_name/string field sizes get mis-resolved to a stray global's
+             * size (e.g. LD_OPENINPUT's cheater.path got sized as 256 bytes
+             * instead of e_name's 33, causing the aggregate-copy to DBRA
+             * 256 times into adjacent stack bytes). */
+            if (cg->with_depth > 0) {
+                type_desc_t *wrt = NULL;
+                int fld = with_lookup_field(cg, node->name, &wrt, NULL);
+                if (fld >= 0 && wrt && wrt->fields[fld].type)
+                    return type_load_size(wrt->fields[fld].type);
+            }
             cg_symbol_t *sym = find_symbol_any(cg, node->name);
             /* Constants: size is determined by VALUE, not declared type.
              * A const like maxmmusize=131072 is typed "integer" but needs
@@ -1348,13 +1361,6 @@ static int expr_size(codegen_t *cg, ast_node_t *node) {
             /* Check built-in identifiers */
             if (str_eq_nocase(node->name, "nil")) return 4;
             if (str_eq_nocase(node->name, "true") || str_eq_nocase(node->name, "false")) return 2;
-            /* Check WITH context for field size */
-            if (cg->with_depth > 0) {
-                type_desc_t *wrt = NULL;
-                int fld = with_lookup_field(cg, node->name, &wrt, NULL);
-                if (fld >= 0 && wrt && wrt->fields[fld].type)
-                    return type_load_size(wrt->fields[fld].type);
-            }
             return 2;
         }
         case AST_FIELD_ACCESS: {
@@ -1625,6 +1631,28 @@ static void emit_write_d0_to_a0_bit(codegen_t *cg, int bit_offset, int bit_width
 /* Load a variable's address into A0 */
 static void gen_lvalue_addr(codegen_t *cg, ast_node_t *node) {
     if (node->type == AST_IDENT_EXPR) {
+        /* P93: inside a WITH block, a bare identifier that matches a
+         * field of the active WITH record must resolve to that field,
+         * not to a same-named global. Lisa Pascal's scope rules put
+         * the with-record fields ABOVE globals. Without this, LD_OPENINPUT's
+         * `path := inputfile` (inside `with cheater do`) resolved `path` to
+         * some unrelated global symbol and aggregate-copied the filename
+         * there instead of into cheater.path — so the subsequent
+         * LDR_CALL(cheater) shipped an empty e_name to the loader. */
+        if (cg->with_depth > 0) {
+            type_desc_t *wrt = NULL;
+            int widx = -1;
+            int fld = with_lookup_field(cg, node->name, &wrt, &widx);
+            if (fld >= 0 && wrt) {
+                gen_with_base(cg, widx);
+                int foff = wrt->fields[fld].offset;
+                if (foff != 0) {
+                    emit16(cg, 0xD0FC);  /* ADDA.W #offset,A0 */
+                    emit16(cg, (uint16_t)(int16_t)foff);
+                }
+                return;
+            }
+        }
         cg_symbol_t *sym = find_symbol_any(cg, node->name);
         if (sym) {
             if (sym->is_param && sym->is_var_param) {

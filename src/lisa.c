@@ -578,9 +578,19 @@ bool lisa_hle_enter_loader(m68k_t *cpu) {
                 name[i] = (char)lisa_mem_read8(&lisa->mem, params_ptr + 31 + i);
             bool ok = ldr_open_file(lisa, name);
             lisa_mem_write8(&lisa->mem, params_ptr + 20, ok ? 1 : 0);
-            if (log)
-                fprintf(stderr, "HLE ENTER_LOADER call_open('%s') -> %s\n",
-                        name, ok ? "OK" : "NOT_FOUND");
+            if (log) {
+                fprintf(stderr, "HLE ENTER_LOADER call_open('%s') [nlen=%u] -> %s\n",
+                        name, nlen, ok ? "OK" : "NOT_FOUND");
+                /* Dump 64 bytes of fake_parms so we can see where the path
+                 * actually starts and whether length byte is at +29 vs +30. */
+                fprintf(stderr, "  fake_parms @$%08X:", params_ptr);
+                for (int i = 0; i < 64; i++) {
+                    uint8_t b = lisa_mem_read8(&lisa->mem, params_ptr + i);
+                    fprintf(stderr, " %02X", b);
+                    if ((i & 15) == 15) fprintf(stderr, "\n                    ");
+                }
+                fprintf(stderr, "\n");
+            }
             break;
         }
         case 1: { /* call_fill = LD_FILLBUF */
