@@ -4915,6 +4915,30 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                                 pcs[i].name, cpu->pc, cpu->a[7], cpu->a[6], cpu->sr);
                         if (strcmp(pcs[i].name, "PARAMEMINIT") == 0)
                             after_parameminit = true;
+                        /* P104-diag: at MDDF_IO entry, full dump of
+                         * configinfo[device]^ so we can find the byte offsets
+                         * of devt and blockstructured empirically. */
+                        if (strcmp(pcs[i].name, "MDDF_IO") == 0) {
+                            uint32_t sp = cpu->a[7];
+                            uint16_t device = cpu_read16(cpu, sp + 8);
+                            extern uint32_t boot_progress_lookup(const char *name);
+                            uint32_t cfgi_off = boot_progress_lookup("configinfo");
+                            uint32_t a5 = cpu->a[5];
+                            uint32_t cfgi_abs = (a5 + cfgi_off) & 0xFFFFFF;
+                            uint32_t cfg_ptr = cpu_read32(cpu, cfgi_abs + device * 4);
+                            fprintf(stderr, "  cfg[%d] at $%06X pts->$%06X\n",
+                                    device, cfgi_abs + device*4, cfg_ptr);
+                            for (uint32_t off = 0; off < 96; off += 8) {
+                                fprintf(stderr, "    +%02X:", off);
+                                for (int b = 0; b < 8; b++) {
+                                    uint32_t a = (cfg_ptr + off + b) & 0xFFFFFF;
+                                    uint16_t w = cpu_read16(cpu, a & ~1u);
+                                    uint8_t byte = (a & 1) ? (w & 0xFF) : (w >> 8);
+                                    fprintf(stderr, " %02X", byte);
+                                }
+                                fprintf(stderr, "\n");
+                            }
+                        }
                         break;
                     }
                 }

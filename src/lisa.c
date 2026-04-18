@@ -3069,6 +3069,72 @@ static bool hle_handle_calldriver(lisa_t *lisa, m68k_t *cpu) {
     return true;
 }
 
+/* P104 scaffold: HLE MDDF_IO. Sits at a higher abstraction than
+ * UltraIO — bypasses the whole psio → LisaIO → UltraIO chain which
+ * depends on a properly initialized ext_diskconfig + MDDFdata
+ * (neither populated without a real compiled ProFile driver).
+ *
+ * Signature:
+ *   procedure MDDF_IO( var ecode  : integer;    [SP+4]  4 bytes (ptr)
+ *                          device : integer;    [SP+8]  2 bytes
+ *                          addr   : absptr;     [SP+10] 4 bytes
+ *                          op     : ioop );     [SP+14] 2 bytes
+ *
+ * Apple's body calls psio(ecode, device, 1, MDDFaddr, addr, sizeof(MDDFdb), op)
+ * — "S-file 1" is the MDDF sfile, MDDFaddr is block-within-sfile=0.
+ * On our disk image MDDF lives at a fixed block (ldr_fs.mddf_block).
+ * Just read the block there directly.
+ *
+ * Pascal caller-clean: RTS, caller cleans args. */
+static bool hle_handle_mddf_io(lisa_t *lisa, m68k_t *cpu) {
+    uint32_t sp = cpu->a[7] & 0xFFFFFF;
+    uint32_t ret_addr  = cpu_read32(cpu, sp + 0);
+    uint32_t ecode_ptr = cpu_read32(cpu, sp + 4);
+    int16_t  device    = (int16_t)cpu_read16(cpu, sp + 8);
+    uint32_t addr      = cpu_read32(cpu, sp + 10);
+    int16_t  op        = (int16_t)cpu_read16(cpu, sp + 14);
+    bool read_op = (op == 0);
+
+    DBGSTATIC(int, mdi_trace, 0);
+    if (mdi_trace < 6) {
+        mdi_trace++;
+        fprintf(stderr, "HLE MDDF_IO: %s dev=%d addr=$%06X @ecode=$%06X\n",
+                read_op ? "READ" : "WRITE", device, addr, ecode_ptr);
+    }
+
+    int16_t error = 0;
+    /* MDDFdb is (roughly) 1 block of kernel-defined size. On PEPSI
+     * (fsversion 15) it fits in a single 512-byte disk page. */
+    uint32_t mddf_block = (uint32_t)ldr_fs.fs_block0;
+    if (mddf_block == 0 || !lisa->profile.mounted) {
+        error = 654;
+    } else {
+        uint8_t block_data[PROFILE_DATA_SIZE];
+        if (read_op) {
+            if (hle_read_block(lisa, mddf_block, block_data, NULL) != 0) {
+                error = 654;
+            } else {
+                for (uint32_t b = 0; b < PROFILE_DATA_SIZE; b++)
+                    cpu->write8(mask_24(addr + b), block_data[b]);
+            }
+        } else {
+            for (uint32_t b = 0; b < PROFILE_DATA_SIZE; b++)
+                block_data[b] = cpu->read8(mask_24(addr + b));
+            if (hle_write_block(lisa, mddf_block, block_data, NULL) != 0)
+                error = 654;
+        }
+    }
+
+    if (ecode_ptr)
+        cpu->write16(mask_24(ecode_ptr), (uint16_t)error);
+
+    /* Pop retAddr, return. Caller cleans args. */
+    cpu->a[7] += 4;
+    cpu->pc = ret_addr;
+    cpu->cycles += 80;
+    return true;
+}
+
 /* Handle SYSTEM_ERROR intercept.
  * SYSTEM_ERROR(integer) is called as: procedure SYSTEM_ERROR(err: integer).
  * Lisa Pascal calling convention: parameter is on stack above return address.
@@ -3442,6 +3508,23 @@ bool lisa_hle_intercept(lisa_t *lisa, m68k_t *cpu) {
     /* Intercept SYSTEM_ERROR for boot failure suppression */
     if (lisa->hle.system_error != 0 && pc == lisa->hle.system_error)
         return hle_handle_system_error(lisa, cpu);
+
+    /* P104 scaffold: intercept MDDF_IO directly and read/write the
+     * MDDF block from/to our ProFile image. Sits above the
+     * psio → LisaIO → UltraIO chain which needs a real ext_diskconfig
+     * (not populated without a compiled SYSTEM.CD_PROFILE). */
+    {
+        extern uint32_t boot_progress_lookup(const char *name);
+        static uint32_t mddf_io_addr = 0;
+        static int mddf_probe_gen = -1;
+        extern int g_emu_generation;
+        if (mddf_probe_gen != g_emu_generation) {
+            mddf_probe_gen = g_emu_generation;
+            mddf_io_addr = boot_progress_lookup("MDDF_IO");
+        }
+        if (mddf_io_addr && pc == mddf_io_addr)
+            return hle_handle_mddf_io(lisa, cpu);
+    }
 
     return false;
 }
