@@ -326,22 +326,35 @@ bool disk_finalize(disk_builder_t *db) {
     W16(mddf, 144, (uint16_t)bitmap_bytes_val); /* bitmap_bytes */
     W16(mddf, 146, (uint16_t)bitmap_pages_val); /* bitmap_pages */
 
-    /* slist — starts after bitmap */
-    uint32_t slist_start = 1 + bitmap_pages_val;
-    W32(mddf, 148, slist_start);                /* slist_addr */
-    W16(mddf, 152, 36);                         /* slist_packing (36 entries per block) */
-    W16(mddf, 154, 1);                          /* slist_block_count */
+    /* slist — as many blocks as needed, allocated from next_free_block.
+     * Must come after files so allocating here doesn't collide with data.
+     * slist_packing = 36 = floor(512 / sizeof(s_entry)) where
+     * s_entry = hintaddr(4) + fileaddr(4) + filesize(4) + version(2)
+     * = 14 bytes (source-sfileio.text:45-50). */
+    #define SENTRY_SIZE 14
+    #define SLIST_PACKING 36
+    #define FIRST_FILE_SFILE 4   /* sfiles 0..3 reserved (0=unused, 1=MDDF, 2=bitmap, 3=rootcat) */
+    uint32_t total_sfiles = (uint32_t)(FIRST_FILE_SFILE + db->num_files);
+    uint32_t slist_block_count =
+        (total_sfiles + SLIST_PACKING - 1) / SLIST_PACKING;
+    if (slist_block_count == 0) slist_block_count = 1;
+    uint32_t slist_block = db->next_free_block;
+    db->next_free_block += slist_block_count;
+    uint32_t slist_fs_page = slist_block - BOOT_TRACK_BLOCKS;
+    W32(mddf, 148, slist_fs_page);              /* slist_addr */
+    W16(mddf, 152, SLIST_PACKING);              /* slist_packing */
+    W16(mddf, 154, (uint16_t)slist_block_count);/* slist_block_count */
 
     /* File management fields */
-    W16(mddf, 156, 4);                          /* first_file */
-    W16(mddf, 158, (uint16_t)(4 + db->num_files)); /* empty_file */
-    W16(mddf, 160, 256);                        /* maxfiles */
+    W16(mddf, 156, FIRST_FILE_SFILE);                                /* first_file */
+    W16(mddf, 158, (uint16_t)total_sfiles);                          /* empty_file */
+    W16(mddf, 160, (uint16_t)(slist_block_count * SLIST_PACKING));   /* maxfiles */
     W16(mddf, 162, 1);                          /* hintsize (pages) */
     W16(mddf, 164, 0);                          /* leader_offset */
     W16(mddf, 166, 1);                          /* leader_pages */
     W16(mddf, 168, 0);                          /* flabel_offset */
     W16(mddf, 170, 0);                          /* unusedi1 */
-    W16(mddf, 172, 0);                          /* map_offset */
+    W16(mddf, 172, 0);                          /* map_offset (filemap is AT hintaddr) */
     W16(mddf, 174, 84);                         /* map_size */
     W16(mddf, 176, (uint16_t)db->num_files);   /* filecount */
 
@@ -361,21 +374,74 @@ bool disk_finalize(disk_builder_t *db) {
     #undef W16
     #undef W32
 
-    /* Catalog start block (filesystem page after slist) */
+    /* Legacy stub catalog still lives at block BOOT_TRACK_BLOCKS+1 so
+     * HLE readers that peek at it don't hit zeros. Step 3d3 replaces
+     * this with a real LDHASH-indexed centry catalog. Orphaned — the
+     * real LOADER reaches the root catalog through slist[rootsnum]. */
     uint16_t cat_block = BOOT_TRACK_BLOCKS + 1;
 
     write_block_data(db, BOOT_TRACK_BLOCKS, mddf, sizeof(mddf));
     write_block_tag(db, BOOT_TRACK_BLOCKS, 0x0001, BOOT_TRACK_BLOCKS, 0, 0, 0);
 
-    /* Write file catalog at block BOOT_TRACK_BLOCKS+1 */
-    /* Catalog entry format (32 bytes each):
-     * Offset 0:     Name length
-     * Offset 1-31:  Name
-     * Offset 32-33: File type
-     * Offset 34-37: File size
-     * Offset 38-39: Start block
-     * Offset 40-41: Block count
-     */
+    /* --- slist: slist_block_count pages of 36 packed 14-byte s_entry
+     * records each. s_entry layout (source-sfileio.text:45-50, big-
+     * endian on disk):
+     *   +0  hintaddr : longint   (FS page of this file's filemap/hint area)
+     *   +4  fileaddr : longint   (FS page of first data chunk, informational)
+     *   +8  filesize : longint   (bytes)
+     *  +12  version  : integer   (1 for user files)
+     *
+     * sfiles 0..3 are reserved (0=unused, 1=MDDF placeholder, 2=bitmap
+     * placeholder, 3=rootcat). sfiles 4..(4+num_files-1) are user
+     * files in `db->files[]` order. 3d4 will fill hintaddr with per-
+     * file filemap pages; for now hintaddr=0 is a placeholder (real
+     * LOADER would TRAP in OPEN_FILE until 3d4 lands). FIND_SENTRY
+     * (source-ldlfs.text:181) computes block = slist_addr +
+     * (sfile div slist_packing), offset = (sfile mod slist_packing) *
+     * sizeof(s_entry). So entry N goes at block slist_block + N/36,
+     * offset (N%36)*14. */
+    uint8_t slist_buf[PROFILE_DATA_SIZE];
+
+    /* Helpers that write into slist_buf */
+    #define SLIST_W16(off, v) do { slist_buf[(off)]   = ((v) >> 8) & 0xFF; \
+                                    slist_buf[(off)+1] = (v) & 0xFF; } while (0)
+    #define SLIST_W32(off, v) do { slist_buf[(off)]   = ((v) >> 24) & 0xFF; \
+                                    slist_buf[(off)+1] = ((v) >> 16) & 0xFF; \
+                                    slist_buf[(off)+2] = ((v) >> 8)  & 0xFF; \
+                                    slist_buf[(off)+3] = (v) & 0xFF; } while (0)
+
+    for (uint32_t sb = 0; sb < slist_block_count; sb++) {
+        memset(slist_buf, 0, sizeof(slist_buf));
+        uint32_t first_sfile_on_block = sb * SLIST_PACKING;
+        for (uint32_t slot = 0; slot < SLIST_PACKING; slot++) {
+            uint32_t sfile = first_sfile_on_block + slot;
+            if (sfile >= total_sfiles) break;
+            int off = (int)(slot * SENTRY_SIZE);
+            if (sfile == 3) {
+                /* sfile 3 = root catalog — placeholder; 3d3 fills this. */
+                SLIST_W16(off + 12, 1);          /* version */
+                continue;
+            }
+            if (sfile < FIRST_FILE_SFILE) continue; /* 0,1,2 stay zero */
+            int fi = (int)(sfile - FIRST_FILE_SFILE);
+            disk_file_t *f = &db->files[fi];
+            uint32_t file_fs_page = f->start_block - BOOT_TRACK_BLOCKS;
+            SLIST_W32(off + 0, 0);               /* hintaddr (3d4) */
+            SLIST_W32(off + 4, file_fs_page);    /* fileaddr — first data page */
+            SLIST_W32(off + 8, f->size);         /* filesize */
+            SLIST_W16(off + 12, 1);              /* version */
+        }
+        uint32_t disk_block = slist_block + sb;
+        uint32_t fs_page = disk_block - BOOT_TRACK_BLOCKS;
+        write_block_data(db, disk_block, slist_buf, sizeof(slist_buf));
+        write_block_tag(db, disk_block, 0x0003, (uint16_t)fs_page, 0, 0, 0);
+    }
+
+    #undef SLIST_W16
+    #undef SLIST_W32
+
+    /* Legacy stub catalog (unchanged — replaced in 3d3). Tag 0x0004
+     * since it's at least catalog-shaped, not bitmap. */
     uint8_t catalog[PROFILE_DATA_SIZE];
     memset(catalog, 0, sizeof(catalog));
     int cat_offset = 0;
@@ -399,10 +465,11 @@ bool disk_finalize(disk_builder_t *db) {
     }
 
     write_block_data(db, cat_block, catalog, sizeof(catalog));
-    write_block_tag(db, cat_block, 0x0002, cat_block, 0, 0, 0);
+    write_block_tag(db, cat_block, 0x0004, cat_block, 0, 0, 0);
 
-    printf("Disk image: %s, %d files, %u blocks used of %u\n",
-           db->volume_name, db->num_files, db->next_free_block, db->total_blocks);
+    printf("Disk image: %s, %d files, %u blocks used of %u (slist @ block %u / FS page %u)\n",
+           db->volume_name, db->num_files, db->next_free_block, db->total_blocks,
+           slist_block, slist_fs_page);
 
     return true;
 }
