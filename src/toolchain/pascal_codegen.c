@@ -3738,6 +3738,33 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                                     rt = t1;  /* one level was enough */
                             }
                         }
+                    } else if (ptr_node->type == AST_ARRAY_ACCESS && ptr_node->children[0]) {
+                        /* P97: WITH arr[i]^ DO ... — array element is a
+                         * pointer, deref gives the record. Used throughout
+                         * NEW_CONFIG: `with configinfo[config_index]^ do`.
+                         * Without this, the inner WITH's record_type was
+                         * NULL and all field references (drvrec_ptr,
+                         * required_drvr, permanent) fell through to the
+                         * placeholder path — silently dropping 3 field
+                         * writes and causing workptr to read uninitialized
+                         * stack memory, UP() to never get a valid driver,
+                         * and 10740/10741 at bootdev init. */
+                        ast_node_t *arr = ptr_node->children[0];
+                        type_desc_t *at = NULL;
+                        if (arr->type == AST_IDENT_EXPR) {
+                            cg_symbol_t *sym = find_symbol_any(cg, arr->name);
+                            if (sym && sym->type) at = sym->type;
+                        }
+                        if (at) {
+                            if (at->kind == TK_POINTER && at->base_type)
+                                at = at->base_type;
+                            if (at->kind == TK_ARRAY && at->element_type) {
+                                type_desc_t *et = at->element_type;
+                                if (et && et->kind == TK_POINTER && et->base_type)
+                                    et = et->base_type;
+                                rt = et;
+                            }
+                        }
                     }
                 } else if (rec_expr->type == AST_IDENT_EXPR) {
                     /* WITH var DO ... — get variable's type */

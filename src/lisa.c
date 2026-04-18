@@ -3088,6 +3088,19 @@ static bool hle_handle_system_error(lisa_t *lisa __attribute__((unused)), m68k_t
      * Suppress the error and return to let INIT_BOOT_CDS continue.
      * The EXIT(init_boot_cds) after SYSTEM_ERROR will return from the procedure. */
     if (err_code >= 10738 && err_code <= 10741) {
+        /* INIT_BOOT_CDS keeps `error` local at A6-12. At 10740/10741, A6
+         * is still INIT_BOOT_CDS's frame (SYSTEM_ERROR does no LINK before
+         * its own stub intercepts). Dump the value that UP() (or the
+         * blockstructured check) produced so we can trace what went wrong. */
+        if (err_code == 10740 || err_code == 10741) {
+            uint32_t init_boot = 0;
+            extern uint32_t boot_progress_lookup(const char *name);
+            init_boot = boot_progress_lookup("INIT_BOOT_CDS");
+            uint32_t a6 = cpu->a[6];
+            uint32_t err_local = cpu_read32(cpu, a6 - 12);
+            fprintf(stderr, "  INIT_BOOT_CDS(@$%06X) A6=$%08X A6-12(err)=$%08X\n",
+                    init_boot, a6, err_local);
+        }
         fprintf(stderr, "HLE: Suppressing SYSTEM_ERROR(%d) — boot device handled by HLE\n",
                 err_code);
         /* Simulate: pop return address + pop parameter, return */

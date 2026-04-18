@@ -4853,6 +4853,58 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             }
         }
 
+        /* Diagnostic: trace entry to UP() to see config_ptr/drvrec state.
+         * UP(var errnum, config_ptr, callers_config_ptr) — right-to-left
+         * push ⇒ at entry: A7+0=retPC, A7+4=&errnum, A7+8=config_ptr,
+         * A7+12=callers_config_ptr. */
+        {
+            extern uint32_t boot_progress_lookup(const char *name);
+            static uint32_t up_addr = 0;
+            static int up_probe_gen = -1;
+            DBGSTATIC(int, up_trace, 0);
+            if (up_probe_gen != g_emu_generation) {
+                up_probe_gen = g_emu_generation;
+                up_addr = boot_progress_lookup("UP");
+            }
+            if (up_addr && cpu->pc == up_addr) {
+                uint32_t sp = cpu->a[7];
+                uint32_t ret_pc = cpu_read32(cpu, sp);
+                uint32_t cfg_ptr = cpu_read32(cpu, sp + 8);
+                uint32_t caller_cfg = cpu_read32(cpu, sp + 12);
+                uint32_t req_drvr = 0, drvrec_ptr = 0, entry_pt = 0, kres = 0;
+                if (cfg_ptr) {
+                    entry_pt   = cpu_read32(cpu, cfg_ptr + 0);
+                    drvrec_ptr = cpu_read32(cpu, cfg_ptr + 12);
+                    req_drvr   = cpu_read32(cpu, cfg_ptr + 60);
+                    if (drvrec_ptr) kres = cpu_read32(cpu, drvrec_ptr + 54);
+                }
+                /* P97 scaffold: break self-referential required_drvr that
+                 * causes UP() to infinite-recurse. Root cause: INIT_BOOT_CDS
+                 * calls NEW_CONFIG 3x, but FIND_EMPTYSLOT keeps returning
+                 * the same config_index (likely a string-compare codegen bug
+                 * on `configinfo[i]^.devname = 'BITBKT'`). So each iter's
+                 * configinfo[parent] = configinfo[config_index] = self, and
+                 * NEW_CONFIG stores req_drvr := self. UP then recurses
+                 * infinitely on the same cfg_ptr. Clear the self-ref so
+                 * UP can proceed to the driver-init path. Remove this when
+                 * FIND_EMPTYSLOT is fixed. */
+                if (cfg_ptr && req_drvr == cfg_ptr) {
+                    cpu_write32(cpu, cfg_ptr + 60, 0);
+                    req_drvr = 0;
+                    DBGSTATIC(int, up_scaf, 0);
+                    if (up_scaf++ < 2)
+                        fprintf(stderr, "  [P97 scaffold] cleared self-ref required_drvr on cfg=$%X\n", cfg_ptr);
+                }
+                if (up_trace < 4) {
+                    up_trace++;
+                    fprintf(stderr, "HLE UP entry: ret=$%06X cfg=$%06X caller=$%06X"
+                            " [entry_pt=$%X drvrec=$%X req_drvr=$%X drv.kres=$%X]\n",
+                            ret_pc, cfg_ptr, caller_cfg,
+                            entry_pt, drvrec_ptr, req_drvr, kres);
+                }
+            }
+        }
+
         /* Jump-only ring: records (src_pc, dst_pc) pairs when PC changes
          * discontinuously (JSR, JMP, RTS, BRA, BSR with distance > 8). */
         static struct { uint32_t src, dst; } jmp_ring[128];
