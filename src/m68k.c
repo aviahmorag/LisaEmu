@@ -5051,6 +5051,11 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                     if (prev_a6 == a6) break;
                     a6 = prev_a6 & 0xFFFFFF;
                 }
+                /* Last 20 PCs — helps pinpoint which JSR called SYSTEM_ERROR. */
+                fprintf(stderr, "  Last 20 PCs:");
+                for (int ri = 20; ri > 0; ri--)
+                    fprintf(stderr, " $%06X", pc_ring[(pc_ring_idx - ri) & 255]);
+                fprintf(stderr, "\n");
             }
 
             /* Dump P_ENQUEUE ($A1B00) prologue on first call */
