@@ -780,16 +780,40 @@ build_result_t toolchain_build(const char *source_dir,
     linker_t *lk = calloc(1, sizeof(linker_t));
     linker_init(lk);
 
-    /* Sort files: STARTUP must be COMPILED LAST (so it sees all other units'
-     * exported globals via the shared table) but LINKED FIRST (so the linker
-     * places it at $400 where the boot ROM jumps to). */
+    /* Sort files: boot-entry module must be COMPILED LAST (so it sees
+     * all other units' exported globals via the shared table) but
+     * LINKED FIRST (moved to module slot 0, so the linker places it
+     * at $400 where the ROM / boot-block path jumps to). Target
+     * declares its boot-entry module via target->boot_entry. */
     int startup_idx = -1;
-    for (int i = 0; i < num_files; i++) {
-        if (strcasestr(files[i].path, "SOURCE-STARTUP.TEXT") != NULL) {
-            startup_idx = i;
-            fprintf(stderr, "Boot entry: %s (compiled last, linked first at $400)\n",
-                    files[i].path);
-            break;
+    if (target->boot_entry) {
+        size_t be_len = strlen(target->boot_entry);
+        for (int i = 0; i < num_files; i++) {
+            const char *slash = strrchr(files[i].path, '/');
+            const char *base = slash ? slash + 1 : files[i].path;
+            /* Match e.g. "SOURCE-STARTUP.TEXT..." or "source-LDPROF.TEXT..."
+             * against boot_entry == "STARTUP" or "LDPROF". We look for the
+             * boot_entry name appearing as a word anywhere in the basename. */
+            for (const char *p = base; *p; p++) {
+                if (strncasecmp(p, target->boot_entry, be_len) != 0) continue;
+                if (p != base) {
+                    char prev = *(p - 1);
+                    if (isalnum((unsigned char)prev)) continue;
+                }
+                char next = p[be_len];
+                if (isalnum((unsigned char)next)) continue;
+                startup_idx = i;
+                break;
+            }
+            if (startup_idx >= 0) {
+                fprintf(stderr, "Boot entry for '%s': %s (module '%s' — compiled last, linked first at $400)\n",
+                        target->name, files[i].path, target->boot_entry);
+                break;
+            }
+        }
+        if (startup_idx < 0) {
+            fprintf(stderr, "WARN: target '%s' declares boot_entry='%s' but no matching source file found in candidates — linker placement will use source-order default\n",
+                    target->name, target->boot_entry);
         }
     }
 
@@ -1022,14 +1046,18 @@ build_result_t toolchain_build(const char *source_dir,
             progress(msg, 10 + (pascal_count * 30 / num_files), 100);
         }
     }
-    /* Now compile STARTUP last — it needs globals from all other units */
-    if (startup_idx >= 0) {
+    /* Now compile the Pascal boot-entry (if any) last — it needs
+     * globals from all other units. For ASM boot-entry targets
+     * (e.g. SYSTEM.BT_PROFILE's LDPROF), this block is skipped and
+     * the asm-last path below handles it. */
+    bool boot_entry_is_asm = (startup_idx >= 0 && files[startup_idx].is_assembly);
+    if (startup_idx >= 0 && !boot_entry_is_asm) {
         pascal_count++;
-        /* Remember how many modules are loaded before STARTUP */
+        /* Remember how many modules are loaded before boot-entry */
         int modules_before_startup = lk->num_modules;
         if (compile_pascal_file(files[startup_idx].path, lk)) {
             pascal_ok++;
-            /* Move STARTUP's module to position 0 so linker places it at $400 */
+            /* Move boot-entry module to position 0 so linker places it at $400 */
             if (lk->num_modules > modules_before_startup && modules_before_startup > 0) {
                 int startup_old_idx = lk->num_modules - 1;
                 link_module_t *startup_mod = lk->modules[startup_old_idx];
@@ -1038,7 +1066,7 @@ build_result_t toolchain_build(const char *source_dir,
                 lk->modules[0] = startup_mod;
 
                 /* Fix symbol table module_idx references after swap.
-                 * STARTUP moved from last → 0; all others shifted +1. */
+                 * Boot-entry moved from last → 0; all others shifted +1. */
                 for (int s = 0; s < lk->num_symbols; s++) {
                     if (lk->symbols[s].module_idx == startup_old_idx) {
                         lk->symbols[s].module_idx = 0;
@@ -1057,14 +1085,46 @@ build_result_t toolchain_build(const char *source_dir,
     fprintf(stderr, "Pascal: %d/%d succeeded, %d failed\n", pascal_ok, pascal_count, pascal_fail);
     result.files_compiled = pascal_ok;
 
-    /* Phase 2: Assemble assembly files */
+    /* Phase 2: Assemble assembly files. If the target's boot-entry is
+     * an asm module, skip it here and compile it last below. */
     int asm_count = 0, asm_ok = 0;
     for (int i = 0; i < num_files; i++) {
         if (!files[i].is_assembly) continue;
+        if (boot_entry_is_asm && i == startup_idx) continue;
         asm_count++;
         bool aok = assemble_file(files[i].path, lk, source_dir);
         if (aok) asm_ok++;
         else fprintf(stderr, "ASM FAIL: %s\n", files[i].path);
+    }
+    /* Now assemble the asm boot-entry last and move its module to
+     * slot 0 so the linker places it at the lowest address — boot-
+     * block placement for SYSTEM.BT_PROFILE etc. depends on this. */
+    if (boot_entry_is_asm) {
+        asm_count++;
+        int modules_before_boot = lk->num_modules;
+        bool aok = assemble_file(files[startup_idx].path, lk, source_dir);
+        if (aok) {
+            asm_ok++;
+            if (lk->num_modules > modules_before_boot && modules_before_boot > 0) {
+                int boot_old_idx = lk->num_modules - 1;
+                link_module_t *boot_mod = lk->modules[boot_old_idx];
+                for (int j = lk->num_modules - 1; j > 0; j--)
+                    lk->modules[j] = lk->modules[j - 1];
+                lk->modules[0] = boot_mod;
+                for (int s = 0; s < lk->num_symbols; s++) {
+                    if (lk->symbols[s].module_idx == boot_old_idx) {
+                        lk->symbols[s].module_idx = 0;
+                    } else if (lk->symbols[s].module_idx >= 0 &&
+                               lk->symbols[s].module_idx < boot_old_idx) {
+                        lk->symbols[s].module_idx++;
+                    }
+                }
+                fprintf(stderr, "Asm boot-entry '%s' moved to module slot 0 (→ $400)\n",
+                        files[startup_idx].path);
+            }
+        } else {
+            fprintf(stderr, "ASM FAIL: %s\n", files[startup_idx].path);
+        }
     }
     fprintf(stderr, "Assembly: %d/%d succeeded\n", asm_ok, asm_count);
     result.files_assembled = asm_ok;

@@ -91,6 +91,7 @@ static const compile_target_t TARGET_SYSTEM_OS = {
      * regresses the kernel build until the module list + $I audit
      * is finished. Tracked as pre-existing tech debt. */
     .strict = false,
+    .boot_entry = "STARTUP",
 };
 
 /* ---- SYSTEM.BT_PROFILE boot-track binary (Phase 2 target) ----
@@ -160,6 +161,7 @@ static const compile_target_t TARGET_BT_PROFILE = {
      * shared_types / shared_globals tables (see toolchain_bridge
      * comment above the ALL_TARGETS loop). */
     .strict = true,
+    .boot_entry = "LDPROF",
 };
 
 /* Registry. New targets (SYS1LIB, LIBQD, Shell, apps...) go here as

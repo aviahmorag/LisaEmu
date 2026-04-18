@@ -37,6 +37,16 @@ typedef struct {
                              * for SYSTEM.OS while its module list
                              * stabilizes). New targets should default to
                              * strict so their linked blobs stay minimal. */
+    const char *boot_entry; /* Module basename (case-insensitive) whose
+                             * compiled code must land at the lowest
+                             * address in the linked blob — the ROM/boot
+                             * path jumps to this module's entry.
+                             * "STARTUP" for SYSTEM.OS (lands at $400);
+                             * "LDPROF" for BT_PROFILE (boot-block entry).
+                             * The toolchain compiles it last (so it
+                             * sees all other units' exports) and moves
+                             * its link module to slot 0 so the linker
+                             * places it first. */
 } compile_target_t;
 
 /* Get the target by name (case-insensitive). */
