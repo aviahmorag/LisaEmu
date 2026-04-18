@@ -205,14 +205,15 @@ no-op, the internal boot state is fully clean:
   MAKE_BUILTIN(cd_scc), MAKE_BUILTIN(cd_console), PARAMEMINIT
 
 Next blocker: inside the builtin-device `for index := 0 to 8` loop at
-SOURCE-STARTUP.TEXT:1950, case 4 should call FS_INIT. Currently none of
-the case bodies fire — PARAMEMINIT's `ALARMASSIGN(var alarm, routine)`
-calls compile with TWO `MOVE.L A0,-(SP)` pushes instead of a routine
-value push + alarm address push. Suspected ord(@proc_name) or
-param_is_var[1] codegen bug for external procedures. Alarms never get
-proper handlers installed, asynchronous timer events jump to bogus
-addresses, CPU wanders $Cxxxxx RAM. See NEXT_SESSION for specific
-investigation plan.
+SOURCE-STARTUP.TEXT:1950, case 4 should call FS_INIT. PARAMEMINIT's
+ALARMASSIGN calls now compile correctly (P102), registering
+PARAMEM_WRITE and TIMER_UNBLK as alarm handlers. IPL drops to 0
+(interrupts enabled) after PARAMEMINIT — scheduler idle is running.
+But FS_INIT's entry still doesn't fire, and PC drifts to $A5xxxx /
+$A9xxxx high RAM regions. VEC-HIST shows vector 10 (line-1010 A-trap)
+firing dozens of times. Next investigation: where inside the builtin
+for-loop does execution exit BOOT_IO_INIT or get diverted into an
+interrupt handler that doesn't return.
 
 **Important debugging correction (today):** A `SYSTEM_ERROR code=0`
 message that appeared right after BOOT_IO_INIT was a **false positive**
@@ -538,6 +539,31 @@ P98 — string compare is a separate bug). Left unchecked, UP()
 recurses infinitely and blows the stack. Scaffold clears
 `required_drvr == cfg_ptr` on UP entry so the compiled code can
 advance. Remove when the bitbucket-init for-loop codegen is fixed.
+
+### P101+P102 codegen fix (2026-04-18 late night, commit `d7f64c6`): exact-match type lookup + snapshot kind
+
+Two-part fix for a cross-unit type collision. Apple-Pascal 8-char-significant
+naming collapses `LogicalAddress` (HWINT, TK_LONGINT) and `logicaladr` (a
+local record inside EXCEPRES's showregs, TK_RECORD) into the same 8-char
+prefix "LOGICALA". Our shared_types pool ends up with both entries
+side-by-side, and the type pointer cached in AlarmAssign's imported
+proc sig could be misidentified when later code paths dereference it.
+
+- P101: `find_type` prefers exact full-string strcasecmp match before
+  falling back to 8-char significant match.
+- P102: `register_proc_sig` snapshots the parameter's type KIND into
+  `sig->param_type_kind[]` at registration time. ARG_BY_REF consults
+  the snapshot instead of dereferencing the cached pointer, which
+  might point at a mutated or unrelated entry after other units are
+  parsed.
+
+Concrete effect: PARAMEMINIT's
+`ALARMASSIGN(param_mem.alarm_ref, ord(@PARAMEM_WRITE))` now compiles
+correctly — pushes `@alarm_ref` (var arg) + `@PARAMEM_WRITE` (routine
+addr) — instead of pushing `@alarm_ref` twice. Alarm handlers now
+register with real code addresses instead of pointing at their own
+alarm slot. Interrupts drop to IPL=0 (scheduler idle) after
+PARAMEMINIT — that hadn't happened pre-P102.
 
 ### P98 codegen fix (2026-04-18 night, commit `d77c49a`): string-compare branches off-by-2
 
