@@ -4170,12 +4170,25 @@ static void process_var_decl(codegen_t *cg, ast_node_t *node, bool is_global) {
             }
             cg_symbol_t *s = add_global_sym(cg, tok, type);
             if (s) {
+                bool trace = s->name[0] && (strcasecmp(s->name, "param_mem") == 0 ||
+                                            strcasecmp(s->name, "Invoke_sched") == 0 ||
+                                            strcasecmp(s->name, "b_syslocal_ptr") == 0 ||
+                                            strcasecmp(s->name, "sct_ptr") == 0);
+                if (trace) {
+                    fprintf(stderr, "[GA-ENTER] %s sz=%d pinned=%d import=%p(off=%d) type_kind=%d\n",
+                            s->name, sz, pinned_offset,
+                            (void*)existing_import,
+                            existing_import ? existing_import->offset : 0,
+                            type ? (int)type->kind : -1);
+                }
                 if (pinned_offset != 0) {
                     /* PASCALDEFS pin wins over natural offset */
                     s->offset = pinned_offset;
+                    if (trace) fprintf(stderr, "  -> PINNED offset=%d\n", s->offset);
                 } else if (existing_import && existing_import->offset != 0) {
                     /* Use the previously assigned offset */
                     s->offset = existing_import->offset;
+                    if (trace) fprintf(stderr, "  -> IMPORTED offset=%d\n", s->offset);
                 } else {
                     /* Assign new global offset (grow DOWNWARD from A5).
                      * Lisa Pascal convention: A5 points to the top of the global
@@ -4186,6 +4199,15 @@ static void process_var_decl(codegen_t *cg, ast_node_t *node, bool is_global) {
                     if (sz >= 2 && (global_offset % 2)) global_offset++;
                     global_offset += sz;
                     s->offset = -global_offset;
+                    if (s->name[0] && (strcasecmp(s->name, "param_mem") == 0 ||
+                                       strcasecmp(s->name, "Invoke_sched") == 0 ||
+                                       strcasecmp(s->name, "b_syslocal_ptr") == 0 ||
+                                       strcasecmp(s->name, "sct_ptr") == 0)) {
+                        fprintf(stderr, "[GLOBAL_ALLOC] %s: sz=%d global_offset(after)=%d offset=%d (=$%08X) type_kind=%d\n",
+                                s->name, sz, global_offset, s->offset,
+                                (uint32_t)s->offset,
+                                s->type ? (int)s->type->kind : -1);
+                    }
                 }
             }
         } else {

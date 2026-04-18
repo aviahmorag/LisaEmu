@@ -4888,8 +4888,10 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 {"Sys_Proc_Init",  0}, {"CONFIG_DOWN",    0},
                 {"LD_DISABLE",     0}, {"INITUID",        0},
                 {"SET_PREFERENCES",0}, {"DiskSync",       0},
+                {"PARAMEM_WRITE",  0}, {"TIMER_UNBLK",    0},
+                {"ALRM",           0},
             };
-            static uint32_t pcs_cache[13];
+            static uint32_t pcs_cache[16];
             static int pci_gen = -1;
             if (pci_gen != g_emu_generation) {
                 pci_gen = g_emu_generation;
@@ -4897,14 +4899,55 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                     pcs_cache[i] = boot_progress_lookup(pcs[i].name);
             }
             DBGSTATIC(int, pci_trace, 0);
-            if (pci_trace < 30) {
+            static bool after_parameminit = false;
+            DBGSTATIC(int, post_gs_count, 0);
+            if (pci_trace < 40) {
                 for (int i = 0; i < (int)(sizeof(pcs)/sizeof(pcs[0])); i++) {
                     if (pcs_cache[i] && cpu->pc == pcs_cache[i]) {
                         pci_trace++;
-                        fprintf(stderr, "[POST-BOOT] entered %s @$%06X (A7=$%08X A6=$%08X)\n",
-                                pcs[i].name, cpu->pc, cpu->a[7], cpu->a[6]);
+                        fprintf(stderr, "[POST-BOOT] entered %s @$%06X (A7=$%08X A6=$%08X SR=$%04X)\n",
+                                pcs[i].name, cpu->pc, cpu->a[7], cpu->a[6], cpu->sr);
+                        if (strcmp(pcs[i].name, "PARAMEMINIT") == 0)
+                            after_parameminit = true;
                         break;
                     }
+                }
+            }
+            /* After PARAMEMINIT, count GETSPACE calls to see if for-loop runs. */
+            /* Trace AlarmAssign internals */
+            /* P102a scaffold: block the buggy TrapTable copy loop at $7150A
+             * from overwriting the vector table. Some caller (in BOOT_IO_INIT
+             * at $5CF4) passes A1=nil to the routine at $714FC, which then
+             * copies 93 words from TrapTable ($71512) to (A1)+. With A1=0
+             * that wipes the entire exception/trap vector table at $0-$BB,
+             * including TRAP5 at $94. The next ALARMASSIGN call's TRAP #5
+             * then fetches a corrupted vector and CPU jumps to garbage.
+             * Detect and short-circuit the loop when A1 is nil or inside
+             * the vector table. Investigate and properly fix next session.
+             *
+             * Symptom: PARAMEMINIT's 2nd ALARMASSIGN(unblk_alarm,
+             * ord(@TIMER_UNBLK)) never returns, for-loop at
+             * STARTUP.TEXT:1950 never starts, FS_INIT never called. */
+            if (cpu->pc == 0x7150A && cpu->a[1] < 0x100) {
+                DBGSTATIC(int, tbk, 0);
+                if (tbk++ < 2)
+                    fprintf(stderr, "[P102a] blocking TrapTable copy to nil (A1=$%08X)\n",
+                            cpu->a[1]);
+                /* Skip the loop — jump past DBRA to JMP (A0) at $71510 */
+                cpu->pc = 0x71510;
+                continue;
+            }
+            if (after_parameminit) {
+                static uint32_t getspace_addr = 0;
+                static int gs_probe_gen = -1;
+                if (gs_probe_gen != g_emu_generation) {
+                    gs_probe_gen = g_emu_generation;
+                    getspace_addr = boot_progress_lookup("GETSPACE");
+                }
+                if (getspace_addr && cpu->pc == getspace_addr && post_gs_count < 15) {
+                    post_gs_count++;
+                    fprintf(stderr, "[POST-PMINIT GETSPACE #%d] A6=$%08X SR=$%04X\n",
+                            post_gs_count, cpu->a[6], cpu->sr);
                 }
             }
         }
