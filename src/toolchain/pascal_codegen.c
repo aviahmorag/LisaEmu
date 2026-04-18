@@ -5026,20 +5026,25 @@ static cg_proc_sig_t *find_proc_sig(codegen_t *cg, const char *name) {
      * STARTUP calls INIT_TWIGGGLOB (3 Gs, 14 chars); the decl is
      * INIT_TWIGGLOB (2 Gs, 13 chars). No exact strcasecmp match —
      * but under Apple's 8-char rule they're the same identifier.
-     * Without this, the caller gets NULL sig, emits generic 4-byte
-     * value pushes, and misses the VAR parameter — so err passes
-     * as value (zero) instead of @err. The linker then further
-     * resolves the call to INIT_TWIG_TABLE (also prefix INIT_TWI),
-     * which pops (retAddr, A1=0) and wipes the vector table.
      * Pick the candidate with the longest common prefix (LCP) so
      * INIT_TWIGGGLOB → INIT_TWIGGLOB (LCP 10) beats
-     * INIT_TWIGGGLOB → INIT_TWIG_TABLE (LCP 9). */
+     * INIT_TWIGGGLOB → INIT_TWIG_TABLE (LCP 9).
+     *
+     * P102c: require BOTH the reference and the candidate to be >= 8
+     * chars before the prefix match applies. Short names (< 8 chars)
+     * are distinct identifiers under Apple's rule and must only match
+     * via exact strcasecmp (the tiers above). Without this guard, a
+     * WITH-field ident like `Dimcont` (7 chars) LCP-matches
+     * `DimContrast` (11 chars) and the compiler treats a field read as
+     * a no-arg proc call — emitting a spurious JSR that corrupts the
+     * stack and, downstream, the sysglobal free-list fwdlink RELSPACE
+     * later walks. */
     size_t rlen = strlen(name);
-    size_t mlen = (rlen <= 8) ? rlen : 8;
-    if (mlen < 3) return NULL;
+    if (rlen < 8) return NULL;
     cg_proc_sig_t *best_local = NULL,   *best_imp = NULL,   *best_fb = NULL;
     size_t best_local_lcp = 0,          best_imp_lcp = 0,   best_fb_lcp = 0;
     #define LCP_UPDATE(cand, best, best_lcp) do {                          \
+        if (strlen((cand)->name) < 8) break;                              \
         const char *a = (cand)->name; const char *b = name; size_t l = 0; \
         while (a[l] && b[l] &&                                             \
                toupper((unsigned char)a[l]) == toupper((unsigned char)b[l])) \
@@ -5049,7 +5054,7 @@ static cg_proc_sig_t *find_proc_sig(codegen_t *cg, const char *name) {
     if (cg->proc_sigs) {
         for (int i = 0; i < cg->num_proc_sigs; i++) {
             cg_proc_sig_t *s = &cg->proc_sigs[i];
-            if (strncasecmp(s->name, name, mlen) != 0) continue;
+            if (strncasecmp(s->name, name, 8) != 0) continue;
             if (!s->is_external && sig_is_fully_resolved(s)) {
                 LCP_UPDATE(s, best_local, best_local_lcp);
             } else if (s->is_external) {
@@ -5061,7 +5066,7 @@ static cg_proc_sig_t *find_proc_sig(codegen_t *cg, const char *name) {
     if (cg->imported_proc_sigs) {
         for (int i = 0; i < cg->imported_proc_sigs_count; i++) {
             cg_proc_sig_t *s = &cg->imported_proc_sigs[i];
-            if (strncasecmp(s->name, name, mlen) != 0) continue;
+            if (strncasecmp(s->name, name, 8) != 0) continue;
             if (!s->is_external && sig_is_fully_resolved(s)) {
                 LCP_UPDATE(s, best_imp, best_imp_lcp);
             } else if (s->is_external) {
