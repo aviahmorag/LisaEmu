@@ -189,18 +189,17 @@ commit as the real replacement.
 | 11 | **Shell (APDM)** | full desktop | Not started |
 | 12 | **Apps** | LisaWrite, LisaCalc, etc. | Not started |
 
-## Current Status (2026-04-18 post-P102c)
+## Current Status (2026-04-18 post-P103/P104)
 
 **Milestones**: **23/27** kernel checkpoints reached natively, last
-checkpoint `SYS_PROC_INIT`. P102b + P102c landed structural fixes
-for 8-char-significant proc resolution and retired the P102a nil-
-TrapTable scaffold. The boot now reaches the same milestone count
-as the pre-P102b "23/27 via scaffold" state, but on a correctly
-compiled foundation: `INIT_TWIGGGLOB` resolves to the Pascal
-`INIT_TWIGGLOB` proc instead of the asm `INIT_TWIG_TABLE`, and
-`Dimcont` (a WITH-block field name) no longer collides with
-`DimContrast` (a LIBHW global). After SYS_PROC_INIT boot hits the
-pre-existing 10707 (FS_MASTER_INIT fail) suppression and halts
+checkpoint `SYS_PROC_INIT`. This session added P103 (structural
+codegen fix) and P104 (MDDF_IO HLE scaffold) — both advance the
+execution chain but the boot still halts at the pre-existing 10707
+(FS_Master_Init returns E_FS_VERSION after MDDF_IO returns
+success, because our disk image's MDDF bytes don't line up with
+Apple's MDDFdb record layout).
+
+After SYS_PROC_INIT boot hits the 10707 suppression and halts
 cleanly via STOP instruction.
 
 **P102b (commit `10b8c71`)**: `INIT_TWIGGGLOB` (3 Gs,
@@ -714,6 +713,67 @@ Triple-diff verification: the only symbol count changes between
 pre-P102b (`85f129a`) and P102c (`27df41d`) are the two
 intentional shifts (INIT_TWIG_TABLE −1, INIT_TWIGGLOB +1). Zero
 collateral.
+
+### P103 codegen fix (2026-04-18 later, commit `cc905c9`): preserve INTERFACE sig on asterisk-comment body decl
+
+Apple Pascal lets IMPLEMENTATION re-declare a proc with its args
+as an asterisk comment instead of a real arg list:
+
+    procedure real_mount (* var ecode : error; device : integer *);
+
+Our lexer correctly eats `(* ... *)` as a comment, so the parser
+sees `procedure real_mount;` with no param list. `gen_proc_or_func`
+then unconditionally called `register_proc_sig(cg, name, NULL, 0,
+...)`, creating a *duplicate* 0-param sig that shadowed the real
+sig from the INTERFACE pre-pass.
+
+Consequence: `fs_mount`'s call to `real_mount` resolved to the
+0-param sig, so the caller emitted generic 4-byte value pushes
+instead of the `@ecode` pointer the var arg required. `real_mount`
+read $8(A6) expecting an address, got the VALUE of `fs_mount`'s
+ecode (= 0), treated it as A1 pointer, and cascaded a nil-@ecode
+through `def_mount`. `MDDF_IO` never ran because `real_mount`
+returned to `fs_mount` before reaching the MDDF read. Full boot
+chain: `InitQVM → InitBufPool → InitFS → fs_mount → real_mount →
+def_mount → [skipped MDDF_IO] → 10707`.
+
+Fix: in gen_proc_or_func, only register a fresh 0-param sig when
+no prior sig exists or the prior sig has 0 params. If the
+INTERFACE already registered a real sig for this name, refresh its
+nest_depth to the body's scope but keep the param descriptors.
+
+Post-fix, the full chain runs: `InitQVM → ... → real_mount →
+def_mount → MDDF_IO` with correct var-pointer semantics. Boot
+still halts at 23/27 because MDDF_IO's real downstream (psio →
+LisaIO → UltraIO) hits E_IO_MODE_BAD — that's what P104 targets.
+
+### P104 MDDF_IO HLE scaffold (2026-04-18 late, commit `bb3fbec`): bypass the psio → LisaIO → UltraIO chain
+
+The disk-IO chain under MDDF_IO requires:
+1. `configinfo[bootdev]^.blockstructured = true` (else UltraIO
+   aborts with `E_IO_MODE_BAD`=803). Set by NEW_CONFIG via
+   `blockstructured := (devt = diskdev)`, which in turn depends on
+   `cd_devt` coming from the driver's info record.
+2. `configinfo[bootdev]^.ext_diskconfig.fs_strt_blok` populated
+   (else LisaIO adds geography.firstblock = garbage to the block
+   number and UltraIO tries to read block `$00CBFFFF`).
+
+Both are real-driver responsibilities that only a compiled
+SYSTEM.CD_PROFILE (Phase 3 work) can satisfy. Until then, P104
+intercepts at `MDDF_IO`'s entry (higher than UltraIO) and reads
+the MDDF block directly from the ProFile image via
+`hle_read_block`. The HLE sets `*ecode=0` on success.
+
+Current blocker after P104: MDDF_IO returns ecode=0, but
+real_mount's subsequent field checks on `MDDFdata^` see
+`fsversion`, `MDDFaddr`, or `volname.length` outside the expected
+range (REL1/PEPSI/CUR for fsversion, 0 for MDDFaddr, ≤max_ename
+for volname length) and raise `E_FS_VERSION`=866 → 10707.
+Means our disk image's on-disk MDDF bytes don't align with
+Apple's `MDDFdb` Pascal record layout at Apple's expected
+offsets. Next session: compare `diskimage.c`'s MDDF writer
+against `SOURCE-VMSTUFF.TEXT:55` (the MDDFdb record) and align
+offsets.
 
 ## Reference: previous session history
 
