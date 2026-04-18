@@ -577,20 +577,36 @@ bool lisa_hle_enter_loader(m68k_t *cpu) {
             for (int i = 0; i < nlen; i++)
                 name[i] = (char)lisa_mem_read8(&lisa->mem, params_ptr + 31 + i);
             bool ok = ldr_open_file(lisa, name);
-            lisa_mem_write8(&lisa->mem, params_ptr + 20, ok ? 1 : 0);
-            if (log) {
-                fprintf(stderr, "HLE ENTER_LOADER call_open('%s') [nlen=%u] -> %s\n",
-                        name, nlen, ok ? "OK" : "NOT_FOUND");
-                /* Dump 64 bytes of fake_parms so we can see where the path
-                 * actually starts and whether length byte is at +29 vs +30. */
-                fprintf(stderr, "  fake_parms @$%08X:", params_ptr);
-                for (int i = 0; i < 64; i++) {
-                    uint8_t b = lisa_mem_read8(&lisa->mem, params_ptr + i);
-                    fprintf(stderr, " %02X", b);
-                    if ((i & 15) == 15) fprintf(stderr, "\n                    ");
+            /* CDD-table workaround (P94): our disk has no SYSTEM.CDD file, so
+             * FIND_CDDS can't populate cdd_stuff; LOADEM then builds an empty
+             * filename via CONCAT('SYSTEM.CD_', '') and fails. We know the
+             * only driver we've placed on disk is SYSTEM.CD_PROFILE; when the
+             * OS asks for an empty name or a name starting with 'SYSTEM.CD_'
+             * with no suffix, transparently redirect to SYSTEM.CD_PROFILE.
+             * This is a layered HLE — real fix is a SYSTEM.CDD builder in the
+             * toolchain. See CLAUDE.md Phase 2 step 11+. */
+            if (!ok && (nlen == 0 ||
+                        (nlen == 10 && strncasecmp(name, "SYSTEM.CD_", 10) == 0))) {
+                const char *fallback = "SYSTEM.CD_PROFILE";
+                ok = ldr_open_file(lisa, fallback);
+                if (log)
+                    fprintf(stderr, "HLE ENTER_LOADER call_open('%s') — redirecting to '%s' -> %s\n",
+                            name, fallback, ok ? "OK" : "STILL_NOT_FOUND");
+                /* Write the fallback name back into cheater.path so that
+                 * downstream code sees it when inspecting the record. */
+                if (ok) {
+                    uint8_t fbl = (uint8_t)strlen(fallback);
+                    lisa_mem_write8(&lisa->mem, params_ptr + 30, fbl);
+                    for (uint8_t i = 0; i < fbl; i++)
+                        lisa_mem_write8(&lisa->mem, params_ptr + 31 + i,
+                                        (uint8_t)fallback[i]);
+                    strncpy(name, fallback, sizeof(name) - 1);
                 }
-                fprintf(stderr, "\n");
             }
+            lisa_mem_write8(&lisa->mem, params_ptr + 20, ok ? 1 : 0);
+            if (log)
+                fprintf(stderr, "HLE ENTER_LOADER call_open('%s') -> %s\n",
+                        name, ok ? "OK" : "NOT_FOUND");
             break;
         }
         case 1: { /* call_fill = LD_FILLBUF */
