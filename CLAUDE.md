@@ -421,6 +421,53 @@ plain `static int el_probed = 0` which stayed set across emu power
 cycles — would have been a sticky-state bug in the lisaOS macOS app
 across run/stop cycles, even though headless-per-process was fine).
 
+### Late-day codegen & toolchain fixes (2026-04-18 evening)
+
+After P91 it was possible to actually observe the real boot path instead
+of corrupted-state PC wandering. That surfaced five more structural
+bugs, all committed and pushed:
+
+- **P92 (`ae89418`)**: `lvalue_record_type` now handles
+  `AST_ARRAY_ACCESS`, so `arr[i].field` resolves its field type/offset.
+  Fix for `jt[i].routine := @FUNC` in INIT_JTDRIVER (was writing 2 bytes
+  at +0 instead of 4 bytes at +2). Previously caused
+  `SYSTEM_ERROR(204)`.
+- **P93 (`1413f71`)**: WITH-record fields shadow same-named globals in
+  `gen_lvalue_addr` and `expr_size`. Apple's Pascal scope rules put
+  WITH fields above globals, but our codegen checked `find_symbol_any`
+  first. Caused LD_OPENINPUT's `path := inputfile` (inside
+  `with cheater do`) to copy into a random global's location and leave
+  `cheater.path` empty — LD_OPENINPUT got zero-length filenames.
+- **P94 (`5439fcc`)**: smart ENTER_LOADER HLE redirects empty or
+  `SYSTEM.CD_` prefix-only filenames to `SYSTEM.CD_PROFILE` (the only
+  driver we place on disk). Layered HLE — real fix is a SYSTEM.CDD
+  builder in the toolchain (TBD).
+- **P95 (`bf429dd`)**: built-in `byte` is `TK_SUBRANGE` with range
+  -128..127 (signed), matching Apple's `byte = -128..127;`
+  declaration in SOURCE-VMSTUFF / source-LOADER / source-TWIG. Was
+  TK_BYTE (unsigned) so byte reads zero-extended. Caused LOADCD's
+  `header = codeblock` test (comparing byte-typed `header` with
+  signed int `codeblock = -123`) to always fail on $0085 vs $FF85.
+- **P96 (`bba0a6a`)**: OBJ endblock offset off-by-4 in
+  `toolchain_bridge.c`. `code_block_size` already includes the 4-byte
+  codeblock header, so endblock was written at
+  `obj + 4 + code_block_size` (too late by 4); LOADCD's search_ptr
+  advance landed on zeroed bytes before the endblock, the header-byte
+  test failed, and LOADCD returned false → `SYSTEM_ERROR(10739)`.
+
+After P96: LOADCD correctly walks the OBJ stream. call_byte returns
+$85 (codeblock), $81 (endblock); call_move(13502 bytes) lands the
+driver payload into RAM at $CCCA08. The boot now raises only
+`SYSTEM_ERROR(10740) stup_init_boot` and `10741 stup_seq_boot`,
+both from the driver-init path (`NEW_DEVICE`, `UP()`, and
+`configinfo[bootdev]^.blockstructured` check). These require real
+driver integration — next session.
+
+Also in this session: the SYSTEM_ERROR diagnostic now keys on the live
+`hle_addr_system_error` (commit `37fe6e9`) so it doesn't produce
+false positives after codegen shifts addresses. FIND_BOOT, call_byte,
+call_word, call_long HLE logging was added for future debugging.
+
 ### P92 codegen fix (2026-04-18, commit `ae89418`): array-of-record field sizing
 
 `src/toolchain/pascal_codegen.c:lvalue_record_type` now handles
