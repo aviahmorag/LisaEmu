@@ -3039,6 +3039,18 @@ static bool hle_handle_calldriver(lisa_t *lisa, m68k_t *cpu) {
         break;
     case HLE_DDOWN: case HLE_HDDOWN: case HLE_DSKUNCLAMP:
     case HLE_DINTERRUPT: case HLE_DALARMS: case HLE_DCONTROL:
+    case HLE_DATTACH: case HLE_DUNATTACH: case HLE_REQRESTART:
+    case HLE_DDISCON:
+        /* Sub-driver attach/detach, request-restart, disconnect — no-op
+         * for our HLE'd driver stack. Real driver semantics are "remember
+         * the caller config_ptr"; since we don't build a real connection
+         * graph, just return success. Without this, UP()'s final DATTACH
+         * for the boot chain (iter 3's sub_driver attach) fell through
+         * to the real driver code at the loaded OBJ data, which is raw
+         * codeblock bytes — CPU jumped into driver memory and wandered
+         * around $Cxxxxx regions instead of returning to BOOT_IO_INIT's
+         * post-INIT_BOOT_CDS flow (CONFIG_DOWN, LD_DISABLE, MAKE_BUILTIN,
+         * etc.). */
         break;
     default:
         if (hle_trace < 200)

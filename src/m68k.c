@@ -4905,6 +4905,44 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             }
         }
 
+        /* Diagnostic: trace post-BOOT_IO_INIT checkpoints — see which procs
+         * actually get entered. Addresses resolved each generation. */
+        {
+            extern uint32_t boot_progress_lookup(const char *name);
+            static uint32_t p_parameminit = 0, p_make_builtin = 0, p_fs_init = 0;
+            static uint32_t p_sys_proc = 0, p_init_boot = 0, p_config_down = 0;
+            static uint32_t p_ld_disable = 0;
+            static int pci_gen = -1;
+            if (pci_gen != g_emu_generation) {
+                pci_gen = g_emu_generation;
+                p_init_boot     = boot_progress_lookup("INIT_BOOT_CDS");
+                p_parameminit   = boot_progress_lookup("PARAMEMINIT");
+                p_make_builtin  = boot_progress_lookup("MAKE_BUILTIN");
+                p_fs_init       = boot_progress_lookup("FS_INIT");
+                p_sys_proc      = boot_progress_lookup("Sys_Proc_Init");
+                p_config_down   = boot_progress_lookup("CONFIG_DOWN");
+                p_ld_disable    = boot_progress_lookup("LD_DISABLE");
+            }
+            DBGSTATIC(int, pci_trace, 0);
+            if (pci_trace < 12 &&
+                (cpu->pc == p_init_boot || cpu->pc == p_parameminit ||
+                 cpu->pc == p_make_builtin || cpu->pc == p_fs_init ||
+                 cpu->pc == p_sys_proc || cpu->pc == p_config_down ||
+                 cpu->pc == p_ld_disable)) {
+                pci_trace++;
+                const char *name = "?";
+                if (cpu->pc == p_init_boot) name = "INIT_BOOT_CDS";
+                else if (cpu->pc == p_parameminit) name = "PARAMEMINIT";
+                else if (cpu->pc == p_make_builtin) name = "MAKE_BUILTIN";
+                else if (cpu->pc == p_fs_init) name = "FS_INIT";
+                else if (cpu->pc == p_sys_proc) name = "Sys_Proc_Init";
+                else if (cpu->pc == p_config_down) name = "CONFIG_DOWN";
+                else if (cpu->pc == p_ld_disable) name = "LD_DISABLE";
+                fprintf(stderr, "[POST-BOOT] entered %s @$%06X (A7=$%08X A6=$%08X)\n",
+                        name, cpu->pc, cpu->a[7], cpu->a[6]);
+            }
+        }
+
         /* Diagnostic: on entry to FIND_EMPTYSLOT, dump the first few configinfo[]
          * entries and their devnames so we can see why the scan doesn't find a
          * 'BITBKT' slot. configinfo lives at A5-$A0 (signed 32-bit global offset
