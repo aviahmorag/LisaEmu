@@ -753,9 +753,15 @@ static uint8_t io_read_cb(uint32_t offset) {
      *   byte 1: [dev:5][nExtWords:2][idHiBit:1]
      *   byte 2: driverID low 8 bits (for idsize=0, short form)
      *
-     * For cd_paraport (value 11 per source-syscall.text:80), emptychan, emptydev,
-     * driverID=34, no extension words, short form:
-     *   byte 10 = 0xBE  (slot=11=1011, chan=7=111, idsize=0)
+     * PM storage uses the INTERNAL form per DRIVERDEFS:79 (cd_paraport=10,
+     * 0-based). GetNxtConfig converts pm_slot → pos.slot = pm_slot+1 (external,
+     * syscall.text:80, cd_paraport=11), then FIND_PM_IDS calls MAKE_INTERNAL
+     * which subtracts 1 back to 10 for comparison against
+     * for_pos[i].boot_slot = cd_paraport (also DRIVERDEFS internal = 10).
+     *
+     * For cd_paraport=10, emptychan=7, emptydev=31, driverID=34, no extension
+     * words, short form:
+     *   byte 10 = 0xAE  (slot=10=1010, chan=7=111, idsize=0)
      *   byte 11 = 0xF8  (dev=31=11111, nExt=0=00, idHi=0)
      *   byte 12 = 0x22  (driverID=34)
      *   byte 13 = 0xF0  (terminator: pm_slot=15)
@@ -770,7 +776,7 @@ static uint8_t io_read_cb(uint32_t offset) {
             0x33,        /* [7]     fadeDelay=3, beginRepeat=3 */
             0x30,        /* [8]     subRepeat=3, pad=0 */
             0x01,        /* [9]     cdCount=1 (one CDD entry follows) */
-            0xBE,        /* [10]    CDD[0].byte0 = slot=cd_paraport=11, chan=emptychan=7, idsize=0 */
+            0xAE,        /* [10]    CDD[0].byte0 = slot=cd_paraport=10, chan=emptychan=7, idsize=0 */
             0xF8,        /* [11]    CDD[0].byte1 = dev=emptydev=31, nExt=0, idHi=0 */
             0x22,        /* [12]    CDD[0].byte2 = driverID=34 (ProFile) */
             0xF0,        /* [13]    terminator: pm_slot=15 */
@@ -779,10 +785,10 @@ static uint8_t io_read_cb(uint32_t offset) {
             0,0,0,0,0,0,0,0,0,0,0,0,0,0,     /* [46-59] */
             0x00, 0x00,  /* [60-61] mem_loss */
             /* [62-63] checksum: XOR of all 32 big-endian words must = 0.
-             * Words: 0004 0001 2733 E333 3001 BEF8 22F0 0000..0000 ????
-             * 0x0004 ^ 0x0001 ^ 0x2733 ^ 0xE333 ^ 0x3001 ^ 0xBEF8 ^ 0x22F0 = 0x680C
-             * so checksum word = 0x680C. */
-            0x68, 0x0C,
+             * Words: 0004 0001 2733 E333 3001 AEF8 22F0 0000..0000 ????
+             * 0x0004 ^ 0x0001 ^ 0x2733 ^ 0xE333 ^ 0x3001 ^ 0xAEF8 ^ 0x22F0 = 0x780C
+             * so checksum word = 0x780C. */
+            0x78, 0x0C,
         };
         int byte_idx = (offset - 0xC181) / 2;
         if (byte_idx >= 0 && byte_idx < 64)

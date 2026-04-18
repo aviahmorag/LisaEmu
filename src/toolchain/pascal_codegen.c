@@ -379,6 +379,19 @@ static type_desc_t *resolve_type(codegen_t *cg, ast_node_t *node) {
              * 1-byte-per-field layout — the asm pin tables and embedded-
              * record offset chains still expect those sizes. */
             bool record_has_nibble = false;
+            /* P90: packed record with a variant part (case..of) must overlap
+             * its arms cleanly. If an arm widens (e.g. boolean to 2 bytes),
+             * its layout can extend past another arm's `longint` storage and
+             * reading a field through one arm picks up stale bytes after the
+             * other arm's assignment. c_ne in PMEM is the smoking gun:
+             *   true:  (PutLastOp:boolean; lastsize:pmbyte; offset:integer)
+             *   false: (l: longint)
+             * Expected 4/4 bytes; default boolean=2 makes true=5, leaving
+             * byte 4 unset after `l := NextEntry`. `offset` at byte 3 then
+             * reads stale data and GetNxtConfig always takes the
+             * errnum:=e_badnext path. Fix: in packed variant records, pack
+             * booleans to 1 byte so arms align. */
+            bool record_has_variant = false;
             if (cg->in_packed) {
                 for (int pi = 0; pi < node->num_children; pi++) {
                     ast_node_t *pf = node->children[pi];
@@ -387,6 +400,13 @@ static type_desc_t *resolve_type(codegen_t *cg, ast_node_t *node) {
                     if (pft && pft->kind == TK_SUBRANGE &&
                         pft->range_low == 0 && pft->range_high == 15) {
                         record_has_nibble = true;
+                    }
+                }
+                for (int pi = 0; pi < node->num_children; pi++) {
+                    ast_node_t *pf = node->children[pi];
+                    if (pf->type == AST_FIELD && pf->num_children == 0 &&
+                        strcmp(pf->name, "__variant_begin__") == 0) {
+                        record_has_variant = true;
                         break;
                     }
                 }
@@ -446,7 +466,7 @@ static type_desc_t *resolve_type(codegen_t *cg, ast_node_t *node) {
                  * unpacked default of 2 bytes so their layouts match
                  * hand-coded asm pin tables that have been validated over
                  * the existing boot sequence. */
-                if (cg->in_packed && record_has_nibble && ft &&
+                if (cg->in_packed && (record_has_nibble || record_has_variant) && ft &&
                     ft->kind == TK_BOOLEAN && fs == 2)
                     fs = 1;
                 /* P87d: bit-packed field decision. Only in packed records
@@ -571,6 +591,16 @@ static type_desc_t *resolve_type(codegen_t *cg, ast_node_t *node) {
                     if (bit_cursor / 8 > offset) offset = bit_cursor / 8;
                     placed_byte_offset = offset;
                     bit_cursor = (offset + fs) * 8;
+                    /* P90: in packed mode, advance `offset` past this field
+                     * (matching the bit-packed branch above and the unpacked
+                     * `offset += fs` at line 623). Otherwise variant_max_end
+                     * and the final t->size capture only placed_byte_offset,
+                     * missing the field's size. c_ne ended up with size=2
+                     * instead of 4 because `offset` stuck at 2 (the start of
+                     * the `offset: integer` field) instead of 4 (past it),
+                     * making LINK A6,#-22 too tight and the 4-byte
+                     * `cracked_ne.l := NextEntry` stomp the saved A6. */
+                    if (cg->in_packed) offset += fs;
                 }
                 if (t->num_fields < 64) {
                     strncpy(t->fields[t->num_fields].name, field->name, 63);
@@ -1492,6 +1522,21 @@ static void emit_read_a0_to_d0(codegen_t *cg, int sz) {
     else              emit16(cg, 0x3010);  /* MOVE.W (A0),D0 */
 }
 
+/* P90: sign-extend a signed byte-subrange type (e.g. pmbyte = -128..127).
+ * Call right after any byte read that put D0 = $000000XX (zero-extended).
+ * Converts to $FFFFFFXX for values >= $80, preserving 32-bit sign for
+ * word/long compares. Without this, MAKE_INTERNAL's `if chan = empty (-1)`
+ * fails: chan byte $FF reads as word $00FF, literal -1 reads as $FFFF,
+ * and the match never fires — chan never becomes emptychan, FIND_PM_IDS
+ * returns false, and boot takes the twiggy-fallback SYSTEM_ERROR(10738). */
+static bool type_is_signed_byte(type_desc_t *t) {
+    return (t && t->kind == TK_SUBRANGE && t->size == 1 && t->range_low < 0);
+}
+static void emit_sign_ext_byte(codegen_t *cg) {
+    emit16(cg, 0x4880);  /* EXT.W D0 */
+    emit16(cg, 0x48C0);  /* EXT.L D0 */
+}
+
 /* Emit size-appropriate MOVE D0,(A0) — stores value from D0 to address in A0 */
 static void emit_write_d0_to_a0(codegen_t *cg, int sz) {
     if (sz == 4)      emit16(cg, 0x2080);  /* MOVE.L D0,(A0) */
@@ -1602,7 +1647,17 @@ static void gen_lvalue_addr(codegen_t *cg, ast_node_t *node) {
         /* array[index]: compute base + (index - low) * element_size */
         gen_lvalue_addr(cg, node->children[0]); /* base in A0 */
         if (node->num_children > 1) {
+            /* P90: protect A0 (the base addr) across the index expression.
+             * If the index involves a WITH-field lookup or any address-of,
+             * `gen_expression` clobbers A0 by loading a new base into it
+             * (gen_with_base, AST_DEREF, etc.). In GetNxtConfig, the
+             * `PMRec[offset]` access where `offset` is a WITH-field of
+             * cracked_ne silently dropped the PMRec base, and CRAK_PM got
+             * called with a pointer into the caller's stack frame instead
+             * of into mypmem — producing entirely bogus pos decoding. */
+            emit16(cg, 0x2F08);  /* MOVE.L A0,-(SP) */
             gen_expression(cg, node->children[1]); /* index in D0 */
+            emit16(cg, 0x205F);  /* MOVEA.L (SP)+,A0 */
             /* Resolve element size from the array type */
             int elem_size = 2;  /* default word */
             int array_low = 0;
@@ -1956,6 +2011,7 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                     emit16(cg, (uint16_t)(int16_t)sym->offset);
                     /* Size-aware dereference of VAR parameter */
                     emit_read_a0_to_d0(cg, type_load_size(sym->type));
+                    if (type_is_signed_byte(sym->type)) emit_sign_ext_byte(cg);
                 } else if (sym->is_param || !sym->is_global) {
                     /* Local/param: size-aware load from stack frame.
                      * For outer-scope variables, follow frame chain first. */
@@ -1992,6 +2048,7 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                         else              emit16(cg, 0x302E);  /* MOVE.W offset(A6),D0 */
                     }
                     emit16(cg, (uint16_t)(int16_t)(sym->offset + byte_offset_adj));
+                    if (sz == 1 && type_is_signed_byte(sym->type)) emit_sign_ext_byte(cg);
                 } else {
                     /* Global: size-aware load from A5 */
                     int sz = type_load_size(sym->type);
@@ -2005,6 +2062,7 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                         emit16(cg, 0x302D);  /* MOVE.W offset(A5),D0 */
                     }
                     emit16(cg, (uint16_t)(int16_t)sym->offset);
+                    if (sz == 1 && type_is_signed_byte(sym->type)) emit_sign_ext_byte(cg);
                 }
             } else if (cg->with_depth > 0) {
                 /* Check WITH context: is this identifier a field of an active WITH record? */
@@ -2027,6 +2085,8 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                     } else {
                         int fsz = type_load_size(wrt->fields[fld].type);
                         emit_read_a0_to_d0(cg, fsz);
+                        if (fsz == 1 && type_is_signed_byte(wrt->fields[fld].type))
+                            emit_sign_ext_byte(cg);
                     }
                 } else {
                     /* Not a WITH field — check for built-in constants
@@ -2812,15 +2872,19 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
              * emits ADDA.W to reach the containing byte, but we need to
              * issue a bit-read rather than a byte-read afterwards. */
             int bit_off = 0, bit_w = 0;
-            if (node->num_children > 0 &&
+            type_desc_t *fld_type = NULL;
+            bool have_field = (node->num_children > 0 &&
                 lvalue_field_info_full(cg, node->children[0], node->name,
-                                       NULL, NULL, &bit_off, &bit_w) &&
-                bit_w > 0) {
+                                       NULL, &fld_type, &bit_off, &bit_w));
+            if (have_field && bit_w > 0) {
                 gen_lvalue_addr(cg, node);
                 emit_read_a0_to_d0_bit(cg, bit_off, bit_w);
             } else {
                 gen_lvalue_addr(cg, node);
-                emit_read_a0_to_d0(cg, expr_size(cg, node));
+                int fsz = expr_size(cg, node);
+                emit_read_a0_to_d0(cg, fsz);
+                if (fsz == 1 && have_field && type_is_signed_byte(fld_type))
+                    emit_sign_ext_byte(cg);
             }
             break;
         }
@@ -2891,6 +2955,47 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
             break;
 
         case AST_ASSIGN: {
+            /* P90: aggregate assignment (record/array). LHS and RHS are both
+             * structured and exceed 4 bytes — emit a byte-copy loop instead
+             * of the scalar-assignment path (which would truncate to a
+             * single MOVE.W). Without this, `mypmem := pmptr^` in FIND_PM_IDS
+             * copies only 2 bytes of the 64-byte pmemrec, and
+             * `booter[i] := booter[devcd]` in INIT_BOOT_CDS leaves for_pos[2]
+             * and for_pos[3] uninitialized — so the match loop compares
+             * against garbage and foundall stays false. */
+            {
+                ast_node_t *lhs_a = node->children[0];
+                ast_node_t *rhs_a = node->children[1];
+                int lhs_type_sz = expr_size(cg, lhs_a);
+                int rhs_type_sz = expr_size(cg, rhs_a);
+                int agg_sz = (lhs_type_sz > rhs_type_sz) ? lhs_type_sz : rhs_type_sz;
+                if (agg_sz > 4) {
+                    /* Compute LHS address on stack. */
+                    gen_lvalue_addr(cg, lhs_a);
+                    emit16(cg, 0x2F08);  /* MOVE.L A0,-(SP) */
+                    /* RHS address into A0 — AST_DEREF uses the evaluated
+                     * pointer, otherwise use lvalue_addr. */
+                    if (rhs_a->type == AST_DEREF && rhs_a->num_children > 0) {
+                        gen_ptr_expression(cg, rhs_a->children[0]);
+                        emit16(cg, 0x2040);  /* MOVEA.L D0,A0 */
+                    } else {
+                        gen_lvalue_addr(cg, rhs_a);
+                    }
+                    emit16(cg, 0x225F);  /* MOVEA.L (SP)+,A1  (LHS addr) */
+                    /* MOVE.W #(agg_sz - 1),D0 */
+                    emit16(cg, 0x303C);
+                    emit16(cg, (uint16_t)(agg_sz - 1));
+                    uint32_t loop_pc = cg->code_size;
+                    emit16(cg, 0x12D8);  /* MOVE.B (A0)+,(A1)+ */
+                    emit16(cg, 0x51C8);  /* DBRA D0,<offset> */
+                    /* DBRA displacement is relative to the displacement
+                     * word's address (= cg->code_size immediately after the
+                     * opcode emit). target = disp_addr + displacement. */
+                    int32_t rel = (int32_t)loop_pc - (int32_t)cg->code_size;
+                    emit16(cg, (uint16_t)(int16_t)rel);
+                    break;
+                }
+            }
             /* Evaluate RHS into D0 */
             int rhs_sz = expr_size(cg, node->children[1]);
             gen_expression(cg, node->children[1]);

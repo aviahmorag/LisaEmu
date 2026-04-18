@@ -847,13 +847,21 @@ build_result_t toolchain_build(const char *source_dir,
                 /* P87d: only bit-pack packed records that contain at least
                  * one Tnibble — see resolver comment for rationale. */
                 bool record_has_nibble = false;
+                /* P90: see pascal_codegen.c resolver — packed variant records
+                 * must pack booleans to 1 byte so variant arms overlap cleanly
+                 * (c_ne in PMEM). A field's variant_arm != 0 marks variant
+                 * membership; any such field signals the record has a variant
+                 * part. */
+                bool record_has_variant = false;
                 if (t->is_packed) {
                     for (int fi2 = 0; fi2 < t->num_fields; fi2++) {
                         type_desc_t *ft2 = t->fields[fi2].type;
                         if (ft2 && ft2->kind == TK_SUBRANGE &&
                             ft2->range_low == 0 && ft2->range_high == 15) {
                             record_has_nibble = true;
-                            break;
+                        }
+                        if (t->fields[fi2].variant_arm != 0) {
+                            record_has_variant = true;
                         }
                     }
                 }
@@ -884,7 +892,7 @@ build_result_t toolchain_build(const char *source_dir,
                      * record_has_nibble to keep boolean-only packed
                      * records (segstates etc.) at the pre-P87c 2-byte
                      * layout that matches hand-coded asm pins. */
-                    if (record_has_nibble && t->fields[fi].type &&
+                    if ((record_has_nibble || record_has_variant) && t->fields[fi].type &&
                         t->fields[fi].type->kind == TK_BOOLEAN && fs == 2)
                         fs = 1;
                     if (t->fields[fi].type && t->fields[fi].type->kind == TK_STRING && (fs % 2)) fs++;
