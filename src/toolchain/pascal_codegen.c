@@ -654,35 +654,89 @@ static type_desc_t *resolve_type(codegen_t *cg, ast_node_t *node) {
                      * `cracked_ne.l := NextEntry` stomp the saved A6. */
                     if (cg->in_packed) offset += fs;
                 }
-                if (t->num_fields < 64) {
-                    strncpy(t->fields[t->num_fields].name, field->name, 63);
-                    t->fields[t->num_fields].name[63] = '\0';
-                    t->fields[t->num_fields].type_name[0] = '\0';
-                    if (field->children[0] && field->children[0]->name[0])
-                        strncpy(t->fields[t->num_fields].type_name,
-                                field->children[0]->name, 11);
-                    t->fields[t->num_fields].type_name[11] = '\0';
-                    /* P85c: byte-subrange widened to 2 bytes stores the value
-                     * byte at offset+1 (big-endian low byte). Record that as
-                     * the field's offset so byte-sized reads/writes access the
-                     * correct byte. Apple's ASM MOVE.W at the slot's even
-                     * offset still sees $00XX (pad+value) as intended. */
-                    t->fields[t->num_fields].offset = placed_byte_offset +
-                        (widen_byte_subrange ? 1 : 0);
-                    t->fields[t->num_fields].bit_offset = (unsigned char)placed_bit_offset;
-                    t->fields[t->num_fields].bit_width = (unsigned char)placed_bit_width;
-                    t->fields[t->num_fields].type = ft;
-                    t->fields[t->num_fields].variant_arm = (signed char)current_arm;
-                    /* P80c trace: record layout for freepool fields */
-                    if (str_eq_nocase(field->name, "firstfree"))
-                        fprintf(stderr, "  [RECORD-LAYOUT] '%s' field '%s' offset=%d fs=%d\n",
-                                t->name[0] ? t->name : "(anon)", field->name, offset, fs);
-                    t->num_fields++;
+                /* P105: the parser collapses `a, b, c : type` into ONE
+                 * AST_FIELD with name="a,b,c". Split on commas so each
+                 * sub-field gets its own offset and size. Without this,
+                 * `UID = record a,b: longint end;` comes out as 4 bytes
+                 * instead of 8, shifting MDDFdb.MDDFaddr from +130 to
+                 * +126 and breaking real_mount's (MDDFaddr <> 0) check. */
+                const char *nm = field->name;
+                int ns = 0;
+                int names_off[16];
+                int names_len[16];
+                int cur_start = 0;
+                for (int ci = 0; ; ci++) {
+                    char c = nm[ci];
+                    if (c == ',' || c == '\0') {
+                        if (ns < 16 && ci > cur_start) {
+                            names_off[ns] = cur_start;
+                            names_len[ns] = ci - cur_start;
+                            ns++;
+                        }
+                        cur_start = ci + 1;
+                        if (c == '\0') break;
+                    }
                 }
-                /* In packed mode we already advanced offset via bit_cursor
-                 * tracking above. For unpacked records, keep the historical
-                 * linear byte-advance. */
-                if (packed_bits == 0 && !cg->in_packed) offset += fs;
+                if (ns == 0) ns = 1; /* safety: treat empty name as one unnamed field */
+
+                for (int si = 0; si < ns; si++) {
+                    /* Re-align for each sub-field except the first (the
+                     * outer alignment already ran for the first). */
+                    if (si > 0) {
+                        if (packed_bits == 0) {
+                            if (fs >= 2 && (offset % 2) && !cg->in_packed) offset++;
+                            if (bit_cursor % 8) bit_cursor = (bit_cursor + 7) & ~7;
+                            if (bit_cursor / 8 > offset) offset = bit_cursor / 8;
+                            placed_byte_offset = offset;
+                            bit_cursor = (offset + fs) * 8;
+                        } else {
+                            int byte_idx = bit_cursor / 8;
+                            int bit_in_byte = bit_cursor % 8;
+                            if (bit_in_byte + packed_bits > 8) {
+                                byte_idx++;
+                                bit_in_byte = 0;
+                                bit_cursor = byte_idx * 8;
+                            }
+                            placed_byte_offset = byte_idx;
+                            placed_bit_offset = 8 - bit_in_byte - packed_bits;
+                            bit_cursor += packed_bits;
+                            offset = byte_idx + 1;
+                        }
+                    }
+
+                    if (t->num_fields < 64) {
+                        int nlen = names_len[si];
+                        if (nlen > 63) nlen = 63;
+                        if (ns == 1 && nm[0]) {
+                            /* preserve original behavior: no commas, just copy */
+                            strncpy(t->fields[t->num_fields].name, nm, 63);
+                        } else if (nlen > 0) {
+                            memcpy(t->fields[t->num_fields].name, nm + names_off[si], nlen);
+                            t->fields[t->num_fields].name[nlen] = '\0';
+                        } else {
+                            t->fields[t->num_fields].name[0] = '\0';
+                        }
+                        t->fields[t->num_fields].name[63] = '\0';
+                        t->fields[t->num_fields].type_name[0] = '\0';
+                        if (field->children[0] && field->children[0]->name[0])
+                            strncpy(t->fields[t->num_fields].type_name,
+                                    field->children[0]->name, 11);
+                        t->fields[t->num_fields].type_name[11] = '\0';
+                        t->fields[t->num_fields].offset = placed_byte_offset +
+                            (widen_byte_subrange ? 1 : 0);
+                        t->fields[t->num_fields].bit_offset = (unsigned char)placed_bit_offset;
+                        t->fields[t->num_fields].bit_width = (unsigned char)placed_bit_width;
+                        t->fields[t->num_fields].type = ft;
+                        t->fields[t->num_fields].variant_arm = (signed char)current_arm;
+                        if (str_eq_nocase(t->fields[t->num_fields].name, "firstfree"))
+                            fprintf(stderr, "  [RECORD-LAYOUT] '%s' field '%s' offset=%d fs=%d\n",
+                                    t->name[0] ? t->name : "(anon)",
+                                    t->fields[t->num_fields].name, offset, fs);
+                        t->num_fields++;
+                    }
+                    /* Advance offset for each sub-field */
+                    if (packed_bits == 0 && !cg->in_packed) offset += fs;
+                }
             }
             /* Close out any trailing bits in packed mode; t->size always
              * reports a byte count. Unpacked records keep their legacy
@@ -2127,6 +2181,39 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                 }
                 break;
             }
+            /* P105: inside a WITH block, a bare identifier that matches
+             * a field of the active WITH record must resolve to that
+             * field, not to a same-named global — even if the global is
+             * a CONST (e.g. an enum ordinal). Mirrors P93's fix in
+             * gen_lvalue_addr and expr_size. Without this, sfileio2's
+             * `with MDDFdata^ do ... fsversion <> REL1_VERSION` resolves
+             * `fsversion` to the LDUTIL enum-ordinal CONST (=0, since
+             * `terror = (fsversion, fserror, ...)` in source-LDUTIL.TEXT)
+             * instead of the MDDFdb field — boot fails with E_FS_VERSION
+             * because the compare is `0 <> 14..17` = always true. */
+            if (cg->with_depth > 0) {
+                type_desc_t *wrt = NULL;
+                int widx = -1;
+                int fld = with_lookup_field(cg, node->name, &wrt, &widx);
+                if (fld >= 0 && wrt) {
+                    gen_with_base(cg, widx);
+                    int foff = wrt->fields[fld].offset;
+                    if (foff != 0) {
+                        emit16(cg, 0xD0FC);  /* ADDA.W #offset,A0 */
+                        emit16(cg, (uint16_t)(int16_t)foff);
+                    }
+                    int fbw = wrt->fields[fld].bit_width;
+                    if (fbw > 0) {
+                        emit_read_a0_to_d0_bit(cg, wrt->fields[fld].bit_offset, fbw);
+                    } else {
+                        int fsz = type_load_size(wrt->fields[fld].type);
+                        emit_read_a0_to_d0(cg, fsz);
+                        if (fsz == 1 && type_is_signed_byte(wrt->fields[fld].type))
+                            emit_sign_ext_byte(cg);
+                    }
+                    break;
+                }
+            }
             cg_symbol_t *sym = find_symbol_any(cg, node->name);
             if (sym) {
                 if (sym->is_const) {
@@ -2706,10 +2793,41 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                 break;
             }
 
-            /* LENGTH(s): first byte of string = length */
+            /* LENGTH(s): first byte of string = length.
+             * If `s` is a direct string variable/field (TK_STRING value,
+             * size > 4), use its ADDRESS — gen_ptr_expression would
+             * load the string's first 4 content bytes and deref them as
+             * if they were a pointer, corrupting the length read. If
+             * `s` is a pointer-to-string (4 bytes), load the pointer. */
             if (str_eq_nocase(fn, "LENGTH")) {
-                if (node->num_children > 0) gen_ptr_expression(cg, node->children[0]);
-                emit16(cg, 0x2040);  /* MOVEA.L D0,A0 */
+                if (node->num_children > 0) {
+                    ast_node_t *arg = node->children[0];
+                    int asz = expr_size(cg, arg);
+                    bool need_addr = false;
+                    /* Direct string: expr_size returns the string's byte
+                     * size (>4). Also explicitly check the identifier's
+                     * type so we catch edge cases where expr_size falls
+                     * back to 2. */
+                    if (asz > 4) need_addr = true;
+                    if (!need_addr && arg->type == AST_IDENT_EXPR) {
+                        type_desc_t *rt = NULL;
+                        if (cg->with_depth > 0) {
+                            (void)with_lookup_field(cg, arg->name, &rt, NULL);
+                            if (rt && rt->kind == TK_STRING) need_addr = true;
+                        }
+                        if (!need_addr) {
+                            cg_symbol_t *sym = find_symbol_any(cg, arg->name);
+                            if (sym && sym->type && sym->type->kind == TK_STRING)
+                                need_addr = true;
+                        }
+                    }
+                    if (need_addr) {
+                        gen_lvalue_addr(cg, arg);       /* A0 = &string */
+                    } else {
+                        gen_ptr_expression(cg, arg);    /* D0 = ptr */
+                        emit16(cg, 0x2040);             /* MOVEA.L D0,A0 */
+                    }
+                }
                 emit16(cg, 0x7000);  /* MOVEQ #0,D0 */
                 emit16(cg, 0x1010);  /* MOVE.B (A0),D0 */
                 break;
@@ -3828,6 +3946,26 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                         cg_symbol_t *sym = find_symbol_any(cg, ptr_node->name);
                         if (sym && sym->type && sym->type->kind == TK_POINTER && sym->type->base_type)
                             rt = sym->type->base_type;
+                        /* P105: `with MDDFdata^ do ...` where MDDFdata is a
+                         * FIELD of an outer WITH's record (not a standalone
+                         * symbol). Resolve via the WITH stack, then deref
+                         * its pointer base type. Without this the inner
+                         * WITH's record_type is NULL, all field lookups
+                         * fall through to find_symbol_any, and names that
+                         * collide with enum-ordinal globals (e.g.
+                         * `fsversion` == terror.fsversion==0 from LDUTIL)
+                         * resolve to 0. Mirrors the non-deref nested-WITH
+                         * fallback a few lines below. */
+                        if (!rt && cg->with_depth > 0) {
+                            type_desc_t *wrt = NULL;
+                            int widx = -1;
+                            int fld = with_lookup_field(cg, ptr_node->name, &wrt, &widx);
+                            if (fld >= 0 && wrt) {
+                                type_desc_t *ft = wrt->fields[fld].type;
+                                if (ft && ft->kind == TK_POINTER && ft->base_type)
+                                    rt = ft->base_type;
+                            }
+                        }
                     } else if (ptr_node->type == AST_DEREF && ptr_node->children[0]) {
                         /* WITH ptr^^ DO ... — double-deref: follow the
                          * pointer chain twice. Required for patterns like

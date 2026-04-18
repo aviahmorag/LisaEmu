@@ -806,15 +806,35 @@ static uint32_t mem_read32_cb(uint32_t addr) {
     return lisa_mem_read32(&g_lisa->mem, addr);
 }
 
+/* P105 diag: watch any write to the MDDF payload (4 bytes at +0..+3) so we
+ * can identify which PC clobbers fsversion after MDDF_IO returns. */
+extern uint32_t g_last_mddf_addr;
+int g_mddf_watch_armed = 0;  /* P105: armed AFTER MDDF_IO HLE finishes writing */
+static int g_mddf_watch_budget = 50;
+static inline void mddf_watch(uint32_t addr, uint32_t val, int sz) {
+    if (!g_last_mddf_addr || !g_mddf_watch_armed || g_mddf_watch_budget <= 0) return;
+    uint32_t base = g_last_mddf_addr;
+    /* Watch the whole MDDF payload (first 200 bytes) */
+    if (addr >= base && addr < base + 200) {
+        extern uint32_t g_last_cpu_pc;
+        fprintf(stderr, "MDDF-WATCH: write%d PC=$%06X addr=$%06X (+%d) val=$%0*X\n",
+                sz*8, g_last_cpu_pc & 0xFFFFFF, addr, (int)(addr - base), sz*2, val);
+        g_mddf_watch_budget--;
+    }
+}
+
 static void mem_write8_cb(uint32_t addr, uint8_t val) {
+    mddf_watch(addr, val, 1);
     lisa_mem_write8(&g_lisa->mem, addr, val);
 }
 
 static void mem_write16_cb(uint32_t addr, uint16_t val) {
+    mddf_watch(addr, val, 2);
     lisa_mem_write16(&g_lisa->mem, addr, val);
 }
 
 static void mem_write32_cb(uint32_t addr, uint32_t val) {
+    mddf_watch(addr, val, 4);
     lisa_mem_write32(&g_lisa->mem, addr, val);
 }
 
@@ -3086,6 +3106,7 @@ static bool hle_handle_calldriver(lisa_t *lisa, m68k_t *cpu) {
  * Just read the block there directly.
  *
  * Pascal caller-clean: RTS, caller cleans args. */
+uint32_t g_last_mddf_addr = 0;  /* P105 diag: saved for SYSTEM_ERROR dump */
 static bool hle_handle_mddf_io(lisa_t *lisa, m68k_t *cpu) {
     uint32_t sp = cpu->a[7] & 0xFFFFFF;
     uint32_t ret_addr  = cpu_read32(cpu, sp + 0);
@@ -3094,6 +3115,7 @@ static bool hle_handle_mddf_io(lisa_t *lisa, m68k_t *cpu) {
     uint32_t addr      = cpu_read32(cpu, sp + 10);
     int16_t  op        = (int16_t)cpu_read16(cpu, sp + 14);
     bool read_op = (op == 0);
+    g_last_mddf_addr = addr;
 
     DBGSTATIC(int, mdi_trace, 0);
     if (mdi_trace < 6) {
@@ -3116,6 +3138,33 @@ static bool hle_handle_mddf_io(lisa_t *lisa, m68k_t *cpu) {
             } else {
                 for (uint32_t b = 0; b < PROFILE_DATA_SIZE; b++)
                     cpu->write8(mask_24(addr + b), block_data[b]);
+                /* P105 diag: dump the values at the three real_mount check
+                 * offsets so we can tell whether the record layout matches. */
+                DBGSTATIC(int, mdi_dump, 0);
+                if (mdi_dump < 2) {
+                    mdi_dump++;
+                    uint16_t fsver = (block_data[0] << 8) | block_data[1];
+                    uint8_t  namelen = block_data[12];
+                    uint32_t mddfaddr = ((uint32_t)block_data[130] << 24) |
+                                        ((uint32_t)block_data[131] << 16) |
+                                        ((uint32_t)block_data[132] << 8)  |
+                                        (uint32_t)block_data[133];
+                    char vname[33] = {0};
+                    int nl = (namelen <= 32) ? namelen : 32;
+                    for (int i = 0; i < nl; i++) vname[i] = block_data[13 + i];
+                    fprintf(stderr, "HLE MDDF_IO DUMP: fsversion=%u @+0, "
+                            "volname.len=%u \"%s\" @+12, MDDFaddr=%u @+130\n",
+                            (unsigned)fsver, (unsigned)namelen, vname,
+                            (unsigned)mddfaddr);
+                    /* Hex dump first 48 bytes + around offset 130 */
+                    fprintf(stderr, "HLE MDDF_IO BYTES 0..47:  ");
+                    for (int i = 0; i < 48; i++)
+                        fprintf(stderr, "%02X%s", block_data[i],
+                                (i % 16 == 15) ? "\n                        " : " ");
+                    fprintf(stderr, "\nHLE MDDF_IO BYTES 128..143:");
+                    for (int i = 128; i < 144; i++) fprintf(stderr, " %02X", block_data[i]);
+                    fprintf(stderr, "\n");
+                }
             }
         } else {
             for (uint32_t b = 0; b < PROFILE_DATA_SIZE; b++)
@@ -3127,6 +3176,10 @@ static bool hle_handle_mddf_io(lisa_t *lisa, m68k_t *cpu) {
 
     if (ecode_ptr)
         cpu->write16(mask_24(ecode_ptr), (uint16_t)error);
+
+    /* P105 diag: arm the watch AFTER the HLE's own bulk writes finish. */
+    extern int g_mddf_watch_armed;
+    g_mddf_watch_armed = 1;
 
     /* Pop retAddr, return. Caller cleans args. */
     cpu->a[7] += 4;
@@ -3204,6 +3257,26 @@ static bool hle_handle_system_error(lisa_t *lisa __attribute__((unused)), m68k_t
     if (err_code == 10707) {
         fprintf(stderr, "HLE: Suppressing SYSTEM_ERROR(%d) — unwind to FS_INIT caller\n",
                 err_code);
+        /* P105 diag: dump MDDFdata^ contents as seen by real_mount. This
+         * tells us which field fails the check. */
+        if (g_last_mddf_addr) {
+            uint8_t buf[32];
+            for (int i = 0; i < 32; i++)
+                buf[i] = cpu->read8(mask_24(g_last_mddf_addr + i));
+            fprintf(stderr, "  MDDFdata^@$%06X first 32: ", g_last_mddf_addr);
+            for (int i = 0; i < 32; i++) fprintf(stderr, "%02X ", buf[i]);
+            fprintf(stderr, "\n");
+            uint8_t at130[8];
+            for (int i = 0; i < 8; i++)
+                at130[i] = cpu->read8(mask_24(g_last_mddf_addr + 130 + i));
+            fprintf(stderr, "  MDDFdata^+130..137 (MDDFaddr,MDDFsize): ");
+            for (int i = 0; i < 8; i++) fprintf(stderr, "%02X ", at130[i]);
+            fprintf(stderr, "\n");
+            /* Dump D0/D1/D2/A0/A1 — often hold the compared values right
+             * before SYSTEM_ERROR */
+            fprintf(stderr, "  regs at 10707: D0=$%08X D1=$%08X D2=$%08X A0=$%08X A1=$%08X\n",
+                    cpu->d[0], cpu->d[1], cpu->d[2], cpu->a[0], cpu->a[1]);
+        }
         /* Walk back up to find the frame where FS_INIT was called.
          * We pop retPC + err arg + repeatedly unwind A6 link chain
          * until we find a return address outside FS_INIT. FS_INIT is
