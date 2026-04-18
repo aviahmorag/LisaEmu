@@ -188,7 +188,18 @@ static void init_builtin_types(codegen_t *cg) {
     add_type(cg, "boolean", TK_BOOLEAN, 2);  /* Lisa Pascal: word-sized on 68000 */
     add_type(cg, "char", TK_CHAR, 1);
     add_type(cg, "real", TK_REAL, 4);
-    add_type(cg, "byte", TK_BYTE, 1);
+    /* P95: Apple's Pascal source declares `byte = -128..127` (signed
+     * subrange) in SOURCE-VMSTUFF, source-LOADER, source-TWIG, etc.
+     * If we register `byte` as TK_BYTE (unsigned), byte reads zero-
+     * extend and comparisons against signed int constants like
+     * `codeblock = -123` fail — $0085 != $FF85. Apple's compiler
+     * sign-extended `byte` reads because the declared range includes
+     * negative values. Register as a signed subrange so our
+     * type_is_signed_byte() catches it and emits EXT.W/EXT.L on load. */
+    {
+        type_desc_t *bt = add_type(cg, "byte", TK_SUBRANGE, 1);
+        if (bt) { bt->range_low = -128; bt->range_high = 127; }
+    }
     add_type(cg, "absptr", TK_LONGINT, 4);   /* Lisa OS: absolute pointer */
     add_type(cg, "ptr", TK_POINTER, 4);
     add_type(cg, "text", TK_FILE, 0);
