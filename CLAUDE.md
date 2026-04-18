@@ -214,17 +214,29 @@ for the line-by-line detail of:
 6. PRAM stub now encodes `pm_slot=10` (internal `cd_paraport`) with
    corrected 32-word XOR checksum.
 
-**Phase 2 in progress:** Step 3d (disk layout) complete as of
-`9b3afa4` — the disk image now carries a real Lisa filesystem the
-compiled LOADER can walk. Current blocker is now purely step 4:
+**Phase 2 Step 4a complete (`d5e50e1`, 2026-04-18 PM):**
+runtime milestones advanced **21 → 24** (+INIT_DRIVER_SPACE,
++SYS_PROC_INIT, +PR_CLEANUP). The old ENTER_LOADER bypass in
+`src/m68k.c:4846` popped 12 bytes and RTSed with garbage result;
+now `lisa_hle_enter_loader()` in `src/lisa.c` decodes
+`fake_parms.opcode` and services every loader call
+(call_open/fill/byte/word/long/move/read) natively against
+`ldr_fs` (which walks the real filesystem laid down in step 3d).
+LOADEM's `LD_OPENINPUT('SYSTEM.OS')` now succeeds; 10738 no
+longer fires. This is a layered scaffolding HLE — still to be
+replaced by the real compiled LOADER when we relink BT_PROFILE at
+a non-conflicting RAM address (currently its virtual-$400 linking
+collides with SYSTEM.OS at $0..$74000).
 
-- Our `ENTER_LOADER` HLE in `src/m68k.c:4846` pops args and RTSes —
-  `fake_parms.result` is uninitialized stack garbage. Until this HLE
-  comes out and the compiled LOADER actually takes over, LD_OPENINPUT
-  still short-circuits.
-- We don't yet compile source-LOADER.TEXT or source-ldlfs.text as the
-  active boot-track loader (SYSTEM.BT_PROFILE links them but
-  LOADER.ldrtrap isn't wired to $204 at runtime).
+**Also this session — critical bug fix (`fa203e2`):** step 3c had
+bumped `BOOT_TRACK_BLOCKS` 24→64 in `diskimage.h` but left
+`lisa.h` at 24. That split made `is_real_image = (fs_block0 !=
+BOOT_TRACK_BLOCKS)` evaluate `64 != 24 = true` for our disks, so
+the cross-compile pre-loader branch (which drops SYSTEM.OS into
+RAM $0 + writes the GETLDMAP parameter block) was never taken —
+runtime milestones had silently dropped from 21 to 5. The macOS
+Xcode app is still on the pre-fix binary; rebuild picks up the
+aligned header and should see the same 24/27 advance.
 
 **The on-disk format the real loader expects** (from `source-ldlfs.text.unix.txt`):
 
@@ -333,19 +345,26 @@ pagelabel. Verify in Phase 3 when implementing layout.
    24-byte pagelabel (`source-DRIVERDEFS.TEXT.unix.txt:207`); real
    fwdlink chaining now encoded for all multi-block extents
    (slist, rootcat, file data). Commit `9b3afa4`.
-8. **Step 4** (next): bootrom-time placement — load LOADER into
-   low RAM at boot, set `[$204] = @ldrtrap` so `ENTER_LOADER`
-   lands in the real compiled LOADER instead of the C HLE. Remove
-   the `ENTER_LOADER` HLE in `src/m68k.c:4846` in the same commit.
+8. ✅ **Step 4a** (`d5e50e1`): smart ENTER_LOADER HLE that decodes
+   `fake_parms.opcode` and dispatches call_open/fill/byte/word/
+   long/move/read to `ldr_fs`. 21 → 24 milestones; 10738 no longer
+   fires. Step 4b (relink BT_PROFILE and run the real compiled
+   LOADER) remains for a future session — blocked on giving
+   BT_PROFILE a high-RAM base address via a new
+   `compile_target_t.base_addr` field in the linker.
 9. Add SYSTEM.CD_PROFILE as a third compile target (source-PROFILE.TEXT +
-   source-PROFILEASM + PROF_INIT + PROF_DOWN).
+   source-PROFILEASM + PROF_INIT + PROF_DOWN). Probably necessary to
+   advance past PR_CLEANUP toward the shell — the scheduler idle loop
+   currently spams `call_open('')` because nothing installs a real
+   driver.
 10. Place the linked driver `.OBJ` on disk via `disk_add_file(db,
     "system.cd_profile", ...)`.
-11. Remove the 10738 suppression in `src/lisa.c:2886` in the same
-    commit as step 10.
+11. Remove the 10738 suppression in `src/lisa.c:2886` (dead after
+    step 4a, but confirm it's not masking other 1073[8-41] errors
+    first).
 
-Steps 1–8 are the heavy lift; Phase 2 is mostly done. Steps 9–11
-are pattern-matching after that.
+Steps 1–8a complete. Remaining Phase-2 work: step 4b (real LOADER
+via BT_PROFILE relink) and 9-11 (SYSTEM.CD_PROFILE driver).
 
 ## Reference: previous session history
 
@@ -379,9 +398,17 @@ Key session highlights for quick reference:
   blocks, 64-slot LDHASH-placed centry catalog across 7 pages,
   per-file filemap pages, and 20-byte on-disk tags matching the
   first 20 bytes of the real 24-byte pagelabel (with fwdlink
-  chaining). Headless test still at 27/29 milestones — blockers
-  are now all in step 4 (remove ENTER_LOADER HLE and wire the
-  compiled LOADER).
+  chaining).
+- **Header alignment fix (`fa203e2`, 2026-04-18 PM):**
+  `lisa.h:BOOT_TRACK_BLOCKS` was stale at 24 after step 3c bumped
+  diskimage.h to 64. Restored runtime milestones from 5 to 21.
+  (The "27/29 milestones resolved" cited in step 3 commit messages
+  was symbols-in-map, not runtime — misleading.)
+- **Phase 2 Step 4a (`d5e50e1`, 2026-04-18 PM):** smart
+  ENTER_LOADER HLE dispatching loader calls against ldr_fs. 21 →
+  24 runtime milestones (INIT_DRIVER_SPACE, SYS_PROC_INIT,
+  PR_CLEANUP). 10738 dead. Layered scaffolding HLE — pending
+  BT_PROFILE relink for real LOADER integration.
 
 ## Active HLE bypasses (to remove as phases land)
 
