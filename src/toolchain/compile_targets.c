@@ -87,16 +87,75 @@ static const compile_target_t TARGET_SYSTEM_OS = {
     .search_dirs = SYSTEM_OS_DIRS,
 };
 
+/* ---- SYSTEM.BT_PROFILE boot-track binary (Phase 2 target) ----
+ *
+ * Apple's boot-track binary for a ProFile boot device. Source:
+ *   _inspiration/LisaSourceCompilation-main/src/MAKE/ALEX-MAKE-BTPROFILE.TEXT
+ *
+ * The real Lisa ROM reads boot-track blocks from the boot device and
+ * jumps to LDPROF's entry. LDPROF + PROF provide ProFile-specific
+ * block-read primitives; the seven common modules (LDASM, SERNUM,
+ * LDUTIL, LOADER, LDLFS, PASMATH, OSINTPASLIB) implement the real
+ * filesystem-walking loader that finds SYSTEM.OS by name and jumps
+ * into INITSYS.
+ *
+ * Apple's link order (from ALEX-MAKE-BTPROFILE.TEXT, output file
+ * system.bt_Profile):
+ *
+ *   LDPROF  (boot entry — assembled from source-LDPROF.TEXT)
+ *   LDASM   (shared asm helpers)
+ *   PROF    (Pascal unit: lddrivers — ProFile driver)
+ *   SERNUM  (serial-number asm)
+ *   LDUTIL  (Pascal unit: boot utility)
+ *   LOADER  (Pascal PROGRAM: main loader body — calls OPENINPUT etc.)
+ *   LDLFS   (Pascal unit: filesystem / catalog walker)
+ *   PASMATH (Pascal runtime: math)
+ *   OSINTPASLIB (Pascal runtime: I/O + interrupts)
+ *
+ * LOADER.TEXT imports proc_prims / asynctr / genio / twiggy / vmstuff /
+ * sfileio / fs_primitives / driverdefs / sysglobal via $U — these
+ * resolve INTERFACE-only at link time (LOADER only uses their TYPE
+ * declarations and constants; no kernel bodies are linked into the
+ * boot-track blob).
+ *
+ * Our compile order (analogous to how SYSTEM.OS puts STARTUP last):
+ * runtime + utility first, LDPROF's boot-entry asm last. Final link
+ * order will match Apple's for segment placement. */
+static const char *const BT_PROFILE_MODULES[] = {
+    /* Pascal runtime — no kernel deps */
+    "PASMATH",
+    "OSINTPASLIB",
+    /* Boot utilities */
+    "LDUTIL",
+    "LDLFS",
+    /* Device driver (Pascal unit `lddrivers`) */
+    "PROF",
+    /* Shared asm helpers */
+    "LDASM",
+    "SERNUM",
+    /* Main loader PROGRAM body */
+    "LOADER",
+    /* Boot entry — assembled last so its entry point lands at the
+     * start of the linked blob, matching Apple's link order. */
+    "LDPROF",
+    NULL
+};
+
+static const compile_target_t TARGET_BT_PROFILE = {
+    .name = "SYSTEM.BT_PROFILE",
+    .out_path = "system.bt_Profile",   /* on-disk filename (lowercase per Apple) */
+    .modules = BT_PROFILE_MODULES,
+    .search_dirs = SYSTEM_OS_DIRS,     /* all 9 sources live in LISA_OS/OS */
+};
+
 /* Registry. New targets (SYS1LIB, LIBQD, Shell, apps...) go here as
- * each ships. For now we only build SYSTEM.OS; other targets are
- * declared in comments as future work. */
+ * each ships. */
 static const compile_target_t *const ALL_TARGETS[] = {
     &TARGET_SYSTEM_OS,
-    /* TODO: SYS1LIB, SYS2LIB, LIBQD, LIBTK, LIBPL, LIBHW (as standalone),
-     * LIBOS, APBG, APDM, APIM, APLC, APLD, APLL, APLP, APLT, APLW, APPW,
-     * Shell, Desktop. Each compiles separately, writes a linked object
-     * onto the target disk at OBJECT/<name>.OBJ where the OS loader
-     * finds it at runtime. */
+    &TARGET_BT_PROFILE,
+    /* TODO: SYSTEM.CD_PROFILE (Phase 3), SYS1LIB, SYS2LIB, LIBQD,
+     * LIBTK, LIBPL, LIBHW (as standalone), LIBOS, APBG, APDM, APIM,
+     * APLC, APLD, APLL, APLP, APLT, APLW, APPW, Shell, Desktop. */
     NULL
 };
 
