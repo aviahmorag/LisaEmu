@@ -189,11 +189,20 @@ commit as the real replacement.
 | 11 | **Shell (APDM)** | full desktop | Not started |
 | 12 | **Apps** | LisaWrite, LisaCalc, etc. | Not started |
 
-## Current Status (2026-04-18 late night, Phase 2 scoping)
+## Current Status (2026-04-18 very late night, Phase 2 scoping)
 
-**Milestones**: 21/27 kernel checkpoints reached natively, last checkpoint
-`BOOT_IO_INIT`. After the P97/P98/P99/P100 chain + CALLDRIVER DATTACH
-no-op, the internal boot state is fully clean:
+**Milestones**: **23/27** kernel checkpoints reached natively, last
+checkpoint `SYS_PROC_INIT`. P101–P102 + a P102a scaffold (block nil
+TrapTable copy) advanced boot past BOOT_IO_INIT — FS_INIT and
+Sys_Proc_Init both ✅ for the first time in real execution (earlier
+24/27 with PR_CLEANUP was a phantom from PC-drift in corrupted state;
+today's 23/27 is legitimate and reproducible). After SYS_PROC_INIT
+boot hits the pre-existing 10707 (FS_MASTER_INIT fail) suppression
+and halts cleanly via STOP instruction.
+
+**Previous (pre-P101/102)**: 21/27 at BOOT_IO_INIT. The P97/P98/P99/P100
+chain + CALLDRIVER DATTACH no-op had already cleared the internal
+state:
 - Zero SYSTEM_ERROR firings on the boot path
 - Zero HLE suppressions needed on INIT_BOOT_CDS (10740 dead, 10741 dead,
   10758 dead)
@@ -204,16 +213,17 @@ no-op, the internal boot state is fully clean:
 - Post-INIT_BOOT_CDS flow advances through CONFIG_DOWN, LD_DISABLE,
   MAKE_BUILTIN(cd_scc), MAKE_BUILTIN(cd_console), PARAMEMINIT
 
-Next blocker: inside the builtin-device `for index := 0 to 8` loop at
-SOURCE-STARTUP.TEXT:1950, case 4 should call FS_INIT. PARAMEMINIT's
-ALARMASSIGN calls now compile correctly (P102), registering
-PARAMEM_WRITE and TIMER_UNBLK as alarm handlers. IPL drops to 0
-(interrupts enabled) after PARAMEMINIT — scheduler idle is running.
-But FS_INIT's entry still doesn't fire, and PC drifts to $A5xxxx /
-$A9xxxx high RAM regions. VEC-HIST shows vector 10 (line-1010 A-trap)
-firing dozens of times. Next investigation: where inside the builtin
-for-loop does execution exit BOOT_IO_INIT or get diverted into an
-interrupt handler that doesn't return.
+Next blocker: `SYSTEM_ERROR(10707)` stup_fsinit — FS_MASTER_INIT fails
+inside FS_INIT because our emulator doesn't have real disk filesystem
+content the kernel expects. The existing suppression at src/lisa.c
+handles the error code but boot halts via STOP. Will need real
+FS_MASTER_INIT data (either compiled+loaded disk image, or a richer
+HLE that satisfies FS_MASTER_INIT's reads).
+
+Also outstanding: the P102a scaffold blocks a nil-pointer TrapTable
+copy at $7150A that would overwrite the vector table. Need to find
+who (in BOOT_IO_INIT at $5CF4) passes A1=$00000000 to the $714FC
+copy routine and fix that caller.
 
 **Important debugging correction (today):** A `SYSTEM_ERROR code=0`
 message that appeared right after BOOT_IO_INIT was a **false positive**
