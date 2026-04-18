@@ -189,17 +189,30 @@ commit as the real replacement.
 | 11 | **Shell (APDM)** | full desktop | Not started |
 | 12 | **Apps** | LisaWrite, LisaCalc, etc. | Not started |
 
-## Current Status (2026-04-18 night, Phase 2 scoping)
+## Current Status (2026-04-18 late night, Phase 2 scoping)
 
 **Milestones**: 21/27 kernel checkpoints reached natively, last checkpoint
-`BOOT_IO_INIT`. Post-P97/P98, UP()→CALLDRIVER(dinit) now **actually
-succeeds** via our existing HLE — 10740 no longer fires at all. The
-remaining suppressions are 10741 (blockstructured=FALSE — a different
-codegen bug keeps the NEW_DEVICE field store from writing true) and
-10758 x2 (MAKE_BUILTIN's FIND_EMPTYSLOT fails because the bitbucket-
-init for-loop at STARTUP.TEXT:1936-1937 only populates configinfo[0]).
-Both are scaffolding HLE suppressions, removable when the underlying
-codegen bugs are fixed. Boot enters scheduler idle loop cleanly.
+`BOOT_IO_INIT`. After the P97/P98/P99/P100 chain + CALLDRIVER DATTACH
+no-op, the internal boot state is fully clean:
+- Zero SYSTEM_ERROR firings on the boot path
+- Zero HLE suppressions needed on INIT_BOOT_CDS (10740 dead, 10741 dead,
+  10758 dead)
+- Zero scaffold HLEs active
+- UP() recurses the real 3-device driver chain with distinct
+  configinfo slots (FIND_EMPTYSLOT returns 39, 38, 37)
+- CALLDRIVER(dinit) + CALLDRIVER(dattach) succeed for each level
+- Post-INIT_BOOT_CDS flow advances through CONFIG_DOWN, LD_DISABLE,
+  MAKE_BUILTIN(cd_scc), MAKE_BUILTIN(cd_console), PARAMEMINIT
+
+Next blocker: inside the builtin-device `for index := 0 to 8` loop at
+SOURCE-STARTUP.TEXT:1950, case 4 should call FS_INIT. Currently none of
+the case bodies fire — PARAMEMINIT's `ALARMASSIGN(var alarm, routine)`
+calls compile with TWO `MOVE.L A0,-(SP)` pushes instead of a routine
+value push + alarm address push. Suspected ord(@proc_name) or
+param_is_var[1] codegen bug for external procedures. Alarms never get
+proper handlers installed, asynchronous timer events jump to bogus
+addresses, CPU wanders $Cxxxxx RAM. See NEXT_SESSION for specific
+investigation plan.
 
 **Important debugging correction (today):** A `SYSTEM_ERROR code=0`
 message that appeared right after BOOT_IO_INIT was a **false positive**
@@ -617,14 +630,11 @@ Key session highlights for quick reference:
 - **P42** Dynamic HLE lookup via `boot_progress_lookup` (cached per `g_emu_generation`)
 - **P78** Signal_sem HLE guard + RELSPACE guard
 - **ENTER_LOADER** (`src/m68k.c:4846`) — pops args + RTS; no real loader runs
-- **10738..10741 + 10758 suppression** (`src/lisa.c:3090`) — masks LD_OPENINPUT
-  garbage return (10738/10739), unsuccessful UP in INIT_BOOT_CDS (10740 —
-  dead post-P97), blockstructured=FALSE (10741 — NEW_DEVICE codegen bug),
-  and MAKE_BUILTIN's FIND_EMPTYSLOT failure (10758 — bitbucket init-loop
-  codegen bug)
-- **Self-ref required_drvr scaffold** (`src/m68k.c` UP entry) — clears
-  `req_drvr == cfg_ptr` to break infinite UP recursion until FIND_EMPTYSLOT
-  returns distinct config_indexes per iteration
+- **10738..10741 suppression** (`src/lisa.c:3090`) — safety net for
+  alternate boot paths (PRAM failures → 10738, LOADCD failures → 10739).
+  On the ProFile-on-paraport default path post-P97..P100, none of these
+  fire — UP() succeeds cleanly, blockstructured comparison works,
+  FIND_EMPTYSLOT finds real slots.
 - **10707 suppression** (`src/lisa.c`) — masks FS_MASTER_INIT failure
 - `$234` fetch bypass: IPL=7→RTE (DB_INIT skip), IPL=0→execute (Lisabug)
 - `$4FBC` NOP-skip: illegal opcode in Workshop init loop
