@@ -4866,42 +4866,15 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 up_probe_gen = g_emu_generation;
                 up_addr = boot_progress_lookup("UP");
             }
-            if (up_addr && cpu->pc == up_addr) {
+            if (up_addr && cpu->pc == up_addr && up_trace < 4) {
+                up_trace++;
                 uint32_t sp = cpu->a[7];
                 uint32_t ret_pc = cpu_read32(cpu, sp);
                 uint32_t cfg_ptr = cpu_read32(cpu, sp + 8);
                 uint32_t caller_cfg = cpu_read32(cpu, sp + 12);
-                uint32_t req_drvr = 0, drvrec_ptr = 0, entry_pt = 0, kres = 0;
-                if (cfg_ptr) {
-                    entry_pt   = cpu_read32(cpu, cfg_ptr + 0);
-                    drvrec_ptr = cpu_read32(cpu, cfg_ptr + 12);
-                    req_drvr   = cpu_read32(cpu, cfg_ptr + 60);
-                    if (drvrec_ptr) kres = cpu_read32(cpu, drvrec_ptr + 54);
-                }
-                /* P97 scaffold: break self-referential required_drvr that
-                 * causes UP() to infinite-recurse. Root cause: INIT_BOOT_CDS
-                 * calls NEW_CONFIG 3x, but FIND_EMPTYSLOT keeps returning
-                 * the same config_index (likely a string-compare codegen bug
-                 * on `configinfo[i]^.devname = 'BITBKT'`). So each iter's
-                 * configinfo[parent] = configinfo[config_index] = self, and
-                 * NEW_CONFIG stores req_drvr := self. UP then recurses
-                 * infinitely on the same cfg_ptr. Clear the self-ref so
-                 * UP can proceed to the driver-init path. Remove this when
-                 * FIND_EMPTYSLOT is fixed. */
-                if (cfg_ptr && req_drvr == cfg_ptr) {
-                    cpu_write32(cpu, cfg_ptr + 60, 0);
-                    req_drvr = 0;
-                    DBGSTATIC(int, up_scaf, 0);
-                    if (up_scaf++ < 2)
-                        fprintf(stderr, "  [P97 scaffold] cleared self-ref required_drvr on cfg=$%X\n", cfg_ptr);
-                }
-                if (up_trace < 4) {
-                    up_trace++;
-                    fprintf(stderr, "HLE UP entry: ret=$%06X cfg=$%06X caller=$%06X"
-                            " [entry_pt=$%X drvrec=$%X req_drvr=$%X drv.kres=$%X]\n",
-                            ret_pc, cfg_ptr, caller_cfg,
-                            entry_pt, drvrec_ptr, req_drvr, kres);
-                }
+                uint32_t req_drvr = cfg_ptr ? cpu_read32(cpu, cfg_ptr + 60) : 0;
+                fprintf(stderr, "HLE UP entry: ret=$%06X cfg=$%06X caller=$%06X req_drvr=$%06X\n",
+                        ret_pc, cfg_ptr, caller_cfg, req_drvr);
             }
         }
 
@@ -4909,37 +4882,30 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
          * actually get entered. Addresses resolved each generation. */
         {
             extern uint32_t boot_progress_lookup(const char *name);
-            static uint32_t p_parameminit = 0, p_make_builtin = 0, p_fs_init = 0;
-            static uint32_t p_sys_proc = 0, p_init_boot = 0, p_config_down = 0;
-            static uint32_t p_ld_disable = 0;
+            struct { const char *name; uint32_t addr; } pcs[] = {
+                {"INIT_BOOT_CDS",  0}, {"PARAMEMINIT",    0},
+                {"MAKE_BUILTIN",   0}, {"FS_INIT",        0},
+                {"Sys_Proc_Init",  0}, {"CONFIG_DOWN",    0},
+                {"LD_DISABLE",     0}, {"INITUID",        0},
+                {"SET_PREFERENCES",0}, {"DiskSync",       0},
+            };
+            static uint32_t pcs_cache[13];
             static int pci_gen = -1;
             if (pci_gen != g_emu_generation) {
                 pci_gen = g_emu_generation;
-                p_init_boot     = boot_progress_lookup("INIT_BOOT_CDS");
-                p_parameminit   = boot_progress_lookup("PARAMEMINIT");
-                p_make_builtin  = boot_progress_lookup("MAKE_BUILTIN");
-                p_fs_init       = boot_progress_lookup("FS_INIT");
-                p_sys_proc      = boot_progress_lookup("Sys_Proc_Init");
-                p_config_down   = boot_progress_lookup("CONFIG_DOWN");
-                p_ld_disable    = boot_progress_lookup("LD_DISABLE");
+                for (int i = 0; i < (int)(sizeof(pcs)/sizeof(pcs[0])); i++)
+                    pcs_cache[i] = boot_progress_lookup(pcs[i].name);
             }
             DBGSTATIC(int, pci_trace, 0);
-            if (pci_trace < 12 &&
-                (cpu->pc == p_init_boot || cpu->pc == p_parameminit ||
-                 cpu->pc == p_make_builtin || cpu->pc == p_fs_init ||
-                 cpu->pc == p_sys_proc || cpu->pc == p_config_down ||
-                 cpu->pc == p_ld_disable)) {
-                pci_trace++;
-                const char *name = "?";
-                if (cpu->pc == p_init_boot) name = "INIT_BOOT_CDS";
-                else if (cpu->pc == p_parameminit) name = "PARAMEMINIT";
-                else if (cpu->pc == p_make_builtin) name = "MAKE_BUILTIN";
-                else if (cpu->pc == p_fs_init) name = "FS_INIT";
-                else if (cpu->pc == p_sys_proc) name = "Sys_Proc_Init";
-                else if (cpu->pc == p_config_down) name = "CONFIG_DOWN";
-                else if (cpu->pc == p_ld_disable) name = "LD_DISABLE";
-                fprintf(stderr, "[POST-BOOT] entered %s @$%06X (A7=$%08X A6=$%08X)\n",
-                        name, cpu->pc, cpu->a[7], cpu->a[6]);
+            if (pci_trace < 30) {
+                for (int i = 0; i < (int)(sizeof(pcs)/sizeof(pcs[0])); i++) {
+                    if (pcs_cache[i] && cpu->pc == pcs_cache[i]) {
+                        pci_trace++;
+                        fprintf(stderr, "[POST-BOOT] entered %s @$%06X (A7=$%08X A6=$%08X)\n",
+                                pcs[i].name, cpu->pc, cpu->a[7], cpu->a[6]);
+                        break;
+                    }
+                }
             }
         }
 

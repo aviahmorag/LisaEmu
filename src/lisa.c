@@ -3099,16 +3099,18 @@ static bool hle_handle_system_error(lisa_t *lisa __attribute__((unused)), m68k_t
      * This is normal for us — we bypass pram entirely.
      * Suppress the error and return to let INIT_BOOT_CDS continue.
      * The EXIT(init_boot_cds) after SYSTEM_ERROR will return from the procedure. */
-    if ((err_code >= 10738 && err_code <= 10741) || err_code == 10758) {
-        /* INIT_BOOT_CDS keeps `error` local at A6-12. At 10740/10741, A6
-         * is still INIT_BOOT_CDS's frame (SYSTEM_ERROR does no LINK before
-         * its own stub intercepts). Dump the value that UP() (or the
-         * blockstructured check) produced so we can trace what went wrong.
-         * 10758 = sys_err_base + cdtoomany — MAKE_BUILTIN's FIND_EMPTYSLOT
-         * returned false because the bitbucket-init for-loop doesn't
-         * correctly populate all configinfo slots (or another codegen bug
-         * keeps devname empty). Suppress to keep boot advancing; remove
-         * when the init codegen is fixed. */
+    if ((err_code >= 10738 && err_code <= 10741)) {
+        /* 10738..10741 suppression retained as a safety net. Post-P97..P100
+         * + CALLDRIVER(DATTACH) no-op, the real INIT_BOOT_CDS flow no longer
+         * triggers these on the ProFile-on-paraport boot path (UP() runs
+         * the recursive driver chain cleanly, error=0). Kept here because
+         * other boot paths (no PRAM, alt device configs) can still trigger
+         * 10738 at FIND_PM_IDS or 10739 at LOADCD.
+         *
+         * 10758 (cdtoomany) is NO LONGER suppressed — P99 fixed the
+         * string-literal aggregate copy that left BITBKT devname empty,
+         * so FIND_EMPTYSLOT finds real empty slots and MAKE_BUILTIN
+         * succeeds. */
         if (err_code == 10740 || err_code == 10741) {
             uint32_t init_boot = 0;
             extern uint32_t boot_progress_lookup(const char *name);
