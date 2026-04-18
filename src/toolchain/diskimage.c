@@ -46,30 +46,59 @@ static void write_block_data(disk_builder_t *db, uint32_t block,
     memcpy(db->image + offset, data, to_write);
 }
 
-/* Write tag bytes for a block */
+/* Write the 20-byte on-disk tag for a block.
+ *
+ * Layout matches the FIRST 20 bytes of Apple's 24-byte pagelabel record
+ * (source-DRIVERDEFS.TEXT.unix.txt:207). The 4-byte bkwdlink tail is
+ * omitted on disk — real ProFile driver recovers it from RAM (see
+ * source-LDPROF.TEXT:202 reading only disk_header=20 bytes, while
+ * SOURCE-PROFILEASM.TEXT:637 checksums 24 bytes once in RAM).
+ *
+ *   @0-1  version (2)          0 = no checksum-present
+ *   @2-3  datastat/filler/volume (2 packed)  0 = dataok + defaults
+ *   @4-5  fileid (2)           block-role id (0xAAAA boot, 0x0001 MDDF,
+ *                               0x0002 bitmap, 0x0003 slist,
+ *                               0x0004 rootcat, sfile# for file pages)
+ *   @6-7  dataused (2)         valid bytes in data portion (0 = unset)
+ *   @8-11 abspage (int4)       absolute FS page of this block
+ *   @12-15 relpage (int4)      relative page within its file
+ *   @16-19 fwdlink (int4)      next chained block (0 = end of chain)
+ *
+ * This matches what the HLE in src/lisa.c:322 already reads
+ * (ldr_get32(tag_buf + 16) for fwdlink) and what the real LOADER's
+ * OPEN_FILE chain walking expects. */
 static void write_block_tag(disk_builder_t *db, uint32_t block,
-                             uint16_t file_id, uint16_t abs_page,
-                             uint16_t rel_page, uint16_t fwd_link,
-                             uint16_t bkwd_link) {
+                             uint16_t file_id,
+                             uint32_t abs_page, uint32_t rel_page,
+                             uint32_t fwd_link) {
     if (block >= db->total_blocks) return;
     uint32_t offset = block * PROFILE_BLOCK_SIZE;
-    /* Tag format (simplified):
-     * Bytes 0-1: file ID
-     * Bytes 2-3: absolute page number
-     * Bytes 4-5: relative page within file
-     * Bytes 6-7: forward link (next block)
-     * Bytes 8-9: backward link (prev block)
-     * Bytes 10-19: reserved/checksum */
-    db->image[offset + 0] = (file_id >> 8) & 0xFF;
-    db->image[offset + 1] = file_id & 0xFF;
-    db->image[offset + 2] = (abs_page >> 8) & 0xFF;
-    db->image[offset + 3] = abs_page & 0xFF;
-    db->image[offset + 4] = (rel_page >> 8) & 0xFF;
-    db->image[offset + 5] = rel_page & 0xFF;
-    db->image[offset + 6] = (fwd_link >> 8) & 0xFF;
-    db->image[offset + 7] = fwd_link & 0xFF;
-    db->image[offset + 8] = (bkwd_link >> 8) & 0xFF;
-    db->image[offset + 9] = bkwd_link & 0xFF;
+    uint8_t *t = db->image + offset;
+
+    /* @0-1 version = 0 */
+    t[0] = 0; t[1] = 0;
+    /* @2-3 datastat/filler/volume = 0 */
+    t[2] = 0; t[3] = 0;
+    /* @4-5 fileid (big-endian int16) */
+    t[4] = (uint8_t)((file_id >> 8) & 0xFF);
+    t[5] = (uint8_t)(file_id & 0xFF);
+    /* @6-7 dataused = 0 */
+    t[6] = 0; t[7] = 0;
+    /* @8-11 abspage (big-endian int4) */
+    t[8]  = (uint8_t)((abs_page >> 24) & 0xFF);
+    t[9]  = (uint8_t)((abs_page >> 16) & 0xFF);
+    t[10] = (uint8_t)((abs_page >> 8)  & 0xFF);
+    t[11] = (uint8_t)(abs_page & 0xFF);
+    /* @12-15 relpage (big-endian int4) */
+    t[12] = (uint8_t)((rel_page >> 24) & 0xFF);
+    t[13] = (uint8_t)((rel_page >> 16) & 0xFF);
+    t[14] = (uint8_t)((rel_page >> 8)  & 0xFF);
+    t[15] = (uint8_t)(rel_page & 0xFF);
+    /* @16-19 fwdlink (big-endian int4) */
+    t[16] = (uint8_t)((fwd_link >> 24) & 0xFF);
+    t[17] = (uint8_t)((fwd_link >> 16) & 0xFF);
+    t[18] = (uint8_t)((fwd_link >> 8)  & 0xFF);
+    t[19] = (uint8_t)(fwd_link & 0xFF);
 }
 
 /* Compute blocks needed for a given byte size */
@@ -120,10 +149,12 @@ bool disk_write_boot_track(disk_builder_t *db, const uint8_t *boot_code, uint32_
         uint32_t remaining = size - offset;
         uint32_t chunk = (remaining > PROFILE_DATA_SIZE) ? PROFILE_DATA_SIZE : remaining;
         write_block_data(db, b, boot_code + offset, chunk);
-        /* Tag boot blocks with file_id = 0xAAAA (boot marker) */
-        write_block_tag(db, b, 0xAAAA, (uint16_t)b, (uint16_t)b,
-                        (b + 1 < blocks) ? (uint16_t)(b + 1) : 0,
-                        (b > 0) ? (uint16_t)(b - 1) : 0);
+        /* Boot track: fileid 0xAAAA marks block as bootable code for
+         * the boot ROM / LDPROF. abspage = relpage = b since the boot
+         * track is its own "file". fwdlink chains to next boot block
+         * or 0 at end. */
+        write_block_tag(db, b, 0xAAAA, b, b,
+                        (b + 1 < blocks) ? (b + 1) : 0);
     }
 
     return true;
@@ -158,11 +189,14 @@ bool disk_add_file(disk_builder_t *db, const char *name, uint8_t file_type,
         uint32_t chunk = (remaining > PROFILE_DATA_SIZE) ? PROFILE_DATA_SIZE : remaining;
         uint32_t block_num = f->start_block + b;
         write_block_data(db, block_num, data + offset, chunk);
-        /* Tag with file ID (index + 1) */
-        uint16_t file_id = (uint16_t)(db->num_files);
-        write_block_tag(db, block_num, file_id, (uint16_t)block_num, (uint16_t)b,
-                        (b + 1 < blocks) ? (uint16_t)(block_num + 1) : 0,
-                        (b > 0) ? (uint16_t)(block_num - 1) : 0);
+        /* File data: fileid = sfile number (FIRST_FILE_SFILE + index).
+         * abspage = FS page of this block; relpage = b (0-based within
+         * file); fwdlink = next block's FS page or 0 at last block. */
+        uint32_t abs_fs_page = block_num - BOOT_TRACK_BLOCKS;
+        uint32_t fwd_fs_page = (b + 1 < blocks)
+            ? (block_num + 1 - BOOT_TRACK_BLOCKS) : 0;
+        uint16_t sfile_id = (uint16_t)(4 + (db->num_files - 1));
+        write_block_tag(db, block_num, sfile_id, abs_fs_page, b, fwd_fs_page);
     }
 
     db->next_free_block += blocks;
@@ -405,7 +439,8 @@ bool disk_finalize(disk_builder_t *db) {
     mddf[188] = (free_pages >> 8)  & 0xFF; mddf[189] =  free_pages        & 0xFF;
 
     write_block_data(db, BOOT_TRACK_BLOCKS, mddf, sizeof(mddf));
-    write_block_tag(db, BOOT_TRACK_BLOCKS, 0x0001, BOOT_TRACK_BLOCKS, 0, 0, 0);
+    /* MDDF lives at FS page 0; fileid 0x0001 identifies MDDF. */
+    write_block_tag(db, BOOT_TRACK_BLOCKS, 0x0001, 0, 0, 0);
 
     /* --- slist: slist_block_count pages of 36 packed 14-byte s_entry
      * records each. s_entry layout (source-sfileio.text:45-50, big-
@@ -456,8 +491,10 @@ bool disk_finalize(disk_builder_t *db) {
         }
         uint32_t disk_block = slist_block + sb;
         uint32_t fs_page = disk_block - BOOT_TRACK_BLOCKS;
+        uint32_t fwd_page = (sb + 1 < slist_block_count)
+            ? (fs_page + 1) : 0;
         write_block_data(db, disk_block, slist_buf, sizeof(slist_buf));
-        write_block_tag(db, disk_block, 0x0003, (uint16_t)fs_page, 0, 0, 0);
+        write_block_tag(db, disk_block, 0x0003, fs_page, sb, fwd_page);
     }
 
     #undef SLIST_W16
@@ -492,7 +529,9 @@ bool disk_finalize(disk_builder_t *db) {
         FMAP_W16(fm, 12, (uint16_t)rootcat_data_pages); /* map[0].cpages */
         write_block_data(db, rootcat_filemap_block, fm, sizeof(fm));
         uint32_t fs_page = rootcat_filemap_block - BOOT_TRACK_BLOCKS;
-        write_block_tag(db, rootcat_filemap_block, 0x0004, (uint16_t)fs_page, 0, 0, 0);
+        /* rootcat filemap is a single page (contiguous extent), no
+         * fwdlink needed. fileid 0x0004 = catalog file. */
+        write_block_tag(db, rootcat_filemap_block, 0x0004, fs_page, 0, 0);
     }
 
     /* Per-file filemaps */
@@ -510,7 +549,7 @@ bool disk_finalize(disk_builder_t *db) {
         uint32_t fs_page = file_filemap_block[i] - BOOT_TRACK_BLOCKS;
         uint16_t sfile_tag = (uint16_t)(FIRST_FILE_SFILE + i);
         write_block_tag(db, file_filemap_block[i], sfile_tag,
-                        (uint16_t)fs_page, 0, 0, 0);
+                        fs_page, 0, 0);
     }
 
     #undef FMAP_W16
@@ -596,7 +635,9 @@ bool disk_finalize(disk_builder_t *db) {
         /* attributes, readpage/offset, writepage/offset stay zero */
     }
 
-    /* Write rootcat data pages with tag 0x0004 */
+    /* Write rootcat data pages with fileid 0x0004 (catalog) and
+     * fwdlink chaining through the contiguous extent so the real
+     * LOADER's OPEN_FILE filemap walk stays consistent. */
     for (uint32_t p = 0; p < rootcat_data_pages; p++) {
         uint32_t block = rootcat_data_block + p;
         uint32_t fs_page = block - BOOT_TRACK_BLOCKS;
@@ -604,8 +645,9 @@ bool disk_finalize(disk_builder_t *db) {
         uint32_t remaining = rc_len - p * PROFILE_DATA_SIZE;
         uint32_t chunk = remaining > PROFILE_DATA_SIZE
                          ? (uint32_t)PROFILE_DATA_SIZE : remaining;
+        uint32_t fwd = (p + 1 < rootcat_data_pages) ? (fs_page + 1) : 0;
         write_block_data(db, block, src, chunk);
-        write_block_tag(db, block, 0x0004, (uint16_t)fs_page, (uint16_t)p, 0, 0);
+        write_block_tag(db, block, 0x0004, fs_page, p, fwd);
     }
     free(rc_buf);
 
