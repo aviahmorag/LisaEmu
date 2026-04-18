@@ -254,16 +254,72 @@ Repeating block structure, each block:
 ```
 Loop until `header == endblock`.
 
+**Per-block tag file IDs** (ground truth from `_inspiration/lisaem-master/src/tools/src/lisafsh-tool.c:66`):
+
+Every disk block carries a small tag (separate from its 512-byte data
+payload) whose first word is a **file ID** marking the block's role:
+
+| Tag ID | Meaning |
+|---|---|
+| `0xAAAA` | Boot sector — block 0 holds the LDPROF stub |
+| `0xBBBB` | OS loader — blocks holding the loader body |
+| `0x0000` | Free block |
+| `0x0001` | MDDF (Master Directory Data File, aka superblock) |
+| `0x0002` | Free-space bitmap |
+| `0x0003` | S-records (slist / file descriptors) |
+| `0x0004` | Directory (catalog) |
+
+On real hardware, when the OS formats a disk it copies the first 512
+bytes of `system.bt_Profile` into block 0 with tag `0xAAAA`, and the
+Lisa ROM's boot routine reads block 0, verifies the tag, and jumps to
+the code. The `FS_Utilities()` syscall also exposes this write-boot-
+block operation at runtime. Our Phase 2 disk-image builder must do
+this at image-build time since we don't run the Lisa OS to format our
+own disk.
+
+**Tag-size discrepancy to resolve**: lisaem's `libdc42.h` declares
+ProFile blocks as `512 data + 20 tag = 532 bytes`. Apple's
+`source-ldlfs.text.unix.txt` declares `pagelabel` as `24 bytes`.
+Likely reconciliation: 20-byte physical ProFile tag + 4 bytes of
+driver-added padding surfaced to the filesystem as the 24-byte
+pagelabel. Verify in Phase 3 when implementing layout.
+
+**Cross-project conclusions from inspection of `_inspiration/`:**
+
+- `LisaSourceCompilation-main/src/MAKE/ALEX-MAKE-FULLOS.TEXT` chains
+  `SYSTEMOS → CDDRIVERS → BTDRIVERS → OSPROGS` — this IS the
+  orchestrator our `toolchain_bridge.c` is replacing.
+- Neither reference project has a modern source-to-bootable-image
+  writer. LisaSourceCompilation relies on manual IUMANAGER steps on
+  real Lisa hardware; lisaem reads DC42 images but doesn't build them
+  from compiled source. Our Phase 2 disk-image builder is genuinely
+  new work (using their format specs as ground truth, not copying
+  code).
+- Apple-source patch we'll still need at some point: `SOURCE-PROFILE`
+  disk-size cap `30000 → 500000` (to allow >16MB ProFile volumes).
+  Not needed for minimal Phase 2 boot; note for later.
+- Pattern to steal from lisaem: sorted-tag-iteration at
+  `lisafsh-tool.c:689` — grouping blocks by `(fileID, abs_sector,
+  next_link)` during layout is a clean design for Phase 3.
+
 **Phase 2 plan (in order):**
 
-1. Add `LOADER` as a second compile target in `compile_targets.c` —
-   module list = source-LOADER.TEXT + source-ldlfs.text +
-   source-LDUTIL + source-LDEQU + source-LDASM + whatever unit deps
-   they declare via `$U` / `$I`.
-2. Teach `toolchain_bridge.c` to iterate `ALL_TARGETS[]` — compile,
-   link, and emit each as its own output artifact.
+1. ✅ Add `SYSTEM.BT_PROFILE` as a second compile target in
+   `compile_targets.c` — matching Apple's `ALEX-MAKE-BTPROFILE.TEXT`
+   9-module list (LDPROF + LDASM + PROF + SERNUM + LDUTIL + LOADER +
+   LDLFS + PASMATH + OSINTPASLIB). Commit `3ef159d`.
+2. ✅ Teach `toolchain_bridge.c` to iterate `ALL_TARGETS[]` — both
+   targets now compile + link each iteration; per-target artifacts
+   land under `<bundle>/<target->name>/linked.bin` + `.map` +
+   `hle_addrs.txt`. Primary target (SYSTEM.OS) mirrors to bundle
+   root for backward-compat with main_sdl.c + the lisaOS app.
+   Both targets currently produce identical linked.bin because we're
+   in LOOSE compile mode — strict module filtering is a Step 3-era
+   concern. No boot regression (same 27/29 milestones).
 3. Bootrom-time placement: load LOADER into low RAM at boot, set
    `[$204] = @ldrtrap` so `ENTER_LOADER` lands in the real loader.
+   Requires switching SYSTEM.BT_PROFILE's compile to strict mode so
+   it links only its 9 modules (not all 97 from LISA_OS/OS).
 4. Extend `diskimage.c` to lay out a complete filesystem:
    - Pick an `fsversion` and commit to that catalog format (likely
      start with < 16 flat-hash for simplicity, B-tree later).

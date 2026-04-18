@@ -644,26 +644,40 @@ build_result_t toolchain_build(const char *source_dir,
         return result;
     }
 
-    /* P58: use the SYSTEM.OS compile target — explicit module list
-     * from the reference project. Current state: the module list
-     * matches Apple's ALEX-COMP-SYSTEMOS.TEXT + ALEX-LINK-SYSTEMOS.TEXT
-     * (~50 modules). However our toolchain currently depends on some
-     * support files that Apple's OS doesn't include in SYSTEM.OS
-     * (e.g., $I-expansion differences, cross-module type propagation).
-     * For now we walk search_dirs and compile EVERYTHING found — once
-     * the toolchain is able to cleanly compile the minimal Apple set,
-     * we'll switch to strict module filtering.
+    /* Phase-2 Step 2: iterate every compile target in ALL_TARGETS.
      *
-     * The module list drives disk-image layout: each target will emit
-     * a separate OBJ file at its out_path. Apps and libraries become
-     * separate targets (future work). */
-    const compile_target_t *target = compile_targets_find("SYSTEM.OS");
-    if (!target) {
-        snprintf(result.error_message, sizeof(result.error_message),
-                 "SYSTEM.OS compile target not found");
-        free(files);
-        return result;
-    }
+     * - Primary target (index 0, SYSTEM.OS) drives disk-image layout
+     *   and writes its outputs to both <bundle>/ (legacy paths for
+     *   main_sdl.c + the lisaOS app) and <bundle>/<target->name>/
+     *   (new per-target layout).
+     * - Subsequent targets (BT_PROFILE, later CD_PROFILE, libs, apps)
+     *   write only to <bundle>/<target->name>/. Placement on disk is
+     *   Phase 2 Step 3.
+     *
+     * shared_types / shared_globals / shared_proc_sigs are
+     * intentionally NOT reset between targets: later targets
+     * (e.g. LOADER, which $U-imports driverdefs / sysglobal /
+     * proc_prims / etc.) need the type definitions built up during
+     * the first target's compile to resolve their interface
+     * references.
+     *
+     * Per target we allocate a fresh linker_t so each target's
+     * linked blob is independent. The primary's linker_t is retained
+     * past the loop for disk-image assembly; non-primary linker_t's
+     * are freed at end-of-iteration. */
+    linker_t *primary_lk = NULL;
+    const compile_target_t *const *all_targets = compile_targets_all();
+    for (int ti = 0; all_targets[ti]; ti++) {
+    const compile_target_t *target = all_targets[ti];
+    bool is_primary = (ti == 0);
+    fprintf(stderr, "\n=== COMPILE TARGET %d: %s ===\n", ti, target->name);
+
+    /* Per-target subdirectory under the .lisa bundle. Safe: even if
+     * SYSTEM.OS is still the only one fully wired end-to-end, the
+     * per-target subdir makes artifacts inspectable. */
+    char target_dir[512];
+    snprintf(target_dir, sizeof(target_dir), "%s/%s", bundle_dir, target->name);
+    (void)mkdir(target_dir, 0755);
 
     int num_files = 0;
     source_file_t *candidates = calloc(MAX_SOURCE_FILES, sizeof(source_file_t));
@@ -1073,8 +1087,13 @@ build_result_t toolchain_build(const char *source_dir,
             {"USE_HDIS",  "USE_HDISK"},      /* 8-char truncated */
             {NULL, NULL}
         };
+        /* Write per-target hle_addrs.txt into <bundle>/<target->name>/.
+         * For the primary target (SYSTEM.OS) also mirror to <bundle>/
+         * so main_sdl.c + the lisaOS app (which still load from the
+         * bundle root) keep working. Mirroring happens via a second
+         * fopen below after the per-target file closes. */
         char hle_path[512];
-        snprintf(hle_path, sizeof(hle_path), "%s/hle_addrs.txt", bundle_dir);
+        snprintf(hle_path, sizeof(hle_path), "%s/hle_addrs.txt", target_dir);
         FILE *hle_f = fopen(hle_path, "w");
         if (hle_f) {
             for (int h = 0; hle_syms[h].name; h++) {
@@ -1102,7 +1121,85 @@ build_result_t toolchain_build(const char *source_dir,
                 }
             }
             fclose(hle_f);
+            /* Primary-target backward-compat mirror. */
+            if (is_primary) {
+                char mirror_path[512];
+                snprintf(mirror_path, sizeof(mirror_path), "%s/hle_addrs.txt", bundle_dir);
+                FILE *mf = fopen(mirror_path, "w");
+                if (mf) {
+                    FILE *src = fopen(hle_path, "r");
+                    if (src) {
+                        char buf[4096]; size_t n;
+                        while ((n = fread(buf, 1, sizeof(buf), src)) > 0) fwrite(buf, 1, n, mf);
+                        fclose(src);
+                    }
+                    fclose(mf);
+                }
+            }
         }
+    }
+
+    /* Write per-target linked.bin + linked.map under <bundle>/<target->name>/.
+     * Inspectable artifacts for every target regardless of whether
+     * it's the one we boot. Primary mirror lives outside the loop
+     * (in the disk-assembly block below). */
+    {
+        uint32_t lsz = 0;
+        const uint8_t *ldata = linker_get_output(lk, &lsz);
+        if (ldata && lsz > 0) {
+            char p[512];
+            snprintf(p, sizeof(p), "%s/linked.bin", target_dir);
+            FILE *f = fopen(p, "wb");
+            if (f) { fwrite(ldata, 1, lsz, f); fclose(f); }
+            snprintf(p, sizeof(p), "%s/linked.map", target_dir);
+            FILE *mf = fopen(p, "w");
+            if (mf) {
+                int *order = (int*)malloc(sizeof(int) * lk->num_symbols);
+                int n = 0;
+                for (int i = 0; i < lk->num_symbols; i++)
+                    if (lk->symbols[i].type == LSYM_ENTRY) order[n++] = i;
+                for (int i = 1; i < n; i++) {
+                    int key = order[i];
+                    int32_t kv = lk->symbols[key].value;
+                    int j = i - 1;
+                    while (j >= 0 && lk->symbols[order[j]].value > kv) {
+                        order[j+1] = order[j]; j--;
+                    }
+                    order[j+1] = key;
+                }
+                for (int i = 0; i < n; i++)
+                    fprintf(mf, "$%06X  %s\n",
+                            lk->symbols[order[i]].value, lk->symbols[order[i]].name);
+                fclose(mf);
+                free(order);
+            }
+            fprintf(stderr, "TARGET '%s' artifacts: %s/linked.bin (%u bytes) + linked.map + hle_addrs.txt\n",
+                    target->name, target_dir, lsz);
+        }
+    }
+
+    /* End-of-target: save primary linker for disk assembly below;
+     * free non-primary linkers immediately since we don't place them
+     * on disk yet (Phase 2 Step 3). */
+    if (is_primary) {
+        primary_lk = lk;
+    } else {
+        fprintf(stderr, "TARGET '%s' linker retained per-target dir; not yet on disk "
+                "(awaiting Phase 2 Step 3).\n", target->name);
+        linker_free(lk);
+        free(lk);
+    }
+    } /* end for ti (per-target compile loop) */
+
+    /* From here on, `lk` refers to the primary target's linker
+     * (SYSTEM.OS) — disk-image layout is still driven entirely by
+     * the primary target. */
+    linker_t *lk = primary_lk;
+    if (!lk) {
+        snprintf(result.error_message, sizeof(result.error_message),
+                 "Primary target (SYSTEM.OS) failed to build");
+        free(files);
+        return result;
     }
 
     if (progress) progress("Building disk image...", 80, 100);
@@ -1141,7 +1238,7 @@ build_result_t toolchain_build(const char *source_dir,
                     if (lk->symbols[i].type == LSYM_ENTRY) order[n++] = i;
                 for (int i = 1; i < n; i++) {
                     int key = order[i];
-                    uint32_t kv = lk->symbols[key].value;
+                    int32_t kv = lk->symbols[key].value;
                     int j = i - 1;
                     while (j >= 0 && lk->symbols[order[j]].value > kv) {
                         order[j+1] = order[j]; j--;
