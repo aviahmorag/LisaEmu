@@ -268,8 +268,14 @@ bool disk_finalize(disk_builder_t *db) {
                                     (buf)[(off)+2] = ((val) >> 8)  & 0xFF; \
                                     (buf)[(off)+3] = (val) & 0xFF; } while(0)
 
-    /* fsversion = 17 (SPRING_VERSION / CUR_VERSION) */
-    W16(mddf, 0, 17);
+    /* fsversion = 15 — pre-B-tree "conventional lookup" path in
+     * source-ldlfs.text (line 530: `if fs_version < btree_fsversion`
+     * where btree_fsversion = 16). Keeps the real LOADER on the
+     * LOOKUP_ENAME + LDHASH flat-hash catalog path that our Step 3d3
+     * centry layout targets. Step 3d2+ will build the matching slist
+     * and catalog. Apple's fsversion 17 needs a B-tree catalog (future
+     * upgrade for parity with shipped AOS 3.x disks). */
+    W16(mddf, 0, 15);
 
     /* volid — UID with two longints, just use a simple ID */
     W32(mddf, 2, 0x00000001);  /* volid.a */
