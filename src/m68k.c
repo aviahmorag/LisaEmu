@@ -5013,9 +5013,13 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             }
 
             /* Trace first SYSTEM_ERROR call — dump caller chain and
-             * instruction bytes around the JSR site. */
+             * instruction bytes around the JSR site. Uses the live
+             * hle_addr_system_error (set by toolchain_bridge at link),
+             * NOT a hardcoded PC — addresses shift whenever codegen
+             * changes. */
+            extern uint32_t hle_addr_system_error;
             DBGSTATIC(int, syserr_dumped, 0);
-            if (cpu->pc == 0x5380 && !syserr_dumped) {
+            if (hle_addr_system_error && cpu->pc == hle_addr_system_error && !syserr_dumped) {
                 syserr_dumped = 1;
                 uint32_t sp = cpu->a[7] & 0xFFFFFF;
                 uint32_t ret_pc = cpu_read32(cpu, sp);
