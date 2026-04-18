@@ -2322,20 +2322,43 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                      * .ne: MOVEQ #0,D0
                      * .done:
                      * For TOK_NE, EOR #1,D0 at the end. */
+                    /* P98: the original branch displacements here were all
+                     * off by 2, landing on the subsequent BRA.S instead of
+                     * on MOVEQ #1 / #0. That made `string = 'literal'` return
+                     * whatever stale value D0 held before the compare — and
+                     * for FIND_EMPTYSLOT's `configinfo[i]^.devname = 'BITBKT'`
+                     * that was almost always "truthy", so it returned TRUE
+                     * on the first iteration and returned config_index=maxdev
+                     * unconditionally, regardless of which slot was free.
+                     * Layout (offsets relative to start of sequence):
+                     *   0:  MOVE.B (A0)+,D2
+                     *   2:  MOVE.B (A1)+,D1
+                     *   4:  CMP.B  D1,D2
+                     *   6:  BNE.S  .ne      ; disp = 20-(6+2) = $10
+                     *   8:  TST.B  D2
+                     *  10:  BEQ.S  .eq      ; disp = 16-(10+2) = $08
+                     *  12:  CMPM.B (A0)+,(A1)+
+                     *  14:  BNE.S  .ne      ; disp = 20-(14+2) = $08
+                     *  16:  SUBQ.B #1,D2
+                     *  18:  BNE.S  .loop    ; disp = 12-(18+2) = -$08 = $F8
+                     *  20:  .eq: MOVEQ #1,D0
+                     *  22:  BRA.S .done     ; disp = 26-(22+2) = $02
+                     *  24:  .ne: MOVEQ #0,D0
+                     *  26:  .done */
                     emit16(cg, 0x1418);  /* MOVE.B (A0)+,D2 */
                     emit16(cg, 0x1219);  /* MOVE.B (A1)+,D1 */
                     emit16(cg, 0xB401);  /* CMP.B D1,D2 */
-                    emit16(cg, 0x660E);  /* BNE.S +14  → .ne */
+                    emit16(cg, 0x6610);  /* BNE.S +$10 → .ne */
                     emit16(cg, 0x4A02);  /* TST.B D2 */
-                    emit16(cg, 0x670A);  /* BEQ.S +10  → .eq */
+                    emit16(cg, 0x6708);  /* BEQ.S +$08 → .eq */
                     /* .loop: */
                     emit16(cg, 0xB308);  /* CMPM.B (A0)+,(A1)+ */
-                    emit16(cg, 0x6606);  /* BNE.S +6 → .ne */
+                    emit16(cg, 0x6608);  /* BNE.S +$08 → .ne */
                     emit16(cg, 0x5302);  /* SUBQ.B #1,D2 */
-                    emit16(cg, 0x66F8);  /* BNE.S -8 → .loop */
+                    emit16(cg, 0x66F8);  /* BNE.S -$08 → .loop */
                     /* .eq: */
                     emit16(cg, 0x7001);  /* MOVEQ #1,D0 */
-                    emit16(cg, 0x6002);  /* BRA.S +2  → .done */
+                    emit16(cg, 0x6002);  /* BRA.S +$02 → .done */
                     /* .ne: */
                     emit16(cg, 0x7000);  /* MOVEQ #0,D0 */
                     /* .done */
