@@ -255,11 +255,62 @@ Option B (Phase 3 — real compiled SYSTEM.CD_PROFILE driver).
 - `ldr_movemultiple` comment documents the silent-drop behavior and
   the P111 blocker.
 
-**Next blocker → P111 (bootspace-page reservation)**: need an
-emulator-side allocator that gives `GET_BOOTSPACE` callers physical
-RAM pages that are NOT simultaneously mapped into the kernel's
-logical address space. Once the MMU-write fix lands driver bytes
-without kernel-data corruption:
+**Next blocker → P111 (GetFree returns kernel-globals pages)**:
+instrumented MMU for the 3 driver-load destinations — all land in
+MMU segment 102 (`sysglobmmu`, per MMPRIM.TEXT:79 — "mmu used to
+map sysglobal data segment"). Segment 102 config at time of load:
+SOR=$3DC (phys base $7B800), SLR=$700. So logical $CCCA08 → phys
+$88208, $CC9408 → $84C08, $CC5E08 → $81608. Kernel A5=$CC6FE0
+maps to phys $827E0 through the SAME segment, so A5-relative
+kernel globals cover roughly phys $7B800..$8xxxx — overlapping
+all three driver-load physical destinations. Driver bytes
+overwrite kernel globals when writes actually land.
+
+Root cause: our compiled `MM4.TEXT:GetFree` is allocating pages
+from the LOW end of the free chunk instead of the HIGH end (Apple
+comment: "Allocate the given number of pages from the high end of
+freespace"). `page_got = $81608 / 512 = 1035` — low page — while
+kernel globals already occupy pages up to ~1060. The memory-
+manager free-list (built by MM_INIT / MAKE_FREE) is either (a) set
+up with the free-list tail pointing at a LOW free chunk that the
+kernel didn't correctly reserve, or (b) our codegen for one of
+GetFree/TAKE_FREE/MAKE_FREE/MERGE_FREE has a bug that puts the
+allocator into the wrong region.
+
+There's already HLE infrastructure around this (P78 Signal_sem
+guard + RELSPACE guard, P83 MERGE_FREE guard per
+`feedback_hle_layers_load_bearing.md`) — the memory manager has
+been fragile for a while. Specifically, we need to verify:
+
+1. Kernel's `bothimem` (runtime — set in LOADER.TEXT:381 as
+   `ldbase + ldsize + slot_code`) is correctly marking the end of
+   loader-reserved memory. Our LOADER runs via HLE, so this may
+   be unset or wrong.
+2. `mmrb_addr` (memory manager record block) — is MM_INIT
+   constructing a free-list that correctly excludes kernel
+   globals?
+3. `GetFree`'s `tail_sdb.freechain.bkwd_link` walk — does the
+   last-free segment actually correspond to free high memory?
+
+Once GetFree returns high-memory pages that don't alias kernel
+globals:
+
+  (a) Flip `ldr_movemultiple` to use `lisa_mem_write8` (MMU-
+      translated) so driver bytes land in physical RAM.
+  (b) Flip the P110 reloc scan `#if 0` → `#if 1` at
+      `src/lisa.c:~690`. Rebases ~70 JSR.L/JMP.L/LEA.L/PEA.L
+      targets per driver load.
+  (c) Relax the CALLDRIVER bypass guard so `fnctn=1` (dinit) with
+      user-RAM `entry_pt` passes through to the real compiled driver.
+  (d) `dinit` delegates to `USE_HDISK + CALL_HDISK` which re-enters
+      CALLDRIVER for the HDISK config (entry_pt 0 → secondary call
+      still HLE'd successfully).
+  (e) `hdinit` on the outer driver populates `ext_diskconfig` natively
+      and retires our MDDF_IO + dcontrol(20) HLEs.
+
+Alternative faster path: **HLE GET_BOOTSPACE** to return pages
+reserved by the emulator, bypassing the compiled GetFree entirely.
+Layered HLE that retires when the memory manager is debugged.
 
   (a) Flip the P110 reloc scan `#if 0` → `#if 1`.
   (b) Relax the CALLDRIVER bypass guard so `fnctn=1` (dinit) with a

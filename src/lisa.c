@@ -672,6 +672,22 @@ bool lisa_hle_enter_loader(m68k_t *cpu) {
         case 5: { /* call_move = LD_MOVEMULTIPLE */
             uint32_t count = lisa_mem_read32(&lisa->mem, params_ptr + 16);
             uint32_t dest  = lisa_mem_read32(&lisa->mem, params_ptr + 4);
+            /* P111 diag: for driver loads, show the MMU segment state for
+             * dest — phys translation, SOR, SLR, changed flag. Tells us
+             * whether seg 102 (for $CC____ destinations) is configured
+             * and where its physical backing lives. */
+            if (cd_profile_open) {
+                int seg = (dest >> 17) & 0x7F;
+                int ctx = lisa->mem.current_context;
+                mmu_segment_t *s = &lisa->mem.segments[ctx][seg];
+                uint32_t phys_base = ((uint32_t)s->sor << 9);
+                uint32_t phys_dest = phys_base + (dest & 0x1FFFF);
+                fprintf(stderr,
+                        "P111 MMU: dest=$%06X seg=%d ctx=%d SOR=$%03X SLR=$%03X "
+                        "chg=$%X phys_base=$%06X phys_dest=$%06X RAM_SIZE=$%X\n",
+                        dest, seg, ctx, s->sor, s->slr, s->changed,
+                        phys_base, phys_dest, LISA_RAM_SIZE);
+            }
             ldr_movemultiple(lisa, (int32_t)count, dest);
             if (log)
                 fprintf(stderr, "HLE ENTER_LOADER call_move(%u bytes -> $%06X)\n",
