@@ -3157,6 +3157,208 @@ static bool hle_handle_mddf_io(lisa_t *lisa, m68k_t *cpu) {
     return true;
 }
 
+/* P108: shared helper — translate an absolute fs-page to a physical disk
+ * block on our ProFile image using ldr_fs.geo_firstblock (MDDF's
+ * geography.firstblock; falls back to fs_block0, the disk block where
+ * the MDDF itself lives). On our cross-compiled images these are equal
+ * (BOOT_TRACK_BLOCKS = 64). On real Lisa images they may differ
+ * (e.g. Twiggy-converted images: MDDF at block 46, firstblock=30). */
+static uint32_t p108_page_to_block(int32_t page) {
+    int32_t block0 = ldr_fs.geo_firstblock;
+    if (block0 <= 0 || block0 > ldr_fs.fs_block0) block0 = ldr_fs.fs_block0;
+    return (uint32_t)(block0 + page);
+}
+
+/* P108: HLE psio. Bypasses the psio → lisaio → UltraIO chain, which
+ * fails at UltraIO with E_IO_MODE_BAD(803) because ext_diskconfig isn't
+ * populated without a compiled SYSTEM.CD_PROFILE driver.
+ *
+ * Callers on the mount path: BitMap_IO (at sfile=2, page=bitmap_addr).
+ * MDDF_IO also calls psio but is intercepted earlier at its own HLE.
+ *
+ * Signature (Pascal caller-clean):
+ *   procedure psio( var ecode   : integer;  [SP+4]   4 bytes (ptr)
+ *                       device  : integer;  [SP+8]   2
+ *                       sfile   : integer;  [SP+10]  2
+ *                       page_no : longint;  [SP+12]  4
+ *                       addrBuf : absptr;   [SP+16]  4
+ *                       nbytes  : longint;  [SP+20]  4
+ *                       op      : ioop );   [SP+24]  2
+ *
+ * page_no is the absolute fs-page within the volume (not sfile-relative),
+ * so physical_block = geo_firstblock + page_no regardless of sfile. */
+__attribute__((unused))
+static bool hle_handle_psio(lisa_t *lisa, m68k_t *cpu) {
+    uint32_t sp = cpu->a[7] & 0xFFFFFF;
+    uint32_t ret_addr   = cpu_read32(cpu, sp + 0);
+    uint32_t ecode_ptr  = cpu_read32(cpu, sp + 4);
+    int16_t  device     = (int16_t)cpu_read16(cpu, sp + 8);
+    int16_t  sfile      = (int16_t)cpu_read16(cpu, sp + 10);
+    int32_t  page_no    = (int32_t)cpu_read32(cpu, sp + 12);
+    uint32_t addr_buf   = cpu_read32(cpu, sp + 16);
+    int32_t  nbytes     = (int32_t)cpu_read32(cpu, sp + 20);
+    int16_t  op         = (int16_t)cpu_read16(cpu, sp + 24);
+    bool read_op = (op == 0);
+
+    DBGSTATIC(int, psio_trace, 0);
+    if (psio_trace < 8) {
+        psio_trace++;
+        fprintf(stderr, "HLE psio: %s dev=%d sfile=%d page=%d addr=$%06X nbytes=%d\n",
+                read_op ? "READ" : "WRITE", device, sfile,
+                (int)page_no, addr_buf, (int)nbytes);
+    }
+
+    int16_t error = 0;
+    if (!lisa->profile.mounted || nbytes < 0 || page_no < 0) {
+        error = 654;
+    } else if (nbytes > 0) {
+        if (!ldr_fs.initialized) ldr_fs_init(lisa);
+        int32_t data_sz = (ldr_fs.data_size > 0 && ldr_fs.data_size <= 512)
+                          ? ldr_fs.data_size : 512;
+        int32_t nfull  = nbytes / data_sz;
+        int32_t extra  = nbytes % data_sz;
+        int32_t bytes_done = 0;
+        uint8_t blk_data[PROFILE_DATA_SIZE];
+        for (int32_t i = 0; i < nfull && error == 0; i++) {
+            uint32_t pblk = p108_page_to_block(page_no + i);
+            if (read_op) {
+                if (hle_read_block(lisa, pblk, blk_data, NULL) != 0) {
+                    error = 654; break;
+                }
+                for (int32_t b = 0; b < data_sz; b++)
+                    cpu->write8(mask_24(addr_buf + bytes_done + b), blk_data[b]);
+            } else {
+                for (int32_t b = 0; b < data_sz; b++)
+                    blk_data[b] = cpu->read8(mask_24(addr_buf + bytes_done + b));
+                if (hle_write_block(lisa, pblk, blk_data, NULL) != 0) {
+                    error = 654; break;
+                }
+            }
+            bytes_done += data_sz;
+        }
+        if (error == 0 && extra > 0) {
+            uint32_t pblk = p108_page_to_block(page_no + nfull);
+            /* Read-modify-write so we preserve trailing bytes on partial writes. */
+            if (hle_read_block(lisa, pblk, blk_data, NULL) != 0) {
+                error = 654;
+            } else if (read_op) {
+                for (int32_t b = 0; b < extra; b++)
+                    cpu->write8(mask_24(addr_buf + bytes_done + b), blk_data[b]);
+            } else {
+                for (int32_t b = 0; b < extra; b++)
+                    blk_data[b] = cpu->read8(mask_24(addr_buf + bytes_done + b));
+                if (hle_write_block(lisa, pblk, blk_data, NULL) != 0) error = 654;
+            }
+        }
+    }
+
+    if (ecode_ptr)
+        cpu->write16(mask_24(ecode_ptr), (uint16_t)error);
+    cpu->a[7] += 4;     /* Pascal caller-clean: pop retAddr, caller cleans args. */
+    cpu->pc = ret_addr;
+    cpu->cycles += 80;
+    return true;
+}
+
+/* P108: HLE vm. Bypasses vm → lisaio → UltraIO. vm is the entry point
+ * for sub-block reads — slist_io, FMAP_IO, HENTRY_IO, pglblio all call
+ * it. Like psio, it fails at UltraIO for want of ext_diskconfig.
+ *
+ * vm treats each disk page as [24-byte pagelabel | 512-byte data]. Our
+ * on-disk tag stores the first 20 bytes of the pagelabel (fileid,
+ * abspage, relpage, fwdlink); the trailing 4 bytes (bkwdlink) are
+ * synthesized as zero on read. Reads that span the 24-byte boundary
+ * concatenate label + data transparently.
+ *
+ * Signature (Pascal caller-clean):
+ *   procedure VM( var ecode : error;    [SP+4]   4
+ *                 device  : integer;    [SP+8]   2
+ *                 page    : longint;    [SP+10]  4
+ *                 offset  : integer;    [SP+14]  2
+ *                 address : absptr;     [SP+16]  4
+ *                 length  : integer;    [SP+20]  2
+ *                 op      : ioop );     [SP+22]  2
+ */
+#define P108_PAGELABEL_SIZE 24
+__attribute__((unused))
+static bool hle_handle_vm(lisa_t *lisa, m68k_t *cpu) {
+    uint32_t sp = cpu->a[7] & 0xFFFFFF;
+    uint32_t ret_addr  = cpu_read32(cpu, sp + 0);
+    uint32_t ecode_ptr = cpu_read32(cpu, sp + 4);
+    int16_t  device    = (int16_t)cpu_read16(cpu, sp + 8);
+    int32_t  page      = (int32_t)cpu_read32(cpu, sp + 10);
+    int16_t  offset    = (int16_t)cpu_read16(cpu, sp + 14);
+    uint32_t address   = cpu_read32(cpu, sp + 16);
+    int16_t  length    = (int16_t)cpu_read16(cpu, sp + 20);
+    int16_t  op        = (int16_t)cpu_read16(cpu, sp + 22);
+    bool read_op = (op == 0);
+
+    DBGSTATIC(int, vm_trace, 0);
+    if (vm_trace < 40) {
+        vm_trace++;
+        fprintf(stderr, "HLE vm: %s dev=%d page=%d off=%d addr=$%06X len=%d\n",
+                read_op ? "READ" : "WRITE", device, (int)page, offset,
+                address, length);
+    }
+
+    int16_t error = 0;
+    if (!lisa->profile.mounted || length < 0 || offset < 0 || page < 0) {
+        error = 654;
+    } else if (length > 0) {
+        if (!ldr_fs.initialized) ldr_fs_init(lisa);
+        uint32_t pblk = p108_page_to_block(page);
+        uint8_t blk_data[PROFILE_DATA_SIZE];
+        uint8_t tag_buf[PROFILE_TAG_SIZE];
+        if (hle_read_block(lisa, pblk, blk_data, tag_buf) != 0) {
+            error = 654;
+        } else {
+            /* Build a 24-byte logical pagelabel from our 20-byte on-disk tag. */
+            uint8_t pgl[P108_PAGELABEL_SIZE] = {0};
+            memcpy(pgl, tag_buf, PROFILE_TAG_SIZE);
+
+            if (read_op) {
+                for (int32_t i = 0; i < length; i++) {
+                    int32_t off_i = offset + i;
+                    uint8_t val = 0;
+                    if (off_i < P108_PAGELABEL_SIZE)
+                        val = pgl[off_i];
+                    else if (off_i < P108_PAGELABEL_SIZE + PROFILE_DATA_SIZE)
+                        val = blk_data[off_i - P108_PAGELABEL_SIZE];
+                    cpu->write8(mask_24(address + i), val);
+                }
+            } else {
+                bool touched_data = false, touched_tag = false;
+                for (int32_t i = 0; i < length; i++) {
+                    int32_t off_i = offset + i;
+                    uint8_t val = cpu->read8(mask_24(address + i));
+                    if (off_i < P108_PAGELABEL_SIZE) {
+                        pgl[off_i] = val;
+                        touched_tag = true;
+                    } else if (off_i < P108_PAGELABEL_SIZE + PROFILE_DATA_SIZE) {
+                        blk_data[off_i - P108_PAGELABEL_SIZE] = val;
+                        touched_data = true;
+                    }
+                }
+                /* Propagate changes back to on-disk tag (first 20 of pgl). */
+                if (touched_tag) memcpy(tag_buf, pgl, PROFILE_TAG_SIZE);
+                if (touched_tag || touched_data) {
+                    if (hle_write_block(lisa, pblk,
+                                         touched_data ? blk_data : NULL,
+                                         touched_tag  ? tag_buf  : NULL) != 0)
+                        error = 654;
+                }
+            }
+        }
+    }
+
+    if (ecode_ptr)
+        cpu->write16(mask_24(ecode_ptr), (uint16_t)error);
+    cpu->a[7] += 4;
+    cpu->pc = ret_addr;
+    cpu->cycles += 80;
+    return true;
+}
+
 /* Handle SYSTEM_ERROR intercept.
  * SYSTEM_ERROR(integer) is called as: procedure SYSTEM_ERROR(err: integer).
  * Lisa Pascal calling convention: parameter is on stack above return address.
@@ -3534,18 +3736,48 @@ bool lisa_hle_intercept(lisa_t *lisa, m68k_t *cpu) {
     /* P104 scaffold: intercept MDDF_IO directly and read/write the
      * MDDF block from/to our ProFile image. Sits above the
      * psio → LisaIO → UltraIO chain which needs a real ext_diskconfig
-     * (not populated without a compiled SYSTEM.CD_PROFILE). */
+     * (not populated without a compiled SYSTEM.CD_PROFILE).
+     *
+     * P108: also intercept psio and vm. psio covers BitMap_IO (and
+     * would cover MDDF_IO if we didn't catch it a level up). vm covers
+     * slist_io, FMAP_IO, HENTRY_IO, pglblio — the sub-block reads that
+     * follow a successful mount. Together they let real_mount and
+     * fs_mount complete without a real compiled SYSTEM.CD_PROFILE. */
     {
         extern uint32_t boot_progress_lookup(const char *name);
-        static uint32_t mddf_io_addr = 0;
-        static int mddf_probe_gen = -1;
         extern int g_emu_generation;
-        if (mddf_probe_gen != g_emu_generation) {
-            mddf_probe_gen = g_emu_generation;
+        static uint32_t mddf_io_addr = 0;
+        static uint32_t psio_addr    = 0;
+        static uint32_t vm_addr      = 0;
+        static int      fsio_probe_gen = -1;
+        if (fsio_probe_gen != g_emu_generation) {
+            fsio_probe_gen = g_emu_generation;
             mddf_io_addr = boot_progress_lookup("MDDF_IO");
+            psio_addr    = boot_progress_lookup("psio");
+            vm_addr      = boot_progress_lookup("VM");
+            if (!vm_addr) vm_addr = boot_progress_lookup("vm");
         }
         if (mddf_io_addr && pc == mddf_io_addr)
             return hle_handle_mddf_io(lisa, cpu);
+        /* P108 (unshipped): psio and vm HLEs compile but are gated off.
+         * Together they carry real_mount and fs_mount past bitmap_io /
+         * slist_io, but the downstream open_sfile → wait_sem / cleanup
+         * path then wanders into low-PC exception cycling without
+         * reaching SYS_PROC_INIT. Even psio alone perturbs the 10707
+         * unwind target (fs_mount now fails deeper, mutating more
+         * state before the suppression fires, and the resulting
+         * unwind PC lands short of SYS_PROC_INIT). Re-enable in a
+         * later session alongside either (a) a richer HLE that covers
+         * open_sfile / wait_sem properly, or (b) Phase 3 proper
+         * (compiled SYSTEM.CD_PROFILE populates ext_diskconfig so the
+         * real psio/vm chain works through UltraIO). */
+        (void)psio_addr; (void)vm_addr;
+        #if 0
+        if (psio_addr && pc == psio_addr)
+            return hle_handle_psio(lisa, cpu);
+        if (vm_addr && pc == vm_addr)
+            return hle_handle_vm(lisa, cpu);
+        #endif
     }
 
     return false;

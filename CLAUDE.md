@@ -189,40 +189,50 @@ commit as the real replacement.
 | 11 | **Shell (APDM)** | full desktop | Not started |
 | 12 | **Apps** | LisaWrite, LisaCalc, etc. | Not started |
 
-## Current Status (2026-04-19 post-P107)
+## Current Status (2026-04-19 post-P108)
 
 **Milestones**: **23/27** kernel checkpoints reached natively, last
-checkpoint `SYS_PROC_INIT`. P107 landed: a codegen fix for
-`with rec.fieldptr^ do` — the missing AST_WITH branch for
-`AST_DEREF(AST_FIELD_ACCESS(...))`. Root cause of the E1_SENTRY_BAD
-we tracked post-P106: fs_mount's `with ptrDCB^.MDDFdata^ do` couldn't
-resolve `rootsnum`, so open_sfile was called with snum=0 (literal
-MOVE.W #0,D0) instead of MDDFdata.rootsnum(=3); sfile 0's s_entry is
-zeroed on our disk image, firing 871.
+checkpoint `SYS_PROC_INIT`. P108 landed a structural codegen fix —
+integer-to-longint arg widening now emits `EXT.L D0` before the
+`MOVE.L D0,-(SP)` push when the caller's expression produces a
+narrow (2-byte) value but the callee's param is 4 bytes. Prior to
+the fix, BitMap_IO's `psio(..., bitmap_bytes, op)` push looked like
+`MOVE.W (A0),D0 ; MOVE.L D0,-(SP)` — the MOVE.W only touches the
+low word, so the pointer register's leftover high word got pushed
+as the top 16 bits of nbytes. `bitmap_bytes = $04B8 = 1208` was
+pushed as `$00CC04B8 = 13,370,552`, and every narrow field passed
+to a longint param carried the same 16 bits of stack garbage.
+Caller-side counterpart to P91's callee-side fix.
 
-Post-P107: fs_mount reads rootsnum correctly. The surviving 10707
-now fires from `real_mount → bitmap_io → psio → LisaIO → UltraIO →
-E_IO_MODE_BAD(803)` — exactly the predicted next blocker. D2=$323 at
-10707 entry confirms 803 not 871.
+P108 fix lives in `src/toolchain/pascal_codegen.c` at the
+AST_FUNC_CALL arg-push loops in `gen_expression` — both the
+callee-clean (LTR) and caller-clean (RTL) branches. Conditional:
+emit EXT.L only when `expr_size(arg) <= 2 && !rhs_has_wide_operand`.
+Skips pointer returns, longint/pointer globals, and subexpressions
+that already produced a 32-bit result.
 
-**P107 commit** `97ac566`: AST_WITH handler in
-`src/toolchain/pascal_codegen.c` gained an `AST_FIELD_ACCESS` branch
-inside the outer `AST_DEREF` case. Uses `lvalue_field_info(parent,
-field_name)` to resolve the field type, then derefs its pointer base
-to get the WITH record type. Mirrors the P105 #1 fix for
-`AST_DEREF(AST_IDENT_EXPR)` but handles the parent-is-field case
-instead.
+P108 also added — then gated off — HLEs for `psio` and `vm` at
+`src/lisa.c` (between `hle_handle_mddf_io` and `hle_handle_system_error`).
+With psio+vm active, bitmap_io succeeds, real_mount completes, the
+second MDDF_IO write runs, and fs_mount advances into open_sfile —
+but wait_sem / slist_io / the cleanup path then wander into low-PC
+exception cycling. Even psio alone perturbs the 10707 unwind
+target: real_mount's failure shifts from bitmap_io to deeper in
+fs_mount, state mutates more before 10707 fires, and the unwind
+lands short of SYS_PROC_INIT (22/27). The gated HLEs stay
+in-source behind `#if 0` in the dispatcher (with
+`__attribute__((unused))` on the handlers to silence warnings) for
+pickup next session alongside either (a) a richer HLE covering
+open_sfile / wait_sem flow, or (b) Phase 3 proper (compiled
+SYSTEM.CD_PROFILE populating ext_diskconfig so the real psio/vm
+chain works through UltraIO).
 
-**Next blocker (confirmed)**: bitmap_io's psio chain. Two paths
-forward (see `NEXT_SESSION.md` for full detail):
-- **P108 option A** — psio-level HLE (~100 LOC, subsumes BITMAP_IO,
-  SLIST_IO, FMAP_IO, HENTRY_IO — all the fs-layer I/O).
-- **P108 option B** — Phase 3 proper: compile SYSTEM.CD_PROFILE,
-  populate ext_diskconfig natively.
-
-Recommendation: A first. Backed-out prototypes of individual BITMAP_IO
-and SLIST_IO HLEs this session showed that partial coverage cascades
-to downstream stack corruption — psio-level is the right scope.
+**Next blocker (unchanged from P107)**: bitmap_io's psio chain.
+The P108 codegen fix doesn't advance the milestone count — it's
+latent correctness for every integer→longint arg widening going
+forward. The actual boot state is identical to post-P107: same
+MDDF_IO READ + dcontrol(20) + 10707-at-real_mount + unwind to
+BOOT_IO_INIT caller → SYS_PROC_INIT.
 
 ## Previous Status (2026-04-19 post-P106)
 

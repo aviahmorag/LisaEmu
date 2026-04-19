@@ -3118,6 +3118,16 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                         emit16(cg, 0x3F00);  /* MOVE.W D0,-(SP) */
                     } else {
                         gen_expression(cg, node->children[i]);
+                        /* P108: widen narrow-typed expressions (e.g. a
+                         * 2-byte integer field) before pushing as a 4-byte
+                         * longint arg. Without EXT.L the high word of D0
+                         * holds whatever was there before the MOVE.W load
+                         * (often the base pointer used to reach the field),
+                         * and the callee reads garbage. Skip for expressions
+                         * that naturally produce a full 32-bit result. */
+                        if (expr_size(cg, node->children[i]) <= 2 &&
+                            !rhs_has_wide_operand(cg, node->children[i]))
+                            emit16(cg, 0x48C0);  /* EXT.L D0 */
                         emit16(cg, 0x2F00);  /* MOVE.L D0,-(SP) */
                     }
                 }
@@ -3134,6 +3144,10 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                         emit16(cg, 0x3F00);  /* MOVE.W D0,-(SP) */
                     } else {
                         gen_expression(cg, node->children[i]);
+                        /* P108: see callee-clean branch above. */
+                        if (expr_size(cg, node->children[i]) <= 2 &&
+                            !rhs_has_wide_operand(cg, node->children[i]))
+                            emit16(cg, 0x48C0);  /* EXT.L D0 */
                         emit16(cg, 0x2F00);  /* MOVE.L D0,-(SP) */
                     }
                 }
