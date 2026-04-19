@@ -123,6 +123,14 @@ typedef struct {
         bool     boot_config_done; /* Have we injected boot device config? */
         int      reads;            /* Stats: blocks read */
         int      writes;           /* Stats: blocks written */
+        /* P115: post-driver SP fixup — kernel CALLDRIVER expects callee-
+         * clean for driver's 4-byte parameters push, but our Pascal
+         * codegen is caller-clean. Set when dinit passthrough fires;
+         * the main loop adjusts SP += 4 on first PC return to kernel
+         * (after PRODRIVER's RTS) so kernel's MOVE.W (SP)+,D0 reads
+         * the right slot. Cleared after fix-up. */
+        bool     p115_sp_fixup_pending;
+        uint32_t p115_post_jsr_pc; /* kernel PC right after JSR (A0) */
     } hle;
 } lisa_t;
 

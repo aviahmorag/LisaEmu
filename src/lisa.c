@@ -3060,6 +3060,16 @@ static int hle_write_block(lisa_t *lisa, uint32_t block_num,
     return 0;
 }
 
+/* P115: tiny accessors so m68k.c can check/clear the passthrough flag
+ * without pulling in the full lisa_t definition. */
+bool lisa_hle_p115_fixup_pending(void) {
+    return g_lisa && g_lisa->hle.p115_sp_fixup_pending;
+}
+
+void lisa_hle_p115_clear(void) {
+    if (g_lisa) g_lisa->hle.p115_sp_fixup_pending = false;
+}
+
 static bool hle_handle_calldriver(lisa_t *lisa, m68k_t *cpu) {
     uint32_t ret_addr   = cpu_read32(cpu, cpu->a[7]);
     uint32_t params_ptr = cpu_read32(cpu, cpu->a[7] + 4);
@@ -3129,7 +3139,7 @@ static bool hle_handle_calldriver(lisa_t *lisa, m68k_t *cpu) {
      *       fixes up on return (bigger HLE, retires with full real-
      *       driver integration).
      * Tracked as P115. */
-#if 0
+#if 1
     if (config_ptr != 0) {
         uint32_t entry_pt = cpu_read32(cpu, config_ptr);
         bool entry_is_real_ram =
@@ -3137,13 +3147,22 @@ static bool hle_handle_calldriver(lisa_t *lisa, m68k_t *cpu) {
             (lisa->hle.badcall == 0 || entry_pt != lisa->hle.badcall) &&
             entry_pt != 0x000003F0;
         if (entry_is_real_ram && fnctn_code == HLE_DINIT) {
-            DBGSTATIC(int, p112_pass, 0);
-            if (p112_pass < 10) {
-                p112_pass++;
+            DBGSTATIC(int, p115_pass, 0);
+            if (p115_pass < 10) {
+                p115_pass++;
                 fprintf(stderr,
-                        "P112: CALLDRIVER(dinit) -> real driver entry=$%06X "
+                        "P115: CALLDRIVER(dinit) -> real driver entry=$%06X "
                         "config=$%06X\n", entry_pt, config_ptr);
             }
+            /* P115: arm the SP fix-up. Kernel CALLDRIVER's JSR (A0) is
+             * 2 bytes; MOVE.W (SP)+,D0 follows immediately. We don't
+             * know the exact post-JSR PC yet without disassembling the
+             * kernel CALLDRIVER body, so set it based on the driver
+             * entry transition: m68k main loop compares prev_drv_pc
+             * (= JSR address) and bumps SP on the first return-to-
+             * kernel when this flag is set. */
+            lisa->hle.p115_sp_fixup_pending = true;
+            lisa->hle.p115_post_jsr_pc = 0;  /* filled in by main loop */
             return false;
         }
     }

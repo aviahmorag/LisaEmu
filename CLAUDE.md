@@ -189,7 +189,93 @@ commit as the real replacement.
 | 11 | **Shell (APDM)** | full desktop | Not started |
 | 12 | **Apps** | LisaWrite, LisaCalc, etc. | Not started |
 
-## Current Status (2026-04-19 post-P114 ABI finding)
+## Current Status (2026-04-19 post-P115 — compiled driver genuinely runs)
+
+**Milestones**: **23/27** SYS_PROC_INIT (stable). The compiled
+SYSTEM.CD_PROFILE now executes NATIVELY for the full INIT_BOOT_CDS
+dinit cascade — three dispatches, one per boot-device level. All
+three return cleanly to the kernel. The post-SYS_PROC_INIT 10707
+suppression unwind still fires (unchanged from P108 baseline), so
+the milestone count doesn't advance yet; MDDF_IO HLE still scaffolds
+the real-mount path. But Phase 3 is genuinely operational.
+
+**P115 shipped:**
+
+1. **CALLDRIVER(dinit) pass-through**
+   (`src/lisa.c:hle_handle_calldriver`, now `#if 1`). When dinit is
+   called with a real user-RAM entry_pt, our HLE arms
+   `p115_sp_fixup_pending` in `lisa->hle` and returns false, letting
+   the kernel CALLDRIVER body run. Kernel pushes its function-result
+   slot (2B) + parameters ptr (4B), JSRs to the compiled driver's
+   DRIVERASM entry at `$207408`.
+
+2. **SP fix-up at $749C2** (`src/m68k.c`, inside the CPU main loop).
+   Every time PC reaches kernel's `MOVE.W (SP)+,D0` (post-JSR
+   unwind) while the passthrough is armed, `SP += 4` compensates
+   for our Pascal codegen's caller-clean RTS (Apple's asm CALLDRIVER
+   expects callee-clean from the driver). This fires exactly twice
+   per dinit: once for the nested fnctn=13 (HDINIT) path, once for
+   the outer return.
+
+3. **Tiny accessors** (`src/lisa.c`):
+   `lisa_hle_p115_fixup_pending()` / `lisa_hle_p115_clear()` — so
+   `m68k.c` can check / clear the passthrough flag without pulling
+   in the full `lisa_t` type.
+
+**Observed boot trace:**
+```
+P112 HLE GET_BOOTSPACE -> $200000 / $203A00 / $207400
+P110: 115 sites rebased × 3 drivers
+for each of 3 devices:
+  P115: CALLDRIVER(dinit) -> real driver entry=$207408 config=$CCBxxx
+  DRV-ENTER  $207408              (entry, JMP DRIVER)
+  DRV-EXIT   $CCB6B0               (USE_HDISK trampoline)
+  DRV-ENTER  $2079E8               (USE_HDISK RTS -> driver)
+  DRV-EXIT   $CCB6B6               (CALL_HDISK trampoline)
+  HLE CALLDRIVER fnctn=13 (HDINIT) -- HLE'd
+  P115 SP fix-up @ $749C2         (kernel CALLDRIVER post-JSR)
+  DRV-ENTER  $207A06               (driver back from HDINIT)
+  P115 SP fix-up @ $749C2         (kernel CALLDRIVER post-JSR, outer)
+  DRV-EXIT   $749C2                (PRODRIVER final RTS, clean)
+  HLE CALLDRIVER fnctn=12 (DATTACH) -- no-op HLE
+HLE CALLDRIVER fnctn=7 (DCONTROL dcode=20) -- health-check HLE
+10707 suppression -> SYS_PROC_INIT 23/27 (unchanged baseline tail)
+```
+
+**What this unlocks**: The boot is now architecturally ready to
+retire the MDDF_IO HLE scaffold. The compiled SYSTEM.CD_PROFILE is
+running its real Pascal/asm code, calling into kernel via the
+DRIVRJT trampolines, going through HDINIT for hardware bring-up.
+The remaining bits (populating `ext_diskconfig` natively so MDDF_IO
+can use UltraIO instead of our P104 HLE) are downstream of what
+P115 unblocked.
+
+**Next blocker → P116 (retire MDDF_IO HLE)**: with dinit running
+on the real driver, check whether `ext_diskconfig.blockstructured`
+and `.fs_strt_blok` get populated natively. If yes, try removing
+the MDDF_IO HLE and letting psio→LisaIO→UltraIO do the mount read.
+If hdinit's ext_diskconfig path still fails (perhaps because the
+kernel's compiled memory manager has its own issues around the
+bootspace we allocated via HLE GET_BOOTSPACE), that'd expose the
+next layer. Concrete steps:
+
+1. Dump `configinfo[bootdev]^.ext_diskconfig` after INIT_BOOT_CDS
+   completes — is it populated?
+2. Try disabling the MDDF_IO HLE (`src/lisa.c:hle_handle_mddf_io`
+   return) and see what happens.
+3. If real_mount now succeeds, milestone count advances past the
+   current 10707 unwind target.
+
+Full infrastructure active (all `#if 1`, all HLE additions):
+- HLE GET_BOOTSPACE ($200000+ pages in MMU seg 16 pass-through).
+- ldr_movemultiple MMU-translated writes.
+- P110 reloc scan (115 sites × 3 drivers).
+- CALLDRIVER dinit pass-through.
+- P115 SP fix-up at $749C2.
+
+Baseline: 23/27 SYS_PROC_INIT clean. Audit: 28013 relocs, 0 unresolved.
+
+## Previous Status (2026-04-19 post-P114 ABI finding)
 
 **Milestones**: **23/27** SYS_PROC_INIT (unchanged). P114 completed
 the crash-root-cause hunt from P113. The finding is a real structural

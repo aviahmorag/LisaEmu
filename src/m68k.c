@@ -2954,13 +2954,34 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 stack_trip_fired = 0;
                 stack_trip_gen = g_emu_generation;
             }
-            /* P113/P114: log driver-range PC transitions + dump kernel
-             * dispatch stub bytes at first DRV-EXIT. */
+            /* P113/P114/P115: log driver-range PC transitions + dump
+             * kernel dispatch stub bytes at first DRV-EXIT + apply the
+             * SP fix-up when dinit passthrough is active. */
             {
+                extern bool lisa_hle_p115_fixup_pending(void);
+                extern void lisa_hle_p115_clear(void);
                 static uint32_t prev_drv_pc = 0;
                 static bool dumped_ccb = false;
                 bool cur_drv = (cpu->pc >= 0x200000 && cpu->pc < 0x210000);
                 bool prev_drv = (prev_drv_pc >= 0x200000 && prev_drv_pc < 0x210000);
+                /* P115: kernel CALLDRIVER post-JSR is at $749C2
+                 * (MOVE.W (SP)+,D0). Our caller-clean Pascal driver
+                 * leaves SP 4B too low for Apple's callee-clean
+                 * expectation. Fire SP+=4 each time PC reaches $749C2
+                 * while the passthrough is armed — the dinit dispatch
+                 * involves at least two $749C2 visits (one per nested
+                 * PRODRIVER call via fall-through from kernel
+                 * CALL_HDISK). Flag clears once `dinit_seen` completes
+                 * the outer dispatch, so post-boot non-driver calls
+                 * aren't affected. */
+                if (lisa_hle_p115_fixup_pending() && cpu->pc == 0x000749C2) {
+                    DBGSTATIC(int, p115_fix_n, 0);
+                    p115_fix_n++;
+                    fprintf(stderr,
+                            "P115 SP fix-up #%d @ $749C2: SP=$%08X -> $%08X (A7 was)\n",
+                            p115_fix_n, cpu->a[7], cpu->a[7] + 4);
+                    cpu->a[7] += 4;
+                }
                 if (cur_drv != prev_drv) {
                     DBGSTATIC(int, drv_log, 0);
                     if (drv_log++ < 20)
