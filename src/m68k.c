@@ -677,8 +677,19 @@ static void illegal_instruction(m68k_t *cpu) {
     /* Track which opcode groups trigger illegal instruction */
     int group = (cpu->ir >> 12) & 0xF;
     if (illegal_opcode_histogram[group]++ < 5) {
+        uint32_t pc = cpu->pc - 2;
         fprintf(stderr, "ILLEGAL: opcode=$%04X group=%X at PC=$%06X\n",
-                cpu->ir, group, cpu->pc - 2);
+                cpu->ir, group, pc);
+        /* P113 diag: dump 16 bytes around PC and 32 bytes at SP.
+         * Classifies stack-return-to-garbage vs. bad-relocation. */
+        fprintf(stderr, "  bytes @PC-8..PC+8:");
+        for (int i = -8; i < 8; i++)
+            fprintf(stderr, " %02X", cpu->read8((pc + i) & 0xFFFFFF));
+        fprintf(stderr, "\n  stack @SP..SP+32:");
+        for (int i = 0; i < 32; i++)
+            fprintf(stderr, " %02X", cpu->read8((cpu->a[7] + i) & 0xFFFFFF));
+        fprintf(stderr, "\n  D0=$%08X D1=$%08X A0=$%08X A1=$%08X A6=$%08X A7=$%08X\n",
+                cpu->d[0], cpu->d[1], cpu->a[0], cpu->a[1], cpu->a[6], cpu->a[7]);
     }
     /* Per M68000 PRM: illegal-instruction exceptions push the PC of the
      * faulting instruction itself, not PC+2. Rewind so the handler sees
@@ -2931,6 +2942,45 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         }
         pc_ring[pc_ring_idx++ & 255] = cpu->pc;
         g_last_cpu_pc = cpu->pc;
+
+        /* P113: detect PC entering stack region ($CBF___-$CBFFFF) — the
+         * classic "returned to garbage retaddr" signature for our P112
+         * driver-dispatch debug. Dump PC ring once so we can see what
+         * path led to the stack jump. */
+        {
+            static int stack_trip_fired = 0;
+            static int stack_trip_gen = -1;
+            if (stack_trip_gen != g_emu_generation) {
+                stack_trip_fired = 0;
+                stack_trip_gen = g_emu_generation;
+            }
+            /* P113: log driver-range PC transitions to trace dinit dispatch. */
+            {
+                static uint32_t prev_drv_pc = 0;
+                bool cur_drv = (cpu->pc >= 0x200000 && cpu->pc < 0x210000);
+                bool prev_drv = (prev_drv_pc >= 0x200000 && prev_drv_pc < 0x210000);
+                if (cur_drv != prev_drv) {
+                    DBGSTATIC(int, drv_log, 0);
+                    if (drv_log++ < 20)
+                        fprintf(stderr, "P113 DRV-%s: PC=$%08X (prev=$%08X) A6=$%08X A7=$%08X\n",
+                                cur_drv ? "ENTER" : "EXIT", cpu->pc, prev_drv_pc,
+                                cpu->a[6], cpu->a[7]);
+                }
+                prev_drv_pc = cpu->pc;
+            }
+            if (!stack_trip_fired && cpu->pc >= 0x00CBE000 && cpu->pc < 0x00CC0000) {
+                stack_trip_fired = 1;
+                fprintf(stderr, "P113 STACK-JUMP: PC=$%08X A6=$%08X A7=$%08X SR=$%04X\n",
+                        cpu->pc, cpu->a[6], cpu->a[7], cpu->sr);
+                fprintf(stderr, "  PC ring (newest first, 256 entries, driver PCs marked *):\n");
+                for (int k = 0; k < 256; k++) {
+                    int idx = (pc_ring_idx - 1 - k + 256) & 0xFF;
+                    uint32_t rp = pc_ring[idx];
+                    const char *mark = (rp >= 0x200000 && rp < 0x210000) ? " *DRV*" : "";
+                    fprintf(stderr, "    [-%3d] PC=$%08X%s\n", k+1, rp, mark);
+                }
+            }
+        }
 
 
 

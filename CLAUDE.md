@@ -189,7 +189,87 @@ commit as the real replacement.
 | 11 | **Shell (APDM)** | full desktop | Not started |
 | 12 | **Apps** | LisaWrite, LisaCalc, etc. | Not started |
 
-## Current Status (2026-04-19 post-P112)
+## Current Status (2026-04-19 post-P113 diagnostics)
+
+**Milestones**: **23/27** SYS_PROC_INIT (unchanged). P113 was a
+diagnostic slice — instrumented the stack-jump crash (from flipping
+P112's dinit passthrough on) and got the full control-flow picture.
+
+**P113 diagnostics shipped (in `src/m68k.c`):**
+- `illegal_instruction()` now dumps 16 bytes around PC + 32 bytes of
+  stack + D0/D1/A0/A1/A6/A7 on every fault.
+- CPU main loop prints `P113 DRV-ENTER/EXIT` transitions whenever PC
+  crosses in/out of the driver's loaded range (`$200000..$20FFFF`).
+- CPU main loop prints `P113 STACK-JUMP` + a 256-entry PC ring dump
+  (driver PCs marked) on the first PC in `$CBE000..$CC0000`.
+
+**Observed crash path (passthrough on):**
+```
+  P112: CALLDRIVER(dinit) -> real driver entry=$207408 config=$CCB72A
+  P113 DRV-ENTER: PC=$207408 (prev=$749C0) A6=$CBFE4C A7=$CBFE20
+  P113 DRV-EXIT:  PC=$CCB6B0 (prev=$207536) A6=$CBFE1C A7=$CBFDDE
+  P113 DRV-ENTER: PC=$2079E8 (prev=$3BDD6)  A6=$CBFE1C A7=$CBFDE2
+  P113 DRV-EXIT:  PC=$CCB6B6 (prev=$207540) A6=$CBFE1C A7=$CBFDD6
+  HLE CALLDRIVER: fnctn=13 (HDINIT) config=$CCB72A params=$CBFE3E
+  <kernel TRACE runs $681A..$68F2 for ~200 bytes>
+  P113 STACK-JUMP: PC=$CBFE00 A6=$CBFE1E A7=$CBFDE6 SR=$2710
+  ILLEGAL: opcode=$00CB group=0 at PC=$CBFE00
+  bytes @PC-8..PC+8: 00 00 00 00 35 56 44 BE 00 CB 00 1F 00 CB FF FF
+  stack @SP..SP+32: 00 01 00 01 51 86 00 CB FD F2 00 04 00 00 00 03
+                    FE 7B 00 00 00 00 35 56 44 BE 00 CB 00 1F 00 CB
+  D0=$1 D1=$0 A0=$216 A1=$FE3E0000 A6=$CBFE1E A7=$CBFDE6
+```
+
+**Interpretation:**
+- Driver actually executes — first entry at `$207408`, then its
+  DRIVERASM trampoline at `$207536` (offset $12E into driver) does
+  `JMP 0(A0)` where A0 was loaded via `MOVE.L DRIVRJT,A0` = whatever
+  is at absolute $210.
+- Trampoline targets are `$CCB6B0` and `$CCB6B6` — kernel jumptable
+  slots in MMU seg 102. So kernel HAS populated DRIVRJT with code at
+  those addresses (first two slots = CANCEL_REQ and ENQUEUE dispatch
+  stubs).
+- Kernel runs those stubs, eventually reaches TRACE ($6806..$68F3),
+  runs ~200 bytes linearly, then RTS returns to the stack at $CBFE00.
+- `A0=$216` at crash = DRIVRJT+6 (ENQUEUE slot address). Suggests
+  something near the end of the TRACE return chain did
+  `LEA 6($210),A0` or equivalent.
+- Stack pattern `$00010001 $518600CB $FDF20004 ...` shows data left
+  over from a Pascal LINK frame or earlier push sequence that wasn't
+  cleaned up.
+
+**P113 gated state**: dinit passthrough reverted to `#if 0` to keep
+baseline at 23/27. Re-enable to repro the above trace in one run.
+
+**Next blocker → P114 (DRIVRJT trampoline frame ABI)**: the
+kernel's CANCEL_REQ / ENQUEUE / etc. dispatch stubs at $CCB6B0+ are
+executing but their return unwinds to garbage. Most likely causes:
+1. Our JSR→driver→JMP-through-trampoline→kernel-stub chain pushes
+   extra frames that the kernel's RTS chain doesn't fully pop.
+2. The kernel dispatch stubs expect certain registers or stack
+   state (e.g., A5 for kernel globals) that the driver's execution
+   disturbed.
+3. The driver called a trampoline whose return was supposed to
+   go back to the driver, but it went back to CALLDRIVER's caller
+   instead (return-address confusion).
+
+Concrete next-session steps:
+1. Dump `$CCB6B0..$CCB700` to see exactly what kernel code is at the
+   jumptable slots (first 40 bytes should be 2-3 dispatch stubs).
+2. Trace PCs through the full driver-to-kernel transition, not just
+   the 30-entry crash window — maybe bump PC ring to 1024.
+3. Check whether the driver's trampoline is supposed to be JSR
+   (push retaddr) or JMP (don't push) — if it was meant to JSR
+   the kernel dispatches but our compiled code emits JMP, that
+   loses the return path.
+4. If it's ABI-deep, consider leaving compiled-driver dispatch
+   off permanently and improving the CALLDRIVER HLE to populate
+   `ext_diskconfig` natively (sidestep the driver entirely).
+
+Baseline clean: `./build/lisaemu --headless Lisa_Source 3000`
+reaches 23/27 SYS_PROC_INIT. 28013 linker relocs. Audit passes.
+
+## Previous Status (2026-04-19 post-P112)
 
 **Milestones**: **23/27** kernel checkpoints reached natively, last
 checkpoint `SYS_PROC_INIT` (unchanged). P112 shipped *all* the

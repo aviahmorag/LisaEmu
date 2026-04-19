@@ -3088,7 +3088,24 @@ static bool hle_handle_calldriver(lisa_t *lisa, m68k_t *cpu) {
      * likely a Pascal function-result (D0 longint vs 2-byte) mismatch,
      * or CALLDRIVER's asm dispatcher expects a different frame shape than
      * what our HLE leaves. Investigate next session. Re-enable this
-     * branch to repro the ILLEGAL trace quickly. */
+     * branch to repro the ILLEGAL trace quickly.
+     *
+     * P113 observations (with passthrough on + all P112 infra active):
+     *   1. DRV-ENTER: $207408 (driver entry) — correct.
+     *   2. DRV runs for ~300 bytes, exits via DRIVRJT trampoline at
+     *      $207536 → $CCB6B0 (kernel jumptable region, MMU seg 102).
+     *   3. DRV re-entered at $2079E8 (different trampoline target),
+     *      exits again via trampoline at $207540 → $CCB6B6.
+     *   4. CALL_HDISK re-enters CALLDRIVER for HDINIT (fnctn=13) — HLE
+     *      returns success.
+     *   5. Kernel then runs 200+ linear bytes of TRACE ($6806..$68F2).
+     *   6. RTS lands in stack at $CBFE00 with ILLEGAL $00CB.
+     * So the driver DOES execute. The crash is somewhere in the kernel
+     * TRACE return path (likely bad stack frame from the DRIVRJT
+     * trampoline convention). Next session: dump $CCB6B0..$CCB6C0 to
+     * see what kernel laid down there as the first dispatch stub, and
+     * trace the TRACE call chain (who called it, what's on the stack
+     * at its RTS). */
 #if 0
     if (config_ptr != 0) {
         uint32_t entry_pt = cpu_read32(cpu, config_ptr);
