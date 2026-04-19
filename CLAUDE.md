@@ -189,7 +189,123 @@ commit as the real replacement.
 | 11 | **Shell (APDM)** | full desktop | Not started |
 | 12 | **Apps** | LisaWrite, LisaCalc, etc. | Not started |
 
-## Current Status (2026-04-19 post-P113 diagnostics)
+## Current Status (2026-04-19 post-P114 ABI finding)
+
+**Milestones**: **23/27** SYS_PROC_INIT (unchanged). P114 completed
+the crash-root-cause hunt from P113. The finding is a real structural
+ABI mismatch between our Pascal codegen and Apple's kernel CALLDRIVER.
+
+**P114 root cause (fully identified):**
+
+Dumped the kernel dispatch stubs at `$CCB6B0` (where driver trampolines
+land via DRIVRJT=$00CCB602):
+```
+  $CCB6B0: 4E F9 00 03 BD AE   JMP.L $0003BDAE   (USE_HDISK impl)
+  $CCB6B6: 4E F9 00 07 49 82   JMP.L $00074982   (CALL_HDISK impl)
+  $CCB6BC: 4E F9 00 03 C2 1A   JMP.L $0003C21A   (OKXFERNEXT impl)
+  $CCB6C2: 4E F9 00 07 0E 94   JMP.L $00070E94
+  $CCB6C8: 4E F9 00 07 67 5E   JMP.L $0007675E
+  $CCB6CE: 4E F9 00 07 67 92   JMP.L $00076792
+  $CCB6D4: 4E F9 00 07 67 BA   JMP.L $000767BA
+```
+
+So the dispatch mechanism is correct: driver's trampoline → DRIVRJT
+offset lookup → kernel dispatch stub → real kernel impl. Kernel's
+code runs. Problem is on the RETURN from the driver.
+
+Cracked open `source-mover.text:636-684` — the real asm CALLDRIVER
+code:
+```asm
+CALLDRIVER
+        MOVE.L  8(SP),D0        ;CONFIG_PTR
+        ...
+        MOVE.L  ENT_PT(A1),D2   ;driver entry point
+        ...
+CD1     MOVEQ   #0,D1
+        MOVE    D1,-(SP)        ;FOR FUNCTION RESULT  (2B)
+        MOVE    INTPAR(A2),D0
+        MOVE    FNCTN_CODE(A2),D1
+        MOVE.L  A2,-(SP)        ;PARAMETERS PASSED ON STACK (4B)
+        MOVE.L  D2,A0
+        JSR     (A0)            ;CALL DRIVER ENTRY
+        MOVE.W  (SP)+,D0        ;POP FUNCTION RESULT (2B)
+CD2     MOVE.L  (SP)+,A1        ;RETURN ADDRESS (4B)
+        ADDQ    #8,SP           ;skip config_ptr + parameters args
+        MOVE.L  (SP)+,A0        ;ERRNUM ADDRESS
+        MOVE.W  D0,(A0)         ;SAVE ERRNUM
+        JMP     (A1)            ;RETURN to original caller
+```
+
+The unwind only works if the DRIVER popped its 4-byte `parameters`
+push before RTS. After driver's standard `UNLK A6; RTS`, SP is 4
+bytes too high:
+
+```
+Stack at line 676 (should be, for Apple's callee-clean driver):
+  SP+0: function result slot (2B)     <- MOVE.W (SP)+,D0 reads this
+  SP+4: retaddr_caller (4B)           <- MOVE.L (SP)+,A1 reads this
+  SP+8: parameters arg, config arg, errnum arg
+
+Stack at line 676 (what our caller-clean driver leaves):
+  SP+0: parameters ptr push (4B)      <- MOVE.W (SP)+,D0 reads HIGH word of ptr
+  SP+4: function result (2B)          <- MOVE.L (SP)+,A1 reads LOW word of ptr + result (garbage)
+  SP+6: retaddr_caller                <- effectively lost
+  ...
+```
+
+So `A1 = garbage`, `JMP (A1)` jumps to stack byte → ILLEGAL $00CB at
+$CBFE00 (stack area). Matches the observed crash exactly.
+
+**P114 findings shipped**:
+- `m68k.c:illegal_instruction` dumps PC bytes + SP stack + regs.
+- `m68k.c` main loop logs DRV-ENTER/EXIT at driver-range transitions
+  (`$200000..$20FFFF`).
+- `m68k.c` main loop dumps jumptable bytes @PC when first DRV-EXIT
+  lands in kernel seg 102, plus DRIVRJT ($210) value.
+- `m68k.c` main loop dumps 256-entry PC ring (driver PCs marked) on
+  first jump into `$CBE000..$CC0000` (stack-jump tripwire).
+- Passthrough stays `#if 0` to preserve 23/27 baseline.
+
+**Next blocker → P115 (Pascal codegen callee-clean for asm-ABI)**:
+two paths, pick one:
+
+1. **Codegen fix** (durable, matches Apple's real toolchain).
+   Modify `src/toolchain/pascal_codegen.c` function-epilogue
+   emission: when a Pascal function is declared with asm-callable
+   conventions (or specifically for `PRODRIVER`-style externals
+   called by asm CALLDRIVER), emit callee-clean epilogue:
+   ```
+   UNLK A6
+   MOVE.L (SP)+,A0    ;pop retaddr to A0
+   ADDQ   #4,SP        ;pop 4-byte parameters arg
+   JMP    (A0)         ;return
+   ```
+   Instead of `UNLK A6 ; RTS`. Apple Pascal's `.UPROC` /
+   procedure-with-asm-conventions flag would drive this — our
+   codegen needs to recognize it. PRODRIVER is declared
+   `function PRODRIVER(parameters: param_ptr): integer;` without
+   special markers, but Apple's toolchain somehow knows. Check
+   if there's a directive in source-PROFILE.TEXT or
+   source-DRIVERDEFS.TEXT.
+
+2. **HLE CALLDRIVER replacement** (scaffolding, retires with path 1).
+   Instead of letting kernel CALLDRIVER run, replace it entirely
+   in the HLE: simulate its work natively (copy config_ptr into
+   parameters record, read ENT_PT from config extension), then
+   manually dispatch to driver with kernel's stack convention,
+   intercept on driver RTS, do kernel's post-call unwind. More
+   complex but keeps the Pascal codegen untouched.
+
+Path 1 is the real fix — it's a single codegen-emission change
+that'd apply to every Pascal function called from asm-ABI
+context. Worth doing even if it takes a session.
+
+Baseline clean: 23/27 SYS_PROC_INIT, 28013 linker relocs, audit
+passes. Everything P112 shipped (HLE GET_BOOTSPACE + MMU-write
+ldr_movemultiple + active P110 reloc scan catching 115 sites/load)
+stays on and infrastructure-ready.
+
+## Previous Status (2026-04-19 post-P113 diagnostics)
 
 **Milestones**: **23/27** SYS_PROC_INIT (unchanged). P113 was a
 diagnostic slice — instrumented the stack-jump crash (from flipping

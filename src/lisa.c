@@ -3105,7 +3105,30 @@ static bool hle_handle_calldriver(lisa_t *lisa, m68k_t *cpu) {
      * trampoline convention). Next session: dump $CCB6B0..$CCB6C0 to
      * see what kernel laid down there as the first dispatch stub, and
      * trace the TRACE call chain (who called it, what's on the stack
-     * at its RTS). */
+     * at its RTS).
+     *
+     * P114 root cause identified (source-mover.text:660-684): kernel's
+     * asm CALLDRIVER expects the driver to be CALLEE-clean for its
+     * 4-byte `parameters` arg — driver's RTS must pop retaddr AND the
+     * 4-byte parameters push before returning. Kernel's post-JSR
+     * unwind is:
+     *   MOVE.W (SP)+,D0   ;POP FUNCTION RESULT (2B)
+     *   MOVE.L (SP)+,A1   ;RETURN ADDRESS (4B)
+     *   ADDQ #8,SP        ;skip config_ptr + parameters args
+     *   MOVE.L (SP)+,A0   ;ERRNUM ADDRESS
+     *   MOVE.W D0,(A0) ; JMP (A1)
+     * This only matches if the driver popped its 4-byte parameters
+     * push. Our Pascal codegen emits standard `UNLK A6; RTS` (caller-
+     * clean), so post-RTS SP is 4 bytes too low — all subsequent
+     * pops read wrong slots, A1 gets garbage, JMP (A1) jumps to
+     * stack byte and ILLEGAL. To fix this we need either:
+     *   (a) Pascal codegen emits `MOVE.L (SP)+,A0 ; ADDQ #4,SP ; JMP (A0)`
+     *       for functions called from asm context (new codegen pass).
+     *   (b) HLE that recognizes CALLDRIVER entry, simulates kernel's
+     *       full stack dance natively, dispatches to driver, and
+     *       fixes up on return (bigger HLE, retires with full real-
+     *       driver integration).
+     * Tracked as P115. */
 #if 0
     if (config_ptr != 0) {
         uint32_t entry_pt = cpu_read32(cpu, config_ptr);

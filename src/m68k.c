@@ -2954,9 +2954,11 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 stack_trip_fired = 0;
                 stack_trip_gen = g_emu_generation;
             }
-            /* P113: log driver-range PC transitions to trace dinit dispatch. */
+            /* P113/P114: log driver-range PC transitions + dump kernel
+             * dispatch stub bytes at first DRV-EXIT. */
             {
                 static uint32_t prev_drv_pc = 0;
+                static bool dumped_ccb = false;
                 bool cur_drv = (cpu->pc >= 0x200000 && cpu->pc < 0x210000);
                 bool prev_drv = (prev_drv_pc >= 0x200000 && prev_drv_pc < 0x210000);
                 if (cur_drv != prev_drv) {
@@ -2965,6 +2967,29 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                         fprintf(stderr, "P113 DRV-%s: PC=$%08X (prev=$%08X) A6=$%08X A7=$%08X\n",
                                 cur_drv ? "ENTER" : "EXIT", cpu->pc, prev_drv_pc,
                                 cpu->a[6], cpu->a[7]);
+                    /* First driver-exit to kernel jumptable area: dump
+                     * 80 bytes at destination so we can see the real
+                     * dispatch stubs. */
+                    if (!cur_drv && prev_drv && !dumped_ccb &&
+                        cpu->pc >= 0x00C00000 && cpu->pc < 0x00D00000) {
+                        dumped_ccb = true;
+                        uint32_t base = cpu->pc;
+                        fprintf(stderr, "P114 JUMPTABLE @ $%06X:\n", base);
+                        for (int row = 0; row < 5; row++) {
+                            fprintf(stderr, "  $%06X:", base + row * 16);
+                            for (int b = 0; b < 16; b++)
+                                fprintf(stderr, " %02X",
+                                        cpu->read8((base + row * 16 + b) & 0xFFFFFF));
+                            fprintf(stderr, "\n");
+                        }
+                        /* Also dump $210 (DRIVRJT value) and the
+                         * longword it points to. */
+                        uint32_t drvrjt_val = cpu->read8(0x210) << 24 |
+                                              cpu->read8(0x211) << 16 |
+                                              cpu->read8(0x212) << 8  |
+                                              cpu->read8(0x213);
+                        fprintf(stderr, "P114 DRIVRJT ($210) = $%08X\n", drvrjt_val);
+                    }
                 }
                 prev_drv_pc = cpu->pc;
             }
