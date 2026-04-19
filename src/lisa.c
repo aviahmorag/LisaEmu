@@ -394,6 +394,18 @@ static void ldr_movemultiple(lisa_t *lisa, int32_t count, uint32_t dest) {
         if (count > 0) {
             if (!ldr_fillbuf(lisa, (ldr_fs.curr_page + 1) * bufsize)) break;
         }
+        /* P110 note: destinations above LISA_RAM_SIZE (e.g. the
+         * SYSTEM.CD_PROFILE driver's $CC____ logical bootspace) silently
+         * drop the write here. Swapping the raw-array write for
+         * lisa_mem_write8 (MMU-translated) makes the bytes land at the
+         * physical RAM the CPU sees through its MMU, but breaks the
+         * boot chain — those physical pages are also mapped by the
+         * kernel's own logical addresses, and the overwrite clobbers
+         * kernel data. Real fix needs proper bootspace-page management
+         * (GET_BOOTSPACE on real Lisa returns physical addresses in an
+         * unused high-RAM region; our emulator needs to reserve those
+         * pages and keep them out of normal kernel aliasing). Tracked
+         * as P111. */
     }
 }
 
@@ -569,6 +581,17 @@ bool lisa_hle_enter_loader(m68k_t *cpu) {
     DBGSTATIC(int, el_log, 0);
     bool log = (el_log++ < 30);
 
+    /* P110: track whether the currently open loader file is SYSTEM.CD_PROFILE,
+     * so call_move can post-process the bulk code copy to rebase absolute
+     * JSR.L/JMP.L targets from link-base $400 to the actual load destination.
+     * Our toolchain emits only absolute-long calls for inter-proc JSR/JMP
+     * (see pascal_codegen.c:3158 — opcode $4EB9), and the linked driver's
+     * link base is $0 with code starting at offset $400 (first $400 bytes
+     * are zero-padding the vector area; stripped in toolchain_bridge.c:~1353
+     * before OBJ-wrapping). Apple's driver was linked position-independently
+     * by their assembler/linker; ours isn't, so we relocate at load time. */
+    static bool cd_profile_open = false;
+
     switch (opcode) {
         case 0: { /* call_open = LD_OPENINPUT */
             uint8_t nlen = lisa_mem_read8(&lisa->mem, params_ptr + 30);
@@ -604,6 +627,9 @@ bool lisa_hle_enter_loader(m68k_t *cpu) {
                 }
             }
             lisa_mem_write8(&lisa->mem, params_ptr + 20, ok ? 1 : 0);
+            /* P110: remember if this open resolved to SYSTEM.CD_PROFILE (the
+             * only file whose bytes need relocation at load time). */
+            cd_profile_open = ok && (strcasecmp(name, "SYSTEM.CD_PROFILE") == 0);
             if (log)
                 fprintf(stderr, "HLE ENTER_LOADER call_open('%s') -> %s\n",
                         name, ok ? "OK" : "NOT_FOUND");
@@ -650,6 +676,68 @@ bool lisa_hle_enter_loader(m68k_t *cpu) {
             if (log)
                 fprintf(stderr, "HLE ENTER_LOADER call_move(%u bytes -> $%06X)\n",
                         count, dest);
+            /* P110: relocate driver code after the bulk copy. Scan for
+             * absolute-long JSR ($4EB9) / JMP ($4EF9) / LEA ($41F9..$4FF9) /
+             * MOVE.L #addr,... / PEA.L ($4879) / whose target falls inside
+             * the original linked.bin range [$400, $400 + count); rebase by
+             * fixup = dest - $400. Scan is byte-aligned because driver code
+             * is 2-byte aligned, but we step by 2 bytes since all 68k
+             * instructions are 2-byte aligned. Our codegen only emits
+             * these absolute-long forms for inter-proc refs (see
+             * pascal_codegen.c:2184/3158 and asm68k.c emission of JMP.L
+             * for symbolic targets), and driver data is typically
+             * 16-bit-aligned integers/pointers, so false-positive risk
+             * is low. If we see a scan hit on a data word, this HLE is
+             * wrong and we need the real fix (codegen PC-relative). */
+            /* P110 reloc scan — gated off. Turning this on requires the
+             * MMU-write fix in ldr_movemultiple above (so reads see real
+             * driver bytes), which in turn requires the P111 bootspace-
+             * page-aliasing fix. With all three in place this rebases
+             * ~70 absolute-long JSR/JMP/LEA/PEA targets per CD_PROFILE
+             * load from link-base $400 to the actual load destination,
+             * making the compiled driver position-correct. Verified
+             * mechanically in the P110 session — scanner finds 70 sites
+             * matching $4EB9/$4EF9/$4879/$41F9.. patterns with targets
+             * in the driver's code range. Infrastructure ready; waits
+             * on the MMU sub-task. */
+#if 0
+            if (cd_profile_open && count >= 100) {
+                uint32_t link_base = 0x400;
+                uint32_t link_end  = link_base + count;
+                uint32_t fixup     = dest - link_base;
+                uint32_t patched   = 0;
+                for (uint32_t off = 0; off + 6 <= count; off += 2) {
+                    uint16_t op = lisa_mem_read16(&lisa->mem, dest + off);
+                    bool is_abs_long =
+                        op == 0x4EB9 ||  /* JSR abs.L */
+                        op == 0x4EF9 ||  /* JMP abs.L */
+                        op == 0x4879 ||  /* PEA abs.L */
+                        /* MOVE/MOVEA abs.L source form $2079..$2F79 for Ax,
+                         * $207C..$2F7C for Dx immediate — we only patch
+                         * JSR/JMP/PEA/LEA which name a code target. Data
+                         * moves to D/An use abs.L for globals, not our
+                         * driver-internal refs, so skip. */
+                        ((op & 0xF1FF) == 0x41F9);  /* LEA abs.L,An */
+                    if (!is_abs_long) continue;
+                    uint32_t target = lisa_mem_read32(&lisa->mem, dest + off + 2);
+                    if (target < link_base || target >= link_end) continue;
+                    uint32_t new_target = target + fixup;
+                    lisa_mem_write32(&lisa->mem, dest + off + 2, new_target);
+                    patched++;
+                    /* skip the 4-byte operand we just rewrote so we don't
+                     * re-examine operand bytes as potential opcodes. */
+                    off += 4;
+                }
+                fprintf(stderr,
+                        "P110: CD_PROFILE relocation — %u sites rebased, "
+                        "fixup=$%06X (dest=$%06X, link_base=$%04X, count=%u)\n",
+                        patched, fixup, dest, link_base, count);
+                /* One-shot: cd_profile_open remains true only for the first
+                 * code block load; reset after fixup. */
+                cd_profile_open = false;
+            }
+#endif
+            (void)cd_profile_open;  /* silence unused-var while gate is off */
             break;
         }
         case 6: { /* call_read = LD_READSEQ(block, destination, pages).
@@ -2982,25 +3070,14 @@ static bool hle_handle_calldriver(lisa_t *lisa, m68k_t *cpu) {
     }
 
     /* If config_ptr points to BADCALL device (bitbucket), intercept disk
-     * functions. Let real driver calls through. (Historical guard — since
-     * we never observe badcall populated on the current boot path, this
-     * branch is effectively dead; retained for the alternate boot paths
-     * that still produce a real badcall pseudo-driver.)
-     *
-     * P109 experiment (reverted — see .claude-handoffs/2026-04-19-P109-*):
-     * Relaxing this guard to let CALLDRIVER(dinit) through to the
-     * compiled SYSTEM.CD_PROFILE driver (entry_pt=$CC5E08 on the current
-     * boot) gets past the DRIVERASM prologue but hits ILLEGAL opcode
-     * $00CC at $CC6B80 a short while later — the dispatcher jumps
-     * through a data word (upper half of a user-RAM pointer) because
-     * the loaded driver image hasn't had OBJ-format reloffset applied.
-     * Next increment: teach LOADCD/ENTER_LOADER HLE to apply the
-     * codeblock reloffset properly, then retry the pass-through. */
+     * functions. Let real driver calls through. (Historical guard; the
+     * P109/P110 experiment to let dinit pass to the compiled driver is
+     * tracked in CLAUDE.md — blocked on full driver-dispatch infra.) */
     if (config_ptr != 0 && lisa->hle.badcall != 0) {
         uint32_t entry_pt = cpu_read32(cpu, config_ptr);
         if (entry_pt != 0 && entry_pt != lisa->hle.badcall &&
-            entry_pt != 0x000003F0)  /* stub address */
-            return false;  /* Real driver, let OS handle */
+            entry_pt != 0x000003F0)
+            return false;
     }
 
     DBGSTATIC(int, hle_trace, 0);

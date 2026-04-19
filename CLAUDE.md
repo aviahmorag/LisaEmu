@@ -189,7 +189,92 @@ commit as the real replacement.
 | 11 | **Shell (APDM)** | full desktop | Not started |
 | 12 | **Apps** | LisaWrite, LisaCalc, etc. | Not started |
 
-## Current Status (2026-04-19 post-P109 diagnostic)
+## Current Status (2026-04-19 post-P110)
+
+**Milestones**: **23/27** kernel checkpoints reached natively, last
+checkpoint `SYS_PROC_INIT` (unchanged). P109 + P110 were both
+investigations; no shipped fix yet, but major scoping progress on
+Option B (Phase 3 — real compiled SYSTEM.CD_PROFILE driver).
+
+**P110 findings**:
+
+1. **`ldr_movemultiple` has a latent bug** — writes go via raw
+   `memcpy(&ram[dest], ...)` with a `dest + avail <= LISA_RAM_SIZE`
+   guard that SILENTLY DROPS the copy for high logical addresses.
+   `GET_BOOTSPACE` returns logical addresses like `$CCCA08`, `$CC9408`,
+   `$CC5E08` for the 3-device INIT_BOOT_CDS cascade; all three are
+   >$240000 (2.25MB), so the driver bytes never actually land in
+   physical RAM. The CALLDRIVER HLE intercepts dispatch, so the
+   missing bytes didn't matter in baseline — but it's why P109's
+   naive dinit pass-through saw ILLEGAL opcode $00CC at $CC6B80
+   (MMU-translated reads returned whatever happened to be at the
+   physical page, not driver code).
+
+2. **The fix — write through MMU** — swapping `memcpy(&ram[dest]...)`
+   for a `lisa_mem_write8(...)` loop lands the driver bytes at the
+   correct physical page (the one MMU maps logical $CCCA08 to). The
+   P110 reloc scanner (see below) then sees real driver code and
+   rebases 70 JSR.L/JMP.L/LEA.L/PEA.L targets per driver load. But
+   this regresses the baseline even WITHOUT the dinit pass-through:
+   milestones drop 23→21, boot halts at `SYSTEM_ERROR(10726)` (=
+   `bombed` in LDEQU — "boot device read failed") from within
+   `LDR_CALL` around `ret=$015074`. Root cause: the physical RAM
+   pages the MMU maps `$CC____` logical to are ALSO aliased to
+   kernel-logical addresses used by some kernel data structure;
+   actually writing real driver bytes there clobbers that kernel
+   data. Tracked as P111 (bootspace-page reservation) — needs a
+   proper bootspace allocator in the emulator's MMU/memory model.
+
+3. **The toolchain emits absolute-long JSR/JMP/LEA/PEA** for inter-
+   proc calls (`pascal_codegen.c:2184/3158` emit `$4EB9`/`$4EF9`);
+   Apple's toolchain emitted PC-relative wherever possible, which
+   is why their drivers were position-independent. Our driver has
+   exactly 70 such sites (measured via the scan) in the 13654-byte
+   SYSTEM.CD_PROFILE — all need load-time rebase. Retiring the
+   scan requires either a PC-relative-preferring codegen pass or
+   a real OBJ-format relocation table.
+
+4. **CLAUDE.md's prior assumption — "apply the codeblock reloffset
+   properly" — was wrong.** Apple's LOADCD (and the LOADER's
+   loadseg) STORE the reloffset in the loaded image's header but
+   NEVER APPLY IT. No other code in `Lisa_Source/` reads the
+   reloff field. The driver relies on PC-relative code and
+   kernel-jumptable absolutes (DRIVRJT=$210) for all inter-
+   module references. Our driver needs load-time relocation
+   because our codegen emits absolute-long where Apple's emitted
+   PC-relative.
+
+**Infrastructure shipped, gated off**:
+
+- `hle_handle_calldriver` now logs `entry_pt` + `kres_addr` per call
+  (observable: driver loaded at `$CC5E08`, config's entry_pt set
+  correctly, badcall never populated — so the historic bypass guard
+  is effectively dead).
+- P110 reloc scan written in-source behind `#if 0` at
+  `src/lisa.c:~690`. Activates alongside a future MMU-write fix.
+- `ldr_movemultiple` comment documents the silent-drop behavior and
+  the P111 blocker.
+
+**Next blocker → P111 (bootspace-page reservation)**: need an
+emulator-side allocator that gives `GET_BOOTSPACE` callers physical
+RAM pages that are NOT simultaneously mapped into the kernel's
+logical address space. Once the MMU-write fix lands driver bytes
+without kernel-data corruption:
+
+  (a) Flip the P110 reloc scan `#if 0` → `#if 1`.
+  (b) Relax the CALLDRIVER bypass guard so `fnctn=1` (dinit) with a
+      user-RAM `entry_pt` passes through to the real compiled driver.
+  (c) `dinit` delegates to `USE_HDISK + CALL_HDISK` which re-enters
+      CALLDRIVER for the HDISK config (entry_pt 0 → secondary call
+      still HLE'd successfully).
+  (d) `hdinit` on the outer driver populates `ext_diskconfig` natively
+      and retires our MDDF_IO + dcontrol(20) HLEs.
+
+Baseline unchanged post-P110: `./build/lisaemu --headless Lisa_Source 3000`
+reaches 23/27 SYS_PROC_INIT clean, `make audit` shows 28013 relocs, 0
+unresolved.
+
+## Previous Status (2026-04-19 post-P109 diagnostic)
 
 **Milestones**: **23/27** kernel checkpoints reached natively, last
 checkpoint `SYS_PROC_INIT` (unchanged from P108). This session (P109)
