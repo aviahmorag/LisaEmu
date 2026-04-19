@@ -58,6 +58,9 @@ typedef struct {
     int16_t smallmap_offset;
     int16_t catentries;
     int16_t fs_version;
+    /* P119: bitmap metadata (for BitMap_IO HLE). */
+    int32_t bitmap_addr;    /* page offset of bitmap within fs */
+    int32_t bitmap_bytes;   /* total bytes of allocation bitmap */
     int32_t root_page;
     int16_t tree_depth;
     int32_t rootsnum;
@@ -224,6 +227,11 @@ static bool ldr_fs_init(lisa_t *lisa) {
     ldr_fs.smallmap_offset = ldr_get16(mddf_buf + 276 + adj);
     ldr_fs.root_page = ldr_get32(mddf_buf + 302 + adj);
     ldr_fs.tree_depth = ldr_get16(mddf_buf + 306 + adj);
+    /* P119: bitmap metadata — MDDF layout:
+     *   136: bitmap_addr (4)     140: bitmap_size (4)
+     *   144: bitmap_bytes (2)    146: bitmap_pages (2) */
+    ldr_fs.bitmap_addr  = ldr_get32(mddf_buf + 136 + adj);
+    ldr_fs.bitmap_bytes = (int32_t)(uint16_t)ldr_get16(mddf_buf + 144 + adj);
 
     fprintf(stderr, "LDR_FS: geo.firstblock=%d datasize=%d slist=%d packing=%d slist_blks=%d\n"
             "LDR_FS: map_off=%d smallmap_off=%d catentries=%d rootsnum=%d\n"
@@ -3367,6 +3375,79 @@ static bool hle_handle_mddf_io(lisa_t *lisa, m68k_t *cpu) {
     return true;
 }
 
+/* P119: BitMap_IO HLE — reads/writes the allocation bitmap directly
+ * from the profile image, bypassing psio → lisaio → UltraIO → DiskIO
+ * (which would spin on status_req without IRQ-driven completion).
+ * Pascal signature:
+ *   procedure BitMap_IO(var ecode:error; device:integer;
+ *                       op:ioop; addr:absptr);
+ * Args on stack (caller-clean):
+ *   SP+0  retaddr (4)
+ *   SP+4  @ecode  (4)
+ *   SP+8  device  (2)
+ *   SP+10 op      (2)
+ *   SP+12 addr    (4)
+ */
+static bool hle_handle_bitmap_io(lisa_t *lisa, m68k_t *cpu) {
+    uint32_t sp = cpu->a[7] & 0xFFFFFF;
+    uint32_t ret_addr  = cpu_read32(cpu, sp + 0);
+    uint32_t ecode_ptr = cpu_read32(cpu, sp + 4);
+    int16_t  device    = (int16_t)cpu_read16(cpu, sp + 8);
+    int16_t  op        = (int16_t)cpu_read16(cpu, sp + 10);
+    uint32_t addr      = cpu_read32(cpu, sp + 12);
+    bool read_op = (op == 0);
+
+    DBGSTATIC(int, bmi_trace, 0);
+    if (bmi_trace < 6) {
+        bmi_trace++;
+        fprintf(stderr, "HLE BitMap_IO: %s dev=%d addr=$%06X bytes=%d\n",
+                read_op ? "READ" : "WRITE", device, addr,
+                (int)ldr_fs.bitmap_bytes);
+    }
+
+    int16_t error = 0;
+    if (!lisa->profile.mounted || ldr_fs.bitmap_bytes <= 0 || ldr_fs.fs_block0 == 0) {
+        error = 654;
+    } else {
+        uint32_t bytes_total = (uint32_t)ldr_fs.bitmap_bytes;
+        uint32_t bitmap_block0 = (uint32_t)(ldr_fs.fs_block0 + ldr_fs.bitmap_addr);
+        uint32_t bytes_done = 0;
+        uint32_t block = bitmap_block0;
+        while (bytes_done < bytes_total && error == 0) {
+            uint8_t block_data[PROFILE_DATA_SIZE];
+            uint32_t chunk = bytes_total - bytes_done;
+            if (chunk > PROFILE_DATA_SIZE) chunk = PROFILE_DATA_SIZE;
+            if (read_op) {
+                if (hle_read_block(lisa, block, block_data, NULL) != 0) {
+                    error = 654;
+                    break;
+                }
+                for (uint32_t b = 0; b < chunk; b++)
+                    cpu->write8(mask_24(addr + bytes_done + b), block_data[b]);
+            } else {
+                memset(block_data, 0, sizeof(block_data));
+                for (uint32_t b = 0; b < chunk; b++)
+                    block_data[b] = cpu->read8(mask_24(addr + bytes_done + b));
+                if (hle_write_block(lisa, block, block_data, NULL) != 0) {
+                    error = 654;
+                    break;
+                }
+            }
+            bytes_done += chunk;
+            block++;
+        }
+    }
+
+    if (ecode_ptr)
+        cpu->write16(mask_24(ecode_ptr), (uint16_t)error);
+
+    /* Pop retAddr, return. Caller cleans the 12 bytes of args. */
+    cpu->a[7] += 4;
+    cpu->pc = ret_addr;
+    cpu->cycles += 80;
+    return true;
+}
+
 /* P108: shared helper — translate an absolute fs-page to a physical disk
  * block on our ProFile image using ldr_fs.geo_firstblock (MDDF's
  * geography.firstblock; falls back to fs_block0, the disk block where
@@ -3956,29 +4037,44 @@ bool lisa_hle_intercept(lisa_t *lisa, m68k_t *cpu) {
     {
         extern uint32_t boot_progress_lookup(const char *name);
         extern int g_emu_generation;
-        static uint32_t mddf_io_addr = 0;
-        static uint32_t psio_addr    = 0;
-        static uint32_t vm_addr      = 0;
+        static uint32_t mddf_io_addr   = 0;
+        static uint32_t bitmap_io_addr = 0;
+        static uint32_t psio_addr      = 0;
+        static uint32_t vm_addr        = 0;
         static int      fsio_probe_gen = -1;
         if (fsio_probe_gen != g_emu_generation) {
             fsio_probe_gen = g_emu_generation;
-            mddf_io_addr = boot_progress_lookup("MDDF_IO");
-            psio_addr    = boot_progress_lookup("psio");
-            vm_addr      = boot_progress_lookup("VM");
+            mddf_io_addr   = boot_progress_lookup("MDDF_IO");
+            bitmap_io_addr = boot_progress_lookup("BitMap_IO");
+            if (!bitmap_io_addr) bitmap_io_addr = boot_progress_lookup("bitmap_io");
+            psio_addr      = boot_progress_lookup("psio");
+            vm_addr        = boot_progress_lookup("VM");
             if (!vm_addr) vm_addr = boot_progress_lookup("vm");
         }
-        /* P116 retired the HLE; P118 kept it retired. MDDF_IO is
-         * not reached in the current boot path (real_mount fails at
-         * UltraIO's `not blockstructured` bitwise-NOT bug before
-         * MDDF_IO would run). Re-enabling this HLE becomes load-
-         * bearing again once the NOT codegen is fixed — at that
-         * point it'd bypass the (not yet implemented) IRQ-driven
-         * I/O completion path. */
+        /* P119 investigation: tried re-enabling MDDF_IO HLE plus a
+         * parallel BitMap_IO HLE (+ narrow NOT-fix for blockstructured).
+         * Together they carry real_mount through the MDDF read,
+         * dcontrol spare check, bitmap read, and MDDF write-protect
+         * write. But fs_mount then proceeds to open_sfile (root
+         * catalog), which would need slist_io / FMAP_IO / HENTRY_IO
+         * HLEs, and further downstream wait_sem / unmount cleanup
+         * (same "wait_sem cleanup wall" P108 identified). More
+         * importantly, the extra real_mount progress MUTATES state
+         * that our 10707 suppression unwind assumes is fresh — so
+         * boot drops from baseline's 23/27 (clean unwind to
+         * SYS_PROC_INIT) to 22/27 (stuck inside FS_INIT).
+         *
+         * The structural fix is Phase-5 (IRQ-driven I/O completion),
+         * not more HLE layering. HLEs kept gated off for pickup
+         * once IRQ completion lands. */
 #if 0
         if (mddf_io_addr && pc == mddf_io_addr)
             return hle_handle_mddf_io(lisa, cpu);
+        if (bitmap_io_addr && pc == bitmap_io_addr)
+            return hle_handle_bitmap_io(lisa, cpu);
 #else
         (void)mddf_io_addr;
+        (void)bitmap_io_addr;
 #endif
         /* P108 (unshipped): psio and vm HLEs compile but are gated off.
          * Together they carry real_mount and fs_mount past bitmap_io /

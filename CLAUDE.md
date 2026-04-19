@@ -271,18 +271,65 @@ for each of 3 devices:
    advances past the MDDF and spare checks, then bitmap_io's
    UltraIO → DiskIO chain enqueues a request and blocks forever.
 
-**Next blocker → P119 (NOT fix + IRQ-driven I/O completion)**:
-Landing the NOT fix durably needs either (a) an IRQ-completion
-path so the bitmap_io spin terminates (Phase-5 work per the phases
-table above), or (b) a layered HLE for `bitmap_io` matching the
-existing `MDDF_IO` HLE scaffold — reading/writing the bitmap
-directly from the profile image, then setting `reqstatus.reqsrv_f
-= complete` on the request block. Path (b) is faster but more
-scaffolding debt. Path (a) is the real structural fix.
+**P119 investigation (layered-HLE path; NOT durable)**:
+Wrote `hle_handle_bitmap_io` and parsed `bitmap_addr` + `bitmap_bytes`
+from the MDDF into `ldr_fs` (`src/lisa.c`). With MDDF_IO HLE
+re-enabled + BitMap_IO HLE added + narrow NOT-fix for
+`blockstructured`, real_mount carries through:
+
+  - MDDF_IO READ (1-block scaffold)
+  - drivercall dcontrol spare-check (existing HLE)
+  - BitMap_IO READ (new, 1208 bytes = MDDF's `bitmap_bytes`)
+  - MDDF_IO WRITE (write-protect test)
+
+real_mount then returns cleanly. fs_mount proceeds to
+`open_sfile(rootsnum, ...)` — and that's where the wall hits: it
+calls through slist_io / FMAP_IO / HENTRY_IO (all of which would
+need HLEs) and ultimately wait_sem for request completion. Even
+cutting off before open_sfile, the new real_mount progress mutates
+state that our 10707 suppression unwind assumes is fresh, so boot
+drops from baseline's 23/27 (clean unwind → SYS_PROC_INIT) to
+22/27 (stuck in FS_INIT). Same wall P108 identified.
+
+**Next blocker → P120 (IRQ-driven I/O completion / Phase-5)**:
+The layered-HLE path can't advance past this without IRQ completion.
+The structural fix is Phase-5: make our ProFile emulator generate
+VIA1 interrupts when an I/O completes, and have the compiled
+kernel's driver-dispatch path handle the completion on the IRQ.
+Specifically:
+
+  1. **ProFile emu IRQ line**: `src/profile.c` currently does
+     polled byte-transfer via `profile_porta_read`. The real
+     ProFile asserts /IRQ on command completion; our emu should
+     latch a "completion pending" signal and drive VIA1 CA1/CA2
+     which the kernel reads as an IRQ source.
+  2. **VIA1 interrupt plumbing**: `src/via6522.c` needs to fire
+     level-1 or level-2 IRQ when VIA1's IER/IFR say so. Check
+     how the baseline vector table routes this (INT1V, $64).
+  3. **Driver's BDR / interrupt handler**: PROFILE.TEXT's
+     `BDR` (bad-disk-response) plus the asm completion code
+     need to run when the IRQ fires. These are in PROFILEASM
+     and probably already compile; just haven't been
+     exercised.
+  4. **Kernel's request completion**: the scheduler's blocked
+     process (spinning in `status_req`) wakes via
+     `Unblock_IO` or similar when the driver signals
+     completion.
+
+Once IRQ completion lands, the MDDF_IO / BitMap_IO HLEs retire
+(both guard-gated off in `src/lisa.c` and ready to flip back to
+0 in the same commit that ships IRQ completion).
+
+Kept in-source for P120:
+- `hle_handle_bitmap_io` function body (`src/lisa.c`)
+- `ldr_fs.bitmap_addr` / `ldr_fs.bitmap_bytes` fields + parse
+- `num_bloks-set` PC-trap diagnostic in `src/m68k.c` (useful
+  for validating hdinit populates ext_diskconfig correctly
+  once the full driver path works)
 
 Meanwhile CALLDRIVER post-JSR fix-up for `dinit` still works; the
-compiled driver still runs hdinit to completion (now correctly
-populating `num_bloks = 9720`).
+compiled driver runs hdinit to completion (now correctly
+populating `num_bloks = 9720` thanks to P118 scanner narrowing).
 
 **Previous next-blocker hypothesis (superseded)** — P118 (boolean NOT):
 
