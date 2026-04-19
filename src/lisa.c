@@ -2981,8 +2981,21 @@ static bool hle_handle_calldriver(lisa_t *lisa, m68k_t *cpu) {
             return false;
     }
 
-    /* If config_ptr points to BADCALL device (bitbucket), intercept disk functions.
-     * Let real driver calls through. */
+    /* If config_ptr points to BADCALL device (bitbucket), intercept disk
+     * functions. Let real driver calls through. (Historical guard — since
+     * we never observe badcall populated on the current boot path, this
+     * branch is effectively dead; retained for the alternate boot paths
+     * that still produce a real badcall pseudo-driver.)
+     *
+     * P109 experiment (reverted — see .claude-handoffs/2026-04-19-P109-*):
+     * Relaxing this guard to let CALLDRIVER(dinit) through to the
+     * compiled SYSTEM.CD_PROFILE driver (entry_pt=$CC5E08 on the current
+     * boot) gets past the DRIVERASM prologue but hits ILLEGAL opcode
+     * $00CC at $CC6B80 a short while later — the dispatcher jumps
+     * through a data word (upper half of a user-RAM pointer) because
+     * the loaded driver image hasn't had OBJ-format reloffset applied.
+     * Next increment: teach LOADCD/ENTER_LOADER HLE to apply the
+     * codeblock reloffset properly, then retry the pass-through. */
     if (config_ptr != 0 && lisa->hle.badcall != 0) {
         uint32_t entry_pt = cpu_read32(cpu, config_ptr);
         if (entry_pt != 0 && entry_pt != lisa->hle.badcall &&
@@ -2993,8 +3006,11 @@ static bool hle_handle_calldriver(lisa_t *lisa, m68k_t *cpu) {
     DBGSTATIC(int, hle_trace, 0);
     if (hle_trace < 50) {
         hle_trace++;
-        fprintf(stderr, "HLE CALLDRIVER: fnctn=%d config=$%06X params=$%06X\n",
-                fnctn_code, config_ptr, params_ptr);
+        uint32_t entry_pt_dbg = config_ptr ? cpu_read32(cpu, config_ptr) : 0;
+        uint32_t kres_addr_dbg = config_ptr ? cpu_read32(cpu, config_ptr + 32) : 0;
+        fprintf(stderr,
+                "HLE CALLDRIVER: fnctn=%d config=$%06X params=$%06X entry_pt=$%06X kres_addr=$%06X\n",
+                fnctn_code, config_ptr, params_ptr, entry_pt_dbg, kres_addr_dbg);
     }
 
     int16_t error = 0;

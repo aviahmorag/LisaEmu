@@ -189,7 +189,62 @@ commit as the real replacement.
 | 11 | **Shell (APDM)** | full desktop | Not started |
 | 12 | **Apps** | LisaWrite, LisaCalc, etc. | Not started |
 
-## Current Status (2026-04-19 post-P108)
+## Current Status (2026-04-19 post-P109 diagnostic)
+
+**Milestones**: **23/27** kernel checkpoints reached natively, last
+checkpoint `SYS_PROC_INIT` (unchanged from P108). This session (P109)
+was an investigation, not a codegen fix.
+
+**P109 finding — Phase 3 readiness**: `SYSTEM.CD_PROFILE` is *already*
+fully compiled, linked (13654 bytes), and placed on disk as an
+OBJ-wrapped file (`system.cd_profile`). LOADCD opens and loads it
+three times during INIT_BOOT_CDS (per the 3-device cascade). The
+loaded driver image lands in user RAM at `$CC5E08`, and that address
+makes it into `configinfo[bootdev]^` as `entry_pt`.
+
+So the *compile + place + load* half of Option B (from the P108
+handoff) was already done — I had the wrong model coming in. The
+remaining gap is driver *dispatch*: our CALLDRIVER HLE at
+`src/lisa.c:hle_handle_calldriver` intercepts every `fnctn=1/12/7`
+call instead of letting them pass to the compiled driver's
+DRIVERASM dispatcher at `entry_pt`.
+
+**P109 experiment (reverted)**: I relaxed the HLE's bypass guard so
+`fnctn=1` (dinit) with a user-RAM `entry_pt` passed through to the
+real driver. Result: DRIVERASM prologue ran, but shortly after hit
+`ILLEGAL opcode $00CC at PC=$CC6B80`. The `$00CC` byte is clearly
+the high byte of a user-RAM pointer being executed as code — the
+dispatcher jumped through a data word. Root cause (likely): our
+LOADCD / smart ENTER_LOADER HLE doesn't apply the codeblock's
+`reloffset` to the loaded driver image. On real Lisa, LOADCD reads
+each codeblock's 4-byte reloffset (OBJ format) and relocates
+absolute-address words accordingly. Our ENTER_LOADER HLE
+(`src/lisa.c:640-702`, `call_move` + `call_read`) copies bytes
+verbatim. Milestones dropped 23→21 (new error 10201 no longer
+matches the 10707 suppression).
+
+Change reverted. Diagnostic kept — CALLDRIVER now logs `entry_pt`
+and `kres_addr` per call so the state is visible in future traces.
+
+**Next blocker → P110**: apply OBJ-format reloffset during
+SYSTEM.CD_PROFILE load. Either (a) in the smart ENTER_LOADER HLE's
+call_read/call_move path (quickest — we already know which file is
+being loaded), or (b) in the toolchain's OBJ wrapper in
+`toolchain_bridge.c:~1393` (durable — emit pre-relocated bytes or
+correct reloffset so any LOADCD-compatible loader handles it).
+Option (b) is the right long-term answer; option (a) unblocks
+P109's dinit-passthrough experiment in a single session.
+
+After that: relax CALLDRIVER HLE's bypass guard (currently gated
+on `badcall != 0`, which is never true on the current boot path)
+so dinit passes through. Expected cascade: dinit →
+`USE_HDISK + CALL_HDISK(...)` → re-enters CALLDRIVER for HDISK
+(config entry_pt will be 0/BADCALL so the secondary call still
+HLE-succeeds). Then `hdinit` on the outer driver populates
+`ext_diskconfig`, which in turn should let psio→LisaIO→UltraIO
+work natively and retire our MDDF_IO + dcontrol(20) HLEs.
+
+## Previous Status (2026-04-19 post-P108)
 
 **Milestones**: **23/27** kernel checkpoints reached natively, last
 checkpoint `SYS_PROC_INIT`. P108 landed a structural codegen fix —
