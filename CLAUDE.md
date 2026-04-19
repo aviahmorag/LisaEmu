@@ -189,7 +189,103 @@ commit as the real replacement.
 | 11 | **Shell (APDM)** | full desktop | Not started |
 | 12 | **Apps** | LisaWrite, LisaCalc, etc. | Not started |
 
-## Current Status (2026-04-19 post-P110)
+## Current Status (2026-04-19 post-P112)
+
+**Milestones**: **23/27** kernel checkpoints reached natively, last
+checkpoint `SYS_PROC_INIT` (unchanged). P112 shipped *all* the
+Phase-3 load-infrastructure: the compiled SYSTEM.CD_PROFILE now
+lives in user RAM with internal JSR/JMP/LEA/PEA/MOVE.L#imm targets
+rebased to its actual load address. The `dinit` pass-through
+itself is gated off pending a Pascal-return ABI fix — last step of
+P113 below.
+
+**P112 shipped (all active):**
+
+1. **HLE `GET_BOOTSPACE`** (`src/lisa.c:lisa_hle_intercept`).
+   Pascal function intercept:
+   `function GET_BOOTSPACE(size: longint; lastalloc: boolean): longint;`
+   Stack at entry: SP+0=retaddr, SP+4=size (4B), SP+8=lastalloc (2B).
+   Caller-clean convention, result in D0. Handler returns
+   addresses from `$200000` stepping up by `(size + 0x1FF) & ~0x1FF + 0x400`
+   per call — pages in MMU seg 16 (`lisabugmmu`, unconfigured on our
+   boot → pass-through, phys == logical). Bounds-checks against
+   `LISA_RAM_SIZE` and falls through to the compiled body if
+   exhausted. Retires when `MM4.TEXT:GetFree` is debugged to
+   return high-memory pages (P111 root cause).
+
+2. **`ldr_movemultiple` MMU-write** (`src/lisa.c:ldr_movemultiple`).
+   Swapped raw `memcpy(&ram[dest],...)` for a `lisa_mem_write8`
+   loop. Driver bytes now land at the MMU-translated physical
+   page regardless of whether logical dest is above 2.25MB. With
+   the P112 GET_BOOTSPACE returning seg-16 pass-through addresses
+   (logical = physical = `$200000..$20xxxx`), writes stay in the
+   RAM buffer and don't alias kernel globals. (Without P112, this
+   alone regressed to `SYSTEM_ERROR(10726)` — P111 finding.)
+
+3. **P110 reloc scan activated** (`src/lisa.c` ENTER_LOADER
+   call_move, `#if 1`). After each bulk copy of the SYSTEM.CD_PROFILE
+   code block, scan for and rebase:
+   - `$4EB9` JSR abs.L
+   - `$4EF9` JMP abs.L
+   - `$4879` PEA abs.L
+   - `$4XF9` LEA abs.L,An (any An via the `(op & 0xF1FF) == 0x41F9` mask)
+   - `$2X3C` MOVE.L #imm,Dn (any Dn via `(op & 0xF1FF) == 0x203C`)
+   - `$2F3C` MOVE.L #imm,-(SP)
+   Targets in `[$400, $400 + count)` are rebased to
+   `target + (dest - $400)`. Finds 115 sites per driver load
+   (was 70 with just JSR/JMP/PEA/LEA) × 3 loads = 345 rebase
+   operations per boot. Audit clean: 28013 linker relocations,
+   zero unresolved.
+
+4. **CALLDRIVER trace** (earlier committed): logs `entry_pt` +
+   `kres_addr` per call so driver-dispatch state is visible in
+   future traces.
+
+**P112 gated off (pending P113):** The CALLDRIVER(dinit)
+pass-through branch in `hle_handle_calldriver` is fenced `#if 0`.
+With it on, the cascade works far enough to:
+- Enter PRODRIVER body at `$207408`,
+- Run `case fnctn_code of dinit: ...`,
+- Delegate to `USE_HDISK + CALL_HDISK(error, configptr, parameters)`,
+- Re-enter CALLDRIVER with fnctn=13 (HDINIT) — secondary call
+  still HLE'd successfully,
+- Then crash on return: `ILLEGAL: opcode=$00CB at PC=$CBFE00`
+  with `SYSTEM_ERROR(10201)`, milestones drop 23→21.
+
+Crash is a Pascal function-return ABI mismatch: PC=$CBFE00 is
+STACK memory, so the driver's RTS popped a garbage return
+address. Either (a) CALLDRIVER's asm dispatcher in DRIVERASM (not
+kernel — it's in the driver blob itself) pushes a different
+frame shape than our HLE assumes, (b) PRODRIVER's prologue/
+epilogue mismatches our codegen conventions, or (c) we missed
+a relocation pattern (currently catches JSR/JMP/PEA/LEA/MOVE.L
+#imm/MOVE.L #imm,-(SP); may be missing DC.L data tables or
+other forms). Repro: flip `#if 0` → `#if 1` near `P112` comment
+in `hle_handle_calldriver`.
+
+**Next blocker → P113 (dinit return ABI)**: with the dinit
+pass-through re-enabled, diagnose the crash at PC=$CBFE00.
+Steps:
+1. Trace byte sequence around the crash site — what did the CPU
+   try to execute, and what was the stack state at the preceding
+   RTS?
+2. Check if DRIVERASM.TEXT's CALLDRIVER entry (offset 90 in
+   DRIVRJT) has a return convention we haven't matched.
+3. Verify PRODRIVER's prologue/epilogue against our Pascal
+   codegen — particularly the LINK/UNLK and result-in-D0 paths.
+4. Consider extending the reloc scan to other instruction forms
+   if the missed-relocation theory pans out.
+
+Once P113 lands, `dinit` runs fully on the compiled driver;
+hdinit (fnctn=13) populates `ext_diskconfig.blockstructured` and
+`.fs_strt_blok` natively. That in turn lets psio→LisaIO→UltraIO
+resolve without E_IO_MODE_BAD, retiring our MDDF_IO HLE +
+dcontrol(20) scaffold.
+
+Baseline clean: `./build/lisaemu --headless Lisa_Source 3000`
+reaches 23/27 SYS_PROC_INIT, 28013 linker relocs, audit passes.
+
+## Previous Status (2026-04-19 post-P110)
 
 **Milestones**: **23/27** kernel checkpoints reached natively, last
 checkpoint `SYS_PROC_INIT` (unchanged). P109 + P110 were both

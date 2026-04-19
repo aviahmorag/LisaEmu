@@ -385,8 +385,20 @@ static void ldr_movemultiple(lisa_t *lisa, int32_t count, uint32_t dest) {
     while (count > 0) {
         int avail = bufsize - ldr_fs.next_byte;
         if (avail > count) avail = count;
-        if (avail > 0 && dest + avail <= LISA_RAM_SIZE) {
-            memcpy(&lisa->mem.ram[dest], &ldr_fs.buf[ldr_fs.next_byte], avail);
+        if (avail > 0) {
+            /* P112: write through MMU (via lisa_mem_write8) so high
+             * logical bootspace addresses (now $20xxxx range thanks to
+             * the HLE GET_BOOTSPACE) land in the expected physical RAM.
+             * Before P112, dests > LISA_RAM_SIZE silently dropped; we
+             * tried swapping in MMU writes without the GET_BOOTSPACE
+             * HLE (P110) and crashed because the compiled memory
+             * manager was handing back pages that aliased kernel
+             * globals. With P112's bootspace HLE those addresses now
+             * land in MMU seg 16 ($200000..$207FFF physical), safely
+             * below the kernel+user areas. */
+            for (int i = 0; i < avail; i++)
+                lisa_mem_write8(&lisa->mem, dest + i,
+                                ldr_fs.buf[ldr_fs.next_byte + i]);
             dest += avail;
             count -= avail;
             ldr_fs.next_byte += avail;
@@ -394,18 +406,6 @@ static void ldr_movemultiple(lisa_t *lisa, int32_t count, uint32_t dest) {
         if (count > 0) {
             if (!ldr_fillbuf(lisa, (ldr_fs.curr_page + 1) * bufsize)) break;
         }
-        /* P110 note: destinations above LISA_RAM_SIZE (e.g. the
-         * SYSTEM.CD_PROFILE driver's $CC____ logical bootspace) silently
-         * drop the write here. Swapping the raw-array write for
-         * lisa_mem_write8 (MMU-translated) makes the bytes land at the
-         * physical RAM the CPU sees through its MMU, but breaks the
-         * boot chain — those physical pages are also mapped by the
-         * kernel's own logical addresses, and the overwrite clobbers
-         * kernel data. Real fix needs proper bootspace-page management
-         * (GET_BOOTSPACE on real Lisa returns physical addresses in an
-         * unused high-RAM region; our emulator needs to reserve those
-         * pages and keep them out of normal kernel aliasing). Tracked
-         * as P111. */
     }
 }
 
@@ -705,18 +705,14 @@ bool lisa_hle_enter_loader(m68k_t *cpu) {
              * 16-bit-aligned integers/pointers, so false-positive risk
              * is low. If we see a scan hit on a data word, this HLE is
              * wrong and we need the real fix (codegen PC-relative). */
-            /* P110 reloc scan — gated off. Turning this on requires the
-             * MMU-write fix in ldr_movemultiple above (so reads see real
-             * driver bytes), which in turn requires the P111 bootspace-
-             * page-aliasing fix. With all three in place this rebases
-             * ~70 absolute-long JSR/JMP/LEA/PEA targets per CD_PROFILE
-             * load from link-base $400 to the actual load destination,
-             * making the compiled driver position-correct. Verified
-             * mechanically in the P110 session — scanner finds 70 sites
-             * matching $4EB9/$4EF9/$4879/$41F9.. patterns with targets
-             * in the driver's code range. Infrastructure ready; waits
-             * on the MMU sub-task. */
-#if 0
+            /* P112: reloc scan activated. With the GET_BOOTSPACE HLE
+             * returning MMU-seg-16 addresses and ldr_movemultiple now
+             * writing via MMU, the driver bytes land safely and the
+             * scan sees the real code. Rebases ~70 absolute-long
+             * JSR/JMP/LEA/PEA targets per CD_PROFILE load from link-
+             * base $400 to the actual load destination, making the
+             * compiled driver position-correct. */
+#if 1
             if (cd_profile_open && count >= 100) {
                 uint32_t link_base = 0x400;
                 uint32_t link_end  = link_base + count;
@@ -725,16 +721,14 @@ bool lisa_hle_enter_loader(m68k_t *cpu) {
                 for (uint32_t off = 0; off + 6 <= count; off += 2) {
                     uint16_t op = lisa_mem_read16(&lisa->mem, dest + off);
                     bool is_abs_long =
-                        op == 0x4EB9 ||  /* JSR abs.L */
-                        op == 0x4EF9 ||  /* JMP abs.L */
-                        op == 0x4879 ||  /* PEA abs.L */
-                        /* MOVE/MOVEA abs.L source form $2079..$2F79 for Ax,
-                         * $207C..$2F7C for Dx immediate — we only patch
-                         * JSR/JMP/PEA/LEA which name a code target. Data
-                         * moves to D/An use abs.L for globals, not our
-                         * driver-internal refs, so skip. */
-                        ((op & 0xF1FF) == 0x41F9);  /* LEA abs.L,An */
-                    if (!is_abs_long) continue;
+                        op == 0x4EB9 ||                  /* JSR abs.L */
+                        op == 0x4EF9 ||                  /* JMP abs.L */
+                        op == 0x4879 ||                  /* PEA abs.L */
+                        ((op & 0xF1FF) == 0x41F9) ||     /* LEA abs.L,An */
+                        ((op & 0xF1FF) == 0x203C) ||     /* MOVE.L #imm,Dn */
+                        /* MOVE.L #imm,-(SP) = PEA equivalent used by
+                         * codegen to push absolute code addresses. */
+                        op == 0x2F3C;
                     uint32_t target = lisa_mem_read32(&lisa->mem, dest + off + 2);
                     if (target < link_base || target >= link_end) continue;
                     uint32_t new_target = target + fixup;
@@ -3085,10 +3079,36 @@ static bool hle_handle_calldriver(lisa_t *lisa, m68k_t *cpu) {
             return false;
     }
 
-    /* If config_ptr points to BADCALL device (bitbucket), intercept disk
-     * functions. Let real driver calls through. (Historical guard; the
-     * P109/P110 experiment to let dinit pass to the compiled driver is
-     * tracked in CLAUDE.md — blocked on full driver-dispatch infra.) */
+    /* P112: dinit pass-through — GATED OFF pending driver-return ABI work.
+     * Cascade works: dinit enters the compiled driver at $207408, runs
+     * PRODRIVER(parameters: param_ptr): integer, delegates to
+     * CALL_HDISK (-> re-CALLDRIVER for HDISK=fnctn 13 -> HLE'd) AND THEN
+     * returns to garbage ($CBFE00 stack byte, ILLEGAL $00CB). The stack
+     * unwind between the driver's RTS and CALLDRIVER's caller is wrong —
+     * likely a Pascal function-result (D0 longint vs 2-byte) mismatch,
+     * or CALLDRIVER's asm dispatcher expects a different frame shape than
+     * what our HLE leaves. Investigate next session. Re-enable this
+     * branch to repro the ILLEGAL trace quickly. */
+#if 0
+    if (config_ptr != 0) {
+        uint32_t entry_pt = cpu_read32(cpu, config_ptr);
+        bool entry_is_real_ram =
+            entry_pt >= 0x040000 && entry_pt < 0x00D00000 &&
+            (lisa->hle.badcall == 0 || entry_pt != lisa->hle.badcall) &&
+            entry_pt != 0x000003F0;
+        if (entry_is_real_ram && fnctn_code == HLE_DINIT) {
+            DBGSTATIC(int, p112_pass, 0);
+            if (p112_pass < 10) {
+                p112_pass++;
+                fprintf(stderr,
+                        "P112: CALLDRIVER(dinit) -> real driver entry=$%06X "
+                        "config=$%06X\n", entry_pt, config_ptr);
+            }
+            return false;
+        }
+    }
+#endif
+    /* Legacy badcall-based guard (effectively dead on current boot). */
     if (config_ptr != 0 && lisa->hle.badcall != 0) {
         uint32_t entry_pt = cpu_read32(cpu, config_ptr);
         if (entry_pt != 0 && entry_pt != lisa->hle.badcall &&
@@ -3887,6 +3907,64 @@ bool lisa_hle_intercept(lisa_t *lisa, m68k_t *cpu) {
         if (vm_addr && pc == vm_addr)
             return hle_handle_vm(lisa, cpu);
         #endif
+    }
+
+    /* P112: HLE GET_BOOTSPACE to return addresses in physical RAM that
+     * DON'T alias the kernel-globals region (MMU seg 102). Our compiled
+     * MM4.TEXT:GetFree is allocating LOW pages that overlap kernel
+     * A5-globals (P111 finding). Rather than debug the memory manager,
+     * short-circuit GET_BOOTSPACE to return addresses in MMU seg 16
+     * (nominally `lisabugmmu` — 2MB..2.125MB physical, unconfigured on
+     * our boot, so pass-through). Layered scaffolding HLE that retires
+     * when the memory manager is fixed.
+     *
+     * ABI (observed via passive diag): Pascal function,
+     *   function GET_BOOTSPACE(size: longint; lastalloc: boolean): longint
+     * stack at entry:
+     *   SP+0: retaddr (4 bytes)
+     *   SP+4: size (4 bytes, longint)
+     *   SP+8: lastalloc (2 bytes, boolean)
+     * caller cleans args. Return value goes in D0. */
+    {
+        extern uint32_t boot_progress_lookup(const char *name);
+        extern int g_emu_generation;
+        static uint32_t gb_addr = 0;
+        static int      gb_probe_gen = -1;
+        static uint32_t gb_next = 0x200000;  /* phys $200000, seg 16 */
+        DBGSTATIC(int, gb_log, 0);
+        if (gb_probe_gen != g_emu_generation) {
+            gb_probe_gen = g_emu_generation;
+            gb_addr = boot_progress_lookup("GET_BOOTSPACE");
+            gb_next = 0x200000;  /* reset per emu generation */
+        }
+        if (gb_addr && pc == gb_addr) {
+            uint32_t sp = cpu->a[7];
+            uint32_t retaddr = cpu_read32(cpu, sp);
+            uint32_t size    = cpu_read32(cpu, sp + 4);
+            /* Round up to 512-byte page + add 1KB guard. */
+            uint32_t alloc   = (size + 0x1FF) & ~0x1FFu;
+            uint32_t result  = gb_next;
+            gb_next += alloc + 0x400;
+            /* Bounds check — keep within LISA_RAM_SIZE ($240000). */
+            if (gb_next > LISA_RAM_SIZE) {
+                fprintf(stderr,
+                        "P112 HLE GET_BOOTSPACE: OUT OF BOOTSPACE "
+                        "(size=%u, next=$%06X). Falling through to compiled body.\n",
+                        size, gb_next);
+                /* Leave CPU state alone — let the real body execute. */
+            } else {
+                if (gb_log < 10) {
+                    gb_log++;
+                    fprintf(stderr,
+                            "P112 HLE GET_BOOTSPACE(size=%u) -> $%06X\n",
+                            size, result);
+                }
+                cpu->d[0] = result;
+                cpu->a[7] += 4;  /* pop retaddr, caller cleans args */
+                cpu->pc = retaddr;
+                return true;
+            }
+        }
     }
 
     return false;
