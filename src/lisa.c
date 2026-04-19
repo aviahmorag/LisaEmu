@@ -1867,6 +1867,22 @@ void lisa_reset(lisa_t *lisa) {
         WRITE32(0x94, 0x00FE0330);  /* TRAP #5 → ROM TRAPTOHW handler */
         WRITE32(0xA0, 0x00FE0300);  /* TRAP #8 → ROM RTE handler */
 
+        /* P120 step-2: emulated Level1 IRQ sentinel.
+         * LIBHW's DriverInit (symbol $070A4A in SYSTEM.OS/linked.map) is a
+         * TRAP #5 trampoline with D7=0 — the real body is in LIBHW which
+         * never gets loaded (no SYSTEM.LLD loader). So INT1V normally stays
+         * at the linker's $3F8 RTE stub and Level1 IRQs are no-ops.
+         *
+         * Install $3F4 at INT1V (overwriting the $3F8 linker default), with
+         * RTE ($4E73) at $3F4 so the CPU can cleanly unwind. Our
+         * lisa_hle_intercept catches PC=$3F4 before the RTE executes, reads
+         * VIA1 IFR, clears the interrupt source (MOVE.B D0,IFR pattern from
+         * Level1's real asm), and falls through to the RTE. Scaffolding HLE;
+         * retires in Phase-9 when LIBHW actually links in. */
+        WRITE32(0x64, 0x000003F4);
+        lisa->mem.ram[0x3F4] = 0x4E;  /* RTE = $4E73 */
+        lisa->mem.ram[0x3F5] = 0x73;
+
         /* Override Line-A/Line-F vectors with safe ROM skip handlers.
          * The OS's LINE1111_TRAP handler calls system_error which isn't
          * initialized yet. INIT_TRAPV will install real handlers when ready. */
@@ -2432,25 +2448,55 @@ int lisa_run_frame(lisa_t *lisa) {
          * data-in phase, it sets completion_pending. Real ProFile asserts
          * /IRQ → VIA1 CA1 at that point; emu mirrors it by driving CA1.
          * Propagates: update_irq → via1_irq callback → irq_via1 → CPU IRQ
-         * level 1 → INT1V ($64). INT1V still points at the linker's $3F8
-         * RTE stub until LIBHW.DriverInit runs (next P120 sub-step), so
-         * the IRQ is taken and immediately returns. Until a transaction
-         * actually exercises this path it's silent scaffolding. */
+         * level 1 → INT1V ($64) → our $3F4 sentinel (step-2). */
         if (profile_check_irq(&lisa->prof)) {
             DBGSTATIC(int, ca1_log, 0);
+            uint8_t ifr_pre = lisa->via1.ifr;
+            via_trigger_ca1(&lisa->via1);
             if (ca1_log < 20) {
                 fprintf(stderr, "P120 ProFile completion → VIA1 CA1 #%d "
-                        "(IER=$%02X IFR=$%02X pre-trigger) PC=$%06X\n",
-                        ++ca1_log, lisa->via1.ier, lisa->via1.ifr,
+                        "(IER=$%02X IFR=$%02X→$%02X irq_via1=%d "
+                        "pending_irq=%d) PC=$%06X\n",
+                        ++ca1_log, lisa->via1.ier, ifr_pre, lisa->via1.ifr,
+                        lisa->irq_via1, lisa->cpu.pending_irq,
                         lisa->cpu.pc);
             }
-            via_trigger_ca1(&lisa->via1);
         }
     }
 
     /* Debug: log CPU/VIA/vector state once after significant execution */
     DBGSTATIC(int, frame_count, 0);
     frame_count++;
+
+    /* P120 step-2 end-to-end plumbing synthetic test (one-shot, gated off).
+     * Flip to `#if 1` to verify the IRQ chain end-to-end: synth fires CA1,
+     * CPU takes level-1 IRQ, PC jumps to INT1V ($3F4 sentinel), Level1 HLE
+     * clears IFR, RTE returns. Previously observed: IRQ #1 is the synth
+     * CA1 with IFR=$02→$00; IRQ #2+ are vretrace level-1 IRQs (IFR=$00,
+     * no VIA1 source) also taken through $3F4 because vretrace uses the
+     * same level. Both paths confirm the plumbing.
+     *
+     * Gated off in normal builds because lowering CPU IPL would unmask
+     * vretrace IRQs that the real boot currently keeps deferred (INTSON
+     * body never runs natively post-SYS_PROC_INIT). Re-enable only for
+     * diagnostic verification. */
+#if 0
+    DBGSTATIC(int, p120_synth_gen, -1);
+    if (frame_count >= 200 && p120_synth_gen != g_emu_generation) {
+        p120_synth_gen = g_emu_generation;
+        uint16_t old_sr = lisa->cpu.sr;
+        lisa->cpu.sr &= ~0x0700;  /* clear IPL mask → accept level-1 IRQ */
+        fprintf(stderr, "P120 step-2 SYNTH: firing one-shot CA1 test @frame %d "
+                "(pre: IER=$%02X IFR=$%02X irq_via1=%d INT1V=$%02X%02X%02X%02X "
+                "PC=$%06X SR=$%04X→$%04X)\n",
+                frame_count, lisa->via1.ier, lisa->via1.ifr, lisa->irq_via1,
+                lisa->mem.ram[0x64], lisa->mem.ram[0x65],
+                lisa->mem.ram[0x66], lisa->mem.ram[0x67],
+                lisa->cpu.pc, old_sr, lisa->cpu.sr);
+        via_write(&lisa->via1, VIA_IER, 0x80 | VIA_IRQ_CA1);
+        lisa->prof.completion_pending = true;
+    }
+#endif
 
     /* Don't force-unmask interrupts or generate vretrace during init.
      * The OS must complete INITSYS before interrupt handlers are ready.
@@ -3924,6 +3970,33 @@ bool lisa_hle_intercept(lisa_t *lisa, m68k_t *cpu) {
     /* ALWAYS intercept prof_entry at $FE0090 (ROM PROM routine) */
     if (pc == 0xFE0090)
         return hle_prof_entry(lisa, cpu);
+
+    /* P120 step-2: emulated Level1 IRQ handler.
+     * INT1V ($64) points here; RTE stub ($4E73) is at $3F4 so the fall-
+     * through return is clean. Replaces what real LIBHW Level1 does on
+     * the hot path: save D0, read VIA1 IFR, mask the interesting bits,
+     * clear the interrupt source by writing back to IFR, dispatch
+     * DiskRoutine/TwiggyRoutine if set. We only do the IFR read+clear
+     * here; DiskRoutine dispatch is a future P120 sub-step. */
+    if (pc == 0x3F4) {
+        uint8_t ifr_val = lisa->via1.ifr & 0x7F;
+        DBGSTATIC(int, level1_hit, 0);
+        if (level1_hit < 20) {
+            fprintf(stderr, "P120 Level1 IRQ #%d @ $3F4: IFR=$%02X IER=$%02X "
+                    "SP=$%08X stack=$%08X|$%04X (CA1=%d)\n",
+                    ++level1_hit, ifr_val, lisa->via1.ier, cpu->a[7],
+                    cpu_read32(cpu, cpu->a[7] + 2),
+                    (uint16_t)((cpu_read32(cpu, cpu->a[7]) >> 16) & 0xFFFF),
+                    !!(ifr_val & VIA_IRQ_CA1));
+        }
+        if (ifr_val != 0) {
+            /* Clear interrupt source (write-to-clear IFR bits). */
+            via_write(&lisa->via1, VIA_IFR, ifr_val);
+        }
+        /* Fall through: the RTE ($4E73) at $3F4 executes normally,
+         * popping SR+PC from stack and returning to interrupted code. */
+        return false;
+    }
 
 
     /* HLE: Level 2 interrupt handler (COPS) at $2082D2.
