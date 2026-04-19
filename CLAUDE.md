@@ -189,52 +189,66 @@ commit as the real replacement.
 | 11 | **Shell (APDM)** | full desktop | Not started |
 | 12 | **Apps** | LisaWrite, LisaCalc, etc. | Not started |
 
-## Current Status (2026-04-19 post-P120-step-1 — ProFile→CA1 IRQ plumbing scaffolded)
+## Current Status (2026-04-19 post-P120-step-2 — INT1V sentinel + Level1 HLE)
 
-**Milestones**: **23/27** SYS_PROC_INIT (stable). P120 step-1 shipped
-ProFile → VIA1 CA1 IRQ plumbing (`389f489`). `profile_t` now carries a
-`completion_pending` flag set at end of SEND_DATA / RECV_DATA phases;
-`profile_check_irq(p)` drains it in the CPU run loop (`src/lisa.c` main
-tick) and drives `via_trigger_ca1(&lisa->via1)` which properly
-propagates through `update_irq → irq_callback (via1_irq) → irq_via1 →
-m68k_set_irq(level=1)`. Also fixed a latent bug in `via1_portb_write`
-and `via1_porta_write`: bare `lisa->via1.ifr |= 0x02` on BSY
-transitions bypassed `update_irq` so `irq_via1` stayed stuck at 0 even
-when a CA1 edge occurred. Both sites now go through `via_trigger_ca1`.
+**Milestones**: **23/27** SYS_PROC_INIT (stable). P120 step-1 + step-2
+shipped — ProFile→CA1 plumbing plus emulated Level1 IRQ handler.
 
-Current boot path never actually initiates a VIA1 transaction —
-compiled hdinit only reads config registers — so the scaffold is
-silent today. Zero P120 completion events observed in the 3000-frame
-baseline, and no regression (still 23/27 SYS_PROC_INIT clean).
+**P120 step-1** (`389f489`): `profile_t.completion_pending` flag set at
+end of SEND_DATA / RECV_DATA phases; `profile_check_irq(p)` drains it
+in the CPU run loop and drives `via_trigger_ca1(&lisa->via1)`.
+Propagates `update_irq → irq_callback (via1_irq) → irq_via1 →
+m68k_set_irq(level=1)`. Also fixed a latent bug: `via1_portb_write` and
+`via1_porta_write` set `lisa->via1.ifr |= 0x02` on BSY transitions
+bypassing `update_irq`, so `irq_via1` stayed stuck at 0 even when a CA1
+edge occurred. Both sites now route through `via_trigger_ca1`.
 
-**Next blocker → P120 step-2 (install INT1V handler)**: INT1V ($64)
-still points at the linker's $3F8 RTE stub because LIBHW's
-`DriverInit` (symbol at $070A4A in `SYSTEM.OS/linked.map`) has zero
-callers. Two paths, documented in the handoff:
+**P120 step-2** (`15163fc`): investigation confirmed LIBHW's DriverInit
+($070A4A in SYSTEM.OS/linked.map) is a **TRAP #5 trampoline** with D7=0
+— the real body is in LIBHW which never gets loaded (no SYSTEM.LLD
+loader). So every LIBHW entry-point (DiskDriver at $070A56,
+TwiggyDriver at $070A6C, DiskSync at $070A82, etc.) is a TRAP5 stub.
+The kernel's PROF_INIT path DOES call these (TRAPs at $070A62, $070A78,
+$070A8E observed before 10707), but all go to the ROM RTE stub at
+$FE0330 and do nothing.
 
-1. **Call DriverInit via targeted HLE**. Structurally right — the
-   routine is already compiled + linked. It installs Level1 at $64,
-   Level2 at $68, Trap5 at $94, programs VIA1/VIA2 ACR/IER/T1, calls
-   AlarmAssign × 4 (BzyCursor, Silence, StContrast, ChkActivity),
-   AlarmRelative for ChkActivity, SetScreenKeybd, processes
-   KeybdQueue. Needs alarm + scheduler subsystems ready (so not
-   before SYS_PROC_INIT). Risk: the alarm/KeybdQueue paths might
-   not be wired up correctly in our current state.
-2. **Narrower HLE**: scan the linked image near DriverInit to find
-   `Level1` (local label, not an ENTRY), install at INT1V. Skips
-   the alarm/keyboard setup. Fallback if (1) regresses.
+Scaffold: `lisa_reset` installs $000003F4 at RAM[$64] (INT1V) with an
+RTE ($4E73) at $3F4. `lisa_hle_intercept` catches PC=$3F4 before the
+RTE, reads VIA1 IFR, clears the interrupt source via `via_write(IFR,
+ifr_val)` (matching real Level1 asm's `MOVE.B IFR(A1),D0 ; MOVE.B
+D0,IFR(A1)` pattern), falls through to the RTE for clean stack unwind.
 
-After step-2, a call chain needs to install the compiled driver's
-`dinterrupt` handler at `DiskRoutine` — `DiskDriver` symbol at
-$070A56 does that (simple: `MOVE.L A0, DiskRoutine ; RTS`). PROFILE
-.TEXT's PROF_INIT probably calls DiskDriver in its normal flow; if
-not, another targeted HLE.
+End-to-end plumbing verified with one-shot synthetic CA1 test (now
+gated `#if 0`): CA1 edge → IFR set → update_irq → irq_via1=1 →
+m68k_set_irq(1) → CPU takes IRQ → PC=$3F4 → Level1 HLE → RTE. Every
+link observed firing. Vretrace level-1 IRQs also vector through the
+same sentinel and are handled correctly (IFR=$00, no VIA1 source,
+clean RTE). Synth is gated off in the shipped build because lowering
+IPL would unmask vretrace IRQs that the real boot currently keeps
+deferred (INTSON body never runs natively post-SYS_PROC_INIT — a
+separate investigation).
 
-After both pieces land: a real ProFile transaction (triggered by
-flipping the MDDF_IO/BitMap_IO HLE `#if 0`→`#if 1` plus the narrow
-NOT-fix for `blockstructured`) fires Level1 → dinterrupt →
-completes the I/O request. Phase-5 done, MDDF_IO and BitMap_IO HLEs
-retire in that same commit (per
+**Next blocker → P120 step-3 (DiskDriver HLE + dinterrupt dispatch)**:
+with the IRQ path proven to fire, the compiled driver's `dinterrupt`
+function (in PROFILEASM, part of SYSTEM.CD_PROFILE; reads VIA1 IFR,
+dispatches to PROFASM if I/O complete) needs to run on each CA1 edge.
+Two pieces:
+
+1. **HLE TRAP #5 with D7=$68 (DiskDriver)**: when PROF_INIT calls
+   DiskDriver(@dinterrupt), capture the A0 arg and store in a new
+   `lisa->hle.disk_routine` field. Retires trivially when LIBHW
+   actually loads.
+2. **Extend the Level1 HLE at $3F4**: after reading+clearing IFR,
+   if `disk_routine != 0`, synthesize a JSR into it. The real
+   dinterrupt is called like a sub-routine from Level1 (it does
+   `TST.W CUR_NUM_REQUESTS(A2) ... JSR PROFASM`), so it expects the
+   usual stack frame. Its RTS returns to Level1, which then RTEs.
+
+After both pieces land: flipping the narrow NOT-fix for
+`blockstructured` + re-enabling the MDDF_IO/BitMap_IO HLEs (both
+gated `#if 0` in `src/lisa.c`) lets real_mount's UltraIO run through
+`status_req`, IRQ completion fires, kernel wakes the blocked
+process. Phase-5 done, layered HLEs retire in that same commit (per
 `feedback_hle_layers_load_bearing.md`).
 
 ## Previous Status (2026-04-19 post-P117 — scanner gate enforced, HDINIT runs natively)
