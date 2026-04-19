@@ -3995,6 +3995,35 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                                     rt = t1;  /* one level was enough */
                             }
                         }
+                    } else if (ptr_node->type == AST_FIELD_ACCESS && ptr_node->children[0]) {
+                        /* P107: WITH rec.fieldptr^ DO ... — the WITH expr
+                         * is a dereferenced pointer field of a record
+                         * (local variable or outer structure). fs_mount's
+                         * `with ptrDCB^.MDDFdata^ do ...` pre-P107 hit this
+                         * branch with NULL rt because no FIELD_ACCESS
+                         * handler existed — the inner AST_DEREF(ptr_node)
+                         * saw ptr_node->type != IDENT/DEREF/ARRAY and fell
+                         * through. Result: WITH record_type stayed NULL,
+                         * and `rootsnum` inside the body couldn't resolve
+                         * via with_lookup_field. find_symbol_any returned
+                         * NULL too, so codegen emitted MOVE.W #0,D0 — i.e.
+                         * open_sfile was called with snum=0 instead of
+                         * MDDFdata.rootsnum(=3). The sfile-0 s_entry is
+                         * all-zeros on our disk image, so slist_io returned
+                         * hintaddr=0 and OPEN_SFILE fired E1_SENTRY_BAD →
+                         * 10707 stup_fsinit.
+                         *
+                         * Resolve the field via lvalue_field_info on the
+                         * parent node; if the field type is a pointer,
+                         * deref to get the record type. */
+                        int fld_off;
+                        type_desc_t *fld_type = NULL;
+                        if (lvalue_field_info(cg, ptr_node->children[0],
+                                              ptr_node->name, &fld_off, &fld_type)) {
+                            if (fld_type && fld_type->kind == TK_POINTER &&
+                                fld_type->base_type)
+                                rt = fld_type->base_type;
+                        }
                     } else if (ptr_node->type == AST_ARRAY_ACCESS && ptr_node->children[0]) {
                         /* P97: WITH arr[i]^ DO ... — array element is a
                          * pointer, deref gives the record. Used throughout
