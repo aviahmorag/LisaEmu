@@ -189,7 +189,42 @@ commit as the real replacement.
 | 11 | **Shell (APDM)** | full desktop | Not started |
 | 12 | **Apps** | LisaWrite, LisaCalc, etc. | Not started |
 
-## Current Status (2026-04-19 post-P106)
+## Current Status (2026-04-19 post-P107)
+
+**Milestones**: **23/27** kernel checkpoints reached natively, last
+checkpoint `SYS_PROC_INIT`. P107 landed: a codegen fix for
+`with rec.fieldptr^ do` — the missing AST_WITH branch for
+`AST_DEREF(AST_FIELD_ACCESS(...))`. Root cause of the E1_SENTRY_BAD
+we tracked post-P106: fs_mount's `with ptrDCB^.MDDFdata^ do` couldn't
+resolve `rootsnum`, so open_sfile was called with snum=0 (literal
+MOVE.W #0,D0) instead of MDDFdata.rootsnum(=3); sfile 0's s_entry is
+zeroed on our disk image, firing 871.
+
+Post-P107: fs_mount reads rootsnum correctly. The surviving 10707
+now fires from `real_mount → bitmap_io → psio → LisaIO → UltraIO →
+E_IO_MODE_BAD(803)` — exactly the predicted next blocker. D2=$323 at
+10707 entry confirms 803 not 871.
+
+**P107 commit** `97ac566`: AST_WITH handler in
+`src/toolchain/pascal_codegen.c` gained an `AST_FIELD_ACCESS` branch
+inside the outer `AST_DEREF` case. Uses `lvalue_field_info(parent,
+field_name)` to resolve the field type, then derefs its pointer base
+to get the WITH record type. Mirrors the P105 #1 fix for
+`AST_DEREF(AST_IDENT_EXPR)` but handles the parent-is-field case
+instead.
+
+**Next blocker (confirmed)**: bitmap_io's psio chain. Two paths
+forward (see `NEXT_SESSION.md` for full detail):
+- **P108 option A** — psio-level HLE (~100 LOC, subsumes BITMAP_IO,
+  SLIST_IO, FMAP_IO, HENTRY_IO — all the fs-layer I/O).
+- **P108 option B** — Phase 3 proper: compile SYSTEM.CD_PROFILE,
+  populate ext_diskconfig natively.
+
+Recommendation: A first. Backed-out prototypes of individual BITMAP_IO
+and SLIST_IO HLEs this session showed that partial coverage cascades
+to downstream stack corruption — psio-level is the right scope.
+
+## Previous Status (2026-04-19 post-P106)
 
 **Milestones**: **23/27** kernel checkpoints reached natively, last
 checkpoint `SYS_PROC_INIT`. The 2026-04-19 session landed **P106**
