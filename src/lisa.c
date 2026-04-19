@@ -1367,14 +1367,12 @@ static void via1_portb_write(uint8_t val, uint8_t ddr, void *ctx) {
     bool bsy_before = profile_bsy(&lisa->prof);
     profile_orb_write(&lisa->prof, val, last_via1_orb);
     bool bsy_after = profile_bsy(&lisa->prof);
-    /* Detect BSY transitions → CA1 interrupt flag */
-    if (bsy_after && !bsy_before) {
-        /* BSY asserted (falling edge) → set CA1 flag */
-        lisa->via1.ifr |= 0x02;
-    }
-    if (!bsy_after && bsy_before) {
-        /* BSY deasserted (rising edge) → also set CA1 flag */
-        lisa->via1.ifr |= 0x02;
+    /* P120: BSY transitions → CA1 edge. Route through via_trigger_ca1 so
+     * update_irq fires the callback chain (irq_via1 → CPU level 1).
+     * Pre-P120 this set IFR bit 2 directly, which left irq_via1 stuck at 0
+     * because update_irq never ran. */
+    if (bsy_after != bsy_before) {
+        via_trigger_ca1(&lisa->via1);
     }
     last_via1_bsy = bsy_after;
     last_via1_orb = val;
@@ -1408,7 +1406,7 @@ static void via1_porta_write(uint8_t val, uint8_t ddr, void *ctx) {
     profile_porta_write(&lisa->prof, val);
     bool bsy_after = profile_bsy(&lisa->prof);
     if (bsy_after != bsy_before) {
-        lisa->via1.ifr |= 0x02;  /* CA1 transition → set flag */
+        via_trigger_ca1(&lisa->via1);  /* P120: propagate through update_irq */
     }
     last_via1_bsy = bsy_after;
 }
@@ -2427,6 +2425,26 @@ int lisa_run_frame(lisa_t *lisa) {
             via_tick(&lisa->via1, via_cycles);
             via_tick(&lisa->via2, via_cycles);
             via_tick_accum -= via_cycles * 10;
+        }
+
+        /* P120: Phase-5 IRQ-driven I/O completion.
+         * When the ProFile state machine finishes a READ data-out or WRITE
+         * data-in phase, it sets completion_pending. Real ProFile asserts
+         * /IRQ → VIA1 CA1 at that point; emu mirrors it by driving CA1.
+         * Propagates: update_irq → via1_irq callback → irq_via1 → CPU IRQ
+         * level 1 → INT1V ($64). INT1V still points at the linker's $3F8
+         * RTE stub until LIBHW.DriverInit runs (next P120 sub-step), so
+         * the IRQ is taken and immediately returns. Until a transaction
+         * actually exercises this path it's silent scaffolding. */
+        if (profile_check_irq(&lisa->prof)) {
+            DBGSTATIC(int, ca1_log, 0);
+            if (ca1_log < 20) {
+                fprintf(stderr, "P120 ProFile completion → VIA1 CA1 #%d "
+                        "(IER=$%02X IFR=$%02X pre-trigger) PC=$%06X\n",
+                        ++ca1_log, lisa->via1.ier, lisa->via1.ifr,
+                        lisa->cpu.pc);
+            }
+            via_trigger_ca1(&lisa->via1);
         }
     }
 

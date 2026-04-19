@@ -52,6 +52,13 @@ typedef struct {
     bool busy;              /* BSY line (active low on real HW) */
     bool cmd_line;          /* Host CMD signal */
     uint8_t response_byte;  /* Next byte to put on PORTA when host reads */
+
+    /* P120: IRQ completion signal — set when the last byte of a READ data
+     * phase has been served, or when a WRITE has fully landed and been
+     * committed to disk. Consumed by profile_check_irq(), which routes to
+     * VIA1 CA1 → kernel INT1V. Real ProFile asserts /IRQ on command
+     * completion; this flag is our emulator-side analogue. */
+    bool completion_pending;
 } profile_t;
 
 void profile_init(profile_t *p);
@@ -68,5 +75,9 @@ uint8_t profile_porta_read(profile_t *p);
 
 /* Returns BSY state for VIA1 IRB bit 1 */
 bool profile_bsy(profile_t *p);
+
+/* P120: returns true and clears the flag if a command completed since the
+ * last call. Caller (lisa.c run loop) routes this to VIA1 CA1. */
+bool profile_check_irq(profile_t *p);
 
 #endif /* PROFILE_H */

@@ -234,6 +234,7 @@ void profile_porta_write(profile_t *p, uint8_t val) {
                 profile_write_block(p, p->block_num);
                 p->state = PSTATE_IDLE;
                 p->busy = false;
+                p->completion_pending = true;  /* P120: fire CA1 */
             }
             break;
 
@@ -277,6 +278,7 @@ uint8_t profile_porta_read(profile_t *p) {
                 if (p->byte_index >= PROFILE_SECTOR_SIZE) {
                     p->state = PSTATE_IDLE;
                     p->busy = false;
+                    p->completion_pending = true;  /* P120: fire CA1 */
                 }
                 return val;
             }
@@ -290,4 +292,12 @@ uint8_t profile_porta_read(profile_t *p) {
 
 bool profile_bsy(profile_t *p) {
     return p->busy;
+}
+
+bool profile_check_irq(profile_t *p) {
+    if (p->completion_pending) {
+        p->completion_pending = false;
+        return true;
+    }
+    return false;
 }
