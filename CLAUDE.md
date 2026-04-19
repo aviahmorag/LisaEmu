@@ -189,7 +189,79 @@ commit as the real replacement.
 | 11 | **Shell (APDM)** | full desktop | Not started |
 | 12 | **Apps** | LisaWrite, LisaCalc, etc. | Not started |
 
-## Current Status (2026-04-19 post-P116 — MDDF_IO HLE retired)
+## Current Status (2026-04-19 post-P117 — scanner gate enforced, HDINIT runs natively)
+
+**Milestones**: **23/27** SYS_PROC_INIT (stable). P117 shipped a
+structural fix to the P110 driver-reloc scanner: the `is_abs_long`
+gate was declared but never consulted, so 43 of every 160 scanner
+hits were false positives, silently corrupting data literals inside
+each compiled driver. One of those corruptions (site $20A75C,
+op=$00A0, 4-byte DC-looking value $0000177C) clobbered the first
+word of `MOVE.B #$3B,IER(A3)` in PROF_INIT's asm prolog — which is
+exactly why P116's HDINIT passthrough attempt crashed at PC=$20A768
+(ILLEGAL $00DC). With the gate now enforced, the compiled PROFILE
+driver's `hdinit` body runs to completion; all 3 INIT_BOOT_CDS
+devices dispatch cleanly through both fn=1 (dinit) and fn=13
+(hdinit). Baseline milestone count is unchanged because hdinit's
+hardware-facing VIA reads don't populate `ext_diskconfig` fully on
+our emulated ProFile, but Phase-3 driver dispatch is now genuinely
+operational on real compiled Apple code.
+
+**P117 shipped**:
+1. **Scanner `is_abs_long` gate enforced** (`src/lisa.c:723` inside
+   the call_move case of `lisa_hle_intercept_enter_loader`). The
+   flag was computed but the code patched every 4-byte operand
+   whose value fell in the driver's link range, regardless of
+   whether the 2-byte op looked like an abs-long instruction.
+   43 false positives per load × 3 loads = 129 spurious writes
+   per boot. One of them inside PROF_INIT caused the P116 crash.
+   Fix: `if (!is_abs_long) continue;` before the target read.
+   Patch count drops 115→75 per driver load.
+2. **HDINIT passthrough enabled** (`src/lisa.c:3157`, fnctn_code
+   `== HLE_DINIT || == HLE_HDINIT`). With the scanner honest, the
+   same P115 SP fix-up mechanism that carries dinit through kernel
+   CALLDRIVER now carries hdinit through cleanly. Fires 9× per boot
+   (3 devices × [outer + nested HDINIT]).
+3. **Diagnostic infrastructure** (kept, off the hot path):
+   - `src/m68k.c`: `pc_ring` promoted to file-scope (`g_pc_ring`)
+     so `illegal_instruction()` can dump it. Dumps 64 entries +
+     bytes at last 10 driver-range PCs on fault. Also widens the
+     `@PC` byte window to ±32 bytes and reports file-offset from
+     driver load base when PC is in driver range.
+
+**Observed post-P117 boot trace:**
+```
+P112 HLE GET_BOOTSPACE -> $200000 / $203A00 / $207400
+P110: 75 sites rebased × 3 drivers   (was 115, now honestly gated)
+for each of 3 devices:
+  P115: CALLDRIVER(fn=1)   -> $207408 config=$CCBxxx   (dinit)
+  P115: CALLDRIVER(fn=13)  -> $207408 config=$CCBxxx   (hdinit, new)
+  P115 SP fix-up @ $749C2 × 3   (outer dinit + nested HDINIT + outer hdinit)
+10707 suppression -> SYS_PROC_INIT 23/27 baseline tail
+```
+
+**Next blocker → P118 (populate `ext_diskconfig` natively)**:
+hdinit's asm body runs the Profile handshake against VIA1 in our
+emulator — the emulated ProFile HLE accepts the writes but doesn't
+feed back realistic status/discsize bytes, so the 14-byte device-
+characteristics read in PROFILEASM loops GTTYP2 ends with
+`drivetype=0` and `discsize=0` in ext_diskconfig. real_mount's
+pre-MDDF checks probably key on `blockstructured` + `fs_strt_blok`
+(derived from drivetype/num_bloks), see those zero, and unwind
+via 10707. Two paths:
+
+1. **Enhance the emulated ProFile** to answer the 14-byte
+   device-characteristics read with realistic bytes (drivetype =
+   T_Profile=0, discsize=9720). Check `_inspiration/lisaem-master/`
+   for a model. Retires ext_diskconfig-related scaffolding.
+2. **HLE-populate after hdinit returns** — watch for hdinit's RTS
+   via the P115 mechanism, then write the expected fields
+   directly to `configinfo[device]^.cb_addr->ext_ptr`. Faster but
+   layered scaffolding.
+
+Path (1) is the structural fix.
+
+## Previous Status (2026-04-19 post-P116 — MDDF_IO HLE retired)
 
 **Milestones**: **23/27** SYS_PROC_INIT (stable). P116 confirmed the
 MDDF_IO HLE is no longer reached on the current boot path — real_mount
