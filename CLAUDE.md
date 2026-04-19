@@ -240,26 +240,46 @@ for each of 3 devices:
 10707 suppression -> SYS_PROC_INIT 23/27 baseline tail
 ```
 
-**Next blocker → P118 (populate `ext_diskconfig` natively)**:
-hdinit's asm body runs the Profile handshake against VIA1 in our
-emulator — the emulated ProFile HLE accepts the writes but doesn't
-feed back realistic status/discsize bytes, so the 14-byte device-
-characteristics read in PROFILEASM loops GTTYP2 ends with
-`drivetype=0` and `discsize=0` in ext_diskconfig. real_mount's
-pre-MDDF checks probably key on `blockstructured` + `fs_strt_blok`
-(derived from drivetype/num_bloks), see those zero, and unwind
-via 10707. Two paths:
+**Next blocker → P118 (boolean NOT codegen vs. 0/1 boolean storage)**:
 
-1. **Enhance the emulated ProFile** to answer the 14-byte
-   device-characteristics read with realistic bytes (drivetype =
-   T_Profile=0, discsize=9720). Check `_inspiration/lisaem-master/`
-   for a model. Retires ext_diskconfig-related scaffolding.
-2. **HLE-populate after hdinit returns** — watch for hdinit's RTS
-   via the P115 mechanism, then write the expected fields
-   directly to `configinfo[device]^.cb_addr->ext_ptr`. Faster but
-   layered scaffolding.
+P118 investigation identified the real post-P117 blocker. With MDDF_IO
+HLE retired and hdinit running, real_mount's `MDDF_IO → psio → lisaio
+→ UltraIO` chain finally executes the compiled disk-I/O path. UltraIO
+fires **E_IO_MODE_BAD (803)** at its entry check (source-VMSTUFF.TEXT:
+651): `if (not blockstructured) or (hdrMode and (ptrPl = NIL))`.
 
-Path (1) is the structural fix.
+Root cause (from decoded NEW_DEVICE + UltraIO in `linked.bin`):
+
+- **NEW_DEVICE compiles** `blockstructured := (devt = diskdev)` to
+  `CMP.W D1,D0 ; SEQ D0 ; NEG.B D0 ; ANDI.W #1,D0 ; MOVE.W D0,$36(A1)` —
+  stores boolean as **0x0001** for TRUE.
+- **UltraIO compiles** `if not blockstructured` to
+  `MOVE.W $36(A0),D0 ; NOT.W D0 ; EXT.L D0 ; TST.L D0 ; BNE` — treats
+  `not` as bitwise **NOT.W**, turning 0x0001 into 0xFFFE (still
+  nonzero → TRUE), so the check fires for every disk read.
+
+Two ways to fix:
+
+1. **Boolean-aware `not`**: extend the existing `is_boolean` gate in
+   `pascal_codegen.c` AST_UNARY_OP/TOK_NOT so it also triggers when
+   the operand is an `AST_IDENT_EXPR` that resolves via `with_lookup_field`
+   to a TK_BOOLEAN field. Tried in-session (P118 attempt) and it
+   regressed to 21/27 with an ILLEGAL at PC=$CBFD98 during the
+   driver-init chain — some other WITH-boolean consumer changed
+   behavior when NOT.W became TST+SEQ+ANDI. Needs narrower scoping.
+
+2. **Apple-convention boolean storage**: change the
+   `SEQ ; NEG.B ; ANDI.W #1` sequence to `SEQ ; EXT.W` so TRUE stores
+   as 0xFFFF. Then bitwise NOT.W works correctly. Risks: may break
+   `ord(boolean)` (if codegen treats it as identity), boolean
+   comparisons with literal #1, and any code that assumes
+   boolean=0/1 storage. Needs audit.
+
+Path (1) is the more local fix but needs careful scoping of
+`with_lookup_field` hits. Path (2) is structurally cleaner but
+wider-reaching. Investigation infrastructure (dumps of UltraIO/
+NEW_DEVICE compiled bytes, devrec at MDDF_IO entry) is all in
+place for next session.
 
 ## Previous Status (2026-04-19 post-P116 — MDDF_IO HLE retired)
 
