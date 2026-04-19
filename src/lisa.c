@@ -3118,6 +3118,7 @@ void lisa_hle_set_addresses(lisa_t *lisa, uint32_t calldriver, uint32_t call_hdi
     lisa->hle.boot_config_done = false;
     lisa->hle.reads = 0;
     lisa->hle.writes = 0;
+    lisa->hle.disk_routine = 0;  /* P120 step-3: captured at DiskDriver HLE */
     if (lisa->hle.active) {
         fprintf(stderr, "HLE: Disk I/O intercepts ACTIVE\n");
         fprintf(stderr, "  CALLDRIVER=$%06X  CALL_HDISK=$%06X\n", calldriver, call_hdisk);
@@ -3971,31 +3972,95 @@ bool lisa_hle_intercept(lisa_t *lisa, m68k_t *cpu) {
     if (pc == 0xFE0090)
         return hle_prof_entry(lisa, cpu);
 
-    /* P120 step-2: emulated Level1 IRQ handler.
-     * INT1V ($64) points here; RTE stub ($4E73) is at $3F4 so the fall-
-     * through return is clean. Replaces what real LIBHW Level1 does on
-     * the hot path: save D0, read VIA1 IFR, mask the interesting bits,
-     * clear the interrupt source by writing back to IFR, dispatch
-     * DiskRoutine/TwiggyRoutine if set. We only do the IFR read+clear
-     * here; DiskRoutine dispatch is a future P120 sub-step. */
+    /* P120 step-2 + step-3: emulated Level1 IRQ handler.
+     * INT1V ($64) points here; RTE stub ($4E73) is at $3F4 and the
+     * linker's RTE stub is at $3F8 (used as a post-driver return trampoline).
+     * Replaces what real LIBHW Level1 does on the hot path: read VIA1 IFR,
+     * clear the interrupt source, then dispatch DiskRoutine.
+     *
+     * Step-3 additions:
+     *   - After clearing IFR, if lisa->hle.disk_routine was captured
+     *     (via the DiskDriver HLE at $070A56), synthesize a JSR into it
+     *     by pushing $3F8 as the return address and setting PC =
+     *     disk_routine. The driver runs, RTSes, lands on $3F8 (= RTE),
+     *     which pops the IRQ-pushed SR+PC and returns to interrupted
+     *     code. DiskRoutine is almost certainly PARALLEL at $074A32
+     *     (the only symbol our boot registers via DiskDriver).
+     *   - If disk_routine == 0, fall through to the $3F4 RTE as before
+     *     (step-2 baseline behavior). */
     if (pc == 0x3F4) {
         uint8_t ifr_val = lisa->via1.ifr & 0x7F;
         DBGSTATIC(int, level1_hit, 0);
         if (level1_hit < 20) {
             fprintf(stderr, "P120 Level1 IRQ #%d @ $3F4: IFR=$%02X IER=$%02X "
-                    "SP=$%08X stack=$%08X|$%04X (CA1=%d)\n",
+                    "SP=$%08X stack=$%08X|$%04X (CA1=%d disk_routine=$%06X)\n",
                     ++level1_hit, ifr_val, lisa->via1.ier, cpu->a[7],
                     cpu_read32(cpu, cpu->a[7] + 2),
                     (uint16_t)((cpu_read32(cpu, cpu->a[7]) >> 16) & 0xFFFF),
-                    !!(ifr_val & VIA_IRQ_CA1));
+                    !!(ifr_val & VIA_IRQ_CA1), lisa->hle.disk_routine);
         }
         if (ifr_val != 0) {
-            /* Clear interrupt source (write-to-clear IFR bits). */
             via_write(&lisa->via1, VIA_IFR, ifr_val);
         }
-        /* Fall through: the RTE ($4E73) at $3F4 executes normally,
-         * popping SR+PC from stack and returning to interrupted code. */
+        if (lisa->hle.disk_routine != 0) {
+            /* Synth JSR disk_routine: push $3F8 (existing RTE stub) as
+             * return address, set PC. When the driver RTSes it lands on
+             * $3F8 → RTE pops the IRQ frame → resume interrupted code. */
+            cpu->a[7] = (cpu->a[7] - 4) & 0xFFFFFF;
+            uint32_t sp = cpu->a[7];
+            cpu->write8(sp,     0x00);
+            cpu->write8(sp + 1, 0x00);
+            cpu->write8(sp + 2, 0x03);
+            cpu->write8(sp + 3, 0xF8);
+            cpu->pc = lisa->hle.disk_routine;
+            return true;   /* skip the $3F4 RTE; we handled dispatch */
+        }
+        /* Fall through: the RTE ($4E73) at $3F4 executes normally. */
         return false;
+    }
+
+    /* P120 step-3: LIBHW DiskDriver trampoline HLE.
+     * Real DiskDriver body lives in LIBHW which doesn't load, so the
+     * TRAP #5 at $070A60 (selector $68) hits our ROM RTE stub and the
+     * routine address never reaches DiskRoutine. Capture it directly
+     * from the C-stack convention at entry. Address is dynamic via
+     * boot_progress_lookup so it rides out codegen shifts.
+     *
+     * Trampoline layout (22 bytes at DiskDriver entry):
+     *   20 6F 00 04    MOVEA.L 4(SP),A0   ; arg1 = routine
+     *   2F 07          MOVE.L D7,-(SP)
+     *   3E 3C 00 68    MOVE.W #$0068,D7
+     *   4E 45          TRAP #5            ; — dies in ROM stub
+     *   2E 1F          MOVE.L (SP)+,D7
+     *   20 5F          MOVEA.L (SP)+,A0
+     *   DE FC 00 04    ADDA.W #$4,SP
+     *   4E D0          JMP (A0)
+     *
+     * On entry SP+0 = retaddr, SP+4 = routine. Capture routine and
+     * simulate the return: pop retaddr + 4-byte arg (8 bytes), PC=retaddr. */
+    {
+        extern uint32_t boot_progress_lookup(const char *name);
+        static uint32_t pc_DiskDriver = 0;
+        static int dd_probed_gen = -1;
+        if (dd_probed_gen != (int)g_emu_generation) {
+            pc_DiskDriver = boot_progress_lookup("DiskDriver");
+            dd_probed_gen = (int)g_emu_generation;
+        }
+        if (pc_DiskDriver && pc == pc_DiskDriver) {
+            uint32_t sp = cpu->a[7] & 0xFFFFFF;
+            uint32_t retaddr = cpu_read32(cpu, sp);
+            uint32_t routine = cpu_read32(cpu, sp + 4);
+            if (lisa->hle.disk_routine != routine) {
+                fprintf(stderr, "P120 DiskDriver HLE @ $%06X: captured "
+                        "disk_routine=$%06X (prev=$%06X) retaddr=$%06X\n",
+                        pc_DiskDriver, routine, lisa->hle.disk_routine,
+                        retaddr);
+            }
+            lisa->hle.disk_routine = routine;
+            cpu->a[7] = (cpu->a[7] + 8) & 0xFFFFFF;  /* pop retaddr + arg */
+            cpu->pc = retaddr;
+            return true;
+        }
     }
 
 

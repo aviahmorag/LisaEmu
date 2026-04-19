@@ -131,6 +131,13 @@ typedef struct {
          * the right slot. Cleared after fix-up. */
         bool     p115_sp_fixup_pending;
         uint32_t p115_post_jsr_pc; /* kernel PC right after JSR (A0) */
+        /* P120 step-3: captured disk-driver routine address from
+         * LIBHW's DiskDriver(routine) trampoline — real body never
+         * loads, so we intercept at $070A56 and record arg1 here.
+         * On each Level1 IRQ (sentinel $3F4) we synthesize a JSR
+         * into this routine so the kernel's PARALLEL dispatcher can
+         * service the completion. 0 = not yet captured. */
+        uint32_t disk_routine;
     } hle;
 } lisa_t;
 
