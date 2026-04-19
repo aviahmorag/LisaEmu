@@ -3326,6 +3326,7 @@ static bool hle_handle_calldriver(lisa_t *lisa, m68k_t *cpu) {
  * Just read the block there directly.
  *
  * Pascal caller-clean: RTS, caller cleans args. */
+__attribute__((unused))
 static bool hle_handle_mddf_io(lisa_t *lisa, m68k_t *cpu) {
     uint32_t sp = cpu->a[7] & 0xFFFFFF;
     uint32_t ret_addr  = cpu_read32(cpu, sp + 0);
@@ -3388,6 +3389,7 @@ static bool hle_handle_mddf_io(lisa_t *lisa, m68k_t *cpu) {
  *   SP+10 op      (2)
  *   SP+12 addr    (4)
  */
+__attribute__((unused))
 static bool hle_handle_bitmap_io(lisa_t *lisa, m68k_t *cpu) {
     uint32_t sp = cpu->a[7] & 0xFFFFFF;
     uint32_t ret_addr  = cpu_read32(cpu, sp + 0);
