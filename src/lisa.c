@@ -3146,23 +3146,26 @@ static bool hle_handle_calldriver(lisa_t *lisa, m68k_t *cpu) {
             entry_pt >= 0x040000 && entry_pt < 0x00D00000 &&
             (lisa->hle.badcall == 0 || entry_pt != lisa->hle.badcall) &&
             entry_pt != 0x000003F0;
-        if (entry_is_real_ram && fnctn_code == HLE_DINIT) {
+        /* P116 note: we also tried extending passthrough to HDINIT
+         * (fnctn=13). PROFILE.TEXT's hdinit body is where
+         * ext_diskconfig would get populated natively. But the real
+         * hdinit body crashed deep (ILLEGAL $00DC at $20A768, about
+         * 4800 bytes into the driver) — likely another relocation
+         * pattern we don't catch, or a Pascal-codegen bug specific to
+         * hdinit's body. Reverted to dinit-only passthrough until the
+         * driver's internal code is debuggable. Tracked as P117. */
+        bool pass_fn = fnctn_code == HLE_DINIT;
+        if (entry_is_real_ram && pass_fn) {
             DBGSTATIC(int, p115_pass, 0);
-            if (p115_pass < 10) {
+            if (p115_pass < 20) {
                 p115_pass++;
                 fprintf(stderr,
-                        "P115: CALLDRIVER(dinit) -> real driver entry=$%06X "
-                        "config=$%06X\n", entry_pt, config_ptr);
+                        "P115: CALLDRIVER(fn=%d) -> real driver entry=$%06X "
+                        "config=$%06X\n", fnctn_code, entry_pt, config_ptr);
             }
-            /* P115: arm the SP fix-up. Kernel CALLDRIVER's JSR (A0) is
-             * 2 bytes; MOVE.W (SP)+,D0 follows immediately. We don't
-             * know the exact post-JSR PC yet without disassembling the
-             * kernel CALLDRIVER body, so set it based on the driver
-             * entry transition: m68k main loop compares prev_drv_pc
-             * (= JSR address) and bumps SP on the first return-to-
-             * kernel when this flag is set. */
+            /* Arm the SP fix-up. See P114/P115 in comments above. */
             lisa->hle.p115_sp_fixup_pending = true;
-            lisa->hle.p115_post_jsr_pc = 0;  /* filled in by main loop */
+            lisa->hle.p115_post_jsr_pc = 0;
             return false;
         }
     }
@@ -3945,8 +3948,17 @@ bool lisa_hle_intercept(lisa_t *lisa, m68k_t *cpu) {
             vm_addr      = boot_progress_lookup("VM");
             if (!vm_addr) vm_addr = boot_progress_lookup("vm");
         }
+        /* P116 experiment: with P115 real-driver dinit running, try
+         * letting MDDF_IO run natively (real_mount -> real psio ->
+         * LisaIO -> UltraIO). If the compiled dinit populated
+         * ext_diskconfig properly, the native chain should work and
+         * we can retire this HLE. */
+#if 0
         if (mddf_io_addr && pc == mddf_io_addr)
             return hle_handle_mddf_io(lisa, cpu);
+#else
+        (void)mddf_io_addr;
+#endif
         /* P108 (unshipped): psio and vm HLEs compile but are gated off.
          * Together they carry real_mount and fs_mount past bitmap_io /
          * slist_io, but the downstream open_sfile → wait_sem / cleanup

@@ -189,7 +189,77 @@ commit as the real replacement.
 | 11 | **Shell (APDM)** | full desktop | Not started |
 | 12 | **Apps** | LisaWrite, LisaCalc, etc. | Not started |
 
-## Current Status (2026-04-19 post-P115 — compiled driver genuinely runs)
+## Current Status (2026-04-19 post-P116 — MDDF_IO HLE retired)
+
+**Milestones**: **23/27** SYS_PROC_INIT (stable). P116 confirmed the
+MDDF_IO HLE is no longer reached on the current boot path — real_mount
+fails BEFORE MDDF_IO would be called, so disabling the HLE is a safe
+cleanup. The dinit-passthrough cascade from P115 still works; baseline
+is identical.
+
+**P116 shipped**:
+1. **MDDF_IO HLE disabled** (`src/lisa.c:3948`, `#if 0`). Real_mount
+   unwinds through 10707 before reaching MDDF_IO — the HLE was
+   scaffolding a code path that's no longer exercised. Removing it
+   doesn't change the observed trace.
+
+**P116 investigated, reverted**:
+2. **HDINIT (fnctn=13) passthrough**. Extended the dinit passthrough
+   to include fnctn=13 so the compiled driver's real `hdinit` body
+   would run and populate `ext_diskconfig` natively. Result: ILLEGAL
+   opcode $00DC at PC=$20A768 — about 4800 bytes into the driver,
+   deep in hdinit's Pascal body. Suggests either (a) another
+   relocation pattern we don't scan (non-JSR/JMP/LEA/PEA absolutes),
+   or (b) Pascal codegen bug specific to hdinit's internal logic
+   (e.g., record-layout mismatch, pointer-arithmetic bug). Reverted.
+   Tracked as P117.
+
+**P116 finding — the real blocker post-dinit**: with dinit running
+but hdinit still HLE'd ("success" without real body), ext_diskconfig
+stays zeroed. real_mount's pre-MDDF checks probably fail on this
+state (likely checking `blockstructured` or `fs_strt_blok`). The
+10707 suppression then unwinds to SYS_PROC_INIT.
+
+**Next blocker → P117 (debug driver hdinit body)**: to actually
+populate ext_diskconfig natively, the driver's hdinit body must
+run. Two sub-paths:
+
+1. **Extend reloc scan** — dump bytes at $20A768 to see what instruction
+   form caused the crash. If it's a pattern we don't handle (e.g.,
+   MOVE.L #imm,An — no MOVEA.L #imm, so this pattern shouldn't
+   exist in 68000; or `MOVE.L disp(PC),...` variants), extend the
+   scan. Alternatively, drive toward PC-relative codegen in
+   pascal_codegen.c so the driver is truly position-independent
+   (Apple's approach).
+
+2. **HLE-populate ext_diskconfig** — bypass the real hdinit body;
+   have our HLE for fnctn=13 write the expected values directly
+   (blockstructured=true, fs_strt_blok=<boot_track_blocks>,
+   num_bloks=9720, drivetype=T_Profile, etc.) to the ext_drive_cb
+   record attached to configinfo. Faster but scaffolding.
+
+Option 1 is the structural fix and ties back to the asm68k /
+pascal_codegen PC-relative emission work that'd retire the P110
+reloc scanner entirely.
+
+**Active infrastructure (all `#if 1`):**
+- HLE GET_BOOTSPACE ($200000+ MMU seg 16 pass-through).
+- ldr_movemultiple MMU-translated writes.
+- P110 reloc scan (115 sites × 3 drivers per boot).
+- CALLDRIVER(dinit) pass-through + P115 SP fix-up @ $749C2.
+
+**Active HLEs (remaining scaffolds):**
+- CALLDRIVER for fnctn=7 (dcontrol dcode=20 spare-table health).
+- CALLDRIVER for fnctn=12 (DATTACH) — no-op.
+- CALLDRIVER for fnctn=13 (HDINIT) — "success" without body.
+- SYSTEM_ERROR(10707) suppression → SYS_PROC_INIT unwind.
+
+**Retired in P116:**
+- MDDF_IO HLE (unreachable on current boot path).
+
+Baseline: 23/27 SYS_PROC_INIT, audit clean.
+
+## Previous Status (2026-04-19 post-P115 — compiled driver genuinely runs)
 
 **Milestones**: **23/27** SYS_PROC_INIT (stable). The compiled
 SYSTEM.CD_PROFILE now executes NATIVELY for the full INIT_BOOT_CDS
