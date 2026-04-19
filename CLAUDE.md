@@ -189,7 +189,58 @@ commit as the real replacement.
 | 11 | **Shell (APDM)** | full desktop | Not started |
 | 12 | **Apps** | LisaWrite, LisaCalc, etc. | Not started |
 
-## Current Status (2026-04-19 post-P105)
+## Current Status (2026-04-19 post-P106)
+
+**Milestones**: **23/27** kernel checkpoints reached natively, last
+checkpoint `SYS_PROC_INIT`. The 2026-04-19 session landed **P106**
+on top of P105 — a two-part fix that carries `real_mount` past the
+`drivercall(dcontrol, dcode=20)` spare-table health check AND the
+subsequent MDDF_io write-protect test. Count is unchanged but
+internal advance is real: pre-P106 real_mount failed at the spare
+check; post-P106 real_mount completes. The next 10707 fires from a
+downstream caller (second `HLE MDDF_IO: WRITE` at a different
+@ecode frame) with D2=$367 (=871 E1_SENTRY_BAD).
+
+**P106 is two related fixes** (commit `ff38ba1`):
+
+1. **CALLDRIVER dcontrol(dcode=20) HLE scaffold** (`src/lisa.c`,
+   `hle_handle_calldriver`). real_mount calls drivercall(dcontrol,
+   dcode=20) to check spare-table health; Apple's real ProFile driver
+   replies with `ar10[0]=SPARES_INTACT(4), ar10[2]=available spares,
+   ar10[3]=SPARE_TABLES_OK(0)`. Pre-P106 our HLE left ar10 zeroed, so
+   real_mount fired E_SPARES_DAMAGED. Split HLE_DCONTROL out of the
+   no-op cluster and write the healthy triple for dcode=20 only.
+   Layered scaffolding HLE — retires in Phase 3 when compiled
+   SYSTEM.CD_PROFILE handles dcontrol natively.
+
+2. **WITH-field array-of-longint read size** (`src/toolchain/pascal_codegen.c`,
+   `expr_size` for `AST_ARRAY_ACCESS`). Even after Fix 1, real_mount
+   still fired E_SPARES_DAMAGED. Disassembly around `$068D50` showed
+   the compare `ar10[0] <> SPARES_INTACT(4)`:
+   ```
+   MOVEQ #0,D0 ; MOVEA.L (A7)+,A0 ; MOVE.W D0,D1 ; MULU.W #4,D1 ;
+   ADDA.L D1,A0 ; MOVE.W (A0),D0  ← reads 2 bytes, not 4
+   ```
+   The stride multiplier was correct (4 = longint size) but the
+   LOAD was 2 bytes — reading only the high word of each longint
+   element. Our `$00000004` stored big-endian at `ar10[0]` read back
+   as `$0000`, compared vs 4 failed. Root cause: `expr_size` returned
+   2 for WITH-field array accesses because the `if (arr) return es;`
+   guard skipped the real size return whenever `arr =
+   find_symbol_any(array_name)` was NULL — which is always true for
+   a WITH-record field. Fix: extend the es-return path to WITH-field
+   case when element type is non-pointer (longint/integer/subrange).
+   Scoped that way per the existing comment warning about
+   pointer-of-array regressions.
+
+**Next blocker**: second `HLE MDDF_IO: WRITE` at `@ecode=$CBFF34`
+(different stack frame from real_mount's `$CBFFB8`), followed by
+SYSTEM_ERROR(10707) with D2=$367 (=871 = `E1_SENTRY_BAD`). The
+caller of this second MDDF_IO WRITE is unknown — likely FS_INIT's
+retry loop or FS_MASTER_INIT's post-mount sfile-open on an sfile
+whose `hintaddr` is 0 on our disk image. Investigation for P107.
+
+## Previous Status (2026-04-19 post-P105)
 
 **Milestones**: **23/27** kernel checkpoints reached natively, last
 checkpoint `SYS_PROC_INIT`. The 2026-04-19 session landed **P105** —
