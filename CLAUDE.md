@@ -240,7 +240,51 @@ for each of 3 devices:
 10707 suppression -> SYS_PROC_INIT 23/27 baseline tail
 ```
 
-**Next blocker → P118 (boolean NOT codegen vs. 0/1 boolean storage)**:
+**P118 shipped (partial)**:
+1. **Scanner narrowed** (`src/lisa.c` call_move reloc scan): dropped
+   `$203C` (MOVE.L #imm,Dn) and `$2F3C` (MOVE.L #imm,-(SP)) from the
+   abs-long whitelist. Those opcodes carry both code pointers AND
+   data literals, and the scanner can't tell them apart. Concrete
+   example: PROF_INIT's `num_bloks := 9720` compiles to
+   `MOVE.L #$25F8,D0` — $25F8 is in the driver's link range $400..
+   $3956, so the old scanner patched it to `$25F8 + fixup` = $209600,
+   and `num_bloks` in `ext_diskconfig` ended up as $FFFF9600 after
+   EXT.L (sign-extended `$9600` → -27648 signed longint). Now 70
+   genuine JSR/JMP/PEA/LEA patches per load, zero data-literal
+   corruption. Confirmed: `num_bloks` now reads correctly as 9720.
+2. **P115 SP fix-up address made dynamic** (`src/m68k.c`): was
+   hardcoded to `$749C2` (CALLDRIVER's post-JSR `MOVE.W (SP)+,D0`).
+   Any codegen tweak that shifts SYSTEM.OS size moves this PC, so
+   we now look up `CALLDRIVER` via `boot_progress_lookup` and scan
+   forward for the `4E 90 30 1F` opcode pair. Cached per generation.
+
+**P118 investigated, not shipped (regresses baseline)**:
+3. **Boolean NOT codegen fix**: with-scope bare-ident booleans hit
+   bitwise `NOT.W` which turns `0x0001` into `0xFFFE` (still TRUE).
+   Adding a `with_lookup_field` check to the `is_boolean` gate in
+   `pascal_codegen.c` correctly compiles `if not blockstructured`,
+   so UltraIO no longer fires E_IO_MODE_BAD. But then bitmap_io's
+   compiled path spins in `status_req` waiting for IRQ-driven I/O
+   completion that our emulator's ProFile HLE doesn't generate —
+   boot drops to 22/27 (FS_INIT). Confirmed via `num_bloks-set`
+   PC trap: when NOT is fixed and scanner is narrowed, real_mount
+   advances past the MDDF and spare checks, then bitmap_io's
+   UltraIO → DiskIO chain enqueues a request and blocks forever.
+
+**Next blocker → P119 (NOT fix + IRQ-driven I/O completion)**:
+Landing the NOT fix durably needs either (a) an IRQ-completion
+path so the bitmap_io spin terminates (Phase-5 work per the phases
+table above), or (b) a layered HLE for `bitmap_io` matching the
+existing `MDDF_IO` HLE scaffold — reading/writing the bitmap
+directly from the profile image, then setting `reqstatus.reqsrv_f
+= complete` on the request block. Path (b) is faster but more
+scaffolding debt. Path (a) is the real structural fix.
+
+Meanwhile CALLDRIVER post-JSR fix-up for `dinit` still works; the
+compiled driver still runs hdinit to completion (now correctly
+populating `num_bloks = 9720`).
+
+**Previous next-blocker hypothesis (superseded)** — P118 (boolean NOT):
 
 P118 investigation identified the real post-P117 blocker. With MDDF_IO
 HLE retired and hdinit running, real_mount's `MDDF_IO → psio → lisaio

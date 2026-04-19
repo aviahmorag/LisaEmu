@@ -3002,22 +3002,55 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 static bool dumped_ccb = false;
                 bool cur_drv = (cpu->pc >= 0x200000 && cpu->pc < 0x210000);
                 bool prev_drv = (prev_drv_pc >= 0x200000 && prev_drv_pc < 0x210000);
-                /* P115: kernel CALLDRIVER post-JSR is at $749C2
-                 * (MOVE.W (SP)+,D0). Our caller-clean Pascal driver
-                 * leaves SP 4B too low for Apple's callee-clean
-                 * expectation. Fire SP+=4 each time PC reaches $749C2
-                 * while the passthrough is armed — the dinit dispatch
-                 * involves at least two $749C2 visits (one per nested
-                 * PRODRIVER call via fall-through from kernel
-                 * CALL_HDISK). Flag clears once `dinit_seen` completes
-                 * the outer dispatch, so post-boot non-driver calls
-                 * aren't affected. */
-                if (lisa_hle_p115_fixup_pending() && cpu->pc == 0x000749C2) {
+                /* P115: kernel CALLDRIVER's post-JSR `MOVE.W (SP)+,D0`
+                 * is the fix-up trigger. Our caller-clean Pascal driver
+                 * leaves SP 4B too low vs Apple's callee-clean CALLDRIVER
+                 * contract. The exact PC shifts whenever SYSTEM.OS's
+                 * size changes (e.g. a codegen tweak), so resolve it
+                 * dynamically via boot_progress_lookup("CALLDRIVER")
+                 * and scan forward for the JSR (A0); MOVE.W (SP)+,D0
+                 * opcode pair ($4E90 $301F). Cache per-generation. */
+                static uint32_t p115_fixup_pc = 0;
+                static int p115_fixup_gen = -1;
+                if (p115_fixup_gen != g_emu_generation) {
+                    p115_fixup_gen = g_emu_generation;
+                    p115_fixup_pc = 0;
+                    extern uint32_t boot_progress_lookup(const char *name);
+                    uint32_t cd_addr = boot_progress_lookup("CALLDRIVER");
+                    if (cd_addr) {
+                        for (uint32_t off = 0; off < 128; off += 2) {
+                            uint8_t b0 = cpu->read8((cd_addr + off + 0) & 0xFFFFFF);
+                            uint8_t b1 = cpu->read8((cd_addr + off + 1) & 0xFFFFFF);
+                            uint8_t b2 = cpu->read8((cd_addr + off + 2) & 0xFFFFFF);
+                            uint8_t b3 = cpu->read8((cd_addr + off + 3) & 0xFFFFFF);
+                            if (b0 == 0x4E && b1 == 0x90 && b2 == 0x30 && b3 == 0x1F) {
+                                p115_fixup_pc = cd_addr + off + 2;
+                                fprintf(stderr,
+                                        "P115: CALLDRIVER post-JSR fix-up PC = $%06X "
+                                        "(CALLDRIVER+$%X)\n", p115_fixup_pc, off + 2);
+                                break;
+                            }
+                        }
+                    }
+                }
+                /* P118 diag: trap the driver's `num_bloks := 9720`
+                 * store. Driver file offset $C6C corresponds to
+                 * load3 RAM $207C74 (load_base $207408 + ($C6C -
+                 * $400)). Log PC hit + register state. */
+                if (cpu->pc >= 0x207C74 && cpu->pc <= 0x207C86) {
+                    DBGSTATIC(int, nbk_n, 0);
+                    if (nbk_n++ < 30)
+                        fprintf(stderr, "P118 num_bloks-set @$%06X D0=$%08X "
+                                "A0=$%08X A6=$%08X SP=$%08X\n",
+                                cpu->pc, cpu->d[0], cpu->a[0], cpu->a[6], cpu->a[7]);
+                }
+                if (lisa_hle_p115_fixup_pending() && p115_fixup_pc &&
+                    cpu->pc == p115_fixup_pc) {
                     DBGSTATIC(int, p115_fix_n, 0);
                     p115_fix_n++;
                     fprintf(stderr,
-                            "P115 SP fix-up #%d @ $749C2: SP=$%08X -> $%08X (A7 was)\n",
-                            p115_fix_n, cpu->a[7], cpu->a[7] + 4);
+                            "P115 SP fix-up #%d @ $%06X: SP=$%08X -> $%08X (A7 was)\n",
+                            p115_fix_n, p115_fixup_pc, cpu->a[7], cpu->a[7] + 4);
                     cpu->a[7] += 4;
                 }
                 if (cur_drv != prev_drv) {
@@ -5070,8 +5103,22 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                             uint32_t a5 = cpu->a[5];
                             uint32_t cfgi_abs = (a5 + cfgi_off) & 0xFFFFFF;
                             uint32_t cfg_ptr = cpu_read32(cpu, cfgi_abs + device * 4);
-                            fprintf(stderr, "  UltraIO device=%d cfg_ptr=$%06X\n",
-                                    device, cfg_ptr);
+                            /* P118 diag: also dump ext_diskconfig at
+                             * devrec+$8 (= ext_addr field). DISKIO (in
+                             * SOURCE-GENIO:182) checks `(block_no+length)
+                             * > ext_config^.num_bloks`; if num_bloks is
+                             * 0 (i.e. hdinit didn't populate it), every
+                             * read fires errbase+8=608. */
+                            uint32_t ext_addr = cpu_read32(cpu, cfg_ptr + 8);
+                            fprintf(stderr, "  UltraIO device=%d cfg_ptr=$%06X ext_addr=$%06X\n",
+                                    device, cfg_ptr, ext_addr);
+                            if (ext_addr) {
+                                fprintf(stderr, "    ext_diskconfig[+0..+23]:");
+                                for (int b = 0; b < 24; b++)
+                                    fprintf(stderr, " %02X",
+                                            cpu->read8((ext_addr + b) & 0xFFFFFF));
+                                fprintf(stderr, "\n");
+                            }
                             for (uint32_t off = 0; off < 128; off += 16) {
                                 fprintf(stderr, "    +%02X:", off);
                                 for (int b = 0; b < 16; b++) {

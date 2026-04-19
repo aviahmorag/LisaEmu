@@ -720,15 +720,20 @@ bool lisa_hle_enter_loader(m68k_t *cpu) {
                 uint32_t patched   = 0;
                 for (uint32_t off = 0; off + 6 <= count; off += 2) {
                     uint16_t op = lisa_mem_read16(&lisa->mem, dest + off);
+                    /* P118: restrict to UNAMBIGUOUS code-pointer opcodes.
+                     * MOVE.L #imm,Dn ($203C) and MOVE.L #imm,-(SP) ($2F3C)
+                     * are used by codegen for BOTH code addresses AND data
+                     * literals (e.g. `num_bloks := 9720` emits MOVE.L
+                     * #$25F8,D0 — and $25F8 falls inside driver link
+                     * range, so the scanner patched it to $209600 and
+                     * poisoned ext_diskconfig.num_bloks). Drop those
+                     * two patterns. JSR/JMP/PEA/LEA only take CODE
+                     * targets, so those remain safe. */
                     bool is_abs_long =
                         op == 0x4EB9 ||                  /* JSR abs.L */
                         op == 0x4EF9 ||                  /* JMP abs.L */
                         op == 0x4879 ||                  /* PEA abs.L */
-                        ((op & 0xF1FF) == 0x41F9) ||     /* LEA abs.L,An */
-                        ((op & 0xF1FF) == 0x203C) ||     /* MOVE.L #imm,Dn */
-                        /* MOVE.L #imm,-(SP) = PEA equivalent used by
-                         * codegen to push absolute code addresses. */
-                        op == 0x2F3C;
+                        ((op & 0xF1FF) == 0x41F9);       /* LEA abs.L,An */
                     /* P117: enforce is_abs_long. Earlier code declared
                      * the flag but never consulted it — causing 43/160
                      * false-positive patches per driver load, including
@@ -3962,11 +3967,13 @@ bool lisa_hle_intercept(lisa_t *lisa, m68k_t *cpu) {
             vm_addr      = boot_progress_lookup("VM");
             if (!vm_addr) vm_addr = boot_progress_lookup("vm");
         }
-        /* P116 experiment: with P115 real-driver dinit running, try
-         * letting MDDF_IO run natively (real_mount -> real psio ->
-         * LisaIO -> UltraIO). If the compiled dinit populated
-         * ext_diskconfig properly, the native chain should work and
-         * we can retire this HLE. */
+        /* P116 retired the HLE; P118 kept it retired. MDDF_IO is
+         * not reached in the current boot path (real_mount fails at
+         * UltraIO's `not blockstructured` bitwise-NOT bug before
+         * MDDF_IO would run). Re-enabling this HLE becomes load-
+         * bearing again once the NOT codegen is fixed — at that
+         * point it'd bypass the (not yet implemented) IRQ-driven
+         * I/O completion path. */
 #if 0
         if (mddf_io_addr && pc == mddf_io_addr)
             return hle_handle_mddf_io(lisa, cpu);
