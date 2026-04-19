@@ -189,7 +189,55 @@ commit as the real replacement.
 | 11 | **Shell (APDM)** | full desktop | Not started |
 | 12 | **Apps** | LisaWrite, LisaCalc, etc. | Not started |
 
-## Current Status (2026-04-19 post-P117 — scanner gate enforced, HDINIT runs natively)
+## Current Status (2026-04-19 post-P120-step-1 — ProFile→CA1 IRQ plumbing scaffolded)
+
+**Milestones**: **23/27** SYS_PROC_INIT (stable). P120 step-1 shipped
+ProFile → VIA1 CA1 IRQ plumbing (`389f489`). `profile_t` now carries a
+`completion_pending` flag set at end of SEND_DATA / RECV_DATA phases;
+`profile_check_irq(p)` drains it in the CPU run loop (`src/lisa.c` main
+tick) and drives `via_trigger_ca1(&lisa->via1)` which properly
+propagates through `update_irq → irq_callback (via1_irq) → irq_via1 →
+m68k_set_irq(level=1)`. Also fixed a latent bug in `via1_portb_write`
+and `via1_porta_write`: bare `lisa->via1.ifr |= 0x02` on BSY
+transitions bypassed `update_irq` so `irq_via1` stayed stuck at 0 even
+when a CA1 edge occurred. Both sites now go through `via_trigger_ca1`.
+
+Current boot path never actually initiates a VIA1 transaction —
+compiled hdinit only reads config registers — so the scaffold is
+silent today. Zero P120 completion events observed in the 3000-frame
+baseline, and no regression (still 23/27 SYS_PROC_INIT clean).
+
+**Next blocker → P120 step-2 (install INT1V handler)**: INT1V ($64)
+still points at the linker's $3F8 RTE stub because LIBHW's
+`DriverInit` (symbol at $070A4A in `SYSTEM.OS/linked.map`) has zero
+callers. Two paths, documented in the handoff:
+
+1. **Call DriverInit via targeted HLE**. Structurally right — the
+   routine is already compiled + linked. It installs Level1 at $64,
+   Level2 at $68, Trap5 at $94, programs VIA1/VIA2 ACR/IER/T1, calls
+   AlarmAssign × 4 (BzyCursor, Silence, StContrast, ChkActivity),
+   AlarmRelative for ChkActivity, SetScreenKeybd, processes
+   KeybdQueue. Needs alarm + scheduler subsystems ready (so not
+   before SYS_PROC_INIT). Risk: the alarm/KeybdQueue paths might
+   not be wired up correctly in our current state.
+2. **Narrower HLE**: scan the linked image near DriverInit to find
+   `Level1` (local label, not an ENTRY), install at INT1V. Skips
+   the alarm/keyboard setup. Fallback if (1) regresses.
+
+After step-2, a call chain needs to install the compiled driver's
+`dinterrupt` handler at `DiskRoutine` — `DiskDriver` symbol at
+$070A56 does that (simple: `MOVE.L A0, DiskRoutine ; RTS`). PROFILE
+.TEXT's PROF_INIT probably calls DiskDriver in its normal flow; if
+not, another targeted HLE.
+
+After both pieces land: a real ProFile transaction (triggered by
+flipping the MDDF_IO/BitMap_IO HLE `#if 0`→`#if 1` plus the narrow
+NOT-fix for `blockstructured`) fires Level1 → dinterrupt →
+completes the I/O request. Phase-5 done, MDDF_IO and BitMap_IO HLEs
+retire in that same commit (per
+`feedback_hle_layers_load_bearing.md`).
+
+## Previous Status (2026-04-19 post-P117 — scanner gate enforced, HDINIT runs natively)
 
 **Milestones**: **23/27** SYS_PROC_INIT (stable). P117 shipped a
 structural fix to the P110 driver-reloc scanner: the `is_abs_long`
