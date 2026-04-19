@@ -500,6 +500,11 @@ static int pascalinit_addr_gen = 0;  /* gen vars for file-scope statics — rese
 static int illegal_opcode_histogram[16] = {0};
 uint32_t g_last_cpu_pc = 0;  /* Visible to lisa_mmu.c for write watchpoints */
 
+/* PC ring buffer — file-scope so illegal_instruction can dump it. */
+static uint32_t g_pc_ring[256];
+static int g_pc_ring_idx = 0;
+static int g_pc_ring_gen = -1;
+
 int g_emu_generation = 0;
 int g_vec_guard_active = 0;  /* P78d: set after SYS_PROC_INIT to protect vector table */
 int m68k_exception_histogram[256] = {0};
@@ -681,11 +686,43 @@ static void illegal_instruction(m68k_t *cpu) {
         fprintf(stderr, "ILLEGAL: opcode=$%04X group=%X at PC=$%06X\n",
                 cpu->ir, group, pc);
         /* P113 diag: dump 16 bytes around PC and 32 bytes at SP.
-         * Classifies stack-return-to-garbage vs. bad-relocation. */
-        fprintf(stderr, "  bytes @PC-8..PC+8:");
-        for (int i = -8; i < 8; i++)
+         * Classifies stack-return-to-garbage vs. bad-relocation.
+         * P117: widen to ±32 bytes + file-offset if PC is in driver range. */
+        fprintf(stderr, "  bytes @PC-32..PC+32:");
+        for (int i = -32; i < 32; i++) {
+            if (i == 0) fprintf(stderr, " [");
             fprintf(stderr, " %02X", cpu->read8((pc + i) & 0xFFFFFF));
-        fprintf(stderr, "\n  stack @SP..SP+32:");
+            if (i == 1) fprintf(stderr, " ]");
+        }
+        if (pc >= 0x200000 && pc < 0x210000) {
+            /* Driver range. Report file-offset against likely load bases. */
+            fprintf(stderr, "\n  PC in driver range: pc=$%06X", pc);
+            fprintf(stderr, "  (off-from-$207408=$%X off-from-$200000=$%X)",
+                    pc - 0x207408, pc - 0x200000);
+            /* P117: dump PC ring, highlighting driver-range PCs and the
+             * last non-driver PC (= caller that jumped into the driver). */
+            fprintf(stderr, "\n  PC ring (newest first, driver PCs marked *):\n");
+            for (int k = 0; k < 64; k++) {
+                int idx = (g_pc_ring_idx - 1 - k + 256) & 0xFF;
+                uint32_t rp = g_pc_ring[idx];
+                const char *mark = (rp >= 0x200000 && rp < 0x210000) ? " *DRV*" : "";
+                fprintf(stderr, "    [-%3d] PC=$%08X%s\n", k+1, rp, mark);
+            }
+            /* P117: dump bytes at last-few ring PCs so we can see the
+             * branch that led to the mid-instruction PC. Look for JMP/
+             * JSR/BRA/Bcc/JMP-through-reg instructions. */
+            fprintf(stderr, "  Bytes at last 10 ring PCs:\n");
+            for (int k = 0; k < 10; k++) {
+                int idx = (g_pc_ring_idx - 1 - k + 256) & 0xFF;
+                uint32_t rp = g_pc_ring[idx];
+                if (rp < 0x200000 || rp >= 0x210000) continue;
+                fprintf(stderr, "    @$%06X:", rp);
+                for (int b = 0; b < 8; b++)
+                    fprintf(stderr, " %02X", cpu->read8((rp + b) & 0xFFFFFF));
+                fprintf(stderr, "\n");
+            }
+        }
+        fprintf(stderr, "  stack @SP..SP+32:");
         for (int i = 0; i < 32; i++)
             fprintf(stderr, " %02X", cpu->read8((cpu->a[7] + i) & 0xFFFFFF));
         fprintf(stderr, "\n  D0=$%08X D1=$%08X A0=$%08X A1=$%08X A6=$%08X A7=$%08X\n",
@@ -2910,10 +2947,11 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             break;
         }
 
-        /* PC ring buffer — trace crashes and escapes */
-        static uint32_t pc_ring[256];
-        static int pc_ring_idx = 0;
-        static int pc_ring_gen = 0;
+        /* PC ring buffer — file-scope (see g_pc_ring above); these
+         * aliases keep existing refs below compact. */
+        #define pc_ring     g_pc_ring
+        #define pc_ring_idx g_pc_ring_idx
+        #define pc_ring_gen g_pc_ring_gen
         /* P80h3: track (PCB, syslocal) pairs created via HLE-CreateProcess
          * so HLE-SelectProcess can update b_syslocal_ptr when the
          * Scheduler dispatches a process. Map_Syslocal (the normal

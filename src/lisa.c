@@ -729,6 +729,16 @@ bool lisa_hle_enter_loader(m68k_t *cpu) {
                         /* MOVE.L #imm,-(SP) = PEA equivalent used by
                          * codegen to push absolute code addresses. */
                         op == 0x2F3C;
+                    /* P117: enforce is_abs_long. Earlier code declared
+                     * the flag but never consulted it — causing 43/160
+                     * false-positive patches per driver load, including
+                     * bytes inside PROF_INIT's prolog (site $20A75C,
+                     * op=$00A0), which corrupted `MOVE.B #$3B,IER(A3)`
+                     * and sent the CPU to an ILLEGAL at $20A768 during
+                     * the HDINIT dispatch. The original operand-skip
+                     * that ran unconditionally also hid non-opcode sites
+                     * from re-examination on the next step. */
+                    if (!is_abs_long) continue;
                     uint32_t target = lisa_mem_read32(&lisa->mem, dest + off + 2);
                     if (target < link_base || target >= link_end) continue;
                     uint32_t new_target = target + fixup;
@@ -3146,15 +3156,19 @@ static bool hle_handle_calldriver(lisa_t *lisa, m68k_t *cpu) {
             entry_pt >= 0x040000 && entry_pt < 0x00D00000 &&
             (lisa->hle.badcall == 0 || entry_pt != lisa->hle.badcall) &&
             entry_pt != 0x000003F0;
-        /* P116 note: we also tried extending passthrough to HDINIT
-         * (fnctn=13). PROFILE.TEXT's hdinit body is where
-         * ext_diskconfig would get populated natively. But the real
-         * hdinit body crashed deep (ILLEGAL $00DC at $20A768, about
-         * 4800 bytes into the driver) — likely another relocation
-         * pattern we don't catch, or a Pascal-codegen bug specific to
-         * hdinit's body. Reverted to dinit-only passthrough until the
-         * driver's internal code is debuggable. Tracked as P117. */
-        bool pass_fn = fnctn_code == HLE_DINIT;
+        /* P117: HDINIT passthrough. With the driver-reloc scanner
+         * gated properly on is_abs_long (see call_move case in
+         * lisa_hle_intercept_enter_loader), PROFILE.TEXT's compiled
+         * hdinit body now runs through to completion. The P116 crash
+         * at PC=$20A768 was traced to 43 false-positive patches per
+         * driver load — one of which clobbered MOVE.B #$3B,IER(A3)
+         * inside PROF_INIT's asm prolog. Fix lives in the scanner;
+         * this flag just opts fn=13 into the same SP-fix-up path
+         * that already works for fn=1. Milestones unchanged at
+         * 23/27 SYS_PROC_INIT — hdinit succeeds but ext_diskconfig
+         * stays partially populated (needs real hardware or a
+         * follow-up HLE for the VIA reads). */
+        bool pass_fn = fnctn_code == HLE_DINIT || fnctn_code == HLE_HDINIT;
         if (entry_is_real_ram && pass_fn) {
             DBGSTATIC(int, p115_pass, 0);
             if (p115_pass < 20) {
