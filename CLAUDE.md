@@ -189,7 +189,62 @@ commit as the real replacement.
 | 11 | **Shell (APDM)** | full desktop | Not started |
 | 12 | **Apps** | LisaWrite, LisaCalc, etc. | Not started |
 
-## Current Status (2026-04-19 post-P120-step-2 — INT1V sentinel + Level1 HLE)
+## Current Status (2026-04-19 post-P120-step-3 — Phase-5 IRQ scaffold complete)
+
+**Milestones**: **23/27** SYS_PROC_INIT (stable). Phase-5 IRQ-driven
+I/O completion scaffold complete across three commits:
+
+- **Step-1** (`389f489`) — `profile_t.completion_pending` fires VIA1
+  CA1 via `profile_check_irq()` + main-loop `via_trigger_ca1()`. Also
+  fixed latent bug where BSY-transition `ifr |= 0x02` bypassed
+  `update_irq` so `irq_via1` stayed stuck at 0.
+- **Step-2** (`15163fc`) — INT1V ($64) → $3F4 sentinel with RTE stub;
+  `lisa_hle_intercept` catches PC=$3F4, reads+clears VIA1 IFR,
+  falls through to RTE. Root-caused that LIBHW.DriverInit ($070A4A)
+  is a TRAP #5 trampoline whose body never loads, so installing a
+  sentinel at INT1V was the minimum viable fix.
+- **Step-3** (`0c97b75`) — `DiskDriver` HLE at `boot_progress_lookup
+  ("DiskDriver")` (dynamic addr, currently $070A56) captures the
+  single-arg routine into `lisa->hle.disk_routine`. Level1 HLE
+  extended: after IFR clear, synthesize a JSR into `disk_routine`
+  by pushing $3F8 (linker RTE stub) as the return address. The only
+  registered routine is **PARALLEL** ($074A32) — a kernel-local
+  Level-1 IRQ dispatcher that walks `configinfo[bootdev]^` and
+  JSRs the compiled driver's PRODRIVER entry.
+
+End-to-end chain verified via the step-2 synth test (gated `#if 0`
+in the shipped build): CA1 edge → IFR set → update_irq → irq_via1
+→ m68k_set_irq(1) → CPU accepts IRQ → vector fetch at $64 → PC=$3F4
+→ Level1 HLE clears IFR → synthesizes JSR → PARALLEL runs
+(confirmed by its `MOVE.B #$3B,IER` clearing IER CA1 bit $02→$00) →
+RTS to $3F8 → RTE pops IRQ frame → continue.
+
+**Next blocker → trigger a real ProFile transaction**: the IRQ
+scaffold is now armed end-to-end, but baseline never initiates a
+VIA1 transaction — compiled hdinit only reads config registers, and
+UltraIO's `if not blockstructured` buggy NOT.W guards real_mount
+away from issuing a disk I/O. Two tracks converge here:
+
+1. **P121 — boolean NOT codegen fix** (separate investigation). See
+   prior "post-P117" status for full root cause. Narrow fix for
+   `blockstructured` only regresses a WITH-scope consumer elsewhere
+   in hdinit; broader fix needs an audit of every `not <boolean>`
+   call site. Either path-per-site scoping of `with_lookup_field`
+   check in `pascal_codegen.c` AST_UNARY_OP / TOK_NOT, or switching
+   boolean storage convention to Apple's 0xFFFF-for-TRUE.
+
+2. **Re-enable layered HLEs**: `MDDF_IO` (`src/lisa.c:3976`) and
+   `BitMap_IO` (`src/lisa.c:3985`), plus the narrow NOT fix for
+   `blockstructured` once P121 scopes it. Per
+   `feedback_hle_layers_load_bearing.md`, these three changes land
+   together with the IRQ-completion scaffold retirement plan.
+
+Once a transaction fires, `profile.completion_pending → VIA1 CA1 →
+Level1 HLE → PARALLEL → compiled driver's dinterrupt → IODONE →
+scheduler unblocks`. Phase-5 done; MDDF_IO/BitMap_IO HLEs retire in
+the same commit that flips them on and proves the path.
+
+## Previous Status (2026-04-19 post-P120-step-2 — INT1V sentinel + Level1 HLE)
 
 **Milestones**: **23/27** SYS_PROC_INIT (stable). P120 step-1 + step-2
 shipped — ProFile→CA1 plumbing plus emulated Level1 IRQ handler.
