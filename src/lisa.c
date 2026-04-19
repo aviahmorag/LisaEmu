@@ -3037,8 +3037,30 @@ static bool hle_handle_calldriver(lisa_t *lisa, m68k_t *cpu) {
     case HLE_HDSKIO:
         fprintf(stderr, "HLE: hdskio → success\n");
         break;
+    case HLE_DCONTROL: {
+        /* real_mount calls drivercall(dcontrol, dcode=20) to check
+         * spare-table health. The real ProFile driver replies with
+         * ar10[0]=SPARES_INTACT(4), ar10[2]=available spares (>2),
+         * ar10[3]=SPARE_TABLES_OK(0). Our HLE driver stack has no
+         * real spare tables, so report healthy constants to let
+         * real_mount advance past the health check. Other dcodes
+         * fall through as no-ops (ar10 left untouched, ecode=0). */
+        uint32_t cparm_ptr = cpu_read32(cpu, params_ptr + 6);
+        if (cparm_ptr != 0) {
+            int16_t dcode = (int16_t)cpu_read16(cpu, cparm_ptr + 2);
+            if (dcode == 20) {
+                cpu->write32(mask_24(cparm_ptr + 4),  4);   /* ar10[0] = SPARES_INTACT */
+                cpu->write32(mask_24(cparm_ptr + 12), 10);  /* ar10[2] = spares available */
+                cpu->write32(mask_24(cparm_ptr + 16), 0);   /* ar10[3] = SPARE_TABLES_OK */
+                if (hle_trace < 50)
+                    fprintf(stderr, "HLE dcontrol(dcode=20): reporting healthy spares @cparm=$%06X\n",
+                            cparm_ptr);
+            }
+        }
+        break;
+    }
     case HLE_DDOWN: case HLE_HDDOWN: case HLE_DSKUNCLAMP:
-    case HLE_DINTERRUPT: case HLE_DALARMS: case HLE_DCONTROL:
+    case HLE_DINTERRUPT: case HLE_DALARMS:
     case HLE_DATTACH: case HLE_DUNATTACH: case HLE_REQRESTART:
     case HLE_DDISCON:
         /* Sub-driver attach/detach, request-restart, disconnect — no-op

@@ -1622,6 +1622,20 @@ static int expr_size(codegen_t *cg, ast_node_t *node) {
                         int es = type_load_size(at->element_type);
                         if (es == 1) return 1;
                         if (arr) return es;
+                        /* P106: WITH-field array of non-pointer elements
+                         * (longint/integer/subrange). `ar10: array[0..9] of
+                         * longint` inside `with cparm do` — codegen was
+                         * reading only the high word of each 4-byte element
+                         * because expr_size fell through to 2 whenever arr
+                         * was NULL (WITH field has no global symbol). That
+                         * turned real_mount's `ar10[0] <> SPARES_INTACT(4)`
+                         * test into (high-word=0) <> 4 = TRUE, firing
+                         * E_SPARES_DAMAGED on a healthy spare-table reply.
+                         * Scoped to non-pointer element types — the prior
+                         * comment warns about pointer-of-arrays regressing
+                         * FS_INIT when we returned 4 unconditionally. */
+                        if (at->element_type->kind != TK_POINTER)
+                            return es;
                     }
                     if (at->kind == TK_STRING)
                         return 1;  /* string subscript returns a char */
