@@ -3710,6 +3710,13 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 fprintf(stderr, "[P86] Scheduler#%d entry A5=$%06X A6=$%06X A7=$%06X c_pcb=$%08X b_syslocal=$%08X inv_sched=$%02X\n",
                         p86_sched_count, a5, cpu->a[6]&0xFFFFFF, cpu->a[7]&0xFFFFFF,
                         cpcb, bsl, isch);
+                fprintf(stderr, "  Last 80 PCs:");
+                for (int ri = 80; ri > 0; ri--)
+                    fprintf(stderr, " $%06X", pc_ring[(pc_ring_idx - ri) & 255]);
+                fprintf(stderr, "\n  SSP top:");
+                for (int si = 0; si < 10; si++)
+                    fprintf(stderr, " $%08X", cpu_read32(cpu, (cpu->a[7] + si*4) & 0xFFFFFF));
+                fprintf(stderr, "\n  D0=$%08X (GETSPACE or other func result)\n", cpu->d[0]);
             }
 
             /* Launch entry — $06EAB0. Dump everything that SETREGS reads,
@@ -5062,9 +5069,15 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 {"InitBufPool",    0}, {"InitFS",         0},
                 {"fs_mount",       0}, {"real_mount",     0},
                 {"def_mount",      0}, {"MDDF_IO",        0},
-                {"UltraIO",        0},
+                {"UltraIO",        0}, {"DISKIO",         0},
+                {"DiskIO",         0}, {"Wait_IO",        0},
+                {"wait_sem",       0}, {"BitMap_IO",      0},
+                {"DRIVERCALL",     0}, {"CVT_BUFF_ADDR",  0},
+                {"ADJ_IO_CNT",     0}, {"CALLDRIVER",     0},
+                {"Scheduler",      0}, {"signal_sem",     0},
+                {"ENTER_SC",       0}, {"MakeSGSpace",    0},
             };
-            static uint32_t pcs_cache[24];
+            static uint32_t pcs_cache[32];
             static int pci_gen = -1;
             if (pci_gen != g_emu_generation) {
                 pci_gen = g_emu_generation;
