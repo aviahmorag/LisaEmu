@@ -3374,6 +3374,86 @@ static bool hle_handle_calldriver(lisa_t *lisa, m68k_t *cpu) {
     return true;
 }
 
+/* P124 scaffold: HLE MakeSGSpace. Apple's compiled MakeSGSpace expects
+ * to yield to the memory-manager process, which calls Get_MM_Space to
+ * extend the sysglobal freepool. We've stubbed SYS_PROC_INIT (P35), so
+ * the memory manager never exists, so MakeSGSpace spins forever in
+ * `while grow_sysglobal do Enter_Scheduler`. This HLE directly runs
+ * the pool-expansion work the memmgr would have done: chops a fresh
+ * chunk out of the sysglobal segment's headroom, links it at the head
+ * of the freelist, bumps freecount. Retires in the same commit that
+ * brings SYS_PROC_INIT online.
+ *
+ * Pascal sig: procedure MakeSGSpace(var no_space : boolean)
+ * Stack: SP+0=retaddr(4), SP+4=@no_space(4). Caller-clean. */
+static bool hle_handle_makesgspace(lisa_t *lisa, m68k_t *cpu) {
+    (void)lisa;
+    uint32_t sp = cpu->a[7] & 0xFFFFFF;
+    uint32_t ret_addr     = cpu_read32(cpu, sp + 0);
+    uint32_t no_space_ptr = cpu_read32(cpu, sp + 4);
+
+    uint32_t a5 = cpu->a[5] & 0xFFFFFF;
+    uint32_t sg_free_pool_addr = cpu_read32(cpu, (a5 - 24575) & 0xFFFFFF);
+    uint32_t grow_sysglobal_addr = (a5 - 26541) & 0xFFFFFF;
+
+    /* Pool header: pool_size(int2)@+0, firstfree(int4)@+2, freecount(int2)@+6. */
+    uint16_t pool_size = cpu_read16(cpu, sg_free_pool_addr);
+    uint32_t firstfree = cpu_read32(cpu, sg_free_pool_addr + 2);
+    uint16_t freecount = cpu_read16(cpu, sg_free_pool_addr + 6);
+
+    /* Pick a chunk from the segment headroom above the initial pool.
+     * Persist across calls so successive invocations grab distinct slots. */
+    static uint32_t next_chunk = 0;
+    static uint32_t chunk_seg_end = 0;
+    if (next_chunk == 0) {
+        /* First call: anchor at end of current pool. Pool occupies
+         * pool_hdr + 8 (header) + pool_size*2 (data) bytes. Extend from
+         * there, staying within the same 128KB MMU segment. */
+        next_chunk = (sg_free_pool_addr + 8 + (uint32_t)pool_size * 2 + 15) & ~0xFu;
+        chunk_seg_end = (sg_free_pool_addr & ~0x1FFFFu) + 0x20000u;
+    }
+
+    const uint32_t CHUNK_BYTES = 4096;
+    int16_t no_space = 0;
+    if (next_chunk + CHUNK_BYTES > chunk_seg_end) {
+        /* Segment headroom exhausted — report no_space=true. */
+        no_space = 1;
+    } else {
+        uint32_t chunk_addr = next_chunk;
+        next_chunk += CHUNK_BYTES;
+
+        /* NEWSPACE equivalent: write a free-entry header (size:int2 in
+         * words, positive = free) at chunk_addr, with next pointing at
+         * the previous firstfree (or stopper=0). Then splice into list. */
+        int16_t chunk_words = (int16_t)(CHUNK_BYTES / 2);
+        cpu->write16(chunk_addr & 0xFFFFFF, (uint16_t)chunk_words);
+        cpu->write32((chunk_addr + 2) & 0xFFFFFF, firstfree);
+
+        uint32_t new_firstfree = chunk_addr - sg_free_pool_addr;
+        cpu->write32((sg_free_pool_addr + 2) & 0xFFFFFF, new_firstfree);
+        cpu->write16((sg_free_pool_addr + 6) & 0xFFFFFF,
+                     (uint16_t)(freecount + chunk_words));
+    }
+
+    /* Clear grow_sysglobal so GETSPACE's EXP_POOLSPACE won't re-trigger. */
+    cpu->write8(grow_sysglobal_addr, 0);
+    cpu->write16(no_space_ptr & 0xFFFFFF, (uint16_t)no_space);
+
+    DBGSTATIC(int, msg_trace, 0);
+    if (msg_trace++ < 20) {
+        fprintf(stderr,
+                "HLE MakeSGSpace#%d: pool@$%06X size=%u firstfree=$%X freecount=%u "
+                "→ granted chunk@$%06X (no_space=%d)\n",
+                msg_trace, sg_free_pool_addr, pool_size, firstfree, freecount,
+                no_space ? 0 : (next_chunk - CHUNK_BYTES), no_space);
+    }
+
+    cpu->a[7] = (sp + 4) & 0xFFFFFF;
+    cpu->pc = ret_addr;
+    cpu->cycles += 60;
+    return true;
+}
+
 /* P104 scaffold: HLE MDDF_IO. Sits at a higher abstraction than
  * UltraIO — bypasses the whole psio → LisaIO → UltraIO chain which
  * depends on a properly initialized ext_diskconfig + MDDFdata
@@ -4202,19 +4282,21 @@ bool lisa_hle_intercept(lisa_t *lisa, m68k_t *cpu) {
     {
         extern uint32_t boot_progress_lookup(const char *name);
         extern int g_emu_generation;
-        static uint32_t mddf_io_addr   = 0;
-        static uint32_t bitmap_io_addr = 0;
-        static uint32_t psio_addr      = 0;
-        static uint32_t vm_addr        = 0;
+        static uint32_t mddf_io_addr     = 0;
+        static uint32_t bitmap_io_addr   = 0;
+        static uint32_t psio_addr        = 0;
+        static uint32_t vm_addr          = 0;
+        static uint32_t makesgspace_addr = 0;
         static int      fsio_probe_gen = -1;
         if (fsio_probe_gen != g_emu_generation) {
             fsio_probe_gen = g_emu_generation;
-            mddf_io_addr   = boot_progress_lookup("MDDF_IO");
-            bitmap_io_addr = boot_progress_lookup("BitMap_IO");
+            mddf_io_addr     = boot_progress_lookup("MDDF_IO");
+            bitmap_io_addr   = boot_progress_lookup("BitMap_IO");
             if (!bitmap_io_addr) bitmap_io_addr = boot_progress_lookup("bitmap_io");
-            psio_addr      = boot_progress_lookup("psio");
-            vm_addr        = boot_progress_lookup("VM");
+            psio_addr        = boot_progress_lookup("psio");
+            vm_addr          = boot_progress_lookup("VM");
             if (!vm_addr) vm_addr = boot_progress_lookup("vm");
+            makesgspace_addr = boot_progress_lookup("MakeSGSpace");
         }
         /* P119 investigation: tried re-enabling MDDF_IO HLE plus a
          * parallel BitMap_IO HLE (+ narrow NOT-fix for blockstructured).
@@ -4242,6 +4324,8 @@ bool lisa_hle_intercept(lisa_t *lisa, m68k_t *cpu) {
             return hle_handle_mddf_io(lisa, cpu);
         if (bitmap_io_addr && pc == bitmap_io_addr)
             return hle_handle_bitmap_io(lisa, cpu);
+        if (makesgspace_addr && pc == makesgspace_addr)
+            return hle_handle_makesgspace(lisa, cpu);
 #else
         (void)mddf_io_addr;
         (void)bitmap_io_addr;
