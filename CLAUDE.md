@@ -239,11 +239,52 @@ Running compile surfaces **~40 sites per compile** where pointer-to-
 array type resolution fails: `ptrStr`, `File_Dir`, `sSeg_Dir`,
 `iUnit_Dir`, `pSeg_list`, …
 
+**However, CHK_LDSN_FREE is not one of those 40 sites.** Deeper
+probing (2026-04-20 follow-up, unshipped) shows the compiled
+CHK_LDSN_FREE body correctly emits `SUBI.W #-2, D0` and `MULU #2, D1`
+for `c_lbt_ptr^[ldsn]` — `array_low=-2, elem_size=2` ARE resolved
+right here. The nonzero value read from `lbt[-1]` comes instead
+from `c_lbt_ptr` itself being **zero** at call time. Why:
+`c_syslocal_ptr^.lbt_addr` reads as zero at MAKE_SYSDATASEG entry,
+even though `STARTUP.TEXT:589 lbt_addr := ord_lbt` runs and (per
+a byte watchpoint on `$CE0000..+256`) writes `$00CE03F8` to
+syslocal offset +90.
+
+The reason the write doesn't persist: **POOL_INIT (PC $007E70)
+writes through logical `$CE0000` before the MMU is programmed for
+seg-103**. First WATCH-SMT (SMT/MMU programming) fires ~57 lines
+later, at line 834. Our emulator's MMU treats unconfigured segments
+as passthrough-with-`% LISA_RAM_SIZE` wrap, so writes to logical
+`$CE0000+N` land at phys `$1A0000+N`. Later, the OS programs
+seg-103 with `SOR=$473` → phys `$08E600`. Reads of logical
+`$CE0000+N` now go to phys `$08E600+N`, which was never written.
+
+So there are TWO independent real-fix directions for the 24/27
+wall, either/both of which will land before P126 can exercise:
+
+1. **Pascal codegen ptr^[i] type resolution** — ~40 sites fail
+   silently. Even if CHK_LDSN_FREE itself is fine, anything that
+   reads from a zero'd syslocal field through a broken ptr^[i]
+   path compounds the bug.
+2. **MMU segment-fault emulation** — on real Lisa, accessing an
+   unconfigured segment faults. Apple's boot sequence presumably
+   programs seg-103 before POOL_INIT runs, OR POOL_INIT's writes
+   take a different path. Our MMU's silent passthrough-wrap hides
+   the ordering issue and lets the OS "succeed" into corrupt
+   state. Fixing this also retires P122 SEG-ALIAS-GUARD (which
+   is the same class of bug: unconfigured seg masked).
+
 **Do NOT write a scaffold HLE to side-step SYSTEM_ERROR(10101).** Per
 `feedback_do_the_real_fix.md` and `feedback_real_emulator_no_semantic_hles.md`,
 suppressing this error would encode nothing about the missing subsystem
-— it's a codegen miscompile and the fix belongs in
-`src/toolchain/pascal_codegen.c`. Tracked as P126 next session.
+— both root causes are real fixes in our own toolchain/emulator.
+Tracked as P126 (codegen) and P127 (MMU segment faults) next session.
+
+**Load-bearing scaffolds to reconsider retiring once the structural
+fixes land**: P122 SEG-ALIAS-GUARD, P124 MakeSGSpace HLE. Both are
+shaped like "encode what the missing subsystem does" but the real
+subsystems they scaffold past are in *our* code (MMU faults + POOL
+expansion via memmgr-process, which itself comes online with Phase 6).
 
 ### P122 follow-up — the handoff's "scheduler ABI" theory was wrong
 
