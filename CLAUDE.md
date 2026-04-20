@@ -181,7 +181,7 @@ commit as the real replacement.
 | 3 | **First driver file (SYSTEM.CD_PROFILE)** | source-PROFILE.TEXT compiled as .OBJ, placed on disk with catalog entry | In progress — driver loads, dispatch armed |
 | 4 | **MDDF / disk-image full FS** | removes 10707 suppression; real FS_INIT / FS_MASTER_INIT | Not started |
 | 5 | **IRQ-driven I/O completion** | removes Block_Process-on-POP deadlock | In progress — IRQ scaffold complete (P120), seg-alias guard shipped (P122); PARALLEL → IODONE still pending |
-| 6 | **SYS_PROC_INIT + real processes** | removes P89i + CreateProcess HLE pile | Not started |
+| 6 | **SYS_PROC_INIT + real processes** | removes P89i + CreateProcess HLE pile; fixes Pascal `ptr^[i]` type-resolution class of bugs (P125 surfaced) | Not started — Make_SProcess blocked on codegen |
 | 7 | **Cleanup HLEs** (FS/MEM/PR_CLEANUP) | real cleanup bodies | Not started |
 | 8 | **Safety-net HLEs** (REG_OPEN_LIST, excep_setup) | remove | Not started |
 | 9 | **System libraries** (SYS1LIB, SYS2LIB) | new compile targets | Not started |
@@ -189,18 +189,83 @@ commit as the real replacement.
 | 11 | **Shell (APDM)** | full desktop | Not started |
 | 12 | **Apps** | LisaWrite, LisaCalc, etc. | Not started |
 
-## Current Status (2026-04-20 post-P122 — seg-alias guard, FS_INIT wall on IODONE)
+## Current Status (2026-04-20 post-P125 — 23/27 SYS_PROC_INIT, stuck on `ptr^[i]` codegen)
 
-**Milestones**: **22/27** FS_INIT. Same count as post-P121, but
-P122 removes a silent memory-corruption bug that was trashing the
-vector table + SGLOBAL pointer mid-boot. Boot is now stable — no
-more fake SCHDTRAP NULL-deref crash — but the real blocker moves
-to **PARALLEL → IODONE**.
+**Milestones**: **23/27** SYS_PROC_INIT (back to the pre-P121 baseline
+but now with real UltraIO + MDDF/BitMap HLEs + SEG-ALIAS-GUARD +
+MakeSGSpace pool-expansion HLE all live).
 
-**P122 shipped** (`e8d410a`) — **SEG-ALIAS-GUARD** in
-`lisa_mem_write8`: drop writes where logical addr ≥ `$20000`
-(i.e. outside seg-0) whose MMU translation lands in phys `< $400`
-(vector table + SGLOBAL slot).
+Today's commits:
+
+- **P122** (`e8d410a`) — **SEG-ALIAS-GUARD** in `lisa_mem_write8`.
+  Drop writes where logical ≥ `$20000` MMU-translates to phys `< $400`.
+  Fixes vector-table corruption when BitMap_IO writes 1208 B through
+  seg-61 (SOR=0 = Apple's "unallocated demand-page" state — our MMU
+  doesn't emulate segment faults, so SOR=0 literally aliases to phys 0).
+  22/27 crash path eliminated; still stuck at 22/27 until P124.
+- **P123** (`a8411a7`) — diagnostics only. Expanded POST-BOOT watchlist
+  + scheduler-entry PC-ring dump. Traced 22/27 FS_INIT wall to compiled
+  `DISKIO` → `GETSPACE(106)` failing (sysglobal pool exhausted after
+  ~60 allocations) → `UltraIO` error recovery → `MakeSGSpace` →
+  `Enter_Scheduler` waiting for a memmgr process that doesn't exist.
+- **P124** (`8651c8f`) — **HLE MakeSGSpace** at `$012970`. Intercepts
+  the compiled Pascal body and runs the pool-expansion work the memmgr
+  would have done: reads `sg_free_pool_addr` (A5-24575), allocates a
+  4 KB chunk from segment headroom, links it at head of firstfree,
+  bumps freecount, clears `grow_sysglobal` (A5-26541), sets
+  `no_space=false`, RTS. Restores 22/27 → **23/27**. Retires with
+  Phase 6 (real memmgr process).
+- **P125** (`5bf47f3`) — diagnostics only. Traced the 23/27 →
+  24/27 wall to `SYS_PROC_INIT` → `Make_SProcess(MemMgr)` →
+  `Get_Resources` → `Make_SysDataseg` → `CHK_LDSN_FREE(ldsn=-1)` →
+  `lbt[-1]` returns non-zero → errnum=304 (e_ldsnused) →
+  SYSTEM_ERROR(10101). **Root cause is a Pascal codegen bug**, not a
+  missing subsystem — see below.
+
+### The real 24/27 wall is a Pascal codegen class-of-bugs
+
+`lbt = array[min_ldsn..max_ldsn] of relptr` where `min_ldsn=-2`.
+Accessed through `c_lbt_ptr: lbt_ptr = ^lbt`. `CHK_LDSN_FREE(ldsn=-1)`
+reads `c_lbt_ptr^[-1]`, which should compile to
+`(c_lbt_ptr + (-1 - -2) * 4) = c_lbt_ptr + 4`. Our codegen falls
+into `gen_lvalue_addr` → `AST_ARRAY_ACCESS` → `AST_DEREF` branch.
+Silently defaults to `array_low=0, elem_size=2` when pointer-to-array
+type chain doesn't resolve — reading `c_lbt_ptr + (-1)*2 = c_lbt_ptr - 2`
+instead. That byte-pair happens to be non-zero in our build, so the
+check reports "ldsn used" and Make_SProcess fails.
+
+P125 added a one-shot warning in `pascal_codegen.c` at that branch.
+Running compile surfaces **~40 sites per compile** where pointer-to-
+array type resolution fails: `ptrStr`, `File_Dir`, `sSeg_Dir`,
+`iUnit_Dir`, `pSeg_list`, …
+
+**Do NOT write a scaffold HLE to side-step SYSTEM_ERROR(10101).** Per
+`feedback_do_the_real_fix.md` and `feedback_real_emulator_no_semantic_hles.md`,
+suppressing this error would encode nothing about the missing subsystem
+— it's a codegen miscompile and the fix belongs in
+`src/toolchain/pascal_codegen.c`. Tracked as P126 next session.
+
+### P122 follow-up — the handoff's "scheduler ABI" theory was wrong
+
+The pre-P122 handoff diagnosed the `MOVEA.L 8(A6),A5` crash at
+`$077524` as a Pascal→asm ABI mismatch (sibling of P115 CALLDRIVER
+SP fix-up). It wasn't. That instruction is SCHDTRAP's `SETUP` block
+(`source-PROCASM.TEXT:100`):
+
+```
+SETUP     MOVEA.L  SGLOBAL,A6               ; read absolute $200
+          MOVEA.L  SYSA5(A6),A5             ; = MOVEA.L 8(A6),A5
+          MOVEA.L  SCHDADDR(A6),A0
+          JMP      (A0)
+```
+
+A6=0 at `$077524` means `SGLOBAL` at absolute `$200` is zero. Tracing
+with a raw-phys-RAM poll showed phys[$200] got zeroed *just before*
+PC=`$069FC6`, with last executed PC=`$066420` (= `BitMap_IO` entry).
+The write went through `cpu->write8` with logical `$7A0000` — seg-61.
+The MMU dump showed seg-61 configured with `SOR=$000 SLR=$700 chg=$3`
+— i.e., logical `$7A0000` → **physical `$000000`** → the 1208-byte
+bitmap read trampled vectors `$0`..`$4B7`, including SGLOBAL at `$200`.
 
 ### Root cause the handoff's "scheduler ABI" theory got wrong
 
@@ -234,38 +299,37 @@ literally to phys 0. The guard encodes the architectural invariant
 that only seg-0 legitimately addresses phys `< $400`; any seg-1+
 write aliasing there is a broken translation.
 
-### Observed behavior post-P122
+### Observed behavior post-P125
 
-- Chain unchanged: `[POST-BOOT] entered fs_mount → real_mount →
-  def_mount → MDDF_IO READ → BitMap_IO READ → (16 × SEG-ALIAS-GUARD
-  drops) → MDDF_IO WRITE → UltraIO @$06C406`.
-- No more `!!! A5 DROP` — vectors stay intact, SCHDTRAP succeeds.
-- `CRASH TO VECTORS: prev_pc=$07752A → pc=$0003F4 op=$4E72` is the
-  **normal** Level1 IRQ dispatch to the INT1V RTE stub, not a crash.
-- 20 `P120 Level1 IRQ` traces still fire with `IFR=$00 CA1=0`
-  (Track 1's gate now short-circuits them cleanly).
-- Boot runs 3000 frames without real errors. Stuck at 22/27 FS_INIT:
-  compiled UltraIO → wait_sem blocks on a disk request that's never
-  signalled as done.
+- Full chain: fs_mount → real_mount → def_mount → MDDF_IO (HLE) →
+  BitMap_IO (HLE, 16 × SEG-ALIAS-GUARD drops) → MDDF_IO WRITE (HLE) →
+  UltraIO → DISKIO → GETSPACE fails → MakeSGSpace (P124 HLE grants
+  4KB chunk) → DISKIO retries → SYS_PROC_INIT reached via 10707
+  suppression unwind → Make_SProcess(MemMgr) → Get_Resources →
+  Make_SysDataseg → errnum=304 → System_Error(10101) → HALT.
 - Audit clean: 8876/8876 symbols resolved, 0 unresolved.
 
-**Next blocker — PARALLEL → IODONE** (handoff's Track 2). The IRQ
-scaffold fires, but PARALLEL at `$074A32` doesn't complete an I/O
-request: the kernel queue entry for the in-flight read isn't found /
-matched, so `signal_sem(IODONE)` never runs, so `wait_sem` never
-wakes. Concrete starting points:
+**Next blocker — `ptr^[i]` codegen type-resolution (P126)**. The 10101
+failure traces to a miscompile of `c_lbt_ptr^[ldsn]` in CHK_LDSN_FREE
+when lbt has a negative low bound (`-2`). Our Pascal codegen at
+`src/toolchain/pascal_codegen.c` (gen_lvalue_addr, AST_DEREF branch)
+silently defaults `array_low=0, elem_size=2` when the pointer's
+target-type chain doesn't resolve to TK_POINTER→TK_ARRAY. P125 added
+a warning that surfaces ~40 sites/compile. Concrete starting points:
 
-1. On the first Level1 IRQ, trace what PARALLEL does: does it see
-   a non-nil `hd_qioreq_list` head? Does it JMP into
-   `configinfo[bootdev]^.PRODRIVER`? Does the compiled driver's
-   dinterrupt reach `IODONE`?
-2. Inspect IRQ #1's supervisor stack frame at SP=`$CBFB68`. The
-   kernel may have pushed a request handle that PARALLEL expects
-   at a fixed offset.
-3. If PARALLEL needs the ProFile driver's PRODRIVER to be loaded
-   and the CALLDRIVER(hdinit) pass-through hasn't actually
-   populated the dispatch table, PARALLEL will bail. Verify
-   `configinfo[bootdev]^` contents at IRQ time.
+1. Run `./build/lisaemu --headless Lisa_Source 1 2>&1 | grep
+   "ARRAY_ACCESS(ptr^\[i\])"` to enumerate every miss by symbol
+   and source file.
+2. For each, inspect the Pascal source to find the declared type
+   chain (e.g., `lbt_ptr = ^lbt; lbt = array[-2..16] of relptr`)
+   and figure out why `find_symbol_any` / `ptr_sym->type->base_type`
+   doesn't end up as TK_ARRAY. Likely candidates: typedef chain
+   not fully followed; forward declarations; type definitions
+   defined in one unit but referenced from another without
+   cross-unit type resolution.
+3. Do NOT add a suppression for SYSTEM_ERROR(10101) — see
+   `feedback_do_the_real_fix.md`. The right fix is structural,
+   in the codegen.
 
 ### IRQ scaffold summary (P120 three-step chain, still in place)
 
@@ -291,6 +355,9 @@ handles the IRQ end-to-end via `dinterrupt → IODONE`.
 - HLE GET_BOOTSPACE ($200000+ MMU seg 16 pass-through).
 - ldr_movemultiple MMU-translated writes.
 - P110 reloc scan (75 sites × 3 drivers per boot).
+- **P124 HLE MakeSGSpace** (`$012970`) — grants 4KB chunks from
+  sysglobal segment headroom so compiled DISKIO's retry loop can
+  succeed. Retires with Phase 6 memmgr process.
 - CALLDRIVER(dinit) + CALLDRIVER(hdinit) pass-through + P115 SP fix-up.
 - Phase-5 IRQ scaffold (profile completion_pending, CA1, INT1V
   sentinel, Level1 HLE with PARALLEL JSR synthesis, CA1 gate).
@@ -378,13 +445,25 @@ Key milestones for orientation:
   so spurious Level1 IRQs short-circuit instead of dispatching
   PARALLEL on garbage. 23/27 → 22/27 (predicted regression inside
   FS_INIT).
-- **P122 (current)**: SEG-ALIAS-GUARD in `lisa_mem_write8`. Root-
-  caused an A5-drop / SCHDTRAP null-deref crash to BitMap_IO's
-  1208-byte write through logical `$7A0000` (seg-61 configured
-  with SOR=0 — Apple's demand-page unallocated state) aliasing
-  to phys `$0`, wiping the vector table + SGLOBAL. Guard drops
-  writes where logical ≥ `$20000` lands at phys `< $400`. Boot
-  stable; next wall is PARALLEL → IODONE.
+- **P122**: SEG-ALIAS-GUARD in `lisa_mem_write8`. Root-caused an
+  A5-drop / SCHDTRAP null-deref crash to BitMap_IO's 1208-byte write
+  through logical `$7A0000` (seg-61 configured with SOR=0 — Apple's
+  demand-page unallocated state) aliasing to phys `$0`, wiping the
+  vector table + SGLOBAL. Guard drops writes where logical ≥ `$20000`
+  lands at phys `< $400`.
+- **P123**: diagnostics only. Traced 22/27 FS_INIT wall to
+  DISKIO → GETSPACE(106) failing (sysglobal pool exhausted).
+- **P124**: HLE MakeSGSpace at `$012970`. Directly runs pool-
+  expansion work the memmgr process would have done — allocates 4KB
+  from segment headroom, links into freelist, clears `grow_sysglobal`,
+  sets `no_space=false`. Restores 22/27 → 23/27 SYS_PROC_INIT.
+- **P125 (current)**: diagnostics only. Traced 23/27 → 24/27 wall
+  to `CHK_LDSN_FREE` reading `c_lbt_ptr^[-1]` on a Pascal
+  `array[-2..16]`. Codegen silently defaults `array_low=0,
+  elem_size=2` in the `ptr^[i]` branch when the pointer-to-array
+  type chain doesn't resolve — reads wrong offset, wrong stride.
+  ~40 sites/compile exposed. Next session (P126): fix the
+  structural codegen class-of-bug in `pascal_codegen.c`.
 
 ## On-disk format reference (load-bearing for Phase 2/3 work)
 
