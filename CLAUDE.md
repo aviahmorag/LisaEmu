@@ -189,7 +189,7 @@ commit as the real replacement.
 | 11 | **Shell (APDM)** | full desktop | Not started |
 | 12 | **Apps** | LisaWrite, LisaCalc, etc. | Not started |
 
-## Current Status (2026-04-20 post-P125 — 23/27 SYS_PROC_INIT, stuck on `ptr^[i]` codegen)
+## Current Status (2026-04-20 post-P126 — 23/27 SYS_PROC_INIT, codegen class-of-bug partially fixed)
 
 **Milestones**: **23/27** SYS_PROC_INIT (back to the pre-P121 baseline
 but now with real UltraIO + MDDF/BitMap HLEs + SEG-ALIAS-GUARD +
@@ -219,8 +219,19 @@ Today's commits:
   24/27 wall to `SYS_PROC_INIT` → `Make_SProcess(MemMgr)` →
   `Get_Resources` → `Make_SysDataseg` → `CHK_LDSN_FREE(ldsn=-1)` →
   `lbt[-1]` returns non-zero → errnum=304 (e_ldsnused) →
-  SYSTEM_ERROR(10101). **Root cause is a Pascal codegen bug**, not a
-  missing subsystem — see below.
+  SYSTEM_ERROR(10101).
+- **P126** (`e150040`) — **ptr^[i] codegen — WITH-field fallback +
+  string-deref case**. In `gen_lvalue_addr` (`AST_ARRAY_ACCESS`
+  → `AST_DEREF` branch), fall back to `with_lookup_field` when
+  `find_symbol_any` misses — same pattern the sibling non-deref
+  branch already used. Also handle pointer-to-string (1-byte
+  stride for `pathnm_ptr^[i]` in UPSHIFT et al). Cut the
+  compile-time ARRAY_ACCESS miss warnings **from 40 to 2**
+  (the remaining 2 are `ptrStr` with a distinct upstream
+  type-resolution bug where the symbol resolves as TK_INTEGER
+  on one pass). Doesn't unblock 24/27 (that wall is the MMU
+  timing issue — see below), but is a real structural fix that
+  removes a silent miscompile class across ~36 call sites.
 
 ### The real 24/27 wall is a Pascal codegen class-of-bugs
 
