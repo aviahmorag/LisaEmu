@@ -180,7 +180,7 @@ commit as the real replacement.
 | 2 | **Real LOADER + filesystem** | source-LOADER.TEXT + source-ldlfs.text + real MDDF/slist/catalog/filemap on profile.image | In progress — started 2026-04-18 |
 | 3 | **First driver file (SYSTEM.CD_PROFILE)** | source-PROFILE.TEXT compiled as .OBJ, placed on disk with catalog entry | In progress — driver loads, dispatch armed |
 | 4 | **MDDF / disk-image full FS** | removes 10707 suppression; real FS_INIT / FS_MASTER_INIT | Not started |
-| 5 | **IRQ-driven I/O completion** | removes Block_Process-on-POP deadlock | In progress — IRQ scaffold complete (P120) |
+| 5 | **IRQ-driven I/O completion** | removes Block_Process-on-POP deadlock | In progress — IRQ scaffold complete (P120), seg-alias guard shipped (P122); PARALLEL → IODONE still pending |
 | 6 | **SYS_PROC_INIT + real processes** | removes P89i + CreateProcess HLE pile | Not started |
 | 7 | **Cleanup HLEs** (FS/MEM/PR_CLEANUP) | real cleanup bodies | Not started |
 | 8 | **Safety-net HLEs** (REG_OPEN_LIST, excep_setup) | remove | Not started |
@@ -189,149 +189,122 @@ commit as the real replacement.
 | 11 | **Shell (APDM)** | full desktop | Not started |
 | 12 | **Apps** | LisaWrite, LisaCalc, etc. | Not started |
 
-## Current Status (2026-04-20 post-P121 — IRQ scaffold exercised, FS_INIT wall)
+## Current Status (2026-04-20 post-P122 — seg-alias guard, FS_INIT wall on IODONE)
 
-**Milestones**: **22/27** FS_INIT. *Intentional* regression from
-baseline 23/27 SYS_PROC_INIT — predicted by P119/P120 handoff. The
-boolean-NOT codegen fix + re-enabled MDDF_IO/BitMap_IO HLEs let
-real_mount carry through `MDDF_IO READ → BitMap_IO READ (1208 B) →
-MDDF_IO WRITE → UltraIO entered`. Pre-P121, UltraIO bailed at
-`if not blockstructured` with E_IO_MODE_BAD, so real_mount never
-issued I/O. Now it does, and the IRQ scaffold is being exercised.
+**Milestones**: **22/27** FS_INIT. Same count as post-P121, but
+P122 removes a silent memory-corruption bug that was trashing the
+vector table + SGLOBAL pointer mid-boot. Boot is now stable — no
+more fake SCHDTRAP NULL-deref crash — but the real blocker moves
+to **PARALLEL → IODONE**.
 
-**P121 shipped**:
+**P122 shipped** (`e8d410a`) — **SEG-ALIAS-GUARD** in
+`lisa_mem_write8`: drop writes where logical addr ≥ `$20000`
+(i.e. outside seg-0) whose MMU translation lands in phys `< $400`
+(vector table + SGLOBAL slot).
 
-1. **Narrow boolean-NOT codegen fix** (`src/toolchain/pascal_codegen.c`
-   AST_UNARY_OP / TOK_NOT, after the existing `is_boolean` checks).
-   When the operand is `AST_IDENT_EXPR` whose name misses both
-   `find_symbol_any` and `find_proc_sig`, AND we're inside a WITH
-   block, AND `with_lookup_field` resolves it to a TK_BOOLEAN field —
-   take the boolean path (`TST.W ; SEQ ; ANDI.W #1`) instead of
-   bitwise `NOT.W`. Narrowest possible scope: doesn't affect any
-   site where the name resolves to a global, a proc, or a non-WITH
-   field.
+### Root cause the handoff's "scheduler ABI" theory got wrong
 
-2. **MDDF_IO + BitMap_IO HLEs re-enabled** (`src/lisa.c`, was `#if 0`).
-   Bypass the psio→LisaIO→UltraIO chain by reading directly from
-   the ProFile image. With the NOT fix in place, UltraIO no longer
-   fires E_IO_MODE_BAD and the chain runs through all three reads.
+The P121 handoff diagnosed the `MOVEA.L 8(A6),A5` crash at
+`$077524` as a Pascal→asm ABI mismatch (sibling of P115 CALLDRIVER
+SP fix-up). It wasn't. That instruction is SCHDTRAP's `SETUP` block
+(`source-PROCASM.TEXT:100`):
 
-**Observed behavior**:
-- `[POST-BOOT] entered fs_mount → real_mount → def_mount → MDDF_IO
-  READ → BitMap_IO READ → MDDF_IO WRITE → UltraIO @$06C406`.
-- 20+ `P120 Level1 IRQ` traces firing — but with `IFR=$00 IER=$00
-  CA1=0`. **Not real CA1 sources** (likely vretrace-routed Level1).
-- IRQ #1 has reasonable `SP=$00CBFB7E`; IRQ #2 has `SP=$00000008`
-  — catastrophic SP corruption between the first and second IRQ.
-  Cascade into 18 more bogus IRQs against zero stack.
-- Boot doesn't crash — 3000 frames complete cleanly. Just stuck
-  in FS_INIT (wait_sem on disk request that never completes).
-- Audit still clean: 8876/8876 symbols resolved, 0 unresolved.
+```
+SETUP     MOVEA.L  SGLOBAL,A6               ; read absolute $200
+          MOVEA.L  SYSA5(A6),A5             ; = MOVEA.L 8(A6),A5
+          MOVEA.L  SCHDADDR(A6),A0
+          JMP      (A0)
+```
 
-**Next blockers — pick a track**:
+A6=0 at `$077524` means `SGLOBAL` at absolute address `$200` is
+zero. Tracing with a raw-phys-RAM poll showed phys[$200] got
+zeroed *just before* PC=`$069FC6`, with last executed address
+`$066420` (= `BitMap_IO` entry per `linked.map`). The write went
+through `cpu->write8` with logical addr `$7A0000` — seg-61. The
+MMU dump showed seg-61 configured with `SOR=$000 SLR=$700 chg=$3`
+— i.e., logical `$7A0000` → **physical `$000000`** → the 1208-byte
+bitmap read trampled vectors `$0`..`$4B7`, including SGLOBAL at
+`$200`.
 
-1. **Spurious-IRQ source** (`src/lisa.c:lisa_hle_intercept` PC=$3F4
-   handler). All Level1 IRQs after the first show IFR=0 — meaning
-   VIA1 isn't asserting. Either the m68k IRQ-acceptance state is
-   sticky from a previous IRQ, or vretrace is routing to Level1
-   without setting IFR, or update_irq has a bug that asserts
-   irq_via1 when IFR&IER==0. Fix: gate the disk_routine JSR on
-   `(ifr_val & VIA_IRQ_CA1) != 0` so we only dispatch on real
-   completions; let the IFR=0 case fall through to the RTE.
-   Likely 5-line change but needs verification that we don't
-   miss real completions queued during HLE entry.
+Seg-61's SOR=0 is Apple's "unallocated demand-page" state: on real
+Lisa hardware the first access to such a segment faults, and the
+SMT fault handler allocates a real physical frame before retrying.
+Our MMU doesn't emulate segment faults — it just translates SOR=0
+literally to phys 0. The guard encodes the architectural invariant
+that only seg-0 legitimately addresses phys `< $400`; any seg-1+
+write aliasing there is a broken translation.
 
-2. **PARALLEL → process unblock** (binary-archaeology PARALLEL
-   $074AA4). Even when CA1 fires legitimately, our PARALLEL
-   call needs to find the matching `request` in the kernel's
-   queue and signal IODONE so the wait_sem wall comes down.
-   Trace what PARALLEL does on the first IRQ: does it identify
-   the request? Does it call IODONE? Does any compiled scheduler
-   code wake up? May need to inspect IRQ #1's stack frame
-   ($CBFB7E) to see if the kernel had pushed a request handle
-   that PARALLEL should consume.
+### Observed behavior post-P122
 
-3. **SP corruption between IRQ #1 and #2**. Likely caused by
-   PARALLEL's first dispatch leaving the stack in a bad state,
-   or a fault during PARALLEL execution that scrambles things.
-   Worth dumping PC ring + reg state at IRQ #2 entry.
+- Chain unchanged: `[POST-BOOT] entered fs_mount → real_mount →
+  def_mount → MDDF_IO READ → BitMap_IO READ → (16 × SEG-ALIAS-GUARD
+  drops) → MDDF_IO WRITE → UltraIO @$06C406`.
+- No more `!!! A5 DROP` — vectors stay intact, SCHDTRAP succeeds.
+- `CRASH TO VECTORS: prev_pc=$07752A → pc=$0003F4 op=$4E72` is the
+  **normal** Level1 IRQ dispatch to the INT1V RTE stub, not a crash.
+- 20 `P120 Level1 IRQ` traces still fire with `IFR=$00 CA1=0`
+  (Track 1's gate now short-circuits them cleanly).
+- Boot runs 3000 frames without real errors. Stuck at 22/27 FS_INIT:
+  compiled UltraIO → wait_sem blocks on a disk request that's never
+  signalled as done.
+- Audit clean: 8876/8876 symbols resolved, 0 unresolved.
 
-Track 1 is the obvious smallest-cut next step. Track 2 is the
-real prize. Track 3 may resolve as a side effect of fixing 1
-or 2.
+**Next blocker — PARALLEL → IODONE** (handoff's Track 2). The IRQ
+scaffold fires, but PARALLEL at `$074A32` doesn't complete an I/O
+request: the kernel queue entry for the in-flight read isn't found /
+matched, so `signal_sem(IODONE)` never runs, so `wait_sem` never
+wakes. Concrete starting points:
+
+1. On the first Level1 IRQ, trace what PARALLEL does: does it see
+   a non-nil `hd_qioreq_list` head? Does it JMP into
+   `configinfo[bootdev]^.PRODRIVER`? Does the compiled driver's
+   dinterrupt reach `IODONE`?
+2. Inspect IRQ #1's supervisor stack frame at SP=`$CBFB68`. The
+   kernel may have pushed a request handle that PARALLEL expects
+   at a fixed offset.
+3. If PARALLEL needs the ProFile driver's PRODRIVER to be loaded
+   and the CALLDRIVER(hdinit) pass-through hasn't actually
+   populated the dispatch table, PARALLEL will bail. Verify
+   `configinfo[bootdev]^` contents at IRQ time.
+
+### IRQ scaffold summary (P120 three-step chain, still in place)
 
 - **Step-1** (`389f489`) — `profile_t.completion_pending` fires VIA1
-  CA1 via `profile_check_irq()` + main-loop `via_trigger_ca1()`. Also
-  fixed latent bug where BSY-transition `ifr |= 0x02` bypassed
-  `update_irq` so `irq_via1` stayed stuck at 0.
+  CA1 via `profile_check_irq()` + main-loop `via_trigger_ca1()`.
 - **Step-2** (`15163fc`) — INT1V ($64) → $3F4 sentinel with RTE stub;
-  `lisa_hle_intercept` catches PC=$3F4, reads+clears VIA1 IFR,
-  falls through to RTE. Root-caused that LIBHW.DriverInit ($070A4A)
-  is a TRAP #5 trampoline whose body never loads, so installing a
-  sentinel at INT1V was the minimum viable fix.
-- **Step-3** (`0c97b75`) — `DiskDriver` HLE at `boot_progress_lookup
-  ("DiskDriver")` (dynamic addr, currently $070A56) captures the
-  single-arg routine into `lisa->hle.disk_routine`. Level1 HLE
-  extended: after IFR clear, synthesize a JSR into `disk_routine`
-  by pushing $3F8 (linker RTE stub) as the return address. The only
-  registered routine is **PARALLEL** ($074A32) — a kernel-local
-  Level-1 IRQ dispatcher that walks `configinfo[bootdev]^` and
-  JSRs the compiled driver's PRODRIVER entry.
+  `lisa_hle_intercept` catches PC=$3F4, reads+clears VIA1 IFR.
+- **Step-3** (`0c97b75`) — `DiskDriver` HLE captures the single-arg
+  routine into `lisa->hle.disk_routine` (= **PARALLEL** at $074A32).
+  Level1 HLE synthesizes JSR into PARALLEL with $3F8 (linker RTE
+  stub) as return address.
+- **P121 track 1** (`87fecec`) — Level1 HLE only JSRs `disk_routine`
+  when `(IFR & VIA_IRQ_CA1) != 0` — i.e. on real CA1 completions.
 
-End-to-end chain verified via the step-2 synth test (gated `#if 0`
-in the shipped build): CA1 edge → IFR set → update_irq → irq_via1
-→ m68k_set_irq(1) → CPU accepts IRQ → vector fetch at $64 → PC=$3F4
-→ Level1 HLE clears IFR → synthesizes JSR → PARALLEL runs
-(confirmed by its `MOVE.B #$3B,IER` clearing IER CA1 bit $02→$00) →
-RTS to $3F8 → RTE pops IRQ frame → continue.
+End-to-end chain: CA1 edge → IFR set → update_irq → irq_via1 →
+m68k_set_irq(1) → vector fetch at $64 → PC=$3F4 → Level1 HLE
+clears IFR → synthesizes JSR → PARALLEL runs → RTS to $3F8 →
+RTE → continue. Retires when compiled `SYSTEM.CD_PROFILE` actually
+handles the IRQ end-to-end via `dinterrupt → IODONE`.
 
-**Next blocker → trigger a real ProFile transaction**: the IRQ
-scaffold is now armed end-to-end, but baseline never initiates a
-VIA1 transaction — compiled hdinit only reads config registers, and
-UltraIO's `if not blockstructured` buggy NOT.W guards real_mount
-away from issuing a disk I/O. Two tracks converge here:
+### Active infrastructure (all `#if 1`)
 
-1. **P121 — boolean NOT codegen fix**. Root cause from prior P118
-   investigation: WITH-scope bare-ident booleans hit bitwise
-   `NOT.W` which turns `0x0001` into `0xFFFE` (still TRUE).
-   `NEW_DEVICE` compiles `blockstructured := (devt = diskdev)` to
-   `SEQ D0 ; NEG.B ; ANDI.W #1` → stores 0x0001 for TRUE.
-   `UltraIO`'s `if not blockstructured` then does `NOT.W ; EXT.L
-   ; TST.L` → 0x0001 → 0xFFFE → still nonzero → check fires for
-   every disk read. Two fix paths:
-   - (a) Boolean-aware NOT: extend `is_boolean` gate in
-     `pascal_codegen.c` AST_UNARY_OP/TOK_NOT so it triggers when
-     operand is `AST_IDENT_EXPR` resolving via `with_lookup_field`
-     to TK_BOOLEAN. P118 attempt regressed elsewhere; needs
-     narrower scoping (per-site WITH-field check).
-   - (b) Apple-convention boolean storage: change `SEQ ; NEG.B ;
-     ANDI.W` to `SEQ ; EXT.W` so TRUE = 0xFFFF. Wider-reaching;
-     needs audit of `ord(boolean)`, `=#1` comparisons, etc.
-
-2. **Re-enable layered HLEs**: `MDDF_IO` (`src/lisa.c:3976`) and
-   `BitMap_IO` (`src/lisa.c:3985`), plus the narrow NOT fix for
-   `blockstructured` once P121 scopes it. Per
-   `feedback_hle_layers_load_bearing.md`, these three changes land
-   together with the IRQ-completion scaffold retirement plan.
-
-Once a transaction fires, `profile.completion_pending → VIA1 CA1 →
-Level1 HLE → PARALLEL → compiled driver's dinterrupt → IODONE →
-scheduler unblocks`. Phase-5 done; MDDF_IO/BitMap_IO HLEs retire in
-the same commit that flips them on and proves the path.
-
-**Active infrastructure (all `#if 1`):**
 - HLE GET_BOOTSPACE ($200000+ MMU seg 16 pass-through).
 - ldr_movemultiple MMU-translated writes.
-- P110 reloc scan (75 sites × 3 drivers per boot, post-P118 narrowing).
+- P110 reloc scan (75 sites × 3 drivers per boot).
 - CALLDRIVER(dinit) + CALLDRIVER(hdinit) pass-through + P115 SP fix-up.
-- Phase-5 IRQ scaffold: profile completion_pending, CA1 trigger,
-  INT1V sentinel, Level1 HLE with PARALLEL JSR synthesis.
+- Phase-5 IRQ scaffold (profile completion_pending, CA1, INT1V
+  sentinel, Level1 HLE with PARALLEL JSR synthesis, CA1 gate).
+- **P122 SEG-ALIAS-GUARD** (`src/lisa_mmu.c` write8) — drops
+  seg-1+ writes that alias into phys `< $400`.
+- MDDF_IO + BitMap_IO HLEs (P121 re-enable).
 
-**Active HLEs (remaining scaffolds):**
+### Active HLEs (remaining scaffolds)
+
 - CALLDRIVER for fnctn=7 (dcontrol dcode=20 spare-table health).
 - CALLDRIVER for fnctn=12 (DATTACH) — no-op.
-- MDDF_IO HLE (gated `#if 0` — pending IRQ transaction proof).
-- BitMap_IO HLE (gated `#if 0` — pending IRQ transaction proof).
+- MDDF_IO HLE — retires when compiled CD_PROFILE handles
+  psio→UltraIO→DiskIO natively with IRQ completion.
+- BitMap_IO HLE — same retirement plan.
 - SYSTEM_ERROR(10707) suppression → SYS_PROC_INIT unwind.
 
 ## Reference: previous session history
@@ -396,8 +369,22 @@ Key milestones for orientation:
   NOT codegen investigated, not shipped (regresses elsewhere).
 - **P119**: BitMap_IO + MDDF_IO layered-HLE path hits open_sfile
   wall in fs_mount; can't advance without IRQ completion.
-- **P120 (current)**: Phase-5 IRQ-driven I/O completion scaffold —
-  see "Current Status" above.
+- **P120**: Phase-5 IRQ-driven I/O completion scaffold — profile
+  completion → VIA1 CA1 → INT1V sentinel → Level1 HLE JSRs
+  PARALLEL.
+- **P121**: narrow boolean-NOT codegen fix (WITH-scope boolean
+  field) + re-enabled MDDF_IO/BitMap_IO HLEs; UltraIO reached for
+  the first time in project history. P121-track-1 added CA1 gate
+  so spurious Level1 IRQs short-circuit instead of dispatching
+  PARALLEL on garbage. 23/27 → 22/27 (predicted regression inside
+  FS_INIT).
+- **P122 (current)**: SEG-ALIAS-GUARD in `lisa_mem_write8`. Root-
+  caused an A5-drop / SCHDTRAP null-deref crash to BitMap_IO's
+  1208-byte write through logical `$7A0000` (seg-61 configured
+  with SOR=0 — Apple's demand-page unallocated state) aliasing
+  to phys `$0`, wiping the vector table + SGLOBAL. Guard drops
+  writes where logical ≥ `$20000` lands at phys `< $400`. Boot
+  stable; next wall is PARALLEL → IODONE.
 
 ## On-disk format reference (load-bearing for Phase 2/3 work)
 
@@ -485,9 +472,18 @@ ProFile blocks: 512 data + 20-byte tag (lisaem `libdc42.h`) +
 - **GET_BOOTSPACE** (`src/lisa.c:lisa_hle_intercept`) — returns pages
   in MMU seg 16 (pass-through). Retires when MM4.GetFree returns
   high-memory pages.
-- **MDDF_IO + BitMap_IO** (`src/lisa.c`, gated `#if 0`) — bypass psio
-  chain by reading directly from disk image. Re-enable + retire once
-  IRQ-completion path proves through.
+- **MDDF_IO + BitMap_IO** (`src/lisa.c`, `#if 1` since P121) — bypass
+  psio chain by reading directly from disk image. P122 added a
+  SEG-ALIAS-GUARD in `lisa_mem_write8` so BitMap_IO's writes through
+  an unallocated (SOR=0) segment don't trample the vector table.
+  Retires once compiled CD_PROFILE handles psio→UltraIO→DiskIO
+  natively with IRQ completion.
+- **SEG-ALIAS-GUARD** (`src/lisa_mmu.c` `lisa_mem_write8`) — drops
+  writes where logical ≥ `$20000` aliases to phys `< $400`.
+  Architectural invariant: only seg-0 addresses the vector table.
+  Retires when the MMU properly emulates Apple's segment-fault
+  demand-paging semantics (currently we translate SOR=0 literally
+  to phys 0 instead of trapping).
 - **10738..10741 suppression** (`src/lisa.c:3090`) — safety net for
   alternate boot paths (PRAM failures → 10738, LOADCD failures →
   10739). Dead on the ProFile-on-paraport default path.
