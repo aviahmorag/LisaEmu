@@ -1905,24 +1905,44 @@ static void gen_lvalue_addr(codegen_t *cg, ast_node_t *node) {
                  * paired with the WITH field-lookup miss). */
                 const char *ptr_name = node->children[0]->children[0]->name;
                 cg_symbol_t *ptr_sym = find_symbol_any(cg, ptr_name);
-                if (ptr_sym && ptr_sym->type &&
-                    ptr_sym->type->kind == TK_POINTER &&
-                    ptr_sym->type->base_type &&
-                    ptr_sym->type->base_type->kind == TK_ARRAY) {
-                    type_desc_t *at = ptr_sym->type->base_type;
+                type_desc_t *pt = (ptr_sym && ptr_sym->type) ? ptr_sym->type : NULL;
+                if (!pt && cg->with_depth > 0) {
+                    /* P126: WITH-field fallback. Many record fields like
+                     * File_Dir / sSeg_Dir / iUnit_Dir / pSeg_list (LCB) or
+                     * ptrStr (WITH-accessed ptrs) are accessed as `fld^[i]`
+                     * inside a WITH on the containing record. find_symbol_any
+                     * misses them; with_lookup_field resolves them. Without
+                     * this, array_low/elem_size default to 0/2 and strides
+                     * silently corrupt. Mirrors the arr[i] branch below. */
+                    type_desc_t *wrt = NULL;
+                    int wfld = with_lookup_field(cg, ptr_name, &wrt, NULL);
+                    if (wfld >= 0 && wrt)
+                        pt = wrt->fields[wfld].type;
+                }
+                if (pt && pt->kind == TK_POINTER && pt->base_type &&
+                    pt->base_type->kind == TK_ARRAY) {
+                    type_desc_t *at = pt->base_type;
                     array_low = at->array_low;
                     if (at->element_type)
                         elem_size = type_size(at->element_type);
+                } else if (pt && pt->kind == TK_POINTER && pt->base_type &&
+                           pt->base_type->kind == TK_STRING) {
+                    /* P126: ptr^[i] on a pointer-to-string (e.g. UPSHIFT's
+                     * `ptrStr : pathnm_ptr` where pathnm_ptr = ^pathname
+                     * and pathname = string). Each element is a char (1 B).
+                     * Pascal string[1..N]: string byte 0 holds length, so
+                     * logical index 1 maps to offset 1 — array_low=0 here
+                     * is intentional (string[i] compiles to base+i directly). */
+                    elem_size = 1;
                 } else {
                     static int deref_warn = 0;
                     if (deref_warn++ < 40)
                         fprintf(stderr,
-                            "  ARRAY_ACCESS(ptr^[i]): '%s' sym=%p type=%p kind=%d base=%p bkind=%d (elem_size defaults to 2, array_low=0) in %s\n",
-                            ptr_name, (void*)ptr_sym,
-                            ptr_sym ? (void*)ptr_sym->type : NULL,
-                            ptr_sym && ptr_sym->type ? ptr_sym->type->kind : -1,
-                            ptr_sym && ptr_sym->type ? (void*)ptr_sym->type->base_type : NULL,
-                            ptr_sym && ptr_sym->type && ptr_sym->type->base_type ? ptr_sym->type->base_type->kind : -1,
+                            "  ARRAY_ACCESS(ptr^[i]): '%s' sym=%p pt=%p kind=%d base=%p bkind=%d (elem_size defaults to 2, array_low=0) in %s\n",
+                            ptr_name, (void*)ptr_sym, (void*)pt,
+                            pt ? pt->kind : -1,
+                            pt ? (void*)pt->base_type : NULL,
+                            pt && pt->base_type ? pt->base_type->kind : -1,
                             cg->current_file);
                 }
             } else if (node->children[0]->type == AST_IDENT_EXPR) {
