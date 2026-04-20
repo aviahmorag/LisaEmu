@@ -1903,7 +1903,8 @@ static void gen_lvalue_addr(codegen_t *cg, ast_node_t *node) {
                  * the store addresses collide — which is why SETMMU's SMT
                  * writes land on random bytes (or get silently dropped when
                  * paired with the WITH field-lookup miss). */
-                cg_symbol_t *ptr_sym = find_symbol_any(cg, node->children[0]->children[0]->name);
+                const char *ptr_name = node->children[0]->children[0]->name;
+                cg_symbol_t *ptr_sym = find_symbol_any(cg, ptr_name);
                 if (ptr_sym && ptr_sym->type &&
                     ptr_sym->type->kind == TK_POINTER &&
                     ptr_sym->type->base_type &&
@@ -1912,6 +1913,17 @@ static void gen_lvalue_addr(codegen_t *cg, ast_node_t *node) {
                     array_low = at->array_low;
                     if (at->element_type)
                         elem_size = type_size(at->element_type);
+                } else {
+                    static int deref_warn = 0;
+                    if (deref_warn++ < 40)
+                        fprintf(stderr,
+                            "  ARRAY_ACCESS(ptr^[i]): '%s' sym=%p type=%p kind=%d base=%p bkind=%d (elem_size defaults to 2, array_low=0) in %s\n",
+                            ptr_name, (void*)ptr_sym,
+                            ptr_sym ? (void*)ptr_sym->type : NULL,
+                            ptr_sym && ptr_sym->type ? ptr_sym->type->kind : -1,
+                            ptr_sym && ptr_sym->type ? (void*)ptr_sym->type->base_type : NULL,
+                            ptr_sym && ptr_sym->type && ptr_sym->type->base_type ? ptr_sym->type->base_type->kind : -1,
+                            cg->current_file);
                 }
             } else if (node->children[0]->type == AST_IDENT_EXPR) {
                 cg_symbol_t *arr_sym = find_symbol_any(cg, node->children[0]->name);

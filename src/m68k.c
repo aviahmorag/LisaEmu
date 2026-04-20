@@ -2981,6 +2981,27 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         pc_ring[pc_ring_idx++ & 255] = cpu->pc;
         g_last_cpu_pc = cpu->pc;
 
+        /* P125 probe: at MAKE_SYSDATASEG entry and exit, and CHK_LDSN_FREE's
+         * lbt[ldsn] read, dump syslocal record fields and lbt contents. */
+        if (cpu->pc == 0x01DE66) {
+            DBGSTATIC(int, sloc_probe, 0);
+            if (sloc_probe++ < 2) {
+                uint32_t a5 = cpu->a[5] & 0xFFFFFF;
+                uint32_t bsl = cpu_read32(cpu, (a5 - 24785) & 0xFFFFFF);
+                fprintf(stderr, "P125 syslocal @ b_syslocal_ptr=$%06X\n", bsl);
+                fprintf(stderr, "  sl_free_pool_addr @+0:   $%08X\n", cpu_read32(cpu, bsl));
+                fprintf(stderr, "  size_slocal       @+4:   $%04X\n", cpu_read16(cpu, bsl + 4));
+                fprintf(stderr, "  mrbt_addr         @+86:  $%08X\n", cpu_read32(cpu, bsl + 86));
+                fprintf(stderr, "  lbt_addr          @+90:  $%08X\n", cpu_read32(cpu, bsl + 90));
+                fprintf(stderr, "  bytes[+80..+100]:");
+                for (int i = 80; i < 100; i++)
+                    fprintf(stderr, " %02X", cpu_read8(cpu, bsl + i));
+                fprintf(stderr, "\n");
+            }
+        }
+        /* Also watch writes to syslocal fields (mrbt_addr, lbt_addr, smrbt_addr)
+         * during boot init — at $CE0056..$CE005D if b_syslocal_ptr=$CE0000. */
+
         /* P113: detect PC entering stack region ($CBF___-$CBFFFF) — the
          * classic "returned to garbage retaddr" signature for our P112
          * driver-dispatch debug. Dump PC ring once so we can see what
@@ -5076,8 +5097,11 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 {"ADJ_IO_CNT",     0}, {"CALLDRIVER",     0},
                 {"Scheduler",      0}, {"signal_sem",     0},
                 {"ENTER_SC",       0}, {"MakeSGSpace",    0},
+                {"Make_SProcess",  0}, {"Get_Resources",  0},
+                {"Make_SysDataseg",0}, {"MAKE_SYSDATASEG",0},
+                {"CreateProcess",  0}, {"FinishCreate",   0},
             };
-            static uint32_t pcs_cache[32];
+            static uint32_t pcs_cache[48];
             static int pci_gen = -1;
             if (pci_gen != g_emu_generation) {
                 pci_gen = g_emu_generation;
@@ -5087,7 +5111,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             DBGSTATIC(int, pci_trace, 0);
             static bool after_parameminit = false;
             DBGSTATIC(int, post_gs_count, 0);
-            if (pci_trace < 40) {
+            if (pci_trace < 200) {
                 for (int i = 0; i < (int)(sizeof(pcs)/sizeof(pcs[0])); i++) {
                     if (pcs_cache[i] && cpu->pc == pcs_cache[i]) {
                         pci_trace++;
