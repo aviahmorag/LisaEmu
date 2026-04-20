@@ -4002,7 +4002,14 @@ bool lisa_hle_intercept(lisa_t *lisa, m68k_t *cpu) {
         if (ifr_val != 0) {
             via_write(&lisa->via1, VIA_IFR, ifr_val);
         }
-        if (lisa->hle.disk_routine != 0) {
+        /* P121 track 1: only dispatch disk_routine on real CA1 (ProFile
+         * completion). Without this gate, every Level1 IRQ — including
+         * vretrace and any other source that vectors through $64 —
+         * synthesizes a JSR into PARALLEL, scrambling the stack and
+         * cascading into bogus IRQs against zeroed memory. CA1 is the
+         * only Level1 source that signals disk completion (per
+         * profile_check_irq → via_trigger_ca1). */
+        if (lisa->hle.disk_routine != 0 && (ifr_val & VIA_IRQ_CA1) != 0) {
             /* Synth JSR disk_routine: push $3F8 (existing RTE stub) as
              * return address, set PC. When the driver RTSes it lands on
              * $3F8 → RTE pops the IRQ frame → resume interrupted code. */
