@@ -189,10 +189,76 @@ commit as the real replacement.
 | 11 | **Shell (APDM)** | full desktop | Not started |
 | 12 | **Apps** | LisaWrite, LisaCalc, etc. | Not started |
 
-## Current Status (2026-04-19 post-P120-step-3 — Phase-5 IRQ scaffold complete)
+## Current Status (2026-04-20 post-P121 — IRQ scaffold exercised, FS_INIT wall)
 
-**Milestones**: **23/27** SYS_PROC_INIT (stable). Phase-5 IRQ-driven
-I/O completion scaffold complete across three commits:
+**Milestones**: **22/27** FS_INIT. *Intentional* regression from
+baseline 23/27 SYS_PROC_INIT — predicted by P119/P120 handoff. The
+boolean-NOT codegen fix + re-enabled MDDF_IO/BitMap_IO HLEs let
+real_mount carry through `MDDF_IO READ → BitMap_IO READ (1208 B) →
+MDDF_IO WRITE → UltraIO entered`. Pre-P121, UltraIO bailed at
+`if not blockstructured` with E_IO_MODE_BAD, so real_mount never
+issued I/O. Now it does, and the IRQ scaffold is being exercised.
+
+**P121 shipped**:
+
+1. **Narrow boolean-NOT codegen fix** (`src/toolchain/pascal_codegen.c`
+   AST_UNARY_OP / TOK_NOT, after the existing `is_boolean` checks).
+   When the operand is `AST_IDENT_EXPR` whose name misses both
+   `find_symbol_any` and `find_proc_sig`, AND we're inside a WITH
+   block, AND `with_lookup_field` resolves it to a TK_BOOLEAN field —
+   take the boolean path (`TST.W ; SEQ ; ANDI.W #1`) instead of
+   bitwise `NOT.W`. Narrowest possible scope: doesn't affect any
+   site where the name resolves to a global, a proc, or a non-WITH
+   field.
+
+2. **MDDF_IO + BitMap_IO HLEs re-enabled** (`src/lisa.c`, was `#if 0`).
+   Bypass the psio→LisaIO→UltraIO chain by reading directly from
+   the ProFile image. With the NOT fix in place, UltraIO no longer
+   fires E_IO_MODE_BAD and the chain runs through all three reads.
+
+**Observed behavior**:
+- `[POST-BOOT] entered fs_mount → real_mount → def_mount → MDDF_IO
+  READ → BitMap_IO READ → MDDF_IO WRITE → UltraIO @$06C406`.
+- 20+ `P120 Level1 IRQ` traces firing — but with `IFR=$00 IER=$00
+  CA1=0`. **Not real CA1 sources** (likely vretrace-routed Level1).
+- IRQ #1 has reasonable `SP=$00CBFB7E`; IRQ #2 has `SP=$00000008`
+  — catastrophic SP corruption between the first and second IRQ.
+  Cascade into 18 more bogus IRQs against zero stack.
+- Boot doesn't crash — 3000 frames complete cleanly. Just stuck
+  in FS_INIT (wait_sem on disk request that never completes).
+- Audit still clean: 8876/8876 symbols resolved, 0 unresolved.
+
+**Next blockers — pick a track**:
+
+1. **Spurious-IRQ source** (`src/lisa.c:lisa_hle_intercept` PC=$3F4
+   handler). All Level1 IRQs after the first show IFR=0 — meaning
+   VIA1 isn't asserting. Either the m68k IRQ-acceptance state is
+   sticky from a previous IRQ, or vretrace is routing to Level1
+   without setting IFR, or update_irq has a bug that asserts
+   irq_via1 when IFR&IER==0. Fix: gate the disk_routine JSR on
+   `(ifr_val & VIA_IRQ_CA1) != 0` so we only dispatch on real
+   completions; let the IFR=0 case fall through to the RTE.
+   Likely 5-line change but needs verification that we don't
+   miss real completions queued during HLE entry.
+
+2. **PARALLEL → process unblock** (binary-archaeology PARALLEL
+   $074AA4). Even when CA1 fires legitimately, our PARALLEL
+   call needs to find the matching `request` in the kernel's
+   queue and signal IODONE so the wait_sem wall comes down.
+   Trace what PARALLEL does on the first IRQ: does it identify
+   the request? Does it call IODONE? Does any compiled scheduler
+   code wake up? May need to inspect IRQ #1's stack frame
+   ($CBFB7E) to see if the kernel had pushed a request handle
+   that PARALLEL should consume.
+
+3. **SP corruption between IRQ #1 and #2**. Likely caused by
+   PARALLEL's first dispatch leaving the stack in a bad state,
+   or a fault during PARALLEL execution that scrambles things.
+   Worth dumping PC ring + reg state at IRQ #2 entry.
+
+Track 1 is the obvious smallest-cut next step. Track 2 is the
+real prize. Track 3 may resolve as a side effect of fixing 1
+or 2.
 
 - **Step-1** (`389f489`) — `profile_t.completion_pending` fires VIA1
   CA1 via `profile_check_irq()` + main-loop `via_trigger_ca1()`. Also

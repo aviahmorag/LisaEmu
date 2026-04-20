@@ -4225,7 +4225,12 @@ bool lisa_hle_intercept(lisa_t *lisa, m68k_t *cpu) {
          * The structural fix is Phase-5 (IRQ-driven I/O completion),
          * not more HLE layering. HLEs kept gated off for pickup
          * once IRQ completion lands. */
-#if 0
+/* P121: re-enabled alongside narrow boolean-NOT codegen fix and
+ * P120 IRQ scaffold. Goal: trigger a real ProFile transaction so
+ * the IRQ path earns its keep. Retires together when compiled
+ * SYSTEM.CD_PROFILE handles psio→UltraIO natively + IRQ
+ * completion fully wakes blocked processes. */
+#if 1
         if (mddf_io_addr && pc == mddf_io_addr)
             return hle_handle_mddf_io(lisa, cpu);
         if (bitmap_io_addr && pc == bitmap_io_addr)

@@ -2406,6 +2406,24 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                         cg_proc_sig_t *sig = find_proc_sig(cg, child->name);
                         if (sig) is_boolean = true;
                     }
+                    /* P121: WITH-scope bare-ident booleans. `not blockstructured`
+                     * inside `with devrec do` (UltraIO) compiled to bitwise NOT.W
+                     * because the ident misses both find_symbol_any and
+                     * find_proc_sig. Stored TRUE=$0001 from NEW_DEVICE's
+                     * SEQ+NEG.B+ANDI.W#1, NOT.W turns it into $FFFE (still
+                     * nonzero, still TRUE) — E_IO_MODE_BAD on every disk read.
+                     * Narrowly scoped: only when both prior lookups missed
+                     * AND the WITH context resolves the name to a TK_BOOLEAN
+                     * field. */
+                    if (!is_boolean && child->name[0] && cg->with_depth > 0) {
+                        type_desc_t *wrt = NULL;
+                        int fi = with_lookup_field(cg, child->name, &wrt, NULL);
+                        if (fi >= 0 && wrt && fi < wrt->num_fields &&
+                            wrt->fields[fi].type &&
+                            wrt->fields[fi].type->kind == TK_BOOLEAN) {
+                            is_boolean = true;
+                        }
+                    }
                 }
                 /* P84: field-access of boolean. Without this, `not sdbstate.memoryF`
                  * emits bitwise `NOT.W D0` which only turns true(=1)→$FFFE (nonzero).
