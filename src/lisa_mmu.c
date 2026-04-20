@@ -341,6 +341,28 @@ void lisa_mem_write8(lisa_mem_t *mem, uint32_t addr, uint8_t val) {
                 }
                 return;  /* DROP the write — protect vector table */
             }
+            /* P122: segment-aliasing guard. Writes whose logical address is
+             * outside seg-0 but whose MMU-translated physical lands inside
+             * the vector table ($000-$3FF) are always bogus — no legit OS
+             * path uses a non-seg-0 logical path to touch vectors/SGLOBAL.
+             * This happens when a segment is configured with SOR=0 and
+             * RW_MEM (unallocated demand-page state in Apple's scheme)
+             * and compiled code writes through a buffer in that segment.
+             * Without this guard, BitMap_IO's 1208-byte read into a
+             * temp_addr in seg-61 (SOR=0) wipes vectors + SGLOBAL, then
+             * SCHDTRAP reads SGLOBAL and dereferences NULL. */
+            if (phys < 0x400 && (addr & 0xFFFFFF) >= 0x20000) {
+                static int sag_count = 0;
+                static int sag_gen = -1;
+                extern int g_emu_generation;
+                if (sag_gen != g_emu_generation) { sag_count = 0; sag_gen = g_emu_generation; }
+                if (sag_count++ < 16) {
+                    int seg = (addr >> 17) & 0x7F;
+                    fprintf(stderr, "SEG-ALIAS-GUARD[%d]: PC=$%06X dropped write log=$%06X (seg%d) → phys=$%06X val=$%02X\n",
+                            sag_count, g_last_cpu_pc, addr, seg, phys, val);
+                }
+                return;
+            }
             }
             /* Watchpoint: $002600..$00260F code region is overwritten during
              * boot — causing SYSTEM_ERROR(10201). Log every write. */
