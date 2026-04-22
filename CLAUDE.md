@@ -189,7 +189,7 @@ commit as the real replacement.
 | 11 | **Shell (APDM)** | full desktop | Not started |
 | 12 | **Apps** | LisaWrite, LisaCalc, etc. | Not started |
 
-## Current Status (2026-04-20 post-P126 — 23/27 SYS_PROC_INIT, codegen class-of-bug partially fixed)
+## Current Status (2026-04-22 post-P127 — 23/27 SYS_PROC_INIT CLEAN; boot runs 3000 frames without HALT)
 
 **Milestones**: **23/27** SYS_PROC_INIT (back to the pre-P121 baseline
 but now with real UltraIO + MDDF/BitMap HLEs + SEG-ALIAS-GUARD +
@@ -220,6 +220,52 @@ Today's commits:
   `Get_Resources` → `Make_SysDataseg` → `CHK_LDSN_FREE(ldsn=-1)` →
   `lbt[-1]` returns non-zero → errnum=304 (e_ldsnused) →
   SYSTEM_ERROR(10101).
+- **P127** (this session) — **Two structural fixes that retired the
+  SYSTEM_ERROR(10101) wall; boot now runs 3000 frames CLEAN at 23/27
+  (previously halted at 10101 inside Make_SProcess).**
+
+  - **P127a** (`src/lisa.c:1999 lisa_reset`) — phys-layout fix.
+    Reset-time pre-programming had `b_syslocal = b_sgheap + l_sgheap`,
+    placing seg-103's phys base at `b_sysglobal + $12E00` — INSIDE
+    seg-102's 128KB phys window (`b_sysglobal..b_sysglobal+$20000`).
+    Our MMU passes through all 128KB of logical offset without
+    enforcing SLR page-count limit, so seg-102 logical writes past
+    sgheap-end (e.g. logical `$CD2E00`) aliased to phys
+    `b_sysglobal+$12E00 = b_syslocal`. P124 MakeSGSpace granted a
+    4KB chunk at logical `$CD2E00` (sgheap grow-headroom), compiled
+    `DISKIO` zero-filled it, and the writes obliterated
+    `c_syslocal_ptr^.lbt_addr` at logical `$CE005A` → `CHK_LDSN_FREE`
+    read bogus `lbt[-1]` → `errnum=304` → `SYSTEM_ERROR(10101)`.
+    Fix: place `b_syslocal` at `b_sysglobal + 0x20000` so seg-102's
+    full 128KB phys window doesn't overlap seg-103. This leaves
+    `$D200` bytes of legitimate growth headroom for sgheap inside
+    seg-102 (unused padding phys RAM, not aliased).
+
+  - **P127b** (`src/toolchain/pascal_codegen.c:1805 gen_lvalue_addr`) —
+    codegen fix for by-value record/array/string params in nested
+    procs. Our calling convention passes records > 4 bytes as
+    4-byte pointers (see `register_proc_sig`), but `gen_lvalue_addr`
+    for a non-var param emitted `LEA offset(A6),A0` (= slot address)
+    instead of `MOVEA.L offset(A6),A0` (= pointer value). In
+    Build_Stack's `with stk_info do ... stk_delta`, the codegen
+    computed `[static_link+20 + 24] = [+44]` directly, reading
+    garbage from the frame past the stk_info pointer slot. Fix: when
+    a param is non-var but type size > 4, treat it like a VAR param
+    (deref the slot). This fixed Build_Stack producing `stk_base =
+    $A8CEF0` (an UNMAPPED seg-84 logical addr) — correct value is
+    now `$D011E0` (within MemMgr's user-stack seg-104).
+
+  Post-P127 state: boot reaches SYS_PROC_INIT (23/27), creates
+  MemMgr (Make_SProcess #1), Move_MemMgr, creates Root
+  (Make_SProcess #2), FinishCreate... then something inside the
+  second FinishCreate (Close_Dataseg → disk write path) calls
+  `MDDF_IO` (at `$066420`), the HLE fires, and CPU runs afterward
+  but stays inside hot page `$042B00` (MM_Setup). No crash, no
+  halt — just doesn't return from SYS_PROC_INIT to
+  `INIT_DRIVER_SPACE` (milestone 24). Investigation pending: why
+  is MDDF_IO being called from Close_Dataseg when Root is
+  non-resident and its seg is still being set up.
+
 - **P126** (`e150040`) — **ptr^[i] codegen — WITH-field fallback +
   string-deref case**. In `gen_lvalue_addr` (`AST_ARRAY_ACCESS`
   → `AST_DEREF` branch), fall back to `with_lookup_field` when

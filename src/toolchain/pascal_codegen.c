@@ -1804,8 +1804,19 @@ static void gen_lvalue_addr(codegen_t *cg, ast_node_t *node) {
         }
         cg_symbol_t *sym = find_symbol_any(cg, node->name);
         if (sym) {
-            if (sym->is_param && sym->is_var_param) {
-                /* VAR param: frame + offset contains pointer */
+            /* P127: by-ref param detection. Our calling convention passes
+             * records/arrays/strings (size > 4) as 4-byte pointers even
+             * when declared without `var`. The frame slot holds a pointer
+             * to the data, not the data itself — so field/element access
+             * must deref, same as explicit VAR params. Without this, a
+             * nested proc reading (say) `stk_info.stk_delta` would compute
+             * (slot_addr + field_offset) and read garbage from the frame
+             * past the slot, when what's needed is (*slot + field_offset). */
+            bool is_byref_val = (sym->is_param && !sym->is_var_param &&
+                                 sym->type && sym->type->size > 4);
+            if ((sym->is_param && sym->is_var_param) || is_byref_val) {
+                /* VAR param OR by-ref-value record/array/string:
+                 * frame slot contains a pointer to the data */
                 int depth = find_local_depth(cg, node->name);
                 if (depth > 0) {
                     emit_frame_access(cg, depth);  /* parent FP → A0 */

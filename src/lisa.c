@@ -1996,7 +1996,24 @@ void lisa_reset(lisa_t *lisa) {
         uint32_t l_dbscreen  = 0x8000;
         uint32_t b_screen    = LISA_RAM_SIZE - l_screen;  /* $1F8000 */
         uint32_t b_dbscreen  = b_screen - l_dbscreen;     /* $1F0000 */
-        uint32_t b_syslocal  = b_sgheap + l_sgheap;
+        /* P127: b_syslocal must live OUTSIDE seg-102's 128KB phys window.
+         * seg-102 (sysglobal/seg $CC0000) has SOR = b_sysglobal>>9 and our
+         * MMU passes through all 128KB of logical offset, so seg-102
+         * logical $CC0000..$CDFFFF maps to phys b_sysglobal..b_sysglobal+$20000.
+         * Formerly b_syslocal = b_sgheap + l_sgheap = b_sysglobal + $12E00,
+         * placing syslocal's phys INSIDE seg-102's window. P124's
+         * MakeSGSpace HLE granted a 4KB chunk at logical $CD2E00 (sgheap
+         * grow-headroom), DISKIO zero-filled that chunk through seg-102,
+         * and the writes landed at phys b_sysglobal+$12E00 = syslocal
+         * base, wiping c_syslocal_ptr^.lbt_addr → CHK_LDSN_FREE read
+         * bogus lbt[-1] → errnum=304 → SYSTEM_ERROR(10101).
+         * Real Lisa avoids this via SLR page-count enforcement (accesses
+         * past the sgheap extent fault). Our MMU doesn't enforce SLR
+         * limits, so the simplest real fix is to place b_syslocal past
+         * seg-102's full 128KB phys window. This leaves $D200 bytes of
+         * legitimate growth headroom for sgheap inside seg-102 (pointed
+         * at real phys RAM but not aliased to any other segment). */
+        uint32_t b_syslocal  = b_sysglobal + 0x20000;
         uint32_t l_syslocal  = 0x4000;    /* 16KB syslocal */
         uint32_t b_opustack  = b_syslocal + l_syslocal;
         uint32_t l_opustack  = 0x4000;    /* 16KB user stack */
@@ -2138,8 +2155,11 @@ void lisa_reset(lisa_t *lisa) {
             /* sysglobmmu (102): maps $CC0000 → physical sysglobal */
             SET_MMU_SEG(ctx, 102, 0x0700, (uint16_t)(b_sysglobal >> 9));
 
-            /* syslocmmu (103): maps $CE0000 → physical syslocal */
-            uint32_t b_syslocal = b_sgheap + l_sgheap;
+            /* syslocmmu (103): maps $CE0000 → physical syslocal.
+             * P127: phys base is b_sysglobal + $20000 (past seg-102's
+             * 128KB phys window) — see the comment in the outer
+             * b_syslocal decl above. Must match the outer value. */
+            uint32_t b_syslocal = b_sysglobal + 0x20000;
             uint32_t l_syslocal = 0x4000;
             SET_MMU_SEG(ctx, 103, 0x0700, (uint16_t)(b_syslocal >> 9));
 
