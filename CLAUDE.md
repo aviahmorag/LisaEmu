@@ -189,7 +189,7 @@ commit as the real replacement.
 | 11 | **Shell (APDM)** | full desktop | Not started |
 | 12 | **Apps** | LisaWrite, LisaCalc, etc. | Not started |
 
-## Current Status (2026-04-23 post-P127g — **27/27 ALL MILESTONES**, boot runs cleanly through PR_CLEANUP)
+## Current Status (2026-04-23 post-P128b — **27/27 ALL MILESTONES**, boot runs cleanly through PR_CLEANUP; 10204/10201 diagnosis complete, three structural bugs identified)
 
 **Milestones**: **23/27** SYS_PROC_INIT (back to the pre-P121 baseline
 but now with real UltraIO + MDDF/BitMap HLEs + SEG-ALIAS-GUARD +
@@ -335,60 +335,81 @@ SYSTEM_ERROR(10201) halts AFTER PR_CLEANUP fires — not blocking the
 milestone sweep. PR_CLEANUP is designed to enter the scheduler idle
 loop, and we trip a hardware exception during the scheduler dispatch.
 
-**P128 investigation (2026-04-23, unshipped) — diagnosed but not
-fixed.** The 10201 crash is a downstream consequence of our 10204
-suppression HLE letting a half-baked PCB ($CCBC40) into the scheduler
-after Root's `Make_SProcess` failed. Both crashes are the **same
-bug**: Launch reads env_save through `b_syslocal_ptr = $CE0000`
-(syslocmmu = seg 103) and gets the **kernel's boot syslocal**, not
-the new process's syslocal.
+**P128b investigation (2026-04-23 pm, unshipped) — full root cause
+found, three independent bugs, all structural (no suppression needed).**
 
-Concrete observations:
-- `Build_Stack#1` (MemMgr) writes env_save fields to kernel-view
-  seg 105 (syslocmmu+2, sor=? via MAP_SEGMENT to new sloc phys).
-- At `Launch#1` fire, `b_syslocal_ptr = $CE0000` still resolves via
-  ctx 1 seg 103 to the kernel's syslocal phys ($04DC*512 = $9B800).
-  env_save.PC reads as `$070000CB` (garbage from the kernel syslocal)
-  instead of Initiate ($055994).
-- RTE jumps to odd PC, traps via LINE_1111 → spurintr_trap ($0726AE)
-  → SYSTEM_ERROR(10204). HLE suppresses, unwinds to STARTUP.
-- `Make_SProcess#2` for Root enters but **never reaches** CreateProcess /
-  Build_Stack (the 10204 unwind short-circuits it).
-- Nonetheless a stale PCB ($CCBC40) is dispatched via `Launch#2`
-  with env_save zeros → Initiate RTS pops 0 → vector walk →
-  SYSTEM_ERROR(10201) at hard_excep+646.
+Earlier P128 hypothesis ("both crashes are the same MMU-aliasing bug")
+was wrong. P128b probes confirm the MMU programming for MemMgr is
+actually correct: `Map_Syslocal(MemMgr) → PROG_MMU(103, 0, 1, 0)`
+reprograms ctx 1 seg 103 sor=$4DC → phys $9B800, and `Move_MemMgr →
+MOVE_IT → MOVER` correctly copies MemMgr's syslocal to the new
+physical location + updates sdb.memaddr. For Launch#2 (MemMgr), seg
+103 sor=$F71 → phys $1EE200 and env_save.PC reads back as $055994
+(Initiate) — correct. The actual bugs are:
 
-**Similar aliasing gap for the stack:** `Build_Stack` writes
-`stk_base^.start_addr := @ExitSys` via kernel seg 104 (sor=$573 → phys
-$0AF7E0 for Root). But the user-side stack access at `USP=$F7FFE0`
-goes through ctx 1 seg 123 sor=$F77 → phys $20EDE0. **Same logical
-stack region, different physical pages** — Apple's OS expects these
-to alias, our emulator does not.
+**Bug B — Block_Process's Ready-queue unlink fails.** During
+`SYS_PROC_INIT → Make_SProcess#2(Root) → ... → Wait_sem → Block_Process
+(self-block)`, Apple's Pascal unlinks the kernel pseudo PCB
+($CCB58E, priority 255, glob_id $ABC from INIT_PROCESS) from Ready
+via `Queue_Process(pcb_ptr, Blocked)` at `source-procprims.text.unix
+.txt:410`. But at Launch#1 the PCB's `next=$CCBC40` (MemMgr) and
+`prev=$CC6B84` (=@fwd_ReadyQ) — still Ready-queue linkage. So
+SelectProcess re-dispatches the just-blocked kernel pseudo. Cause
+TBD: either QUEUE_PR dequeue step miscompiled, or a later path
+re-queues it into Ready, or our PCB next/prev offsets disagree
+with the compiled asm's.
 
-**Root cause class:** MMU context-switch / per-process aliasing.
-Apple's design relies on the scheduler reprogramming seg 103 (and
-other per-process segs) at dispatch so that fixed kernel-logical
-addresses like `b_syslocal_ptr = $CE0000` resolve to each process's
-own physical pages. Our emulator currently only has one "dom=0"
-programming path (ctx 1) and never reprograms seg 103 when
-dispatching MemMgr/Root.
+**Bug A — ENTER_SC supervisor-path corrupts env_save.** Block_Process
+self-block calls `Enter_Scheduler`. Apple's ENTER_SC asm
+(`source-PROCASM.TEXT:57`) has a supervisor-mode fast path: `ADDQ
+#4,SP ; BRA.S SCHDTRAP` that assumes an interrupt's PC+SR trap frame
+already sits on SSP underneath the JSR return address. STARTUP's
+init code is supervisor-mode but NOT an interrupt — there's no
+pre-existing trap frame. SCHDTRAP then pops garbage bytes as PC/SR
+and stores them in the current process's env_save. Direct evidence:
 
-**Right fix (next session):** find where Apple's scheduler /
-dispatch code is *supposed* to reprogram seg 103 (or switch
-segment1/segment2 bits to flip contexts) and observe what our
-emulator does at that moment. Either our `PROG_MMU` HLE misses a
-call, or `segment1/segment2` bits aren't being set by the scheduler,
-or each process should have its own domain (1-3) and we only ever
-see dom=0. Then retire the 10204 suppression HLE in the same
-commit as the real fix (per `feedback_hle_layers_load_bearing.md`).
+```
+[P128] ENTER_SC#1 SR=$2704 SSP=$CBF622 ret-PC=$0121C6
+  SSP top 8 longs: $000121C6 $08200700 $00CBF63E $000127AC $00CCB58E ...
+[P128] SCHDTRAP#1 SR=$2700 SSP=$CBF626
+  SSP top 8 longs: $08200700 $00CBF63E $000127AC $00CCB58E ...
+```
 
-Candidate entry points to probe first:
-- `src/lisa.c` 10204 HLE — confirm which call site in Apple's code
-  triggers it (spurintr_trap is installed on which vector?).
-- `SOURCE-PROCASM.TEXT` SCHDTRAP / Launch — no MMU reprogramming
-  there, so it must happen elsewhere (SCHED.TEXT? Prepare_Process?).
-- Our `PROG_MMU` trace with all segs & all domains logged — see if
-  dom=1/2/3 is ever programmed.
+After `ADDQ #4` and SCHDTRAP's A6 dance, the (SP)+ pops read
+mid-data. Launch#1 then RTEs to `$070000CB` (garbage) → line-1111 →
+`spurintr_trap` → `SYSTEM_ERROR(10204)`.
+
+**Bug C — kernel-view and user-view stack segs don't alias.**
+Build_Stack writes `stk_base^.start_addr := @ExitSys` via
+`stk_handle.seg_ptr = $D00000` (seg 104 = minsysldsnmmu, ldsn=-2)
+which maps to phys $0AF7E0. But at Launch#2, Initiate's RTS reads
+the user stack at `USP=$F7FFE0` via seg 123 (stackmmu) which maps
+to phys $20EDE0 — **different physical page.** Apple's design
+expects the same physical RAM to be visible through the kernel-side
+MMU (seg 104, used during creation) and the user-side MMU (seg 123,
+used by the running process). Our emulator doesn't enforce that
+aliasing when `SET_LDSN(stk_sdb, stackmmu, mmustack)` programs
+seg 123. Result: RTS reads zeros → PC=0 → vector walk → 10201 at
+hard_excep+646.
+
+**Fix order (next session):**
+1. **Bug B** — instrument `Block_Process → Queue_Process(Blocked)`
+   post-dequeue; confirm which sub-step fails. Fix the Pascal codegen
+   or the off-by-offset PCB layout assumption.
+2. **Bug A** — either (a) find/fix the init-time Wait_sem call that
+   hits a count=0 sem (shouldn't happen if sems are init'd to 1) so
+   Block_Process never fires, or (b) synthesize a PC+SR trap frame in
+   our ENTER_SC supervisor-path handler.
+3. **Bug C** — make `SET_LDSN` / `MAP_SEGMENT` programming of seg 123
+   mirror the physical base of the corresponding kernel-side seg so
+   both LDSN views share pages.
+
+Retire the 10204 suppression HLE (`src/lisa.c`) in the same commit as
+the real fix for A+B (per `feedback_hle_layers_load_bearing.md`).
+
+Full probe recipes, SSP dumps, PCB hex, and file/line anchors:
+see `.claude-handoffs/2026-04-23-post-P128b-NEXT_SESSION.md` on the
+next session (this session's handoff).
 
 Boot progress ledger: 336 / 2153 procedures entered (15.6%). Every
 kernel init milestone is green.
