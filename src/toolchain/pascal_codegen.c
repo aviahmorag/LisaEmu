@@ -3205,9 +3205,27 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                     bool is_var_arg = (sig && i < sig->num_params && sig->param_is_var[i]);
                     bool by_ref = ARG_BY_REF(cg, sig, i);
                     int psize = (sig && i < sig->num_params) ? sig->param_size[i] : 4;
+                    /* P128c: when the callee is asm (callee-clean) and the
+                     * actual param is 1-byte (byte/char/enum/bool), push via
+                     * MOVE.B D0,-(SP) so the value lands in the HIGH byte of
+                     * the 2-byte slot. Apple's asm uses `MOVE.B (SP)+,Dn`
+                     * which reads the HIGH byte. Our Pascal→Pascal convention
+                     * puts the byte in the LOW byte (MOVE.W D0,-(SP)) which
+                     * asm reads as $00. QUEUE_PR(Blocked) silently took the
+                     * Ready path pre-P128c because of this mismatch. */
+                    int pkind = (sig && i < sig->num_params) ? sig->param_type_kind[i] : 0;
+                    bool is_byte_param = !is_var_arg && !by_ref &&
+                        sig && i < sig->num_params && sig->param_type[i] &&
+                        type_size(sig->param_type[i]) == 1 &&
+                        (pkind == TK_CHAR || pkind == TK_BOOLEAN ||
+                         pkind == TK_ENUM || pkind == TK_BYTE ||
+                         pkind == TK_SUBRANGE);
                     if (is_var_arg || by_ref) {
                         gen_lvalue_addr(cg, node->children[i]);
                         emit16(cg, 0x2F08);  /* MOVE.L A0,-(SP) */
+                    } else if (is_byte_param) {
+                        gen_expression(cg, node->children[i]);
+                        emit16(cg, 0x1F00);  /* MOVE.B D0,-(SP) — high byte of word slot */
                     } else if (psize <= 2) {
                         gen_expression(cg, node->children[i]);
                         emit16(cg, 0x3F00);  /* MOVE.W D0,-(SP) */
@@ -3761,9 +3779,21 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                         bool is_var_arg = (call_sig && a < call_sig->num_params && call_sig->param_is_var[a]);
                         bool by_ref = ARG_BY_REF(cg, call_sig, a);
                         int psize = (call_sig && a < call_sig->num_params) ? call_sig->param_size[a] : 4;
+                        /* P128c: see PROC_CALL site. Byte-sized args to asm
+                         * procs must land in the HIGH byte of the 2-byte slot. */
+                        int pkind = (call_sig && a < call_sig->num_params) ? call_sig->param_type_kind[a] : 0;
+                        bool is_byte_param = !is_var_arg && !by_ref &&
+                            call_sig && a < call_sig->num_params && call_sig->param_type[a] &&
+                            type_size(call_sig->param_type[a]) == 1 &&
+                            (pkind == TK_CHAR || pkind == TK_BOOLEAN ||
+                             pkind == TK_ENUM || pkind == TK_BYTE ||
+                             pkind == TK_SUBRANGE);
                         if (is_var_arg || by_ref) {
                             gen_lvalue_addr(cg, node->children[a]);
                             emit16(cg, 0x2F08);
+                        } else if (is_byte_param) {
+                            gen_expression(cg, node->children[a]);
+                            emit16(cg, 0x1F00);  /* MOVE.B D0,-(SP) */
                         } else if (psize <= 2) {
                             gen_expression(cg, node->children[a]);
                             emit16(cg, 0x3F00);
@@ -4391,11 +4421,18 @@ static void process_var_decl(codegen_t *cg, ast_node_t *node, bool is_global) {
      * offsets disagree with asm code's hardcoded PASCALDEFS offsets. */
     struct { const char *name; int offset; } pdefs_pins[] = {
         /* Scheduler queue heads — asm PROCASM.TEXT addresses them
-         * directly as PFWD_REA(A5), PFWD_BLO(A5), etc. */
+         * directly as PFWD_REA(A5), PFWD_BLO(A5), etc. The asm treats each
+         * head as a 2-field struct { next, prev } where prev is at
+         * PREV_SCH(head) = 4(head). Apple's layout therefore places
+         * bkwd_* at fwd_* + 4 (higher A5-relative offset = less negative).
+         * Pre-P128c had bkwd_* at fwd_* - 4 which caused QUEUE_PR's
+         * `MOVEA.L PREV_SCH(A0),A2` to read the WRONG global (0 for an
+         * unused slot), which then corrupted the vector table on the
+         * subsequent Q_PCB enqueue. */
         { "fwd_ReadyQ",  -1116 },   /* PFWD_REA */
-        { "bkwd_ReadyQ", -1120 },
+        { "bkwd_ReadyQ", -1112 },   /* PFWD_REA + 4 */
         { "fwd_BlockQ",  -1108 },   /* PFWD_BLO */
-        { "bkwd_BlockQ", -1112 },
+        { "bkwd_BlockQ", -1104 },   /* PFWD_BLO + 4 */
         /* Sysglobal pointer — asm uses B_SYSLOCAL_PTR(A5) at -24785 */
         { "b_syslocal_ptr", -24785 },
         /* System globals referenced from asm */

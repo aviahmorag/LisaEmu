@@ -189,7 +189,7 @@ commit as the real replacement.
 | 11 | **Shell (APDM)** | full desktop | Not started |
 | 12 | **Apps** | LisaWrite, LisaCalc, etc. | Not started |
 
-## Current Status (2026-04-23 post-P128b — **27/27 ALL MILESTONES**, boot runs cleanly through PR_CLEANUP; 10204/10201 diagnosis complete, three structural bugs identified)
+## Current Status (2026-04-24 post-P128c — **Bug B fixed**, 10204 eliminated; 26/27 milestones reach MEM_CLEANUP; next blocker is Bug C (stack-LDSN aliasing, Initiate's RTS reads uninit USP))
 
 **Milestones**: **23/27** SYS_PROC_INIT (back to the pre-P121 baseline
 but now with real UltraIO + MDDF/BitMap HLEs + SEG-ALIAS-GUARD +
@@ -335,8 +335,59 @@ SYSTEM_ERROR(10201) halts AFTER PR_CLEANUP fires — not blocking the
 milestone sweep. PR_CLEANUP is designed to enter the scheduler idle
 loop, and we trip a hardware exception during the scheduler dispatch.
 
-**P128b investigation (2026-04-23 pm, unshipped) — full root cause
-found, three independent bugs, all structural (no suppression needed).**
+**P128c (2026-04-24) — Bug B shipped: two structural fixes retire the
+10204 cascade. Next blocker shifts to Bug C (stack-LDSN aliasing).**
+
+- **P128c.1 — Pascal global-layout fix for queue heads**. Apple's asm
+  treats `fwd_BlockQ` / `fwd_ReadyQ` as 2-field head structs and reads
+  the prev/tail pointer at `PREV_SCH(head) = 4(head)`. That requires
+  `bkwd_BlockQ` at `fwd_BlockQ + 4` (higher address = less-negative
+  A5-offset). Our PASCALDEFS-pin table in `src/toolchain/pascal_codegen.c`
+  had `bkwd_*` at `fwd_* - 4`. Fix: change pin offsets so
+  `bkwd_ReadyQ = -1112` (PFWD_REA + 4) and `bkwd_BlockQ = -1104`
+  (PFWD_BLO + 4). Now Blocked-queue init correctly sets
+  `bkwd_BlockQ := fwd_BlockQ` at the address asm reads from.
+- **P128c.2 — Pascal codegen fix: byte args to callee-clean procs**.
+  Apple's Pascal-to-asm calling convention places 1-byte arguments
+  (byte/char/bool/enum/subrange) in the HIGH byte of a 2-byte stack
+  slot, so the asm's `MOVE.B (SP)+,Dn` (which reads the byte at
+  logical SP on big-endian 68000) gets the correct value. Our
+  codegen pushed byte-args via `MOVE.W D0,-(SP)` which puts the
+  value in the LOW byte, so `MOVE.B (SP)+,D1` in QUEUE_PR's
+  `MOVE.B (SP)+,D1 ; get queue` read 0 for every `Blocked`
+  (enum=1) — QUEUE_PR silently took the Ready path instead of
+  the Blocked path, so `Block_Process → Queue_Process(pcb, Blocked)`
+  was a no-op. Fix: `pascal_codegen.c` push site for callee-clean
+  callers now emits `MOVE.B D0,-(SP)` ($1F00) when the param's
+  actual type size is 1 and the kind is byte/char/bool/enum/
+  subrange. On m68k, predec byte-size on A7 decrements by 2 for
+  alignment and writes the byte at the low-addr byte (= HIGH byte
+  of the word slot). Retires at both PROC_CALL and FUNC_CALL
+  push sites.
+
+**Observed behaviour post-P128c**: 10204 completely eliminated.
+Boot now correctly blocks kern, dispatches MemMgr via the real
+scheduler, crashes in Initiate's `LINK A6,#-6; UNLK A6; RTS`
+because RTS reads USP=$F7FFE0 (user-view of MemMgr stack) which
+is uninitialized — Build_Stack wrote `@ExitSys` via seg 104
+(kernel-view) to a different physical page than seg 123
+(user-view) points at. SYSTEM_ERROR(10201) at hard_excep+646.
+This is Bug C from the P128b handoff.
+
+Milestones regressed 27→26 (last checkpoint: MEM_CLEANUP) because
+PR_CLEANUP was previously reached only via the 10204 unwind path.
+With the real scheduler dispatching MemMgr, boot fails at Bug C
+before PR_CLEANUP gets called. This is architectural progress —
+we're failing in the correct flow, not in the wrong flow.
+
+**Next**: Bug C — make seg 104 (minsysldsnmmu) and seg 123
+(stackmmu) of the same process map to aliased physical pages
+when SET_LDSN programs the stack sdb. See the P128b handoff's
+Layer-3 analysis for the concrete diagnosis.
+
+**P128b investigation (2026-04-23 pm) — full root cause
+found, three independent bugs, all structural (no suppression needed).
+P128c shipped fixes for Bug B; Bug A no longer fires; Bug C is next.**
 
 Earlier P128 hypothesis ("both crashes are the same MMU-aliasing bug")
 was wrong. P128b probes confirm the MMU programming for MemMgr is
