@@ -2076,7 +2076,20 @@ void lisa_reset(lisa_t *lisa) {
         W32D(l_drivers);     /* l_drivers */
         W32D(himem);         /* himem */
         W32D(lomem);         /* lomem */
-        W32D(LISA_RAM_SIZE); /* l_physicalmem */
+        /* P127-NEXT: l_physicalmem must be ≤ 2MB. Apple's tail_sdb
+         * sentinel hardcodes memaddr=4096 in MM4 init, which is
+         * 2MB/512 (the max block address for a real Lisa 2/10). Our
+         * emulator has 2.25MB RAM (LISA_RAM_SIZE) to dodge the
+         * mmucodemmu SOR=$FE4 → phys $1FC800 wrap issue (see
+         * f4e2f8c). But if we report 2.25MB to the OS, MAKE_REGION
+         * creates a physical-memory sdb spanning blocks 0..4607 and
+         * MM can allocate segs with memaddr > 4096. INSERTSDB's
+         * freechain walk never finds memaddr > c_sdb.memaddr because
+         * the tail sentinel is capped at 4096 — boot spins in
+         * Build_Syslocal's MM_Setup side-effect. Cap the OS's view
+         * at exactly 2MB. The extra 256KB stays reserved for the
+         * mmucodemmu scaffold and nothing else. */
+        W32D(2 * 1024 * 1024); /* l_physicalmem — clamped to 2MB */
         {
             /* fs_block0: the disk block of the MDDF (filesystem page 0).
              * For real images this may differ from BOOT_TRACK_BLOCKS (e.g. 46 vs 24).

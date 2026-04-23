@@ -189,7 +189,7 @@ commit as the real replacement.
 | 11 | **Shell (APDM)** | full desktop | Not started |
 | 12 | **Apps** | LisaWrite, LisaCalc, etc. | Not started |
 
-## Current Status (2026-04-22 post-P127 — 23/27 SYS_PROC_INIT CLEAN; boot runs 3000 frames without HALT)
+## Current Status (2026-04-23 post-P127b+ — 23/27 SYS_PROC_INIT CLEAN; boot runs 3000 frames without HALT; three blocker classes retired, one remaining)
 
 **Milestones**: **23/27** SYS_PROC_INIT (back to the pre-P121 baseline
 but now with real UltraIO + MDDF/BitMap HLEs + SEG-ALIAS-GUARD +
@@ -220,9 +220,59 @@ Today's commits:
   `Get_Resources` → `Make_SysDataseg` → `CHK_LDSN_FREE(ldsn=-1)` →
   `lbt[-1]` returns non-zero → errnum=304 (e_ldsnused) →
   SYSTEM_ERROR(10101).
-- **P127** (this session) — **Two structural fixes that retired the
-  SYSTEM_ERROR(10101) wall; boot now runs 3000 frames CLEAN at 23/27
-  (previously halted at 10101 inside Make_SProcess).**
+- **P127b+** (this session) — **Two more structural fixes retire the
+  MM_Setup infinite-loop wall; boot still 23/27 but the next blocker is
+  a subtle state bug (freechain walk cycle in INSERTSDB) — NOT a
+  codegen bug anymore.**
+
+  - **P127c** (`src/toolchain/pascal_codegen.c` SIZEOF handler) —
+    `SIZEOF(initSegMap)` inside `with c_syslocal_ptr^ do` returned 2
+    (default) instead of 16 (packed array[0..127] of boolean). The
+    handler only looked up argument as `find_type` or
+    `find_symbol_any`, never checked WITH-scoped fields. Fix: also
+    consult `with_lookup_field` and use the field's type size. This
+    retired MM_Setup's initSegMap-clear loop infinite spin (`long_ptr
+    := @initSegMap + Sizeof(initSegMap)`, decrement by 4, until ==
+    @initSegMap; started at +2 so never hit +0).
+
+  - **P127d** (`src/lisa.c` loader-params) — clamp `l_physicalmem`
+    reported to the OS at 2MB. Apple's MM4 hardcodes
+    `tail_sdb.memaddr = 4096` (= 2MB / 512-byte block) as the
+    freechain sentinel. Our emulator has 2.25MB RAM (LISA_RAM_SIZE)
+    to dodge the mmucodemmu SOR=$FE4 → phys $1FC800 wrap. Reporting
+    the full 2.25MB to the OS let MAKE_REGION / GetFree produce sdbs
+    with memaddr > 4096. INSERTSDB's freechain walk loops on any
+    memaddr exceeding the tail — fatal. Clamp: pass 2*1024*1024 for
+    l_physicalmem. Keeps the emulator RAM at 2.25MB but the OS sees
+    exactly 2MB. The clamp itself is correct, but the INSERTSDB spin
+    with `c_sdb.memaddr=4480` still happens via a different path
+    (GetFree's `f_sdb.memaddr + f_sdb.memsize - size = 4480`, so
+    some free sdb has memaddr+memsize ≥ 4486 — cause not yet
+    identified).
+
+### The 24/27 wall now: INSERTSDB freechain walk cycles (3-node cycle)
+
+At `Move_MemMgr → MOVE_IT → INSERTSDB` for mmstk_sdb (or mmsl_sdb),
+`c_sdb.memaddr = 4480` (> Apple's tail sentinel 4096). The freechain
+walks head ($CCB034, memaddr=0) → $B4F800 (memaddr=1404) → $CCB062
+(memaddr=4096, = tail) → back to head. Never finds memaddr > 4480.
+Infinite loop in $046DCC..$046DFE (PC ring confirmed).
+
+`4480 = $1180`. Write trace (`WRITE-4480` probe) confirmed the store
+happens at PC $04C386 inside MOVE_IT, via GetFree's
+`allocaddr := memaddr + memsize - size` line (MM4.TEXT:78). Root
+cause: some f_sdb has memaddr+memsize ≥ 4486, which implies the
+free pool contains blocks past 4096 despite the l_physicalmem clamp.
+Still to investigate:
+  1. Is AVAIL_INIT's `MAKE_FREE(freebase/mempgsize, freelen/mempgsize)`
+     writing a correct size? lomem=$AB800, himem=$1F0000 should
+     produce memaddr=1372, memsize=2594. Max in pool = 3966, <4096.
+     But GetFree observes memaddr+memsize > 4486.
+  2. Does another path extend the free chain past himem?
+  3. Is GetFree itself miscompiled (reading wrong fields)?
+
+- **P127a+b** (prior commit `6420a1a`) — **Retired the
+  SYSTEM_ERROR(10101) wall.**
 
   - **P127a** (`src/lisa.c:1999 lisa_reset`) — phys-layout fix.
     Reset-time pre-programming had `b_syslocal = b_sgheap + l_sgheap`,

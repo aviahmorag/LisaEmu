@@ -2981,6 +2981,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         pc_ring[pc_ring_idx++ & 255] = cpu->pc;
         g_last_cpu_pc = cpu->pc;
 
+
         /* P125 probe: at MAKE_SYSDATASEG entry and exit, and CHK_LDSN_FREE's
          * lbt[ldsn] read, dump syslocal record fields and lbt contents. */
         if (cpu->pc == 0x01DE66) {
@@ -5100,6 +5101,8 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 {"Make_SProcess",  0}, {"Get_Resources",  0},
                 {"Make_SysDataseg",0}, {"MAKE_SYSDATASEG",0},
                 {"CreateProcess",  0}, {"FinishCreate",   0},
+                {"MM_Setup",       0}, {"Build_Syslocal", 0},
+                {"Build_PCB",      0},
             };
             static uint32_t pcs_cache[48];
             static int pci_gen = -1;

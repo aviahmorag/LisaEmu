@@ -1307,9 +1307,6 @@ static bool lvalue_field_info_full(codegen_t *cg, ast_node_t *parent_node,
             if (out_type) *out_type = parent->fields[fi].type;
             if (out_bit_offset) *out_bit_offset = parent->fields[fi].bit_offset;
             if (out_bit_width) *out_bit_width = parent->fields[fi].bit_width;
-            /* P89d probe — log every slocal_sdbRP field resolution with the
-             * parent record's name and layout snapshot, to diagnose
-             * cross-module PCB layout skew. */
             return true;
         }
     }
@@ -2831,6 +2828,23 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                             /* Check if it's a variable and get its type size */
                             cg_symbol_t *s = find_symbol_any(cg, arg->name);
                             if (s && s->type && s->type->size > 0) sz = s->type->size;
+                            /* P127-NEXT: also check WITH-scoped fields.
+                             * `Sizeof(initSegMap)` inside `with c_syslocal_ptr^ do`
+                             * references a record field — not a type and not a
+                             * standalone symbol. Without this, sz defaulted to 2,
+                             * causing MM_Setup's initSegMap-clearing loop
+                             * (`long_ptr := @initSegMap + Sizeof(initSegMap)`,
+                             * decrement by 4, until == @initSegMap) to start at
+                             * +2 instead of +16 and never hit the target, spinning
+                             * forever inside SYS_PROC_INIT's Build_Syslocal. */
+                            else if (cg->with_depth > 0) {
+                                type_desc_t *wrt = NULL;
+                                int fld = with_lookup_field(cg, arg->name, &wrt, NULL);
+                                if (fld >= 0 && wrt && wrt->fields[fld].type &&
+                                    wrt->fields[fld].type->size > 0) {
+                                    sz = wrt->fields[fld].type->size;
+                                }
+                            }
                         }
                     }
                 }
