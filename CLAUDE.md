@@ -266,31 +266,54 @@ Today's commits:
   Get_Resources → Make_SysDataseg (×2) → CreateProcess →
   Build_Syslocal → MM_Setup → Build_PCB → FinishCreate.
 
-### The 24/27 wall now: illegal-instruction crash at PC=$000028
+- **P127f** (this session): **SMT pre-population**. Root-caused the
+  A6=0 illegal-instruction crash to REMAP_SEGMENT iterating the SMT
+  from entry 17..511 and matching every slot whose origin==0 against
+  an old_memaddr==0. Our reset-time `SET_MMU_SEG` wrote directly to
+  `mem->segments[ctx][seg]` but NEVER populated the OS-visible SMT
+  (a block at `smt_base` in RAM that the Pascal code scans). So the
+  OS's SMT had origin=0 for seg-101 (superstack), seg-102, seg-103,
+  etc. During Move_MemMgr's REMAP_SEGMENT call, the OS found SMT[101]
+  matching and called MAP_SEGMENT with c_mmu=101 — which wrote
+  c_sdb.memaddr=$F80 as seg-101's SOR in the current context. Seg-101
+  IS the supervisor stack. Reprogramming it invalidated the stack
+  mid-call: UNLK A6 read zero for saved_A6 and ret_pc, RTS popped 0
+  into PC, CPU walked the vector table until it hit the illegal
+  opcode at $000028.
 
-After Make_SProcess(MemMgr) completes, something subsequently runs
-into a hardware exception (`SYSTEM_ERROR(10201) = e_hardsyscode`).
-Observed state at crash:
-  - PC=$000028 (inside the vector table — vector 10 slot)
-  - Opcode at $000028 = $00FE (illegal)
-  - A6 = 0 (frame pointer LOST)
-  - Stack @SP..+32 = all zeros
-  - No POST-BOOT entry for Move_MemMgr or for MemMgr's `Initiate`
-    appears in the log before the crash — so the crash likely
-    happens either inside Move_MemMgr's compiled body, or when the
-    scheduler tries to dispatch the newly-queued MemMgr process and
-    the process's env_save_area context is bad.
+  Fix: added `SET_SMT_ENTRY(seg, origin_blk, access, limit_blk)` that
+  writes the 4-byte SMT entry at `smt_base + seg*4` with the correct
+  origin/access/limit, alongside every `SET_MMU_SEG` call. Wrote
+  entries for segs 101, 102, 103, 104, 105, 123. The REMAP_SEGMENT
+  scan now correctly skips these (their origins are non-zero and
+  specific), and the three SEG101-REPRG events now fire only for
+  contexts 2/3/4 (other domains), NOT context 1 (live supervisor
+  context) — so the stack stays intact.
 
-Investigation starting points next session:
-  1. Add POST-BOOT trace for MOVE_MEMMGR ($04C3B4), MOVE_IT ($04C1BE),
-     REMAP_SEGMENT, Initiate ($070xxx). See which one the CPU was
-     executing right before A6=0.
-  2. Check env_save_area.A6 that Build_Stack sets (MM4:395 computes
-     `A6 := MMU_Base(stackmmu+1) - (seg_size - (ord(@stk_base^.start_addr)
-     - seg_ptr))`). If seg_ptr is wrong for MemMgr, A6 = 0 is
-     plausible.
-  3. Dump the stack at $CBFF82 and pc_ring right before the illegal
-     fire — the crash diag already captures these.
+### The 24/27 wall now: SYSTEM_ERROR(10593) in MOVE_IT
+
+After MAP_SEGMENT[57] correctly unwinds, Move_MemMgr proceeds past
+REMAP_SEGMENT to the second MOVE_IT (for mmsl_sdb). Then GetFree
+fails with `mmstk_sdb.memsize = 0` — i.e. the first MOVE_IT's input
+sdb had memsize=0, so nothing actually got moved, and subsequent
+state is inconsistent. 10593 = `e_memhos` / "cannot find free
+memory".
+
+Probable root cause: Make_SysDataseg's compiled output for MemMgr's
+stack (resident segment) doesn't populate sdb.memsize. Either:
+  1. Codegen miscompiles the memsize assignment.
+  2. Our MRBT-to-sdb chain is off (mmstk_sdb pointer resolves to the
+     wrong sdb which happens to have memsize=0).
+  3. Resident-stack Make_SysDataseg takes a path that leaves memsize
+     uninitialized.
+
+Starting points next session:
+  - Add a probe in Move_MemMgr body to dump mmstk_sdb fields at
+    MOVE_IT entry.
+  - Compare with Pascal expected memsize = seg_size / mempgsize
+    (should be ~9 for a 4KB stk_size).
+  - If mmstk_sdb points to wrong sdb, inspect MM_Setup's
+    MRBT[stackmmu].sdbRP assignment path.
 
 At `Move_MemMgr → MOVE_IT → INSERTSDB` for mmstk_sdb (or mmsl_sdb),
 `c_sdb.memaddr = 4480` (> Apple's tail sentinel 4096). The freechain

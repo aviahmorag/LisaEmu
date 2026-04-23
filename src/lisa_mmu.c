@@ -263,7 +263,30 @@ static void update_mmu_context(lisa_mem_t *mem) {
     mem->mmu_enabled = true;
 }
 
+/* P127-NEXT: ring buffer of recent writes to $CBFF7A..+8, dumped
+ * at MAP_SEGMENT BAD UNLK. Defined here, referenced via extern
+ * from m68k.c. */
+typedef struct { uint32_t pc; uint32_t addr; uint8_t val; } fzring_entry_t;
+fzring_entry_t g_fzring[64];
+int g_fzring_idx = 0;
+int g_fzring_gen = -1;
+
+static lisa_mem_t *g_last_mem = NULL;
+int lisa_mmu_current_context(void) {
+    return g_last_mem ? g_last_mem->current_context : -1;
+}
+
+void fzring_dump(int n) {
+    fprintf(stderr, "  FZRING (last %d writes to $CBFF7A..+8):\n", n);
+    for (int k = n; k > 0; k--) {
+        int idx = (g_fzring_idx - k) & 63;
+        fprintf(stderr, "    [-%d] PC=$%06X addr=$%06X val=$%02X\n",
+                k, g_fzring[idx].pc, g_fzring[idx].addr, g_fzring[idx].val);
+    }
+}
+
 void lisa_mem_write8(lisa_mem_t *mem, uint32_t addr, uint8_t val) {
+    g_last_mem = mem;
     addr &= 0xFFFFFF;
 
     switch (addr_region(addr)) {
@@ -466,6 +489,27 @@ void lisa_mem_write8(lisa_mem_t *mem, uint32_t addr, uint8_t val) {
                             wsmt_count, g_last_cpu_pc, addr, phys, val, seg, fn, fld);
                     }
                 }
+            }
+            /* P127-NEXT: ring-buffer ALL writes to PHYS $8677A..+8.
+             * This is the phys addr that seg-101 logical $CBFF7A
+             * maps to (SOR=$334 → base $66800 + offset $1FF7A).
+             * Captures writes through ANY logical alias. */
+            uint32_t phys_wrapped = phys % LISA_RAM_SIZE;
+            if (phys_wrapped >= 0x8677A && phys_wrapped < 0x86782) {
+                extern uint32_t g_last_cpu_pc;
+                extern int g_emu_generation;
+                extern fzring_entry_t g_fzring[64];
+                extern int g_fzring_idx;
+                extern int g_fzring_gen;
+                if (g_fzring_gen != g_emu_generation) {
+                    g_fzring_gen = g_emu_generation;
+                    g_fzring_idx = 0;
+                    memset(g_fzring, 0, sizeof(g_fzring));
+                }
+                g_fzring[g_fzring_idx & 63].pc = g_last_cpu_pc;
+                g_fzring[g_fzring_idx & 63].addr = addr;
+                g_fzring[g_fzring_idx & 63].val = val;
+                g_fzring_idx++;
             }
             mem->ram[phys] = val;
             break;

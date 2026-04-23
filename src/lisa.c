@@ -2178,10 +2178,34 @@ void lisa_reset(lisa_t *lisa) {
                 lisa->mem.segments[ctx][seg].changed = 3; \
             } while(0)
 
+            /* P127-NEXT: also write the SMT (in RAM at smt_base) so the
+             * OS's Pascal code (REMAP_SEGMENT etc.) sees consistent
+             * entries. Otherwise SMT[seg].origin stays at uninitialized
+             * 0, and REMAP_SEGMENT's scan falsely matches segs with
+             * old_memaddr=0 and reprograms random live segments (e.g.
+             * seg-101 supervisor stack while we're running on it).
+             *
+             * SMT entry format (per LDASM do_an_mmu):
+             *   +0: origin (word, in 512-byte blocks = mempgsize)
+             *   +2: access (byte: $5=RO, $6=stack, $7=RW, $C=absent)
+             *   +3: limit (byte, in 512-byte blocks)
+             *
+             * We write for each pre-programmed SMT entry in domain 0
+             * (SMT index = 0*128 + seg = seg). */
+            #define SET_SMT_ENTRY(seg, origin_blk, access_byte, limit_blk) do { \
+                uint32_t _a = (smt_base + (seg) * 4) & 0xFFFFFF; \
+                lisa_mem_write8(&lisa->mem, _a + 0, ((origin_blk) >> 8) & 0xFF); \
+                lisa_mem_write8(&lisa->mem, _a + 1, (origin_blk) & 0xFF); \
+                lisa_mem_write8(&lisa->mem, _a + 2, (access_byte) & 0xFF); \
+                lisa_mem_write8(&lisa->mem, _a + 3, (limit_blk) & 0xFF); \
+            } while(0)
+
             int ctx = 1;  /* Normal context */
 
             /* sysglobmmu (102): maps $CC0000 → physical sysglobal */
             SET_MMU_SEG(ctx, 102, 0x0700, (uint16_t)(b_sysglobal >> 9));
+            /* SMT[102] = { origin=b_sysglobal/512, access=RW_MEM, limit=l_sysglobal/512 } */
+            SET_SMT_ENTRY(102, b_sysglobal / 512, 0x07, l_sysglobal / 512);
 
             /* syslocmmu (103): maps $CE0000 → physical syslocal.
              * P127: phys base is b_sysglobal + $20000 (past seg-102's
@@ -2190,6 +2214,7 @@ void lisa_reset(lisa_t *lisa) {
             uint32_t b_syslocal = b_sysglobal + 0x20000;
             uint32_t l_syslocal = 0x4000;
             SET_MMU_SEG(ctx, 103, 0x0700, (uint16_t)(b_syslocal >> 9));
+            SET_SMT_ENTRY(103, b_syslocal / 512, 0x07, l_syslocal / 512);
 
             /* Stack segments: Lisa MMU DO_AN_MMU computes SOR differently
              * for stack type ($600): SOR = origin + length - hw_adjust,
@@ -2202,19 +2227,24 @@ void lisa_reset(lisa_t *lisa) {
 
             /* superstkmmu (101): maps $CA0000 → physical supervisor stack */
             SET_MMU_SEG(ctx, 101, 0x0600, STACK_SOR(b_superstack, l_superstack));
+            /* SMT[101] = { origin=b_superstack/512, access=stack($6), limit=l_superstack/512 } */
+            SET_SMT_ENTRY(101, b_superstack / 512, 0x06, l_superstack / 512);
 
             /* stackmmu (123): maps $F60000 → physical user stack + jump table */
             uint32_t b_stack = b_syslocal + l_syslocal;
             uint32_t b_opustack = b_stack;
             SET_MMU_SEG(ctx, 123, 0x0600, STACK_SOR(b_opustack, l_opustack));
+            SET_SMT_ENTRY(123, b_opustack / 512, 0x06, l_opustack / 512);
 
             /* Also map segment 104 for legacy compatibility */
             SET_MMU_SEG(ctx, 104, 0x0600, STACK_SOR(b_stack, l_opustack));
+            SET_SMT_ENTRY(104, b_stack / 512, 0x06, l_opustack / 512);
 
             #undef STACK_SOR
 
             /* screenmmu (105): maps $D20000 → physical screen */
             SET_MMU_SEG(ctx, 105, 0x0700, (uint16_t)(b_screen >> 9));
+            SET_SMT_ENTRY(105, b_screen / 512, 0x07, l_screen / 512);
 
             /* realmemmmu (85-100): identity map first 2MB as real memory */
             for (int s = 85; s <= 100; s++) {

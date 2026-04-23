@@ -2981,6 +2981,53 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         pc_ring[pc_ring_idx++ & 255] = cpu->pc;
         g_last_cpu_pc = cpu->pc;
 
+        /* P127-NEXT: probe MAP_SEGMENT entry and UNLK/RTS exit. The
+         * illegal-inst crash at $000028 trace shows RTS from MAP_SEGMENT
+         * lands at PC=0 → CPU walks vector table → hits $00FE opcode at
+         * $028. A6=0 at crash. Need to see MAP_SEGMENT's A6 at entry,
+         * and stack state at the UNLK. */
+        if (cpu->pc == 0x00F8E2) {
+            DBGSTATIC(int, ms_probe, 0);
+            ms_probe++;
+            uint32_t sp = cpu->a[7] & 0xFFFFFF;
+            uint32_t retpc = cpu_read32(cpu, sp);
+            bool bad = (retpc == 0 || retpc > 0x00FFFFFF);
+            if (ms_probe <= 3 || ms_probe >= 55 || bad) {
+                extern int lisa_mmu_current_context(void);
+                fprintf(stderr, "MAP_SEGMENT[%d] ENTRY%s: ret=$%06X A5=$%06X "
+                        "A6=$%06X SP=$%06X SR=$%04X ctx=%d\n",
+                        ms_probe, bad ? "-BAD" : "", retpc,
+                        cpu->a[5] & 0xFFFFFF, cpu->a[6] & 0xFFFFFF,
+                        sp, cpu->sr, lisa_mmu_current_context());
+            }
+        }
+        if (cpu->pc == 0x00FBE8) {
+            DBGSTATIC(int, msu_probe, 0);
+            msu_probe++;
+            uint32_t a6 = cpu->a[6] & 0xFFFFFF;
+            uint32_t saved_a6 = cpu_read32(cpu, a6);
+            uint32_t ret_pc = cpu_read32(cpu, (a6 + 4) & 0xFFFFFF);
+            bool bad = (ret_pc == 0 || ret_pc > 0x00FFFFFF);
+            if (msu_probe <= 3 || msu_probe >= 55 || bad) {
+                extern int lisa_mmu_current_context(void);
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                fprintf(stderr, "MAP_SEGMENT[%d] UNLK%s: A6=$%06X "
+                        "(saved_A6=$%08X ret_pc=$%08X) SP=$%06X ctx=%d\n",
+                        msu_probe, bad ? "-BAD" : "", a6, saved_a6, ret_pc, sp,
+                        lisa_mmu_current_context());
+                if (bad) {
+                    fprintf(stderr, "  Last 40 PCs:");
+                    for (int k = 40; k > 0; k--)
+                        fprintf(stderr, " $%06X",
+                                pc_ring[(pc_ring_idx - k) & 255]);
+                    fprintf(stderr, "\n");
+                    /* Dump the full $CBFF7A..+8 write ring */
+                    extern void fzring_dump(int n);
+                    fzring_dump(30);
+                }
+            }
+        }
+
         /* P125 probe: at MAKE_SYSDATASEG entry and exit, and CHK_LDSN_FREE's
          * lbt[ldsn] read, dump syslocal record fields and lbt contents. */
         if (cpu->pc == 0x01DE66) {
@@ -5102,6 +5149,10 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 {"CreateProcess",  0}, {"FinishCreate",   0},
                 {"MM_Setup",       0}, {"Build_Syslocal", 0},
                 {"Build_PCB",      0},
+                {"MOVE_MEMMGR",    0}, {"MOVE_IT",        0},
+                {"MAP_SEGMENT",    0}, {"REMAP_SEGMENT",  0},
+                {"REMOVESDB",      0},
+                {"Queue_Process",  0},
             };
             static uint32_t pcs_cache[48];
             static int pci_gen = -1;
