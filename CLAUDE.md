@@ -189,7 +189,7 @@ commit as the real replacement.
 | 11 | **Shell (APDM)** | full desktop | Not started |
 | 12 | **Apps** | LisaWrite, LisaCalc, etc. | Not started |
 
-## Current Status (2026-04-23 post-P127e — 23/27 SYS_PROC_INIT; Make_SProcess(MemMgr) now completes end-to-end; four structural blockers retired; next wall is a process-switch crash)
+## Current Status (2026-04-23 post-P127g — **27/27 ALL MILESTONES**, boot runs cleanly through PR_CLEANUP)
 
 **Milestones**: **23/27** SYS_PROC_INIT (back to the pre-P121 baseline
 but now with real UltraIO + MDDF/BitMap HLEs + SEG-ALIAS-GUARD +
@@ -290,30 +290,55 @@ Today's commits:
   contexts 2/3/4 (other domains), NOT context 1 (live supervisor
   context) — so the stack stays intact.
 
-### The 24/27 wall now: SYSTEM_ERROR(10593) in MOVE_IT
+- **P127g** (this session): **ptr^[i].field codegen fix — unblocked
+  all remaining milestones.** Tracing `MOVE_IT(mmstk_sdb)` showed
+  mmstk_sdb.memsize=0 (completely-zero sdb record). Root cause: the
+  compiled `c_mrbt^[stackmmu].sdbRP` in Move_MemMgr was reading from
+  mrbtEnt's offset +0 (the `access` field, a byte) instead of +2
+  (the `sdbRP` relptr). Our codegen's `lvalue_record_type` in
+  `pascal_codegen.c` handled AST_ARRAY_ACCESS only when `children[0]`
+  was AST_IDENT_EXPR — it had NO case for AST_DEREF as the base
+  (i.e. `ptr^[i]` form). So for `c_mrbt^[stackmmu].sdbRP`,
+  lvalue_field_info silently failed, `field_off` defaulted to 0,
+  and the generated code did `LEA (c_mrbt + 122*4)(A0); MOVE.W
+  (A0),D0` — reading access+state bytes instead of sdbRP. The
+  "sdbRP" value was then added to b_sysglobal_ptr producing a
+  pointer into sysglobal that happens to contain all zeros →
+  mmstk_sdb all zero → GetFree(size=0) → rest of flow broken.
+  
+  Fix: extended `lvalue_record_type`'s AST_ARRAY_ACCESS branch to
+  handle AST_DEREF base. If `arr->type == AST_DEREF` and its child
+  is an AST_IDENT_EXPR, resolve the pointer's base_type (which
+  should be an array), unwrap to its element_type, and return the
+  record type. Also handles WITH-scoped pointer-to-array case.
+  
+  Result: `c_mrbt^[stackmmu].sdbRP` now correctly resolves to
+  offset 2 within the 4-byte mrbtEnt. Move_MemMgr gets the real
+  stack sdb (memsize=9, sdbtype=stack, valid memchain). MOVE_IT
+  succeeds, Move_MemMgr returns, SYS_PROC_INIT returns, and
+  INITSYS continues through INIT_DRIVER_SPACE → FS_CLEANUP →
+  MEM_CLEANUP → PR_CLEANUP. **All 27 milestones resolve.**
 
-After MAP_SEGMENT[57] correctly unwinds, Move_MemMgr proceeds past
-REMAP_SEGMENT to the second MOVE_IT (for mmsl_sdb). Then GetFree
-fails with `mmstk_sdb.memsize = 0` — i.e. the first MOVE_IT's input
-sdb had memsize=0, so nothing actually got moved, and subsequent
-state is inconsistent. 10593 = `e_memhos` / "cannot find free
-memory".
+  Class-of-bug observation: this is the same structural class as
+  P126's ptr^[i] codegen fix — missing AST_DEREF handling in
+  related codegen paths. The 2 remaining `ptrStr` warnings from
+  P125 surfaced the existence of the class; P126 fixed one path
+  (gen_lvalue_addr for AST_ARRAY_ACCESS →AST_DEREF), P127g fixes
+  a sibling path (lvalue_record_type for AST_ARRAY_ACCESS where
+  base is AST_DEREF). Likely more sibling sites remain to
+  harden — watch for future miscompiles around `ptr^[i].field`
+  constructs.
 
-Probable root cause: Make_SysDataseg's compiled output for MemMgr's
-stack (resident segment) doesn't populate sdb.memsize. Either:
-  1. Codegen miscompiles the memsize assignment.
-  2. Our MRBT-to-sdb chain is off (mmstk_sdb pointer resolves to the
-     wrong sdb which happens to have memsize=0).
-  3. Resident-stack Make_SysDataseg takes a path that leaves memsize
-     uninitialized.
+### Remaining issues past 27/27
 
-Starting points next session:
-  - Add a probe in Move_MemMgr body to dump mmstk_sdb fields at
-    MOVE_IT entry.
-  - Compare with Pascal expected memsize = seg_size / mempgsize
-    (should be ~9 for a 4KB stk_size).
-  - If mmstk_sdb points to wrong sdb, inspect MM_Setup's
-    MRBT[stackmmu].sdbRP assignment path.
+SYSTEM_ERROR(10201) halts AFTER PR_CLEANUP fires — not blocking the
+milestone sweep. PR_CLEANUP is designed to enter the scheduler idle
+loop, and we likely trip a hardware exception during the scheduler
+dispatch. Not a milestone blocker; addressed in a later phase when
+real process dispatch comes online.
+
+Boot progress ledger: 336 / 2153 procedures entered (15.6%). Every
+kernel init milestone is green.
 
 At `Move_MemMgr → MOVE_IT → INSERTSDB` for mmstk_sdb (or mmsl_sdb),
 `c_sdb.memaddr = 4480` (> Apple's tail sentinel 4096). The freechain

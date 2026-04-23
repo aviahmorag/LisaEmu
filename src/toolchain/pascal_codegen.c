@@ -1276,6 +1276,26 @@ static type_desc_t *lvalue_record_type(codegen_t *cg, ast_node_t *node) {
                 int wfld = with_lookup_field(cg, arr->name, &wrt, NULL);
                 if (wfld >= 0 && wrt) at = wrt->fields[wfld].type;
             }
+        } else if (arr->type == AST_DEREF && arr->children[0] &&
+                   arr->children[0]->type == AST_IDENT_EXPR) {
+            /* P127g: ptr^[i].field case — e.g. c_mrbt^[stackmmu].sdbRP.
+             * The base is `ptr^`, an array. Resolve ptr's type chain:
+             * ptr → ^array → array (element_type). Previously this fell
+             * through to NULL, so field_off defaulted to 0 and array
+             * element reads picked up the WRONG field (sdbRP → access). */
+            cg_symbol_t *psym = find_symbol_any(cg, arr->children[0]->name);
+            if (psym && psym->type && psym->type->kind == TK_POINTER &&
+                psym->type->base_type) {
+                at = psym->type->base_type;  /* ptr to array → array */
+            } else if (!psym && cg->with_depth > 0) {
+                type_desc_t *wrt = NULL;
+                int wfld = with_lookup_field(cg, arr->children[0]->name, &wrt, NULL);
+                if (wfld >= 0 && wrt) {
+                    type_desc_t *ft = wrt->fields[wfld].type;
+                    if (ft && ft->kind == TK_POINTER && ft->base_type)
+                        at = ft->base_type;
+                }
+            }
         }
         if (at && at->kind == TK_POINTER && at->base_type) at = at->base_type;
         if (at && at->kind == TK_ARRAY && at->element_type) {
