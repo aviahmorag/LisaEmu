@@ -2981,7 +2981,6 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         pc_ring[pc_ring_idx++ & 255] = cpu->pc;
         g_last_cpu_pc = cpu->pc;
 
-
         /* P125 probe: at MAKE_SYSDATASEG entry and exit, and CHK_LDSN_FREE's
          * lbt[ldsn] read, dump syslocal record fields and lbt contents. */
         if (cpu->pc == 0x01DE66) {

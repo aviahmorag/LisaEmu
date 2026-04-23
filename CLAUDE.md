@@ -189,7 +189,7 @@ commit as the real replacement.
 | 11 | **Shell (APDM)** | full desktop | Not started |
 | 12 | **Apps** | LisaWrite, LisaCalc, etc. | Not started |
 
-## Current Status (2026-04-23 post-P127b+ — 23/27 SYS_PROC_INIT CLEAN; boot runs 3000 frames without HALT; three blocker classes retired, one remaining)
+## Current Status (2026-04-23 post-P127e — 23/27 SYS_PROC_INIT; Make_SProcess(MemMgr) now completes end-to-end; four structural blockers retired; next wall is a process-switch crash)
 
 **Milestones**: **23/27** SYS_PROC_INIT (back to the pre-P121 baseline
 but now with real UltraIO + MDDF/BitMap HLEs + SEG-ALIAS-GUARD +
@@ -250,7 +250,47 @@ Today's commits:
     some free sdb has memaddr+memsize ≥ 4486 — cause not yet
     identified).
 
-### The 24/27 wall now: INSERTSDB freechain walk cycles (3-node cycle)
+- **P127e** (this session) — **screen clamp**. `b_screen` was
+  computed as `LISA_RAM_SIZE - l_screen = $238000` (top of 2.25MB).
+  But the REAL Lisa screen sits at `$1F8000` (top of 2MB). AVAIL_INIT
+  computes `freelen := himem - lomem` using `himem = b_dbscreen`,
+  and with b_dbscreen=$230000 the free pool extended to memaddr 4480
+  — past Apple's tail_sdb.memaddr=4096 sentinel. MAKE_FREE probe
+  showed `maddr=1372 msize=3108 (end=4480)` — the 512-bytes-too-many.
+  Fix: hardcode `LISA_HW_RAM_SIZE = 2MB` for screen-base computation,
+  independent of LISA_RAM_SIZE. Post-fix: `MAKE_FREE[1] maddr=1372
+  msize=2596 (end=3968)`, free pool stays strictly < 4096. INSERTSDB
+  freechain walk terminates normally now.
+
+  After P127e: Make_SProcess(MemMgr) completes end-to-end:
+  Get_Resources → Make_SysDataseg (×2) → CreateProcess →
+  Build_Syslocal → MM_Setup → Build_PCB → FinishCreate.
+
+### The 24/27 wall now: illegal-instruction crash at PC=$000028
+
+After Make_SProcess(MemMgr) completes, something subsequently runs
+into a hardware exception (`SYSTEM_ERROR(10201) = e_hardsyscode`).
+Observed state at crash:
+  - PC=$000028 (inside the vector table — vector 10 slot)
+  - Opcode at $000028 = $00FE (illegal)
+  - A6 = 0 (frame pointer LOST)
+  - Stack @SP..+32 = all zeros
+  - No POST-BOOT entry for Move_MemMgr or for MemMgr's `Initiate`
+    appears in the log before the crash — so the crash likely
+    happens either inside Move_MemMgr's compiled body, or when the
+    scheduler tries to dispatch the newly-queued MemMgr process and
+    the process's env_save_area context is bad.
+
+Investigation starting points next session:
+  1. Add POST-BOOT trace for MOVE_MEMMGR ($04C3B4), MOVE_IT ($04C1BE),
+     REMAP_SEGMENT, Initiate ($070xxx). See which one the CPU was
+     executing right before A6=0.
+  2. Check env_save_area.A6 that Build_Stack sets (MM4:395 computes
+     `A6 := MMU_Base(stackmmu+1) - (seg_size - (ord(@stk_base^.start_addr)
+     - seg_ptr))`). If seg_ptr is wrong for MemMgr, A6 = 0 is
+     plausible.
+  3. Dump the stack at $CBFF82 and pc_ring right before the illegal
+     fire — the crash diag already captures these.
 
 At `Move_MemMgr → MOVE_IT → INSERTSDB` for mmstk_sdb (or mmsl_sdb),
 `c_sdb.memaddr = 4480` (> Apple's tail sentinel 4096). The freechain

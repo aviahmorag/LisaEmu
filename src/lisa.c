@@ -1991,11 +1991,26 @@ void lisa_reset(lisa_t *lisa) {
                                           * Must be (a) page-aligned ($200 = 512 bytes)
                                           * for MMU SOR consistency, and (b) ≤ 32767 because
                                           * INIT_FREEPOOL takes fp_size as int2. */
-        /* Screen at top of 2MB RAM, like real Lisa */
+        /* Screen at top of 2MB RAM, like real Lisa.
+         * P127-NEXT: this MUST be 2MB not LISA_RAM_SIZE. Our emulator
+         * has 2.25MB RAM (LISA_RAM_SIZE) to dodge the mmucodemmu
+         * phys-wrap, but the REAL Lisa hardware screen is at $1F8000
+         * (top of 2MB). If we place it at LISA_RAM_SIZE - l_screen =
+         * $238000, then b_dbscreen = $230000 and himem = $230000.
+         * AVAIL_INIT then builds a free pool spanning lomem..$230000,
+         * producing memaddrs up to block 4480. INSERTSDB's freechain
+         * walk hits Apple's hardcoded tail_sdb.memaddr=4096 sentinel
+         * but the chain contains memaddrs > 4096, so the walk loops
+         * forever inside Move_MemMgr's MOVE_IT → GetFree. Clamping
+         * the screen to 2MB (canonical Lisa hardware address) keeps
+         * all memaddrs ≤ 4095 and stays compatible with real-Lisa
+         * screen polling at $1F8000. */
+        #define LISA_HW_RAM_SIZE  (2 * 1024 * 1024)  /* real Lisa hardware */
         uint32_t l_screen    = 0x8000;    /* 32KB screen buffer */
         uint32_t l_dbscreen  = 0x8000;
-        uint32_t b_screen    = LISA_RAM_SIZE - l_screen;  /* $1F8000 */
-        uint32_t b_dbscreen  = b_screen - l_dbscreen;     /* $1F0000 */
+        uint32_t b_screen    = LISA_HW_RAM_SIZE - l_screen;  /* $1F8000 */
+        uint32_t b_dbscreen  = b_screen - l_dbscreen;        /* $1F0000 */
+        #undef LISA_HW_RAM_SIZE
         /* P127: b_syslocal must live OUTSIDE seg-102's 128KB phys window.
          * seg-102 (sysglobal/seg $CC0000) has SOR = b_sysglobal>>9 and our
          * MMU passes through all 128KB of logical offset, so seg-102
