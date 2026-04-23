@@ -333,9 +333,62 @@ Today's commits:
 
 SYSTEM_ERROR(10201) halts AFTER PR_CLEANUP fires — not blocking the
 milestone sweep. PR_CLEANUP is designed to enter the scheduler idle
-loop, and we likely trip a hardware exception during the scheduler
-dispatch. Not a milestone blocker; addressed in a later phase when
-real process dispatch comes online.
+loop, and we trip a hardware exception during the scheduler dispatch.
+
+**P128 investigation (2026-04-23, unshipped) — diagnosed but not
+fixed.** The 10201 crash is a downstream consequence of our 10204
+suppression HLE letting a half-baked PCB ($CCBC40) into the scheduler
+after Root's `Make_SProcess` failed. Both crashes are the **same
+bug**: Launch reads env_save through `b_syslocal_ptr = $CE0000`
+(syslocmmu = seg 103) and gets the **kernel's boot syslocal**, not
+the new process's syslocal.
+
+Concrete observations:
+- `Build_Stack#1` (MemMgr) writes env_save fields to kernel-view
+  seg 105 (syslocmmu+2, sor=? via MAP_SEGMENT to new sloc phys).
+- At `Launch#1` fire, `b_syslocal_ptr = $CE0000` still resolves via
+  ctx 1 seg 103 to the kernel's syslocal phys ($04DC*512 = $9B800).
+  env_save.PC reads as `$070000CB` (garbage from the kernel syslocal)
+  instead of Initiate ($055994).
+- RTE jumps to odd PC, traps via LINE_1111 → spurintr_trap ($0726AE)
+  → SYSTEM_ERROR(10204). HLE suppresses, unwinds to STARTUP.
+- `Make_SProcess#2` for Root enters but **never reaches** CreateProcess /
+  Build_Stack (the 10204 unwind short-circuits it).
+- Nonetheless a stale PCB ($CCBC40) is dispatched via `Launch#2`
+  with env_save zeros → Initiate RTS pops 0 → vector walk →
+  SYSTEM_ERROR(10201) at hard_excep+646.
+
+**Similar aliasing gap for the stack:** `Build_Stack` writes
+`stk_base^.start_addr := @ExitSys` via kernel seg 104 (sor=$573 → phys
+$0AF7E0 for Root). But the user-side stack access at `USP=$F7FFE0`
+goes through ctx 1 seg 123 sor=$F77 → phys $20EDE0. **Same logical
+stack region, different physical pages** — Apple's OS expects these
+to alias, our emulator does not.
+
+**Root cause class:** MMU context-switch / per-process aliasing.
+Apple's design relies on the scheduler reprogramming seg 103 (and
+other per-process segs) at dispatch so that fixed kernel-logical
+addresses like `b_syslocal_ptr = $CE0000` resolve to each process's
+own physical pages. Our emulator currently only has one "dom=0"
+programming path (ctx 1) and never reprograms seg 103 when
+dispatching MemMgr/Root.
+
+**Right fix (next session):** find where Apple's scheduler /
+dispatch code is *supposed* to reprogram seg 103 (or switch
+segment1/segment2 bits to flip contexts) and observe what our
+emulator does at that moment. Either our `PROG_MMU` HLE misses a
+call, or `segment1/segment2` bits aren't being set by the scheduler,
+or each process should have its own domain (1-3) and we only ever
+see dom=0. Then retire the 10204 suppression HLE in the same
+commit as the real fix (per `feedback_hle_layers_load_bearing.md`).
+
+Candidate entry points to probe first:
+- `src/lisa.c` 10204 HLE — confirm which call site in Apple's code
+  triggers it (spurintr_trap is installed on which vector?).
+- `SOURCE-PROCASM.TEXT` SCHDTRAP / Launch — no MMU reprogramming
+  there, so it must happen elsewhere (SCHED.TEXT? Prepare_Process?).
+- Our `PROG_MMU` trace with all segs & all domains logged — see if
+  dom=1/2/3 is ever programmed.
 
 Boot progress ledger: 336 / 2153 procedures entered (15.6%). Every
 kernel init milestone is green.
