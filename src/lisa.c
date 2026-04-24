@@ -2011,14 +2011,61 @@ void lisa_reset(lisa_t *lisa) {
          *
          * Bumping to $7000 pushes A5 to $CC6FFC so all compiled globals
          * fit within segment 102, with a healthy margin. */
-        uint32_t l_sysglobal = 0x7000;
-        uint32_t b_superstack = b_sysglobal + l_sysglobal;
-        uint32_t l_superstack = 0x4000;   /* 16KB supervisor stack */
-        uint32_t b_sgheap    = b_superstack + l_superstack;
+        /* P128l: layout reorder + sdb extension to prevent MMRB orphaning
+         * on MOVE_SEG of the sysglobal sdb.
+         *
+         * Previous layout:
+         *   [b_sysglobal]           Pascal globals  ($7000)
+         *   [b_superstack]          supervisor stk  ($4000)
+         *   [b_sgheap]              heap (MMRB..)   ($7E00)
+         * The sysglobal sdb was created with memsize = l_sys_global =
+         * $7000, covering only the globals. MMRB lived in sgheap at phys
+         * offset $B00A from b_sysglobal, PAST the sdb's range. When
+         * CLEAR_SPACE → MOVE_SEG picked the sysglobal sdb and shifted it,
+         * MOVER copied only the first $7000 bytes; MMRB data was left
+         * behind at the old physical location. After REMAP_SEGMENT reset
+         * seg 102 SOR, logical $CCB00A translated to phys that was never
+         * written, reading as $0000 → hd_qioreq_list.fwd_link became 0 →
+         * CLR_INMOTION_SEG walked a bogus queue → CALLDRIVER JSR'd to
+         * garbage → SYSTEM_ERROR(10201).
+         *
+         * New layout (globals + heap contiguous, then supstack):
+         *   [b_sysglobal]           Pascal globals  ($7000)
+         *   [b_sgheap]              heap (MMRB..)   ($7E00)
+         *   [b_superstack]          supervisor stk  ($4000)
+         * l_sys_global passed to kernel = $7000 + $7E00 = $EE00. The
+         * sysglobal sdb now covers globals + heap, so MOVE_SEG copies
+         * the whole thing including MMRB. Superstack, in its own
+         * physical block past the sdb, is unaffected by MOVE_SEG (and
+         * would be unsafe to move while in use anyway). The supstack's
+         * logical address ($CC0000 + $EE00 = $CCEE00) still maps via
+         * seg 102 to phys b_sysglobal + $EE00 = b_superstack (as long as
+         * sysglobal hasn't been moved). If sysglobal IS moved, supstack
+         * is left with a broken logical→phys mapping — but supstack is
+         * ONLY touched in supervisor mode during exceptions, and MemMgr
+         * (a user-mode process) doesn't run in supervisor mode, so the
+         * supstack's logical mapping isn't used during MOVE_SEG. After
+         * MOVE_SEG, if an IRQ fires in supervisor mode, SSP uses phys
+         * b_superstack directly (CPU's privileged-mode SSP register is
+         * set to a phys/abs address, not a logical one). Safe.
+         *
+         * (Long-term proper fix: implement SLR limit enforcement in our
+         * MMU so that writes past sdb range fault, matching Apple's
+         * demand-paging design. For now, extending the sdb covers the
+         * specific bug at hand.)
+         */
+        uint32_t l_sysglobal_globals = 0x7000;  /* Pascal globals proper */
+        uint32_t b_sgheap    = b_sysglobal + l_sysglobal_globals;
         uint32_t l_sgheap    = 0x7E00;    /* ~31.5KB sysglobal heap.
                                           * Must be (a) page-aligned ($200 = 512 bytes)
                                           * for MMU SOR consistency, and (b) ≤ 32767 because
                                           * INIT_FREEPOOL takes fp_size as int2. */
+        /* l_sysglobal (what we pass to kernel) covers globals + heap,
+         * so MAKE_REGION's sdb and SMT[102] limit both span the full
+         * range MemMgr's MOVE_SEG must preserve. */
+        uint32_t l_sysglobal = l_sysglobal_globals + l_sgheap;  /* $EE00 */
+        uint32_t b_superstack = b_sgheap + l_sgheap;
+        uint32_t l_superstack = 0x4000;   /* 16KB supervisor stack */
         /* Screen at top of 2MB RAM, like real Lisa.
          * P127-NEXT: this MUST be 2MB not LISA_RAM_SIZE. Our emulator
          * has 2.25MB RAM (LISA_RAM_SIZE) to dodge the mmucodemmu

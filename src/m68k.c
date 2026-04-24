@@ -511,6 +511,13 @@ uint32_t g_p128f_last_pc = 0;
 uint32_t g_p128f_last_a6 = 0;
 uint32_t g_p128f_last_a0 = 0;
 uint32_t g_p128f_last_sp = 0;
+/* P128l: watch writes to MMRB+0..+3 (hd_qioreq_list.fwd_link + bkwd_link)
+ * after MM_INIT has completed. The MMRB is at logical/phys $CCB00A in
+ * our boot (mmrb_addr from A5-25691). Armed at SYS_PROC_INIT entry (once
+ * the P80-DIAG dump confirms fwd=$402A); fires on the first byte write
+ * that touches MMRB+0..+3. */
+bool g_p128l_mmrb_watch_armed = false;
+uint32_t g_p128l_mmrb_addr = 0;  /* = mmrb_addr read at arm time */
 int g_vec_guard_active = 0;  /* P78d: set after SYS_PROC_INIT to protect vector table */
 int m68k_exception_histogram[256] = {0};
 #define exception_histogram m68k_exception_histogram
@@ -3874,6 +3881,86 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 fprintf(stderr, "\n");
             }
 
+            /* P128l probe — CLR_INMOTION_SEG entry ($049046). After PR_CLEANUP
+             * MemMgr gets dispatched and enters its main loop (MEMMGR at
+             * $04B7FE). Processing a service request eventually reaches
+             * MOVE_SEG → CLR_INMOTION_SEG, which walks c_mmrb^.hd_qioreq_list.
+             * For an empty queue, fwd_link should be ord(@fwd_link) -
+             * b_sysglobal_ptr (self-pointer relative, = $402A for
+             * mmrb_addr=$CCB00A). At SYS_PROC_INIT entry the P80-DIAG
+             * dump shows fwd=$402A (correct). At CLR_INMOTION_SEG time the
+             * walk iterates with ordaddr=$CC6FE0 = b_sysglobal_ptr → meaning
+             * fwd_link read as 0. Something clobbered MMRB+0 between
+             * SYS_PROC_INIT and here, OR c_mmrb points somewhere else.
+             *
+             * Dump: mmrb_addr from A5-25691, MMRB+0..+16 via that pointer,
+             * and the CURRENT b_sysglobal_ptr. */
+            /* P128l MAP_SEGMENT entry probe — diagnose why REMAP_SEGMENT
+             * ends up unmapping seg 102 (origin=0) when it should remap
+             * to new memaddr $04E4. MAP_SEGMENT is called with (c_sdb,
+             * c_mmu, domain, c_access). Check c_sdb: if nil, the "unmap"
+             * branch fired. If not nil, dump c_sdb^.memaddr/memsize to
+             * see what MAP_SEGMENT will write as origin/limit. */
+            DBGSTATIC(int, p128l_ms_count, 0);
+            if (cpu->pc == 0x00F8E6 && p128l_ms_count < 50) {
+                p128l_ms_count++;
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                uint32_t ret = cpu_read32(cpu, sp);
+                uint32_t c_sdb = cpu_read32(cpu, sp + 4);
+                uint16_t c_mmu = cpu_read16(cpu, sp + 8);
+                uint16_t domain_arg = cpu_read16(cpu, sp + 10);
+                uint16_t c_access = cpu_read16(cpu, sp + 12);
+                uint16_t memaddr = 0, memsize = 0;
+                if ((c_sdb & 0xFFFFFF) != 0) {
+                    memaddr = cpu_read16(cpu, (c_sdb + 8) & 0xFFFFFF);
+                    memsize = cpu_read16(cpu, (c_sdb + 10) & 0xFFFFFF);
+                }
+                fprintf(stderr,
+                    "[P128l] MAP_SEGMENT#%d entry ret=$%06X c_sdb=$%08X c_mmu=%d domain=%d c_access=$%04X memaddr=$%04X memsize=$%04X\n",
+                    p128l_ms_count, ret, c_sdb, c_mmu, domain_arg, c_access, memaddr, memsize);
+            }
+
+            /* P128l REMAP_SEGMENT internal probe — grab c_sdb, then dump
+             * c_sdb^.memaddr at one-shot offset. The Pascal scans SMT and
+             * takes the nil/non-nil branch based on memaddr; we want to
+             * know which it chose for seg 102 remap. Hook the second
+             * MAP_SEGMENT call from REMAP_SEGMENT; that fires with c_sdb
+             * depending on the branch. Covered by the MAP_SEGMENT probe
+             * above. */
+
+            DBGSTATIC(int, p128l_cis_count, 0);
+            if (cpu->pc == 0x049046 && p128l_cis_count < 5) {
+                p128l_cis_count++;
+                uint32_t a5 = cpu->a[5] & 0xFFFFFF;
+                uint32_t mmrb_addr_slot = (a5 - 25691) & 0xFFFFFF;
+                uint32_t mmrb = cpu_read32(cpu, mmrb_addr_slot);
+                uint32_t sgp = cpu_read32(cpu, 0x200);
+                fprintf(stderr,
+                    "[P128l] CLR_INMOTION_SEG#%d entry ret=$%06X A5=$%06X A6=$%08X A7=$%08X SR=$%04X\n",
+                    p128l_cis_count,
+                    cpu_read32(cpu, cpu->a[7] & 0xFFFFFF),
+                    a5, cpu->a[6], cpu->a[7], cpu->sr);
+                fprintf(stderr,
+                    "        mmrb_addr slot @$%06X = $%08X  sgp(@$200) = $%08X\n",
+                    mmrb_addr_slot, mmrb, sgp);
+                if ((mmrb & 0xFFFFFF) >= 0xCC0000 && (mmrb & 0xFFFFFF) < 0xCE0000) {
+                    uint32_t m = mmrb & 0xFFFFFF;
+                    uint16_t fwd = cpu_read16(cpu, m);
+                    uint16_t bkw = cpu_read16(cpu, m + 2);
+                    fprintf(stderr,
+                        "        MMRB@%06X hd_qioreq_list: fwd=$%04X bkwd=$%04X\n",
+                        m, fwd, bkw);
+                    fprintf(stderr,
+                        "        expected self-pointer fwd = (MMRB - b_sgp) = $%04X\n",
+                        (m - (sgp & 0xFFFFFF)) & 0xFFFF);
+                    /* First 16 bytes of MMRB (hd_qioreq_list + seg_wait_sem). */
+                    fprintf(stderr, "        MMRB first 16 bytes: ");
+                    for (int i = 0; i < 16; i += 2)
+                        fprintf(stderr, " $%04X", cpu_read16(cpu, m + i));
+                    fprintf(stderr, "\n");
+                }
+            }
+
             /* P128j probe — CHK_LDSN_FREE entry/exit.
              * errnum = e_dsbase + e_ldsnused = 304 surfaces at the 10101.
              * CHK_LDSN_FREE is at $01B194. Args: var errnum, ldsn, numb_ldsn.
@@ -4805,6 +4892,14 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 fprintf(stderr, "    sds_sem@+34:     count=%d owner=$%04X wait_q=$%08X\n",
                         (int16_t)cpu_read16(cpu, mmrb + 34),
                         cpu_read16(cpu, mmrb + 36), cpu_read32(cpu, mmrb + 38));
+                /* P128l: arm the MMRB+0..+3 write watchpoint now that we've
+                 * confirmed MMRB is properly initialized (fwd=bkwd=$402A).
+                 * Any write to these 4 bytes after this point is the bug we
+                 * want to catch. */
+                g_p128l_mmrb_addr = mmrb & 0xFFFFFF;
+                g_p128l_mmrb_watch_armed = true;
+                fprintf(stderr, "[P128l] MMRB watchpoint armed: $%06X..$%06X\n",
+                        g_p128l_mmrb_addr, g_p128l_mmrb_addr + 3);
             }
         }
         /* P80: VEC-GUARD PC trace removed — binary layout shifts on recompile.

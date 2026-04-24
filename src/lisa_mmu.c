@@ -324,6 +324,8 @@ extern uint32_t g_p128f_last_pc;
 extern uint32_t g_p128f_last_a6;
 extern uint32_t g_p128f_last_a0;
 extern uint32_t g_p128f_last_sp;
+extern bool g_p128l_mmrb_watch_armed;
+extern uint32_t g_p128l_mmrb_addr;
 
 void lisa_mem_write8(lisa_mem_t *mem, uint32_t addr, uint8_t val) {
     /* P128f watchpoint — log writes that touch the OPEN_SFILE devnum
@@ -347,6 +349,26 @@ void lisa_mem_write8(lisa_mem_t *mem, uint32_t addr, uint8_t val) {
         p128f_w8_count++;
     }
 
+    /* P128l MMRB+0..+3 watchpoint: any byte write that touches
+     * hd_qioreq_list.fwd_link/bkwd_link after MM_INIT is suspect.
+     * Fires at MOST 16 times per generation. Capture PC + regs so we
+     * can trace who clobbered the self-pointer. */
+    static int p128l_w8_gen = -1;
+    static int p128l_w8_count = 0;
+    if (p128l_w8_gen != g_emu_generation) {
+        p128l_w8_gen = g_emu_generation;
+        p128l_w8_count = 0;
+    }
+    if (g_p128l_mmrb_watch_armed &&
+        g_p128l_mmrb_addr != 0 &&
+        a >= g_p128l_mmrb_addr && a <= g_p128l_mmrb_addr + 3 &&
+        p128l_w8_count < 16) {
+        fprintf(stderr,
+          "[P128l-W8] MMRB+%u write val=$%02X (PC=$%06X A6=$%06X A0=$%06X SP=$%06X)\n",
+          (unsigned)(a - g_p128l_mmrb_addr), val,
+          g_p128f_last_pc, g_p128f_last_a6, g_p128f_last_a0, g_p128f_last_sp);
+        p128l_w8_count++;
+    }
 
     addr &= 0xFFFFFF;
 
@@ -540,11 +562,16 @@ void lisa_mem_write8(lisa_mem_t *mem, uint32_t addr, uint8_t val) {
                     if (wsmt_gen != g_emu_generation) {
                         wsmt_count = 0; wsmt_gen = g_emu_generation;
                     }
-                    if (wsmt_count++ < 128) {
-                        uint32_t off  = phys - smt_lo;
-                        uint32_t seg  = off / 4;
-                        uint32_t fld  = off % 4;   /* 0/1=origin hi/lo, 2=access, 3=limit */
-                        const char *fn = (fld < 2) ? "origin" : (fld == 2 ? "access" : "limit");
+                    uint32_t off  = phys - smt_lo;
+                    uint32_t seg  = off / 4;
+                    uint32_t fld  = off % 4;   /* 0/1=origin hi/lo, 2=access, 3=limit */
+                    const char *fn = (fld < 2) ? "origin" : (fld == 2 ? "access" : "limit");
+                    /* Always log writes to seg 102 (the MMRB-aliasing seg);
+                     * otherwise obey the 128 cap so early-boot bulk writes
+                     * stay readable. */
+                    bool is_seg102 = (seg == 102);
+                    if (is_seg102 || wsmt_count < 128) {
+                        if (!is_seg102) wsmt_count++;
                         fprintf(stderr,
                             "WATCH-SMT[%d]: PC=$%06X log=$%06X phys=$%06X val=$%02X (dom=0 seg=%u %s byte=%u)\n",
                             wsmt_count, g_last_cpu_pc, addr, phys, val, seg, fn, fld);
