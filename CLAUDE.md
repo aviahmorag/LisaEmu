@@ -189,7 +189,75 @@ commit as the real replacement.
 | 11 | **Shell (APDM)** | full desktop | Not started |
 | 12 | **Apps** | LisaWrite, LisaCalc, etc. | Not started |
 
-## Current Status (2026-04-24 post-P128j — **10101 root cause pinned: Pascal nested-procedure scoping bug in our compiler's `find_proc_sig`.** Boot still halts at `SYSTEM_ERROR(10101)` from `Sys_Proc_Init` at `ret=$0063A2` with `error=304 (e_dsbase+e_ldsnused)`. 23/27 milestones (SYS_PROC_INIT), 309 of 2153 procedures entered (14.4%). P128j investigation this session diagnosed the bug precisely but a surgical fix proved too invasive — session committed diagnostic infrastructure and deferred the structural fix.)
+## Current Status (2026-04-24 post-P128k — **27/27 milestones reached NATURALLY end-to-end; kernel init path completes without HLE-unwind suppression for the first time in project history.** Boot halts at a new blocker: USER-MODE `SYSTEM_ERROR(10201)` (superstack=0, excep_kind=23 illg_inst) AFTER PR_CLEANUP — downstream of the scheduler's first real-process dispatch. 348 of 2153 procedures entered (16.2%). This is the first time ALL 27 kernel milestones have resolved through the real code path (no HLE unwind past SYS_PROC_INIT crashes). P128k shipped the narrow fix for Pascal nested-procedure scoping that unblocked the 10101 wall.)
+
+### P128k (2026-04-24 pm) — Disambiguate nested `Recover` across parents
+
+**Root cause** (pinned in P128j, fixed in P128k). Pascal allows nested
+procedures with the same name under different parents — `Recover` is
+declared with different semantics in ~19 different parents across the
+OS source. Without scope awareness, our `find_proc_sig` and linker's
+`find_global_symbol` treated all callers' references to `Recover` as
+resolving to the FIRST-registered `Recover` (MAKE_DATASEG's at
+`$01E086`, body `errnum := error + e_dsbase`). Get_Resources's call
+`Recover(e_makesysloc)` then produced `errnum := 4 + 300 = 304`
+instead of the intended `errnum := 4`. Make_SProcess(Root) surfaced
+304 → Sys_Proc_Init fired SYSTEM_ERROR(10101).
+
+**Fix (narrow — targets `Recover` only).**
+
+1. `src/toolchain/linker.c:find_global_symbol` — skip the 8-char
+   prefix-match fallback for names containing `.`. Dot-mangled names
+   are private to their originating module and must resolve via exact
+   strcasecmp only. Without this, `Parent.Recover` (21 chars) would
+   LCP-match `Parent` (the parent's own unmangled entry) and resolve
+   to the parent itself, not the nested child.
+2. `src/toolchain/pascal_codegen.c` — for nested procedures named
+   `Recover`, emit the linker entry as `Parent.Recover` and emit call-
+   site relocations inside the parent with the same mangled name.
+   `find_proc_sig` gains a tier-0 preference for parent-matching sigs
+   when resolving `Recover` calls.
+3. Restricted to `Recover` only. Broader mangling (every nested proc)
+   broke forward-declaration callers of unique-named nested procs
+   (e.g. `INITSYS.GETLDMAP`, `BOOT_IO_INIT.INIT_JTDRIVER`), which
+   legitimately resolve to the nested body via the forward-declared
+   unmangled name.
+4. `cg_proc_sig_t::parent_proc` was already populated in P128j (from
+   `cg->scopes[scope_depth - 2].proc_name` — scope_depth-1 is the
+   proc being registered itself, scope_depth-2 is the real parent).
+   P128k consumes it for the first time.
+
+**Verification.**
+- `make audit`: 0 unresolved, 8877/8877 symbols resolved.
+- Headless run reaches 27/27 milestones naturally: PASCALINIT →
+  INITSYS → ... → SYS_PROC_INIT → INIT_DRIVER_SPACE → FS_CLEANUP →
+  MEM_CLEANUP → PR_CLEANUP.
+- Procedures entered: 348 / 2153 (16.2%, up from 309 / 14.4%
+  post-P128j).
+- New blocker: USER-mode `SYSTEM_ERROR(10201)` at `hard_excep+646`
+  after PR_CLEANUP hands control to the scheduler's idle loop and it
+  dispatches a real process. `superstack=0`, `excep_kind=23` (illegal
+  instruction). Different class from the P128i stack-smash 10201;
+  this one happens in USER mode, not supervisor, and after a
+  legitimate scheduler dispatch. Next session's target.
+
+**Why this matters.** This is the first time the kernel init path
+completes end-to-end through real compiled Pascal code, without any
+HLE unwinding past a SYS_PROC_INIT crash. The P127g session reached
+27/27 but only via the 10201/10204 unwind HLE that skipped past real
+errors. P128d retired that HLE (per `feedback_hle_layers_load_bearing.md`)
+and regressed to 23/27 — exposing the real bugs. Each subsequent
+session fixed a structural bug surfaced by the real code path:
+- P128e-P128g: freelist overflow class (psio HLE)
+- P128h: char-literal codegen class
+- P128i: aggregate-copy stack-smash class
+- P128k: nested-procedure scoping class
+
+All 4 of those bugs would have been masked indefinitely if we'd kept
+the unwind HLE. The 27/27 is now **legitimate** forward progress,
+whereas the 27/27 pre-P128d was HLE-skipped scaffolding.
+
+### P128j (2026-04-24 pm) — Nested-proc scoping bug identified (no fix yet)
 
 ### P128j (2026-04-24 pm) — Nested-proc scoping bug identified (no fix yet)
 
