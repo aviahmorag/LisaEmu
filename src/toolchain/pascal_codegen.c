@@ -3415,7 +3415,30 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                 ast_node_t *rhs_a = node->children[1];
                 int lhs_type_sz = expr_size(cg, lhs_a);
                 int rhs_type_sz = expr_size(cg, rhs_a);
-                int agg_sz = (lhs_type_sz > rhs_type_sz) ? lhs_type_sz : rhs_type_sz;
+                /* P128i: use destination size (LHS) as the copy count. Apple
+                 * Pascal string assignment with different declared max lengths
+                 * (e.g. `name: e_name (33 B) := volPath: pathname (256 B)`)
+                 * must truncate the source to fit the destination — NOT
+                 * copy the larger source size past the destination bounds.
+                 * The old MAX rule smashed the stack frame header (saved-A6
+                 * and return-PC slots) of the enclosing procedure whenever
+                 * a larger string was assigned to a smaller one (ReadDir's
+                 * `name := volPath` corrupted its own return address).
+                 * Pure MIN broke unrelated assignments where expr_size
+                 * under-reports RHS size due to type-resolution misses, so
+                 * stick with LHS: always safe for the destination and
+                 * preserves record/same-size-array semantics (where LHS ==
+                 * RHS size). When LHS > RHS, we read some trailing bytes
+                 * past the source's declared end but stay inside the dest —
+                 * not crashy (cf. MAX's stack-smash failure mode). */
+                int agg_sz = lhs_type_sz;
+                if (agg_sz < rhs_type_sz && rhs_type_sz > 4) {
+                    /* Keep the old larger size IF LHS looks under-resolved
+                     * (<=4 bytes, i.e. default fallback) AND RHS is a clear
+                     * structured type. This handles codegen corner cases
+                     * where expr_size(LHS) falls through to the default 2. */
+                    if (lhs_type_sz <= 4) agg_sz = rhs_type_sz;
+                }
                 if (agg_sz > 4) {
                     /* Compute LHS address on stack. */
                     gen_lvalue_addr(cg, lhs_a);

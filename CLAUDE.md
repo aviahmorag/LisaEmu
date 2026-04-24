@@ -189,7 +189,121 @@ commit as the real replacement.
 | 11 | **Shell (APDM)** | full desktop | Not started |
 | 12 | **Apps** | LisaWrite, LisaCalc, etc. | Not started |
 
-## Current Status (2026-04-24 post-P128h — **case-of-char codegen bug retired; DecompPath works; post-SYS_PROC_INIT bogus-sem cascade no longer the blocker.** Boot now advances past MAKE_DATASEG → DS_OPEN → FMAP_IO → vm before hitting SYSTEM_ERROR(10201) at `hard_excep+646` — the SAME Bug C from P128b (kernel-view and user-view stack segments don't alias for newly-created process's Initiate RTS), now re-exposed because we actually reach the Initiate path. 10201 was previously masked by the open_temp(-1) fake-sem infinite loop that preceded it.)
+## Current Status (2026-04-24 post-P128i — **aggregate-copy stack-smash retired; 10201 gone; we now hit a real Pascal-level `SYSTEM_ERROR(10101)` from `Make_SProcess(Root)`.** Boot reaches 23/27 milestones (SYS_PROC_INIT). 309 of 2153 procedures entered (14.4%, up from 276 / 12.8% pre-P128i). The P128h handoff's "Bug C MMU aliasing" hypothesis for the 10201 turned out to be wrong — the real bug was a codegen string-assignment overflow in ReadDir (`name: e_name (33 B) := volPath: pathname (256 B)` copied 256 bytes via MAX, smashing 223 bytes past the destination into the enclosing procedure's saved-A6 and return-PC slots; ReadDir's RTS then popped garbage PC, CPU ran as NOPs through unmapped seg-100 for ~120 instructions, hit an illegal inst, hard_excep fired 10201). Next blocker is the 10101 wall — same family as P125-era: Make_SProcess returns an error that propagates from deeper MAKE_DATASEG → DS_OPEN → open_temp → FMAP_IO → vm → slist_io flow.)
+
+### P128i (2026-04-24 pm) — Retire aggregate-copy stack smash (class-of-bug)
+
+**Root cause (structural).** Our Pascal codegen at
+`src/toolchain/pascal_codegen.c:~3418` (AST_ASSIGN, aggregate branch
+for agg_sz > 4) selected copy size as `MAX(lhs_type_sz, rhs_type_sz)`.
+For Apple Pascal string assignment with different declared max lengths
+(e.g. `name: e_name (33 B) := volPath: pathname (256 B)` inside
+ReadDir's flat_catalog path via LOOKUP_BY_ENAME), MAX produced 256 —
+but the destination `name` only holds 33 bytes. The MOVE.B/DBRA copy
+loop at ReadDir+$3A (`$0306B6`) wrote 256 bytes, overrunning 223
+bytes past `name` upward through the Pascal stack frame and smashing:
+- ReadDir's saved-A6 slot at (A6) → became $FF12D851 (the literal
+  instruction bytes of the copy loop itself at $0306B4..+3,
+  interpreted as longword because A1 had advanced to its own code
+  after overrunning the destination).
+- ReadDir's return-PC slot at (A6+4) → became $C8FFFC70 (more
+  loop-instruction bytes).
+
+ReadDir's UNLK/RTS then popped those. The CPU ran garbage PC
+$C8FFFC70, which translated through our realmem seg-100 mapping to
+phys $2DFC70 — past physical RAM (2.25 MB). Unmapped memory reads
+returned zeros; zeros decode as ORI.B #0,D0 (4-byte NOP-equivalent),
+so PC advanced 4 bytes per iteration through $C8FFFC70..$C9000028,
+eventually hitting a non-NOP byte that produced an illegal
+instruction. The illegal-inst trap routed through EXCEPASM's
+divzero_trap/he_trap → hard_excep. superstack was true (already on
+supervisor stack) → hard_excep called SYSTEM_ERROR(10201) at
+`hard_excep+646`.
+
+**Fix — `src/toolchain/pascal_codegen.c:~3418`.**
+```c
+int agg_sz = lhs_type_sz;                         // was: MAX(lhs, rhs)
+if (agg_sz < rhs_type_sz && rhs_type_sz > 4) {
+    if (lhs_type_sz <= 4) agg_sz = rhs_type_sz;   // under-resolved LHS fallback
+}
+```
+
+LHS is always the destination, so `lhs_type_sz` bounds what's safe to
+write. For records and same-size arrays, LHS_sz == RHS_sz so behavior
+is unchanged. For truncating string assignments (smaller LHS, larger
+RHS), we copy only the destination's capacity — no overflow. The
+under-resolved-LHS fallback handles cases where expr_size(LHS)
+returned its default 2-byte guess (type-chain resolution miss); in
+those cases use RHS size as the old code did.
+
+**Diagnosis (why the P128h handoff's hypothesis was wrong).** The
+handoff assumed "Bug C: kernel-view (seg 104) and user-view (seg 123)
+stack pages don't alias for the newly-created Root process's Initiate
+RTS." Reasonable given the P128b analysis, but the [P128d] Initiate
+probe never fired this session — Initiate was never dispatched. The
+10201 fired BEFORE reaching Launch. The actual failure was deep
+inside DS_OPEN → FMAP_IO → vm, with illegal-inst on a garbage PC. A
+ReadDir write-watchpoint on `$CBF38E..$CBF395` (ReadDir's saved-A6 +
+return-PC slots) caught the byte-wise write sequence at PC=$0306B6 —
+a MOVE.B (A0)+,(A1)+ / DBRA loop copying instruction bytes through
+the frame header. Tracing back to the DBRA counter (`MOVE.W #$FF,D0`
+= 256 iterations) made the aggregate-copy mechanism obvious.
+
+**Verification.**
+- `make audit`: 0 unresolved, 8876/8876 symbols resolved, link clean.
+- Headless run: boot reaches SYS_PROC_INIT, enters MAKE_DATASEG →
+  DS_OPEN → open_temp → FMAP_IO → vm → slist_io → signal_sem, no
+  stack corruption. Halts cleanly at SYSTEM_ERROR(10101) from
+  Sys_Proc_Init at $0063A2 (the Make_SProcess(Root) error branch).
+- `[P128i-RUNAWAY]` probe (fires on PC first entering $C8000000..
+  $CA000000) does NOT fire anymore — the garbage-PC runaway is gone.
+- Procedures entered: 309 / 2153 (14.4%, up from 276 / 12.8% pre-fix).
+- Milestone count: 23/27 SYS_PROC_INIT (same as before, but reaching
+  much further inside that milestone's body before the next blocker).
+
+**Files changed (P128i).**
+- `src/toolchain/pascal_codegen.c:~3418` — structural fix:
+  `agg_sz = lhs_type_sz` with under-resolved-LHS fallback. Comment
+  block explains the failure mode the old MAX rule produced.
+- `src/m68k.c` — P128i diagnostic probes: `hard_excep` entry dump
+  (excep_kind, superstack, save_info_ptr decoded, pc_error,
+  access_adr for bus/addr errors, last 120 PCs + SSP + A6 window),
+  and a one-shot runaway-start probe that fires on the first PC
+  entering $C8xxxxxx..$CAxxxxxx (seg-100 unmapped region). Keep
+  these as load-bearing diagnostic infrastructure per
+  `feedback_hle_layers_load_bearing.md` — they caught this bug and
+  will catch similar codegen overflows.
+
+**Retires.** The "Bug C MMU-aliasing" narrative from the P128b/d
+handoffs was not the right diagnosis once P128h cleared the
+open_temp(-1) cascade. P128i closes that investigation line. The
+10201 is genuinely gone. (The P128d `mmustack hw_adjust` fix in
+`lisa_hle_prog_mmu` remains correct and in place — just wasn't the
+fix for THIS occurrence of 10201.)
+
+### Next blocker — SYSTEM_ERROR(10101) from Make_SProcess(Root)
+
+`Sys_Proc_Init → Make_SProcess(Root, resident=false) → Get_Resources →
+Make_SysDataseg → MAKE_DATASEG('x') → DS_OPEN → open_temp → FMAP_IO
+→ vm → slist_io → signal_sem → error != 0 → System_Error(10101)`.
+
+This is the same 10101 wall P125-P127 grappled with. With P128h+P128i
+in place, MAKE_DATASEG now runs significantly deeper into its
+error-handling path before returning a non-zero ecode. The `error`
+Make_SProcess returns is almost certainly a propagation of an earlier
+ecode from MAKE_DATASEG('x') failing (because 'x' isn't a real
+file — it's Apple's placeholder for an unfilled progname at
+`MAKE_SYSDATASEG`).
+
+**Next-session starting move:** add a probe at `System_Error(10101)`
+call site (`ret=$0063A2`, inside Sys_Proc_Init at ~$1A2 offset from
+$006240) that dumps the `error` register value and A6's frame slots.
+Then trace back through Make_SProcess → Get_Resources → Make_SysDataseg
+→ MAKE_DATASEG → DS_OPEN → ... to see what ecode propagated up and
+whether our Pascal handles it right. Fix whatever codegen bug or
+logic error produced it. Do NOT bypass 10101 with an HLE — per
+`feedback_do_the_real_fix.md`, make Make_SProcess succeed naturally
+or raise the ecode that Apple's own code expects.
 
 ### P128h (2026-04-24 pm, post-dff5940) — Single-char string-literal codegen fix
 

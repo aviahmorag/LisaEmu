@@ -3815,15 +3815,143 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             static uint32_t pc_Initiate = 0;
             static uint32_t pc_Build_Stack = 0;
             static uint32_t pc_ExitSys = 0;
+            static uint32_t pc_hard_excep = 0;
             static int      pc_gen_p128d = -1;
             if (pc_gen_p128d != g_emu_generation) {
                 pc_Initiate    = boot_progress_lookup("Initiate");
                 pc_Build_Stack = boot_progress_lookup("Build_Stack");
                 pc_ExitSys     = boot_progress_lookup("ExitSys");
+                pc_hard_excep  = boot_progress_lookup("hard_excep");
                 pc_gen_p128d = g_emu_generation;
             }
             DBGSTATIC(int, p128d_init_count, 0);
             DBGSTATIC(int, p128d_bs_count,   0);
+            DBGSTATIC(int, p128i_he_count,   0);
+            DBGSTATIC(int, p128i_runaway_armed, 0);
+            DBGSTATIC(int, p128i_runaway_fired, 0);
+
+            /* P128i runaway-start probe: the hard_excep dump shows PC running
+             * through $C8FFFFxx..$C9000xxx (seg 100 unmapped zero memory) at
+             * 4-byte stride for 120+ instructions before hitting an illegal
+             * inst. By the time we're deep into the runaway, pc_ring is full
+             * of it and we lose the transition. Trigger once when PC first
+             * lands in the bad range (logical $C80000..$CA0000 = seg 100),
+             * capture the ring + SSP state + A6 chain as it was at the jump
+             * instant.
+             *
+             * Only arm AFTER we've entered SYS_PROC_INIT — earlier startup
+             * code legitimately runs in the $CAxxxx..$CCxxxx range. */
+            /* Arm unconditionally at startup. The range $C80000..$CA0000 is
+             * seg 100 (realmem pass-through). Normal boot never executes
+             * code there, so any PC landing in that range is the start of
+             * the runaway we want to capture. */
+            p128i_runaway_armed = 1;
+            /* Use FULL 32-bit PC: the ring shows $C8FFFE84 with top 8 bits
+             * $C8 set (not masked). This is how the trap-handler's popped
+             * PC value looks — a 32-bit word with high bits non-zero. */
+            if (p128i_runaway_armed && !p128i_runaway_fired &&
+                cpu->pc >= 0xC8000000u && cpu->pc < 0xCA000000u) {
+                p128i_runaway_fired = 1;
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                fprintf(stderr, "\n[P128i-RUNAWAY] PC first entered seg-100 range: PC=$%06X SR=$%04X A7=$%08X A6=$%08X A5=$%08X\n",
+                        cpu->pc, cpu->sr, cpu->a[7], cpu->a[6], cpu->a[5]);
+                fprintf(stderr, "  Last 255 PCs (oldest→newest) BEFORE runaway:\n");
+                for (int ri = 255; ri > 0; ri--) {
+                    uint32_t rpc = pc_ring[(pc_ring_idx - ri) & 255];
+                    fprintf(stderr, "    $%08X\n", rpc);
+                }
+                fprintf(stderr, "  SSP top 16 longs at time of jump:");
+                for (int i = 0; i < 16; i++) {
+                    if ((i & 3) == 0) fprintf(stderr, "\n    [SP+%2d]:", i*4);
+                    fprintf(stderr, " $%08X", cpu_read32(cpu, (sp + i*4) & 0xFFFFFF));
+                }
+                fprintf(stderr, "\n  A6 frame window:");
+                uint32_t a6m = cpu->a[6] & 0xFFFFFF;
+                for (int i = -8; i < 16; i++) {
+                    if ((i & 3) == 0) fprintf(stderr, "\n    [A6+%3d]:", i*4);
+                    fprintf(stderr, " $%08X", cpu_read32(cpu, (a6m + i*4) & 0xFFFFFF));
+                }
+                fprintf(stderr, "\n");
+            }
+
+            /* P128i probe — hard_excep entry. Capture excep_kind, superstack,
+             * save_info_ptr, and for bus/addr errors the access_adr / pc_error
+             * / sr_error. Dump the ~30-entry PC ring so we can see exactly
+             * what path triggered the CPU exception that funnelled into
+             * hard_excep and thence to SYSTEM_ERROR(10201).
+             *
+             * Pascal call convention pushes args left-to-right, so on entry
+             * (before LINK):
+             *   SP+0  : return PC (4 bytes)
+             *   SP+4  : save_info_ptr (4 bytes)
+             *   SP+8  : excep_kind (2 bytes)
+             *   SP+10 : superstack (2 bytes, boolean) */
+            if (pc_hard_excep && cpu->pc == pc_hard_excep && p128i_he_count < 3) {
+                p128i_he_count++;
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                uint32_t ret = cpu_read32(cpu, sp);
+                uint32_t save_info_ptr = cpu_read32(cpu, sp + 4);
+                uint16_t excep_kind = cpu_read16(cpu, sp + 8);
+                uint16_t superstack = cpu_read16(cpu, sp + 10);
+                const char *kind_name = "?";
+                switch (excep_kind) {
+                    case 21: kind_name = "bus_error"; break;
+                    case 22: kind_name = "addr_error"; break;
+                    case 23: kind_name = "illg_inst"; break;
+                    case 24: kind_name = "priv_violation"; break;
+                    case 25: kind_name = "line_1010"; break;
+                    case 26: kind_name = "line_1111"; break;
+                    case 27: kind_name = "spur_intr"; break;
+                    case 28: kind_name = "unexpected_ex"; break;
+                    case 29: kind_name = "div_zero"; break;
+                    case 30: kind_name = "value_oob"; break;
+                    case 31: kind_name = "ovfw"; break;
+                }
+                fprintf(stderr, "[P128i] hard_excep#%d ENTRY ret=$%06X superstack=%d excep_kind=%d (%s) save_info_ptr=$%08X SR=$%04X A7=$%08X\n",
+                        p128i_he_count, ret, superstack, excep_kind, kind_name,
+                        save_info_ptr, cpu->sr, cpu->a[7]);
+                /* Dump term_ex_data at save_info_ptr. For bus/addr errors:
+                 * fun_field(2), access_adr(4), inst_register(2), sr_error(2),
+                 * pc_error(4). */
+                uint32_t sip = save_info_ptr & 0xFFFFFF;
+                if (excep_kind == 21 || excep_kind == 22) {
+                    uint16_t fun_field = cpu_read16(cpu, sip);
+                    uint32_t access_adr = cpu_read32(cpu, sip + 2);
+                    uint16_t inst_reg  = cpu_read16(cpu, sip + 6);
+                    uint16_t sr_error  = cpu_read16(cpu, sip + 8);
+                    uint32_t pc_error  = cpu_read32(cpu, sip + 10);
+                    int rw = (fun_field >> 4) & 1;
+                    int in_flag = (fun_field >> 3) & 1;
+                    int fc = fun_field & 7;
+                    fprintf(stderr, "        fun_field=$%04X (rw=%d inst=%d fc=%d) access_adr=$%08X inst_reg=$%04X sr_error=$%04X pc_error=$%08X\n",
+                            fun_field, rw, !in_flag, fc, access_adr, inst_reg, sr_error, pc_error);
+                    int seg; uint16_t sor, slr; uint8_t chg;
+                    uint32_t aa_phys = lisa_mmu_xlate_info(access_adr, &seg, &sor, &slr, &chg);
+                    fprintf(stderr, "        access_adr→ seg%d SOR=$%03X SLR=$%03X chg=$%X phys=$%06X\n",
+                            seg, sor, slr, chg, aa_phys);
+                } else {
+                    uint16_t sr_err = cpu_read16(cpu, sip);
+                    uint32_t pc_err = cpu_read32(cpu, sip + 2);
+                    fprintf(stderr, "        sr=$%04X pc_error=$%08X\n", sr_err, pc_err);
+                }
+                /* Last 120 PCs leading up to the exception — expand to catch
+                 * the RTS/JMP that landed PC in unmapped memory. */
+                fprintf(stderr, "        Last 120 PCs (oldest→newest):\n");
+                for (int ri = 120; ri > 0; ri--) {
+                    uint32_t rpc = pc_ring[(pc_ring_idx - ri) & 255];
+                    fprintf(stderr, "          $%08X\n", rpc);
+                }
+                /* Stack window at the time of exception. */
+                fprintf(stderr, "        SSP window ($%06X +0..+32):", sp);
+                for (int i = 0; i < 32; i += 4)
+                    fprintf(stderr, " $%08X", cpu_read32(cpu, (sp + i) & 0xFFFFFF));
+                fprintf(stderr, "\n");
+                /* Current A6 frame (if any). */
+                fprintf(stderr, "        A6 frame ($%08X +0..+32):", cpu->a[6]);
+                for (int i = 0; i < 32; i += 4)
+                    fprintf(stderr, " $%08X", cpu_read32(cpu, (cpu->a[6] + i) & 0xFFFFFF));
+                fprintf(stderr, "\n");
+            }
 
             /* Launch entry — inspect MemMgr's MRBT[stackmmu] and compare
              * against the physical SOR that seg 123 ends up with. The
