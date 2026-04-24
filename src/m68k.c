@@ -5372,8 +5372,10 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 {"MAP_SEGMENT",    0}, {"REMAP_SEGMENT",  0},
                 {"REMOVESDB",      0},
                 {"Queue_Process",  0},
+                {"open_temp",      0}, {"DS_OPEN",        0},
+                {"MAKE_DATASEG",   0},
             };
-            static uint32_t pcs_cache[48];
+            static uint32_t pcs_cache[55];
             static int pci_gen = -1;
             if (pci_gen != g_emu_generation) {
                 pci_gen = g_emu_generation;
@@ -5383,7 +5385,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             DBGSTATIC(int, pci_trace, 0);
             static bool after_parameminit = false;
             DBGSTATIC(int, post_gs_count, 0);
-            if (pci_trace < 200) {
+            if (pci_trace < 800) {
                 for (int i = 0; i < (int)(sizeof(pcs)/sizeof(pcs[0])); i++) {
                     if (pcs_cache[i] && cpu->pc == pcs_cache[i]) {
                         pci_trace++;
@@ -5489,6 +5491,203 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                     post_gs_count++;
                     fprintf(stderr, "[POST-PMINIT GETSPACE #%d] A6=$%08X SR=$%04X\n",
                             post_gs_count, cpu->a[6], cpu->sr);
+                }
+            }
+
+            /* P128e probe: log Wait_sem / Signal_sem / Block_Process entries
+             * with the @sem / @pcb argument decoded from the stack. Goal:
+             * identify which sem the kernel pseudo-PCB sleeps on inside
+             * Make_SProcess#2 (Root) and find who is supposed to signal it.
+             *
+             * Pascal callee-clean: at proc entry SP=ret_pc; args directly
+             * above. Wait_sem(var sem; control: set): @sem at SP+4,
+             * control at SP+8 (set is 4 bytes). Signal_sem(var sem):
+             * @sem at SP+4. Block_Process(pcb_ptr; blk_reasons: set):
+             * pcb_ptr at SP+4, blk_reasons at SP+8. */
+            {
+                static uint32_t pc_wait = 0, pc_sig = 0, pc_block = 0,
+                                pc_unblock = 0, pc_msp = 0, pc_getres = 0,
+                                pc_finish = 0, pc_open_temp = 0,
+                                pc_make_dataseg = 0, pc_ds_open = 0,
+                                pc_make_sysds = 0, mt_off = 0;
+                static int probe_gen = -1;
+                static int p128e_msp_count = 0;
+                static bool p128e_armed = false;
+                static int p128e_log_count = 0;
+                if (probe_gen != g_emu_generation) {
+                    probe_gen = g_emu_generation;
+                    pc_wait = boot_progress_lookup("Wait_sem");
+                    pc_sig = boot_progress_lookup("Signal_sem");
+                    pc_block = boot_progress_lookup("Block_Process");
+                    pc_unblock = boot_progress_lookup("Unblock_Process");
+                    pc_msp = boot_progress_lookup("Make_SProcess");
+                    pc_getres = boot_progress_lookup("Get_Resources");
+                    pc_finish = boot_progress_lookup("FinishCreate");
+                    pc_open_temp = boot_progress_lookup("open_temp");
+                    pc_make_dataseg = boot_progress_lookup("MAKE_DATASEG");
+                    pc_ds_open = boot_progress_lookup("DS_OPEN");
+                    pc_make_sysds = boot_progress_lookup("MAKE_SYSDATASEG");
+                    mt_off = boot_progress_lookup("mounttable");
+                    p128e_msp_count = 0;
+                    p128e_armed = false;
+                    p128e_log_count = 0;
+                }
+                /* Arm probe at Make_SProcess#2 entry (Root). */
+                if (pc_msp && cpu->pc == pc_msp) {
+                    p128e_msp_count++;
+                    if (p128e_msp_count >= 2) {
+                        if (!p128e_armed) {
+                            fprintf(stderr, "[P128e] ARMED at Make_SProcess#%d\n",
+                                    p128e_msp_count);
+                            p128e_armed = true;
+                        }
+                    }
+                }
+                if (p128e_armed && p128e_log_count < 80) {
+                    uint32_t sp = cpu->a[7];
+                    if (cpu->pc == pc_wait) {
+                        uint32_t ret = cpu_read32(cpu, sp);
+                        uint32_t sem = cpu_read32(cpu, sp + 4);
+                        uint16_t ctrl = cpu_read16(cpu, sp + 8);
+                        int16_t cnt = (int16_t)cpu_read16(cpu, sem);
+                        uint32_t own = cpu_read32(cpu, sem + 2);
+                        uint32_t wq  = cpu_read32(cpu, sem + 6);
+                        fprintf(stderr,
+                          "[P128e] Wait_sem ret=$%06X @sem=$%08X ctrl=$%04X "
+                          "cnt=%d own=$%06X wq=$%06X SR=$%04X SP=$%06X\n",
+                          ret, sem, ctrl, cnt, own, wq, cpu->sr, sp);
+                        fprintf(stderr, "         stack@SP:");
+                        for (int o = 0; o < 24; o += 4)
+                            fprintf(stderr, " $%08X", cpu_read32(cpu, sp + o));
+                        fprintf(stderr, "\n");
+                        p128e_log_count++;
+                    } else if (cpu->pc == pc_sig) {
+                        uint32_t ret = cpu_read32(cpu, sp);
+                        uint32_t sem = cpu_read32(cpu, sp + 4);
+                        int16_t cnt = (int16_t)cpu_read16(cpu, sem);
+                        uint32_t own = cpu_read32(cpu, sem + 2);
+                        uint32_t wq  = cpu_read32(cpu, sem + 6);
+                        fprintf(stderr,
+                          "[P128e] Signal_sem ret=$%06X @sem=$%06X "
+                          "cnt=%d own=$%06X wq=$%06X\n",
+                          ret, sem, cnt, own, wq);
+                        p128e_log_count++;
+                    } else if (cpu->pc == pc_block) {
+                        uint32_t ret = cpu_read32(cpu, sp);
+                        uint32_t pcb = cpu_read32(cpu, sp + 4);
+                        uint32_t reasons = cpu_read32(cpu, sp + 8);
+                        fprintf(stderr,
+                          "[P128e] Block_Process ret=$%06X pcb=$%06X "
+                          "reasons=$%08X SR=$%04X\n",
+                          ret, pcb, reasons, cpu->sr);
+                        p128e_log_count++;
+                    } else if (cpu->pc == pc_unblock) {
+                        uint32_t ret = cpu_read32(cpu, sp);
+                        uint32_t pcb = cpu_read32(cpu, sp + 4);
+                        uint32_t reasons = cpu_read32(cpu, sp + 8);
+                        fprintf(stderr,
+                          "[P128e] Unblock_Process ret=$%06X pcb=$%06X "
+                          "reasons=$%08X\n",
+                          ret, pcb, reasons);
+                        p128e_log_count++;
+                    } else if (cpu->pc == pc_getres) {
+                        fprintf(stderr,
+                          "[P128e] Get_Resources entry SR=$%04X A6=$%06X\n",
+                          cpu->sr, cpu->a[6]);
+                        p128e_log_count++;
+                    } else if (cpu->pc == pc_finish) {
+                        fprintf(stderr,
+                          "[P128e] FinishCreate entry SR=$%04X A6=$%06X\n",
+                          cpu->sr, cpu->a[6]);
+                        p128e_log_count++;
+                    } else if (cpu->pc == pc_make_sysds) {
+                        /* var ecode (4), var progname (4), memsize (4),
+                         * discsize (4), var refnum (4), var segptr (4),
+                         * ldsn (2). caller-clean push order = left-to-right
+                         * so at entry: ret(4), @ecode(4), @progname(4),
+                         * memsize(4), discsize(4), @refnum(4), @segptr(4),
+                         * ldsn(2) */
+                        fprintf(stderr,
+                          "[P128e] MAKE_SYSDATASEG @ecode=$%08X @progname=$%08X "
+                          "memsize=$%08X discsize=$%08X ldsn=%d\n",
+                          cpu_read32(cpu, sp + 4), cpu_read32(cpu, sp + 8),
+                          cpu_read32(cpu, sp + 12), cpu_read32(cpu, sp + 16),
+                          (int16_t)cpu_read16(cpu, sp + 28));
+                        p128e_log_count++;
+                    } else if (cpu->pc == pc_make_dataseg) {
+                        /* var errnum, var segname, mem_size, disc_size,
+                         * var refnum, var segptr, ldsn, dstype */
+                        fprintf(stderr,
+                          "[P128e] MAKE_DATASEG @errnum=$%08X @segname=$%08X "
+                          "mem=$%08X disc=$%08X ldsn=%d dstype=$%04X\n",
+                          cpu_read32(cpu, sp + 4), cpu_read32(cpu, sp + 8),
+                          cpu_read32(cpu, sp + 12), cpu_read32(cpu, sp + 16),
+                          (int16_t)cpu_read16(cpu, sp + 28),
+                          cpu_read16(cpu, sp + 30));
+                        p128e_log_count++;
+                    } else if (cpu->pc == pc_ds_open) {
+                        fprintf(stderr,
+                          "[P128e] DS_OPEN entry A6=$%06X SR=$%04X\n",
+                          cpu->a[6], cpu->sr);
+                        /* dump first 6 longs of args */
+                        fprintf(stderr, "         args:");
+                        for (int o = 4; o < 36; o += 4)
+                            fprintf(stderr, " $%08X", cpu_read32(cpu, sp + o));
+                        fprintf(stderr, "\n");
+                        p128e_log_count++;
+                    } else if (cpu->pc == pc_open_temp) {
+                        /* open_temp(var ecode, device, var ptrFCB).
+                         * caller-clean: at entry SP+0=ret, SP+4=@ecode,
+                         * SP+8=device(word), SP+10=@ptrFCB */
+                        uint32_t ecode_addr = cpu_read32(cpu, sp + 4);
+                        int16_t device = (int16_t)cpu_read16(cpu, sp + 8);
+                        uint32_t fcb_addr = cpu_read32(cpu, sp + 10);
+                        /* dump mounttable[device] */
+                        uint32_t mt_abs = (cpu->a[5] + mt_off) & 0xFFFFFF;
+                        uint32_t mte = cpu_read32(cpu, mt_abs + (device & 0xFFFF) * 4);
+                        fprintf(stderr,
+                          "[P128e] open_temp @ecode=$%08X device=%d @ptrFCB=$%08X "
+                          "mt@$%06X mt[%d]=$%08X\n",
+                          ecode_addr, device, fcb_addr, mt_abs, device, mte);
+                        /* also dump first 16 entries of mounttable */
+                        fprintf(stderr, "         mounttable[0..15]:");
+                        for (int i = 0; i < 16; i++) {
+                            if (i % 4 == 0) fprintf(stderr, "\n           ");
+                            fprintf(stderr, " %2d=$%08X",
+                                    i, cpu_read32(cpu, mt_abs + i * 4));
+                        }
+                        fprintf(stderr, "\n");
+                        p128e_log_count++;
+                    }
+                }
+                /* P128e SplitPathname probe — separate trigger so it
+                 * fires for the RELEVANT calls during Make_SProcess#2.
+                 * SplitPathname(var ecode, var path: pathname,
+                 *                var device: int, var volPath: pathname).
+                 * caller-clean: SP+4=@ecode, SP+8=@path, SP+12=@device,
+                 * SP+16=@volPath. Pascal pathname is string[32] = 1
+                 * length byte + 32 chars (= 34 bytes alloc). */
+                if (p128e_armed && p128e_log_count < 80) {
+                    uint32_t pc_split = boot_progress_lookup("SplitPathname");
+                    static int p128e_split_count = 0;
+                    if (probe_gen != g_emu_generation - 1) p128e_split_count = 0;
+                    if (pc_split && cpu->pc == pc_split && p128e_split_count < 12) {
+                        uint32_t sp = cpu->a[7];
+                        uint32_t path_addr = cpu_read32(cpu, sp + 8);
+                        uint32_t dev_addr = cpu_read32(cpu, sp + 12);
+                        /* read length byte and first 24 chars of path */
+                        uint8_t len = cpu->read8(path_addr & 0xFFFFFF);
+                        char path_buf[32];
+                        int n = len < 24 ? len : 24;
+                        for (int i = 0; i < n; i++)
+                            path_buf[i] = cpu->read8((path_addr + 1 + i) & 0xFFFFFF);
+                        path_buf[n] = '\0';
+                        fprintf(stderr,
+                          "[P128e] SplitPathname @path=$%06X len=%d \"%s\" @dev=$%06X\n",
+                          path_addr, len, path_buf, dev_addr);
+                        p128e_split_count++;
+                        p128e_log_count++;
+                    }
                 }
             }
         }
