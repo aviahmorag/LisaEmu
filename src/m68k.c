@@ -3874,6 +3874,139 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 fprintf(stderr, "\n");
             }
 
+            /* P128j probe — CHK_LDSN_FREE entry/exit.
+             * errnum = e_dsbase + e_ldsnused = 304 surfaces at the 10101.
+             * CHK_LDSN_FREE is at $01B194. Args: var errnum, ldsn, numb_ldsn.
+             * With Pascal left-to-right push: SP+4=ret, SP+8=@errnum,
+             * SP+12=ldsn(word), SP+14=numb_ldsn(word). */
+            DBGSTATIC(int, p128j_chk_count, 0);
+            DBGSTATIC(int, p128j_inner_count, 0);
+            DBGSTATIC(int, p128j_recover_count, 0);
+
+            /* P128j RECOVER probe — $01E086 is MAKE_DATASEG's RECOVER nested
+             * procedure. error arg is an int2 at SP+4 (after JSR). Static
+             * link may or may not be present; dump both A6 frame and
+             * stacked args. */
+            if (cpu->pc == 0x01E086 && p128j_recover_count < 10) {
+                p128j_recover_count++;
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                uint32_t ret = cpu_read32(cpu, sp);
+                uint16_t err_arg = cpu_read16(cpu, (sp + 4) & 0xFFFFFF);
+                fprintf(stderr,
+                    "[P128j-REC] RECOVER#%d ENTRY ret=$%06X error_arg=%d ($%04X) A2=$%08X A6=$%08X\n",
+                    p128j_recover_count, ret, (int16_t)err_arg, err_arg,
+                    cpu->a[2], cpu->a[6]);
+                /* Last 30 PCs to see path that led to RECOVER. */
+                fprintf(stderr, "        Last 30 PCs:\n");
+                for (int ri = 30; ri > 0; ri--) {
+                    uint32_t rpc = pc_ring[(pc_ring_idx - ri) & 255];
+                    fprintf(stderr, "          $%06X\n", rpc);
+                }
+            }
+
+            /* P128j EXIT probe — CHK_LDSN_FREE's UNLK at $01B296. Read
+             * @errnum from (A6+8) and dump the final errnum value that gets
+             * returned to the caller. */
+            DBGSTATIC(int, p128j_exit_count, 0);
+            if (cpu->pc == 0x01B296 && p128j_exit_count < 10) {
+                p128j_exit_count++;
+                uint32_t a6 = cpu->a[6] & 0xFFFFFF;
+                uint32_t errnum_ptr = cpu_read32(cpu, (a6 + 8) & 0xFFFFFF);
+                uint16_t errnum_val = cpu_read16(cpu, errnum_ptr & 0xFFFFFF);
+                uint32_t ret = cpu_read32(cpu, (cpu->a[7]) & 0xFFFFFF);
+                fprintf(stderr,
+                    "[P128j-EXIT] CHK_LDSN_FREE exit #%d: @errnum=$%06X *@errnum=%d ($%04X) ret=$%06X\n",
+                    p128j_exit_count, errnum_ptr, (int16_t)errnum_val, errnum_val, ret);
+            }
+
+            /* P128j inner probe — at PC $01B258 (MOVE.W (A0),D0 inside
+             * CHK_LDSN_FREE's loop body). This is the EXACT read of
+             * c_lbt_ptr^[ldsn]. Dump A0 (the computed element address)
+             * and the word read. Also compare against the current ldsn
+             * arg at A6+12. */
+            if (cpu->pc == 0x01B258 && p128j_inner_count < 10) {
+                p128j_inner_count++;
+                uint32_t a0 = cpu->a[0] & 0xFFFFFF;
+                uint16_t val = cpu_read16(cpu, a0);
+                uint32_t a6 = cpu->a[6] & 0xFFFFFF;
+                int16_t ldsn_arg = (int16_t)cpu_read16(cpu, (a6 + 12) & 0xFFFFFF);
+                uint32_t lbt_ptr = cpu_read32(cpu, (a6 - 8) & 0xFFFFFF);
+                fprintf(stderr,
+                    "[P128j-INNER] CHK_LDSN_FREE loop #%d: ldsn(A6+12)=%d, c_lbt_ptr(A6-8)=$%08X, "
+                    "elem_addr=A0=$%08X, *(A0)=$%04X  (expect addr = lbt_ptr + (ldsn+2)*2)\n",
+                    p128j_inner_count, ldsn_arg, lbt_ptr, cpu->a[0], val);
+            }
+            if (cpu->pc == 0x01B194 && p128j_chk_count < 8) {
+                p128j_chk_count++;
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                uint32_t ret = cpu_read32(cpu, sp);
+                uint32_t errnum_ptr = cpu_read32(cpu, sp + 4);
+                uint16_t ldsn = cpu_read16(cpu, sp + 8);
+                uint16_t numb_ldsn = cpu_read16(cpu, sp + 10);
+                uint32_t a5 = cpu->a[5] & 0xFFFFFF;
+                uint32_t bsl = cpu_read32(cpu, (a5 - 24785) & 0xFFFFFF);
+                uint32_t lbt_addr = 0;
+                /* CHK_LDSN_FREE's compiled body reads lbt_addr at syslocal+$5A
+                 * (= 90). An earlier note in this file used +86 — wrong.
+                 * +90 matches the actual ADDA.W #$5A in the compiled body. */
+                if (bsl >= 0x400 && bsl < 0xF00000) {
+                    lbt_addr = cpu_read32(cpu, (bsl + 90) & 0xFFFFFF);
+                }
+                /* Dump lbt[-2..3] around the requested ldsn so we can see
+                 * what's there. lbt is array[-2..16] of relptr, 2 bytes
+                 * per elem (int2 = relptr). */
+                fprintf(stderr,
+                    "[P128j] CHK_LDSN_FREE#%d entry ret=$%06X @errnum=$%06X ldsn=%d numb=%d "
+                    "A5=$%06X b_syslocal=$%08X lbt_addr=$%08X\n",
+                    p128j_chk_count, ret, errnum_ptr, (int16_t)ldsn, numb_ldsn,
+                    a5, bsl, lbt_addr);
+                if (lbt_addr >= 0x400 && lbt_addr < 0xF00000) {
+                    /* array[-2..16], 2-byte elems, so element ldsn is at
+                     * lbt_addr + (ldsn - (-2))*2 = lbt_addr + (ldsn+2)*2. */
+                    fprintf(stderr, "       lbt entries near ldsn=%d:\n", (int16_t)ldsn);
+                    for (int d = -2; d <= 16; d++) {
+                        uint32_t e = (lbt_addr + (d + 2) * 2) & 0xFFFFFF;
+                        uint16_t v = cpu_read16(cpu, e);
+                        fprintf(stderr, "         lbt[%2d] @$%06X = $%04X\n", d, e, v);
+                    }
+                }
+            }
+
+            /* P128j probe — error value at Sys_Proc_Init's SYSTEM_ERROR(10101)
+             * call site for the Root-process path. PC=$00639C is the JSR just
+             * after `if error <> 0` test; return addr will be $0063A2. The
+             * `error: integer` local is at A6-14 (word). Dump it + D0 + the
+             * A6 frame + the return chain so we can identify which ecode the
+             * Root creation path surfaced. Also dump (A6-14) for the earlier
+             * call at $0062A6 (MemMgr path), just in case we hit that instead. */
+            DBGSTATIC(int, p128j_10101_count, 0);
+            if ((cpu->pc == 0x00639C || cpu->pc == 0x0062A6) && p128j_10101_count < 4) {
+                p128j_10101_count++;
+                uint32_t a6 = cpu->a[6] & 0xFFFFFF;
+                uint16_t err = cpu_read16(cpu, (a6 - 14) & 0xFFFFFF);
+                const char *site = (cpu->pc == 0x0062A6) ? "MemMgr" : "Root";
+                fprintf(stderr,
+                    "[P128j] SYSTEM_ERROR(10101) about to fire at PC=$%06X (%s path) "
+                    "error=(A6-14)=%d ($%04X) D0=$%08X D1=$%08X D2=$%08X A6=$%08X\n",
+                    cpu->pc, site, (int16_t)err, err, cpu->d[0], cpu->d[1], cpu->d[2], cpu->a[6]);
+                /* Dump A6 frame: saved A6, saved return PC, args 1..6 of
+                 * Make_SProcess. A6-local side: saved A2 at A6-4, mmpcb_ptr
+                 * at A6-8, rootpcb_ptr at A6-12, error at A6-14. */
+                fprintf(stderr, "        A6 frame: saved_A6=$%08X ret=$%08X\n",
+                        cpu_read32(cpu, a6 & 0xFFFFFF),
+                        cpu_read32(cpu, (a6 + 4) & 0xFFFFFF));
+                fprintf(stderr, "        locals: A2=$%08X mmpcb=$%08X rootpcb=$%08X\n",
+                        cpu_read32(cpu, (a6 - 4) & 0xFFFFFF),
+                        cpu_read32(cpu, (a6 - 8) & 0xFFFFFF),
+                        cpu_read32(cpu, (a6 - 12) & 0xFFFFFF));
+                /* Last 30 PCs leading up to this call site. */
+                fprintf(stderr, "        Last 30 PCs:\n");
+                for (int ri = 30; ri > 0; ri--) {
+                    uint32_t rpc = pc_ring[(pc_ring_idx - ri) & 255];
+                    fprintf(stderr, "          $%06X\n", rpc);
+                }
+            }
+
             /* P128i probe — hard_excep entry. Capture excep_kind, superstack,
              * save_info_ptr, and for bus/addr errors the access_adr / pc_error
              * / sr_error. Dump the ~30-entry PC ring so we can see exactly

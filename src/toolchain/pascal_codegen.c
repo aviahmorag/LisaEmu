@@ -5312,6 +5312,22 @@ static void register_proc_sig(codegen_t *cg, const char *name, ast_node_t *param
     strncpy(sig->name, name, 63);
     sig->nest_depth = nest_depth;
     sig->takes_static_link = (nest_depth >= 2);
+    /* P128k: capture the enclosing (parent) procedure's name so
+     * find_proc_sig can prefer a nested sig whose parent matches the
+     * current compilation scope. A top-level (depth 1) proc has no
+     * parent. When nest_depth >= 2, the parent is the innermost scope
+     * that's ALREADY open at registration time. register_proc_sig is
+     * called during parse/analysis of the parent's declaration block —
+     * the parent's scope is cg->scopes[cg->scope_depth-1]. */
+    /* register_proc_sig is called AFTER push_scope for the procedure being
+     * registered — so scopes[scope_depth-1] is the current proc's own scope.
+     * The real enclosing parent is at scopes[scope_depth-2]. Top-level procs
+     * have scope_depth == 1 and thus no parent. */
+    sig->parent_proc[0] = '\0';
+    if (nest_depth >= 2 && cg->scope_depth >= 2) {
+        const char *p = cg->scopes[cg->scope_depth - 2].proc_name;
+        if (p && p[0]) strncpy(sig->parent_proc, p, 63);
+    }
     sig->num_params = num_params < CODEGEN_MAX_PARAMS ? num_params : CODEGEN_MAX_PARAMS;
     for (int i = 0; i < sig->num_params; i++) {
         /* str_val[0] != '\0' means VAR parameter (set by parser) */
@@ -5388,6 +5404,13 @@ static cg_proc_sig_t *find_proc_sig(codegen_t *cg, const char *name) {
     cg_proc_sig_t *imp_resolved = NULL;
     cg_proc_sig_t *imp_partial = NULL;
     cg_proc_sig_t *fallback = NULL;
+    (void)0; /* P128k: parent_proc tracking kept in sig for future use; lookup
+              * disabled because it requires symbol-table mangling to emit
+              * different addresses for same-named nested procs across parents,
+              * which in turn collides with the linker's 8-char prefix match
+              * and breaks other call paths. Kept the parent_proc field so
+              * find_proc_sig can tier on it later when the linker learns to
+              * suppress prefix match for dot-mangled names. */
     /* Search local signatures */
     if (cg->proc_sigs) {
         for (int i = 0; i < cg->num_proc_sigs; i++) {

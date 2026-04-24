@@ -189,7 +189,107 @@ commit as the real replacement.
 | 11 | **Shell (APDM)** | full desktop | Not started |
 | 12 | **Apps** | LisaWrite, LisaCalc, etc. | Not started |
 
-## Current Status (2026-04-24 post-P128i — **aggregate-copy stack-smash retired; 10201 gone; we now hit a real Pascal-level `SYSTEM_ERROR(10101)` from `Make_SProcess(Root)`.** Boot reaches 23/27 milestones (SYS_PROC_INIT). 309 of 2153 procedures entered (14.4%, up from 276 / 12.8% pre-P128i). The P128h handoff's "Bug C MMU aliasing" hypothesis for the 10201 turned out to be wrong — the real bug was a codegen string-assignment overflow in ReadDir (`name: e_name (33 B) := volPath: pathname (256 B)` copied 256 bytes via MAX, smashing 223 bytes past the destination into the enclosing procedure's saved-A6 and return-PC slots; ReadDir's RTS then popped garbage PC, CPU ran as NOPs through unmapped seg-100 for ~120 instructions, hit an illegal inst, hard_excep fired 10201). Next blocker is the 10101 wall — same family as P125-era: Make_SProcess returns an error that propagates from deeper MAKE_DATASEG → DS_OPEN → open_temp → FMAP_IO → vm → slist_io flow.)
+## Current Status (2026-04-24 post-P128j — **10101 root cause pinned: Pascal nested-procedure scoping bug in our compiler's `find_proc_sig`.** Boot still halts at `SYSTEM_ERROR(10101)` from `Sys_Proc_Init` at `ret=$0063A2` with `error=304 (e_dsbase+e_ldsnused)`. 23/27 milestones (SYS_PROC_INIT), 309 of 2153 procedures entered (14.4%). P128j investigation this session diagnosed the bug precisely but a surgical fix proved too invasive — session committed diagnostic infrastructure and deferred the structural fix.)
+
+### P128j (2026-04-24 pm) — Nested-proc scoping bug identified (no fix yet)
+
+**Root cause.** Pascal allows multiple nested procedures with the same
+name under different parents (e.g. `Recover` is nested in MANY parent
+procedures: MAKE_DATASEG, DS_OPEN, DS_CLOSE, OPEN2_DATASEG,
+Open_Event_Chn, Send_Event_Chn, Wait_Event_Chn, Setup_Directory,
+Setup_IUInfo, Build_DPT, Change_Directory, List_LibFiles, Free_Program,
+Load_Program, Get_ProgInfo, **Get_Resources**, Make_Process,
+Make_SProcess). Each nested Recover has different semantics — e.g.
+MAKE_DATASEG's Recover does `errnum := error + e_dsbase` while
+Get_Resources's Recover does `errnum := error` (no dsbase).
+
+Our codegen's `find_proc_sig` and linker's `find_global_symbol` both
+treat the name `Recover` as a GLOBAL symbol, not scope-aware. When
+Get_Resources's body calls `Recover(e_makesysloc)`, the relocation
+targets symbol "Recover" which the linker resolves to
+MAKE_DATASEG's Recover (at `$01E086`, registered first).
+MAKE_DATASEG's Recover then computes `errnum := 4 + 300 = 304`
+instead of Get_Resources's Recover's correct `errnum := 4`.
+
+Sys_Proc_Init sees `error != 0` (= 304) after Make_SProcess(Root)
+returns and fires `SYSTEM_ERROR(10101)`.
+
+**Diagnostic evidence (shipped probes).**
+- `[P128j] SYSTEM_ERROR(10101) about to fire at PC=$00639C (Root path)
+  error=(A6-14)=304 ($0130)` — fires at the SYSTEM_ERROR call site,
+  confirms the errnum value.
+- `[P128j] CHK_LDSN_FREE#N entry ret=... ldsn=-1 numb=1 lbt_addr=$CE03F8`
+  — all 6 calls to CHK_LDSN_FREE show `lbt[ldsn]=0` for every tested
+  ldsn. CHK_LDSN_FREE itself correctly returns `errnum=3 (e_ldsnfree)`.
+- `[P128j-EXIT] CHK_LDSN_FREE exit #N: *@errnum=3 ($0003)` — confirms.
+- `[P128j-REC] RECOVER#1 ENTRY ret=$05645A error_arg=4 ($0004)` —
+  MAKE_DATASEG's Recover at `$01E086` is being called from Get_Resources's
+  body at `ret=$05645A` (= `$056454+6`, i.e. the JSR at `$056454`
+  inside Get_Resources). The binary's JSR at `$056454` targets
+  `$01E086`, confirming the linker resolved "Recover" to the wrong
+  procedure.
+- Get_Resources's own Recover lives at `$05622C` (disassembly shows
+  `MOVE.W D0,(A0)` = `errnum := error` at `$056352`, NO `+ e_dsbase`).
+  The JSR from Get_Resources's body should target `$05622C` but targets
+  `$01E086`.
+
+**Attempted fix (reverted).** Session P128j tried a mangled-name
+approach: register each nested proc's entry as "Parent.ChildName"
+(e.g. `Get_Resources.Recover`) and emit relocations with the mangled
+name. At codegen time, `find_proc_sig` was extended with a tier-0
+preference for sigs whose `parent_proc` matches an ancestor scope.
+**This broke other call paths:** the linker's 8-char prefix match
+(line 76-92 of `src/toolchain/linker.c`) falls back to prefix matching
+when exact match fails. A mangled reloc "Get_Resources.Recover" (21
+chars, unknown to linker because entry point registration didn't
+propagate the mangled name reliably) prefix-matched "Get_Resources"
+(LCP=13) and resolved the JSR to Get_Resources's own entry,
+creating infinite recursion. Boot regressed catastrophically. Reverted.
+
+**What P128j kept in the tree (load-bearing infrastructure).**
+- `src/toolchain/pascal_codegen.h` — new `parent_proc[64]` field on
+  `cg_proc_sig_t`. Populated at registration time. Not consumed yet
+  (find_proc_sig skips the tier-0 check, commented out pending a
+  proper linker-aware fix). Retains the info for a future proper fix.
+- `src/toolchain/pascal_codegen.c:~5311` — registration populates
+  `sig->parent_proc` from `cg->scopes[scope_depth - 2].proc_name`
+  (scope_depth-1 is the proc being registered itself; scope_depth-2
+  is the real parent).
+- `src/m68k.c` — P128j diagnostic probes:
+  - CHK_LDSN_FREE entry at `$01B194` (dumps ldsn arg, numb_ldsn,
+    b_syslocal, lbt_addr, and lbt[-2..16] contents).
+  - CHK_LDSN_FREE loop `$01B258` (dumps A0 = elem_addr and *A0 = lbt
+    word being read).
+  - CHK_LDSN_FREE exit `$01B296` (dumps *@errnum at UNLK).
+  - RECOVER entry at `$01E086` (dumps error_arg, ret, A6 frame, last
+    30 PCs — shows which CALLER hit this wrong Recover).
+  - SYSTEM_ERROR call sites at `$00639C` (Root path) and `$0062A6`
+    (MemMgr path) in Sys_Proc_Init (dumps `error` local at A6-14).
+
+**Possible fixes for next session.**
+
+1. **Linker-aware nested-proc resolution.** Teach the linker to
+   understand dot-mangled names: when resolving a reloc "A.B", skip
+   the 8-char prefix match entirely (names with dots are private to
+   their originating module; prefix match would steal the resolution).
+   Re-enable codegen's mangled emission. This is the cleanest approach
+   but touches `src/toolchain/linker.c`'s symbol resolution.
+2. **Direct-address emission for nested calls.** Inside a codegen
+   unit, a nested proc's ADDRESS is known (cg->globals\[i].offset once
+   the module's code_size reaches its entry). When emitting JSR from
+   the parent's body, use a MODULE-INTERNAL relocation (not a global
+   linker reloc) that's resolved at link time by adding the module's
+   base_addr to the offset. Bypasses the linker's symbol matching for
+   nested calls entirely. Requires a new internal-reloc kind.
+3. **Per-OBJ local symbols.** Emit nested procs as LOCAL symbols
+   (not globals) in the OBJ, with mangled names to avoid collisions
+   within the module. Link-time resolution sees only one mangled
+   symbol per parent, avoiding cross-parent mixups. Needs OBJ
+   format work.
+
+Recommended: **option 1** — smallest diff, targeted fix.
+
+### P128i (2026-04-24 pm) — Retire aggregate-copy stack smash (class-of-bug)
 
 ### P128i (2026-04-24 pm) — Retire aggregate-copy stack smash (class-of-bug)
 

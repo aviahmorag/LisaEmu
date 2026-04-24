@@ -154,6 +154,14 @@ typedef struct {
      * true iff nest_depth>=2. */
     int nest_depth;
     bool takes_static_link;
+    /* P128k: name of the enclosing procedure for a nested sig. Empty string
+     * for top-level / unit procs. Used by find_proc_sig to disambiguate
+     * nested procedures that share a name across different parents (e.g.
+     * Pascal `Recover` is a common nested-procedure name — MAKE_DATASEG
+     * has its own Recover, Get_Resources has its own Recover; calls inside
+     * Get_Resources's body should resolve to Get_Resources's nested
+     * Recover, not MAKE_DATASEG's). */
+    char parent_proc[64];
 } cg_proc_sig_t;
 
 /* Relocation */
