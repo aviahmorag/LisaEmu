@@ -4428,10 +4428,51 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             uint32_t sp = cpu->a[7] & 0xFFFFFF;
             int16_t size = (int16_t)cpu_read16(cpu, (sp + 4) & 0xFFFFFF);
             uint32_t b_area = cpu_read32(cpu, (sp + 6) & 0xFFFFFF);
+            uint32_t ret_pc = cpu_read32(cpu, sp) & 0xFFFFFF;
             DBGSTATIC(int, gs_count, 0);
+            DBGSTATIC(int, gs_walk_dumps, 0);
+            /* P128g probe: on each GETSPACE call to sysglobal, dump the pool
+             * header + first few free-list entries so we can see why the
+             * first call (GetFCB, amount=254) returns FALSE even though the
+             * pool has just been freshly initialized. */
+            /* P128g probe, ungated — watch the sysglobal pool throughout boot so we
+             * can see WHEN freecount and the freelist diverge, and WHEN firstfree
+             * goes to 0 despite freecount claiming thousands of free words. */
+            if (b_area == 0xCC6FE0 && gs_walk_dumps < 60) {
+                /* hdr_freepool layout (SYSGLOBAL.TEXT:540):
+                 *   +0 pool_size: int2 (2 bytes, words)
+                 *   +2 firstfree: int4 (4 bytes, byte offset into pool)
+                 *   +6 freecount: int2 (2 bytes, words)
+                 * Total: 8 bytes
+                 * ent_freepool: +0 size(int2), +2 next(int4). 6 bytes. */
+                uint32_t gv_addr = (b_area - 24575) & 0xFFFFFF;
+                uint32_t pool = cpu_read32(cpu, gv_addr) & 0xFFFFFF;
+                uint16_t psize = cpu_read16(cpu, pool) & 0xFFFF;
+                uint32_t fff   = cpu_read32(cpu, pool + 2);
+                uint16_t fc    = cpu_read16(cpu, pool + 6) & 0xFFFF;
+                fprintf(stderr,
+                  "[P128g-ENTRY] GETSPACE #%d size=%d b_area=$%08X ret=$%06X SR=$%04X\n"
+                  "  pool=$%06X hdr: size=%u(w,=%dB) firstfree=$%X freecount=%u(w,=%dB)\n",
+                  gs_count + 1, size, b_area, ret_pc, cpu->sr,
+                  pool, psize, psize * 2, fff, fc, fc * 2);
+                /* Walk free list: each entry is {size:int2, next:int4} */
+                uint32_t cur = fff;
+                int steps = 0;
+                while (cur != 0 && steps < 8) {
+                    uint32_t ent = (pool + cur) & 0xFFFFFF;
+                    int16_t esize = (int16_t)cpu_read16(cpu, ent);
+                    int32_t enext = (int32_t)cpu_read32(cpu, ent + 2);
+                    fprintf(stderr, "    free[%d] @off=$%X addr=$%06X size=%d(w,=%dB) next=$%X\n",
+                            steps, cur, ent, esize, esize * 2, enext);
+                    if (esize <= 0 || (uint32_t)enext == cur) break;
+                    cur = (uint32_t)enext;
+                    steps++;
+                }
+                gs_walk_dumps++;
+            }
             if (gs_count++ < 60 || (cpu->a[6] & 0xFFFFFF) >= 0xD00000) {
                 fprintf(stderr, "[GETSPACE #%d] size=%d b_area=$%08X ret=$%06X A6=$%06X\n",
-                        gs_count, size, b_area, cpu_read32(cpu, sp) & 0xFFFFFF,
+                        gs_count, size, b_area, ret_pc,
                         cpu->a[6] & 0xFFFFFF);
                 if ((cpu->a[6] & 0xFFFFFF) >= 0xD00000) {
                     /* Dump caller chain for the corrupt A6 call */
@@ -5157,26 +5198,34 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 bool same_pool = ((allocated >> 16) == (gs_pending_b_area >> 16));
                 if (g_p128f_watch_armed) {
                     static int p128f_zero_logs = 0;
-                    if (p128f_zero_logs < 5) {
-                        /* Dump pool header at the adjusted pool address.
-                         * For sysglobal: pool_hdr is at b_area - 24575
-                         * (the same offset the Pascal GETSPACE uses).
-                         * Header layout:
-                         *   +0 pool_size  (int2, in WORDS)
-                         *   +2 firstfree  (int4, byte offset, 0 = empty)
-                         *   +6 freecount  (int2, WORDS available) */
-                        uint32_t hdr = gs_pending_b_area - 24575;
-                        uint16_t psize = cpu_read16(cpu, hdr) & 0xFFFF;
-                        uint32_t fff = cpu_read32(cpu, hdr + 2);
-                        uint16_t fc = cpu_read16(cpu, hdr + 6) & 0xFFFF;
+                    if (p128f_zero_logs < 8) {
+                        /* Pascal GETSPACE (source-SYSG1.TEXT:203) does:
+                         *   if b_area = b_sysglobal_ptr then b_area := b_area - 24575
+                         *   x := pointer(b_area)         { x = @sg_free_pool_addr }
+                         *   c_pool_ptr := pointer(x^)    { = value of sg_free_pool_addr
+                         *                                   = mb_sgheap = real pool-hdr addr }
+                         * So the pool header lives at *(b_area - 24575), not at
+                         * (b_area - 24575). Dereference through the global first.
+                         * Header layout (hdr_pool record, SYSG1 line 50ish):
+                         *   +0 pool_size  (int2, in words)
+                         *   +2 firstfree  (int2, byte offset into pool, 0 = empty)
+                         *   +4 freecount  (int2, words available)
+                         *   +6 padding/etc. */
+                        uint32_t gv_addr = gs_pending_b_area - 24575;       /* @sg_free_pool_addr */
+                        uint32_t pool_hdr = cpu_read32(cpu, gv_addr) & 0xFFFFFF;  /* sg_free_pool_addr value */
+                        uint16_t psize = cpu_read16(cpu, pool_hdr) & 0xFFFF;
+                        uint32_t fff   = cpu_read32(cpu, pool_hdr + 2);          /* int4 */
+                        uint16_t fc    = cpu_read16(cpu, pool_hdr + 6) & 0xFFFF; /* int2 at +6 */
                         fprintf(stderr,
                           "[P128f-ZF] GETSPACE ret_PC=$%06X varptr=$%06X "
-                          "b_area=$%06X allocated=$%06X amount=%u D0=$%08X "
-                          "[hdr@$%06X size=%u ff=$%X fc=%u (=%u bytes)] %s\n",
+                          "b_area=$%06X allocated=$%06X amount=%u D0=$%08X\n"
+                          "  @sg_free_pool_addr=$%06X (gv_addr=%s) → pool_hdr=$%06X\n"
+                          "  hdr: size=%u(words) firstfree=$%X freecount=%u(words,=%u bytes) %s\n",
                           gs_pending_ret, gs_pending_varptr,
                           gs_pending_b_area, allocated,
                           gs_pending_amount, cpu->d[0],
-                          hdr, psize, fff, fc, fc * 2,
+                          gv_addr, (gv_addr & 1) ? "ODD!" : "even",
+                          pool_hdr, psize, fff, fc, fc * 2,
                           same_pool ? "(SAME_POOL → zero-fill)" :
                                      "(OUT-OF-POOL → skip zero-fill)");
                         p128f_zero_logs++;
