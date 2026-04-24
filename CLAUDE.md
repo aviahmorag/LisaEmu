@@ -189,7 +189,80 @@ commit as the real replacement.
 | 11 | **Shell (APDM)** | full desktop | Not started |
 | 12 | **Apps** | LisaWrite, LisaCalc, etc. | Not started |
 
-## Current Status (2026-04-24 post-P128c — **Bug B fixed**, 10204 eliminated; 26/27 milestones reach MEM_CLEANUP; next blocker is Bug C (stack-LDSN aliasing, Initiate's RTS reads uninit USP))
+## Current Status (2026-04-24 post-P128d — **Bug C fixed**, 10201 eliminated; real scheduler dispatches MemMgr through Initiate end-to-end; boot reaches scheduler idle (Pause at $07765A). 23/27 milestones is architectural progress, not regression — cleanup milestones were only reached before via the 10201 unwind HLE which is now retired.)
+
+### P128d (2026-04-24) — Bug C shipped
+
+Root cause: `lisa_hle_prog_mmu` in `src/lisa.c` stored the SMT `origin`
+directly as the MMU's SOR register value — but the real Lisa
+`DO_AN_MMU` asm handler (source-LDASM.TEXT:403-411) applies a stack-
+segment transform before writing the SOR:
+
+```
+if access = mmustack ($6) then
+  if length = 0 then length := $100       (meaning full 128KB)
+  origin := origin + length - hw_adjust   (hw_adjust = $100 pages)
+  length := length - 1
+```
+
+This places the stack segment's valid pages at the TOP of the 128KB
+logical window, so Build_Stack's formula
+`A6 := MMU_Base(stackmmu+1) - (seg_size - offset)` — which positions
+the user-mode USP near the top of the window — maps to physical
+bytes actually inside the allocated stack pages.
+
+Without the transform, seg 123 SOR was written as `memaddr` ($F77 for
+mmstk_sdb post-Move_MemMgr). User logical $F7FFE0 then translated to
+phys $20EDE0 — **past** the 9 allocated stack pages at $1EEE00..$1F0000
+— and Initiate's RTS popped zeros → PC=0 → vector walk →
+`SYSTEM_ERROR(10201)` at hard_excep+646.
+
+With the transform (shipped in this session): seg 123 SOR = $E80,
+USP=$F7FFE0 → phys $1EFFE0 ∈ [$1EEE00, $1F0000]. RTS now reads the
+`@ExitSys` byte pattern Build_Stack wrote (via seg 104 kernel view,
+copied by Move_MemMgr's MOVER to the new phys location).
+
+Files changed in P128d:
+
+- **`src/lisa.c:889`** — add the `mmustack` branch to the SOR
+  computation inside `lisa_hle_prog_mmu`.
+- **`src/lisa.c:4042`** — retire the 10201/10204 SYS_PROC_INIT unwind
+  HLE (per `feedback_hle_layers_load_bearing.md`): the two root
+  causes it was scaffolding past (Bug B shipped in P128c, Bug C
+  shipped in P128d) are structurally fixed. SYSTEM_ERROR now HALTs
+  as it should, so any future 10201/10204 surfaces a real bug
+  instead of being silently suppressed.
+- **`src/lisa_mmu.c` / `src/lisa_mmu.h`** — add three diagnostic
+  helpers used by the new probe and useful for future MMU-aliasing
+  investigations: `lisa_mmu_xlate_info()` (translate logical → phys
+  and report seg/SOR/SLR), `lisa_mmu_seg_info()` (read any context's
+  segment descriptor), `lisa_mem_read_phys8/16/32()` (phys-direct
+  reads, bypassing MMU).
+- **`src/m68k.c`** — P128d probe block that logs Build_Stack entry,
+  Move_MemMgr entry, MOVE_IT entry, Mover entry, REMAP_SEGMENT,
+  Launch entry (with MRBT/sdb/seg-context dump), and Initiate entry
+  (with USP→phys translation). Leave-in for future regression
+  hunts; capped to a few fires per probe.
+
+### Post-P128d boot state
+
+- `./build/lisaemu --headless Lisa_Source 3000`:
+  **23/27 milestones** (last: SYS_PROC_INIT).
+- **No** `SYSTEM_ERROR(10201)` or `SYSTEM_ERROR(10204)`. Only 10707
+  (FS_MASTER_INIT suppression) fires, unrelated.
+- Boot ends at Pause ($07765A, 2 bytes into the Pause procedure's
+  `STOP #$2000` idle pattern, SR=$2000). MemMgr dispatch succeeded;
+  scheduler drained the Ready queue and entered idle.
+- **Why 23/27 instead of 26/27**: the 10201 unwind HLE used to skip
+  past SYS_PROC_INIT and let INITSYS fire INIT_DRIVER_SPACE,
+  FS_CLEANUP, MEM_CLEANUP. With the real scheduler now dispatching
+  MemMgr, the kernel pseudo-PCB self-blocks inside SYS_PROC_INIT
+  waiting for MemMgr to signal a semaphore; if MemMgr hits its own
+  Pause before signalling, SYS_PROC_INIT never returns to INITSYS.
+  Diagnosing this is the next step (Phase 6 area).
+- `make audit`: 0 unresolved, 8876/8876 resolved.
+
+### P128c recap (2026-04-24 am) — Bug B shipped
 
 **Milestones**: **23/27** SYS_PROC_INIT (back to the pre-P121 baseline
 but now with real UltraIO + MDDF/BitMap HLEs + SEG-ALIAS-GUARD +
@@ -329,14 +402,7 @@ Today's commits:
   harden — watch for future miscompiles around `ptr^[i].field`
   constructs.
 
-### Remaining issues past 27/27
-
-SYSTEM_ERROR(10201) halts AFTER PR_CLEANUP fires — not blocking the
-milestone sweep. PR_CLEANUP is designed to enter the scheduler idle
-loop, and we trip a hardware exception during the scheduler dispatch.
-
-**P128c (2026-04-24) — Bug B shipped: two structural fixes retire the
-10204 cascade. Next blocker shifts to Bug C (stack-LDSN aliasing).**
+### P128c (earlier this session) — Bug B shipped: two structural fixes retire the 10204 cascade.
 
 - **P128c.1 — Pascal global-layout fix for queue heads**. Apple's asm
   treats `fwd_BlockQ` / `fwd_ReadyQ` as 2-field head structs and reads

@@ -886,8 +886,36 @@ void lisa_hle_prog_mmu(uint32_t domain, uint32_t index,
         uint8_t access = mem->ram[entry_addr + 2];
         uint8_t limit = mem->ram[entry_addr + 3];
 
-        uint16_t sor = origin;
-        uint16_t slr = ((uint16_t)access << 8) | limit;
+        /* Real Lisa DO_AN_MMU asm (source-LDASM.TEXT:403-411) applies a
+         * hardware adjustment for stack-type segments before writing the
+         * SOR/SLR registers:
+         *   if access = mmustack ($6) then
+         *     if length = 0 then length := $100  (meaning full 128KB)
+         *     origin := origin + length - hw_adjust   (hw_adjust = $100)
+         *     length := length - 1
+         *
+         * This places the stack at the TOP of the 128KB logical window so
+         * that USP = MMU_Base(stackmmu+1) - small_offset correctly maps to
+         * phys = memaddr*512 + (seg_size - small_offset) — i.e. within the
+         * allocated stack pages. Without the adjustment, the user-mode
+         * stack pointer (which Build_Stack places near the top of the
+         * logical window) translates to phys way past the end of the
+         * allocated stack, reading uninitialized zeros and crashing on
+         * the first RTS.
+         *
+         * Our previous HLE stored `sor = origin` directly, missing this
+         * adjustment — the cause of "Bug C" (SYSTEM_ERROR(10201) in
+         * Initiate's RTS). Apply the same transform DO_AN_MMU does. */
+        uint16_t length = limit;
+        uint16_t sor;
+        if (access == 0x6 /* mmustack */) {
+            if (length == 0) length = 0x100;   /* 0 encodes full 128KB = 256 pages */
+            sor = (uint16_t)(origin + length - 0x100);
+            length = (uint16_t)(length - 1);
+        } else {
+            sor = origin;
+        }
+        uint16_t slr = ((uint16_t)access << 8) | (uint8_t)length;
 
         if (domain < 4) {
             int ctx = 1 + (int)domain;
@@ -4004,37 +4032,20 @@ static bool hle_handle_system_error(lisa_t *lisa __attribute__((unused)), m68k_t
         }
     }
 
-    /* P80d: hard exception during SYS_PROC_INIT — unwind past the entire
-     * SYS_PROC_INIT by walking the A6 chain to find the STARTUP return
-     * address. SYS_PROC_INIT's process creation code hits a frame pointer
-     * corruption in SEG_IO during FinishCreate/CreateProcess, causing a
-     * bus error → hard_excep → SYSTEM_ERROR(10201). Instead of trying to
-     * return to the corrupt context, skip SYS_PROC_INIT entirely and let
-     * the boot continue with INIT_DRIVER_SPACE. */
-    extern int g_vec_guard_active;
-    if (g_vec_guard_active && (err_code == 10201 || err_code == 10204)) {
-        static int supp_10201 = 0;
-        fprintf(stderr, "HLE: SYSTEM_ERROR(%d) during SYS_PROC_INIT — unwinding to STARTUP (#%d)\n",
-                err_code, supp_10201 + 1);
-        if (supp_10201++ > 0) {
-            /* Second+ occurrence: halt to debug */
-            fprintf(stderr, "SYSTEM_ERROR(%d): HALTING (debug)\n", err_code);
-            cpu->stopped = true;
-            return true;
-        }
-        /* Restore SP to the boot stack level (before SYS_PROC_INIT was called).
-         * Walk the supervisor stack to find a valid return frame. */
-        uint32_t boot_sp = 0xCBFFFC;  /* SP at SYS_PROC_INIT entry from P80 diag */
-        cpu->a[7] = boot_sp;
-        /* Pop the SYS_PROC_INIT return address and continue */
-        uint32_t ret = cpu_read32(cpu, boot_sp);
-        cpu->a[7] = boot_sp + 4;
-        cpu->pc = ret;
-        /* Restore A6 to the STARTUP frame */
-        cpu->a[6] = cpu_read32(cpu, boot_sp - 4);  /* saved A6 is below SP */
-        cpu->cycles += 50;
-        return true;
-    }
+    /* The 10201/10204 SYS_PROC_INIT unwind HLE was retired in P128d.
+     * The two root causes have been fixed structurally:
+     *   - Bug B (10204): Queue_Process byte-arg push + queue-head layout
+     *     (P128c, commit b69c22f). Block_Process now correctly unlinks
+     *     the kernel pseudo-PCB from Ready before self-blocking.
+     *   - Bug C (10201): lisa_hle_prog_mmu missing the stack-segment
+     *     origin adjustment that real DO_AN_MMU asm performs
+     *     (source-LDASM.TEXT:403-411). Seg 123 (stackmmu) now maps
+     *     to phys such that Build_Stack's writes and Initiate's RTS
+     *     read see the same bytes.
+     * With both fixed, the natural SYSTEM_ERROR path below handles
+     * anything that still reaches 10201/10204 — it will HALT so we
+     * can debug, not silently unwind past real bugs.
+     */
 
     /* SYSTEM_ERROR should halt — it never returns on a real Lisa.
      * Stop the CPU to prevent infinite recursion. lisa->halted is sticky

@@ -31,6 +31,62 @@ void lisa_mmu_register(lisa_mem_t *mem) {
     g_active_mem = mem;
 }
 
+uint8_t lisa_mem_read_phys8(uint32_t phys) {
+    lisa_mem_t *mem = g_active_mem;
+    if (!mem) return 0;
+    phys &= 0xFFFFFF;
+    if (phys >= LISA_RAM_SIZE) return 0;
+    return mem->ram[phys];
+}
+uint16_t lisa_mem_read_phys16(uint32_t phys) {
+    return ((uint16_t)lisa_mem_read_phys8(phys) << 8) | lisa_mem_read_phys8(phys + 1);
+}
+uint32_t lisa_mem_read_phys32(uint32_t phys) {
+    return ((uint32_t)lisa_mem_read_phys16(phys) << 16) | lisa_mem_read_phys16(phys + 2);
+}
+
+bool lisa_mmu_seg_info(int ctx, int seg,
+                       uint16_t *out_sor, uint16_t *out_slr,
+                       uint8_t *out_changed) {
+    lisa_mem_t *mem = g_active_mem;
+    if (!mem) return false;
+    if (ctx < 0 || ctx >= MMU_NUM_CONTEXTS) return false;
+    if (seg < 0 || seg >= MMU_NUM_SEGMENTS) return false;
+    mmu_segment_t *s = &mem->segments[ctx][seg];
+    if (out_sor) *out_sor = s->sor;
+    if (out_slr) *out_slr = s->slr;
+    if (out_changed) *out_changed = s->changed;
+    return s->changed != 0;
+}
+
+uint32_t lisa_mmu_xlate_info(uint32_t logical,
+                             int *out_seg, uint16_t *out_sor,
+                             uint16_t *out_slr, uint8_t *out_changed) {
+    lisa_mem_t *mem = g_active_mem;
+    int seg = (logical >> 17) & 0x7F;
+    if (out_seg) *out_seg = seg;
+    if (!mem) {
+        if (out_sor) *out_sor = 0;
+        if (out_slr) *out_slr = 0;
+        if (out_changed) *out_changed = 0;
+        return logical & 0xFFFFFF;
+    }
+    int ctx = mem->current_context;
+    if (ctx >= MMU_NUM_CONTEXTS) ctx = 0;
+    mmu_segment_t *s = &mem->segments[ctx][seg];
+    if (out_sor) *out_sor = s->sor;
+    if (out_slr) *out_slr = s->slr;
+    if (out_changed) *out_changed = s->changed;
+    if (!mem->mmu_enabled) return logical & 0xFFFFFF;
+    if (s->changed == 0) return logical & 0xFFFFFF;
+    uint32_t offset = logical & 0x1FFFF;
+    uint32_t phys = ((uint32_t)s->sor << 9) + offset;
+    uint16_t slr_type = s->slr & SLR_MASK;
+    if (slr_type == SLR_IO_SPACE || slr_type == SLR_SIO_SPACE)
+        return 0xFC0000 | offset;
+    return phys & 0xFFFFFF;
+}
+
 void lisa_mmu_dump_segments(void) {
     lisa_mem_t *mem = g_active_mem;
     if (!mem) {

@@ -3788,6 +3788,272 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
 
         }
 
+        /* P128d probe — Bug C investigation. When the scheduler dispatches
+         * MemMgr via Launch, the RTE switches to user mode with USP pointing
+         * at what Build_Stack wrote for env_save.A7. Initiate's body is
+         * essentially empty, so it runs LINK A6,#-6 / UNLK A6 / RTS — the
+         * RTS pops PC from USP. The handoff claims USP translates to phys
+         * that differs from the kernel-view physical base of the stack
+         * segment (Bug C aliasing).
+         *
+         * This probe fires at Initiate entry and dumps:
+         *   - cpu SR (to confirm user mode), A7 (= USP in user mode)
+         *   - MMU translation of A7: seg/SOR/SLR → phys
+         *   - 32 bytes at A7 via cpu_read (what RTS will see)
+         *   - The PC that RTS will pop (USP+4 after LINK's saved A6 push,
+         *     i.e. the original USP's +0 word)
+         *
+         * Also fires at Build_Stack entry and just before its RTS (detected
+         * via return-address check at a later PC) to dump the stk_info
+         * values being used in the A6 formula. */
+        {
+            static uint32_t pc_Initiate = 0;
+            static uint32_t pc_Build_Stack = 0;
+            static uint32_t pc_ExitSys = 0;
+            static int      pc_gen_p128d = -1;
+            if (pc_gen_p128d != g_emu_generation) {
+                pc_Initiate    = boot_progress_lookup("Initiate");
+                pc_Build_Stack = boot_progress_lookup("Build_Stack");
+                pc_ExitSys     = boot_progress_lookup("ExitSys");
+                pc_gen_p128d = g_emu_generation;
+            }
+            DBGSTATIC(int, p128d_init_count, 0);
+            DBGSTATIC(int, p128d_bs_count,   0);
+
+            /* Launch entry — inspect MemMgr's MRBT[stackmmu] and compare
+             * against the physical SOR that seg 123 ends up with. The
+             * handoff's layer-2 hypothesis is that MM_Setup sets
+             * MRBT[stackmmu].sdbRP to point at the wrong sdb. Read the
+             * mmstk_sdb ($CCBCD2) and mmsl_sdb ($CCBD1C) memaddrs and see
+             * which one the MRBT points at. */
+            static uint32_t pc_Launch_p128 = 0;
+            static int pc_gen_p128d3 = -1;
+            if (pc_gen_p128d3 != g_emu_generation) {
+                pc_Launch_p128 = boot_progress_lookup("Launch");
+                pc_gen_p128d3 = g_emu_generation;
+            }
+            DBGSTATIC(int, p128d_launch_count, 0);
+            if (pc_Launch_p128 && cpu->pc == pc_Launch_p128 && p128d_launch_count < 3) {
+                p128d_launch_count++;
+                /* b_syslocal_ptr lives at A5-24785. Read logical syslocal addr. */
+                uint32_t a5 = cpu->a[5] & 0xFFFFFF;
+                uint32_t bsl_logical = cpu_read32(cpu, (a5 - 24785) & 0xFFFFFF);
+                /* Translate to phys via realmemmmu or kernel view. First
+                 * translate through current MMU context. */
+                int sl_seg; uint16_t sl_sor, sl_slr; uint8_t sl_chg;
+                uint32_t bsl_phys = lisa_mmu_xlate_info(bsl_logical, &sl_seg, &sl_sor, &sl_slr, &sl_chg);
+                fprintf(stderr, "[P128d] Launch#%d MRBT probe: b_syslocal logical=$%06X → seg%d SOR=$%03X phys=$%06X\n",
+                        p128d_launch_count, bsl_logical, sl_seg, sl_sor, bsl_phys);
+                /* Always read the REAL MemMgr syslocal at mmsl_sdb's phys
+                 * (derived from its memaddr). Not via the current MMU — it
+                 * may be misprogrammed. */
+                uint16_t ms_ma = cpu_read16(cpu, 0xCCBD1C + 8);
+                uint32_t memmgr_sl_phys = (uint32_t)ms_ma * 512;
+                fprintf(stderr, "       MemMgr sl phys (via mmsl_sdb.memaddr=$%04X) = $%06X\n",
+                        ms_ma, memmgr_sl_phys);
+                fprintf(stderr, "       MemMgr syslocal phys first 128 bytes:\n       ");
+                for (int i = 0; i < 128; i++) {
+                    fprintf(stderr, "%02X", lisa_mem_read_phys8(memmgr_sl_phys + i));
+                    if ((i & 3) == 3) fprintf(stderr, " ");
+                    if ((i & 31) == 31) fprintf(stderr, "\n       ");
+                }
+                fprintf(stderr, "\n");
+                /* mrbt_addr is at offset 86 in syslocal — read it directly. */
+                uint32_t mrbt_addr_logical = lisa_mem_read_phys32(memmgr_sl_phys + 86);
+                fprintf(stderr, "       MemMgr syslocal.mrbt_addr (offset 86) = $%08X (logical)\n",
+                        mrbt_addr_logical);
+                /* Translate mrbt_addr to phys (it's logical via syslocmmu context
+                 * where seg 103 points at MemMgr's own syslocal). Its offset in
+                 * syslocal = mrbt_addr - MMU_BASE(103) = mrbt_addr - $CE0000. */
+                if ((mrbt_addr_logical & 0xFF0000) == 0xCE0000) {
+                    uint32_t mrbt_off = mrbt_addr_logical - 0xCE0000;
+                    uint32_t mrbt_phys = memmgr_sl_phys + mrbt_off;
+                    fprintf(stderr, "       MRBT phys=$%06X (offset $%X in syslocal)\n",
+                            mrbt_phys, mrbt_off);
+                    /* MRBT entries: mrbt = array[1..124] of mrbtEnt(4 bytes). */
+                    for (int i = 100; i <= 124; i++) {
+                        uint32_t eaddr = mrbt_phys + (i - 1) * 4;
+                        uint8_t  access = lisa_mem_read_phys8(eaddr);
+                        uint8_t  state  = lisa_mem_read_phys8(eaddr + 1);
+                        uint16_t sdbRP  = lisa_mem_read_phys16(eaddr + 2);
+                        uint32_t sdb_abs = sdbRP ? (0xCC6FE0u + sdbRP) : 0u;  /* b_sysglobal = $CC6FE0 */
+                        if (sdbRP || access || state)
+                            fprintf(stderr, "       MRBT[%d]: access=$%02X state=$%02X sdbRP=$%04X → sdb_abs=$%06X\n",
+                                    i, access, state, sdbRP, sdb_abs);
+                    }
+                }
+                /* The mrbt_addr field of syslocal (absptr, 4 bytes) lives
+                 * at a specific offset. The layout is:
+                 *   sl_free_pool_addr(4) + size_slocal(2) + env_save_area(70)
+                 *   + SCB(10) + mrbt_addr(4)
+                 * offset 0+4+2 = 6, env_save_area at 6, ends at 76, SCB
+                 * 76..85, mrbt_addr at 86. But Pascal records may pad. Try
+                 * 86 and neighbors. */
+                for (int off = 80; off <= 96; off += 2) {
+                    uint32_t v = lisa_mem_read_phys32(bsl_phys + off);
+                    fprintf(stderr, "       syslocal@phys+%d = $%08X\n", off, v);
+                }
+                /* Read known sdbs' memaddr from their sysglobal locations. */
+                uint16_t stk_ma = cpu_read16(cpu, 0xCCBCD2 + 8);
+                uint16_t stk_ms = cpu_read16(cpu, 0xCCBCD2 + 10);
+                uint16_t sl_ma  = cpu_read16(cpu, 0xCCBD1C + 8);
+                uint16_t sl_ms  = cpu_read16(cpu, 0xCCBD1C + 10);
+                fprintf(stderr, "       mmstk_sdb@CCBCD2: memaddr=$%04X memsize=$%04X (phys base=$%06X)\n",
+                        stk_ma, stk_ms, stk_ma * 512);
+                fprintf(stderr, "       mmsl_sdb @CCBD1C: memaddr=$%04X memsize=$%04X (phys base=$%06X)\n",
+                        sl_ma, sl_ms, sl_ma * 512);
+                /* Dump seg 123 and seg 103 across all contexts. */
+                for (int c = 0; c < 5; c++) {
+                    uint16_t s123, l123, s103, l103;
+                    uint8_t c123, c103;
+                    bool has123 = lisa_mmu_seg_info(c, 123, &s123, &l123, &c123);
+                    bool has103 = lisa_mmu_seg_info(c, 103, &s103, &l103, &c103);
+                    if (has123 || has103)
+                        fprintf(stderr, "       ctx%d: seg123 SOR=$%03X SLR=$%03X chg=$%X | seg103 SOR=$%03X SLR=$%03X chg=$%X\n",
+                                c, s123, l123, c123, s103, l103, c103);
+                }
+            }
+
+            if (pc_Initiate && cpu->pc == pc_Initiate && p128d_init_count < 6) {
+                p128d_init_count++;
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                int sup = (cpu->sr & 0x2000) != 0;
+                int seg; uint16_t sor, slr; uint8_t chg;
+                uint32_t phys_sp = lisa_mmu_xlate_info(sp, &seg, &sor, &slr, &chg);
+                fprintf(stderr, "[P128d] Initiate#%d entry PC=$%06X SR=$%04X (%s) A7=$%08X A6=$%08X A5=$%08X\n",
+                        p128d_init_count, cpu->pc, cpu->sr,
+                        sup ? "supervisor" : "user",
+                        cpu->a[7], cpu->a[6], cpu->a[5]);
+                fprintf(stderr, "        USP logical=$%06X → seg%d SOR=$%03X SLR=$%03X chg=$%X phys=$%06X\n",
+                        sp, seg, sor, slr, chg, phys_sp);
+                fprintf(stderr, "        USP+0..+31 content:");
+                for (int i = 0; i < 32; i += 4) {
+                    uint32_t w = cpu_read32(cpu, (sp + i) & 0xFFFFFF);
+                    fprintf(stderr, " [+%d]=$%08X", i, w);
+                }
+                fprintf(stderr, "\n        Top-of-stack (USP+0) = PC that RTS would pop = $%08X (ExitSys=$%06X)\n",
+                        cpu_read32(cpu, sp & 0xFFFFFF), pc_ExitSys);
+            }
+
+            /* Move_MemMgr entry/exit: dump mmstk_sdb.memaddr before/after so
+             * we can see whether MOVE_IT actually updates memaddr and whether
+             * the new memaddr matches the user-mode seg 123 SOR at Launch. */
+            static uint32_t pc_Move_MemMgr = 0, pc_Move_It = 0, pc_Mover = 0;
+            static uint32_t pc_Map_Domain = 0, pc_Remap_Segment = 0;
+            static uint32_t pc_gen_p128d2 = (uint32_t)-1;
+            if (pc_gen_p128d2 != (uint32_t)g_emu_generation) {
+                pc_Move_MemMgr = boot_progress_lookup("Move_MemMgr");
+                pc_Move_It     = boot_progress_lookup("Move_It");
+                pc_Mover       = boot_progress_lookup("Mover");
+                pc_Map_Domain  = boot_progress_lookup("Map_Domain");
+                pc_Remap_Segment = boot_progress_lookup("REMAP_SEGMENT");
+                pc_gen_p128d2 = g_emu_generation;
+            }
+            DBGSTATIC(int, p128d_mover_count, 0);
+            DBGSTATIC(int, p128d_moveit_count, 0);
+            DBGSTATIC(int, p128d_mm_count, 0);
+            DBGSTATIC(int, p128d_md_count, 0);
+            DBGSTATIC(int, p128d_rs_count, 0);
+
+            if (pc_Move_MemMgr && cpu->pc == pc_Move_MemMgr && p128d_mm_count < 2) {
+                p128d_mm_count++;
+                fprintf(stderr, "[P128d] Move_MemMgr#%d entry A5=$%08X A6=$%08X\n",
+                        p128d_mm_count, cpu->a[5], cpu->a[6]);
+            }
+            /* MOVE_IT(c_sdb: sdb_ptr). LINK entry: SP+0=ret, SP+4=c_sdb.
+             * sdb layout: memchain(4), memaddr(int2)@4, memsize(int2)@6. */
+            if (pc_Move_It && cpu->pc == pc_Move_It && p128d_moveit_count < 6) {
+                p128d_moveit_count++;
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                uint32_t ret = cpu_read32(cpu, sp);
+                uint32_t c_sdb = cpu_read32(cpu, sp + 4);
+                uint16_t memaddr = cpu_read16(cpu, (c_sdb + 8) & 0xFFFFFF);
+                uint16_t memsize = cpu_read16(cpu, (c_sdb + 10) & 0xFFFFFF);
+                fprintf(stderr, "[P128d] MOVE_IT#%d entry ret=$%06X c_sdb=$%08X memaddr=$%04X memsize=$%04X (phys_base=$%06X, bytes=%u)\n",
+                        p128d_moveit_count, ret, c_sdb, memaddr, memsize,
+                        (uint32_t)memaddr * 512u, (uint32_t)memsize * 512u);
+            }
+            /* Mover(src: absptr, dst: absptr, len: int4). LINK entry:
+             * SP+0=ret, SP+4=src, SP+8=dst, SP+12=len. */
+            if (pc_Mover && cpu->pc == pc_Mover && p128d_mover_count < 8) {
+                p128d_mover_count++;
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                uint32_t ret = cpu_read32(cpu, sp);
+                uint32_t src = cpu_read32(cpu, sp + 4);
+                uint32_t dst = cpu_read32(cpu, sp + 8);
+                uint32_t len = cpu_read32(cpu, sp + 12);
+                int s_seg, d_seg; uint16_t s_sor, s_slr, d_sor, d_slr; uint8_t s_chg, d_chg;
+                uint32_t s_phys = lisa_mmu_xlate_info(src, &s_seg, &s_sor, &s_slr, &s_chg);
+                uint32_t d_phys = lisa_mmu_xlate_info(dst, &d_seg, &d_sor, &d_slr, &d_chg);
+                fprintf(stderr, "[P128d] Mover#%d entry ret=$%06X src=$%08X→seg%d phys=$%06X(SOR=$%03X) dst=$%08X→seg%d phys=$%06X(SOR=$%03X) len=%u\n",
+                        p128d_mover_count, ret, src, s_seg, s_phys, s_sor,
+                        dst, d_seg, d_phys, d_sor, len);
+            }
+            /* REMAP_SEGMENT(c_sdb, old_memaddr, old_memsize). Each call
+             * updates MMU domains after sdb.memaddr changes. */
+            if (pc_Remap_Segment && cpu->pc == pc_Remap_Segment && p128d_rs_count < 6) {
+                p128d_rs_count++;
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                uint32_t ret = cpu_read32(cpu, sp);
+                uint32_t c_sdb = cpu_read32(cpu, sp + 4);
+                uint16_t oa = cpu_read16(cpu, sp + 8);
+                uint16_t os = cpu_read16(cpu, sp + 10);
+                uint16_t new_ma = cpu_read16(cpu, (c_sdb + 8) & 0xFFFFFF);
+                uint16_t new_ms = cpu_read16(cpu, (c_sdb + 10) & 0xFFFFFF);
+                fprintf(stderr, "[P128d] REMAP_SEGMENT#%d ret=$%06X c_sdb=$%08X old=memaddr=$%04X memsize=$%04X new=memaddr=$%04X memsize=$%04X\n",
+                        p128d_rs_count, ret, c_sdb, oa, os, new_ma, new_ms);
+            }
+            /* Map_Domain fires when Set_Address_Space switches process domain.
+             * Dump the target domain's seg 123 SOR that gets programmed. */
+            if (pc_Map_Domain && cpu->pc == pc_Map_Domain && p128d_md_count < 4) {
+                p128d_md_count++;
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                uint32_t ret = cpu_read32(cpu, sp);
+                fprintf(stderr, "[P128d] Map_Domain#%d entry ret=$%06X A5=$%08X A6=$%08X (args@SP+4..)\n",
+                        p128d_md_count, ret, cpu->a[5], cpu->a[6]);
+                /* Args depend on calling convention; dump SP for caller inspection. */
+                for (int i = 0; i < 4; i++) {
+                    uint32_t v = cpu_read32(cpu, sp + 4 + i*4);
+                    fprintf(stderr, "        SP+%d=$%08X\n", 4 + i*4, v);
+                }
+            }
+
+            if (pc_Build_Stack && cpu->pc == pc_Build_Stack && p128d_bs_count < 3) {
+                p128d_bs_count++;
+                /* At Build_Stack entry, before LINK executes, the parent's
+                 * frame is at A6 (set up by CreateProcess). stk_info is a
+                 * by-value param of CreateProcess (40 bytes). Our codegen
+                 * passes records > 4 bytes as 4-byte pointers, so slot at
+                 * A6 + param_offset contains a pointer to the actual stk_info.
+                 *
+                 * Rather than guess offsets, dump the whole A6 frame window
+                 * and let analysis identify which dwords are the stk_info
+                 * pointer / stk_handle pointer / sloc_ptr. */
+                uint32_t a6 = cpu->a[6] & 0xFFFFFF;
+                fprintf(stderr, "[P128d] Build_Stack#%d entry PC=$%06X A6=$%08X A5=$%08X A7=$%08X\n",
+                        p128d_bs_count, cpu->pc, cpu->a[6], cpu->a[5], cpu->a[7]);
+                fprintf(stderr, "        A6 frame window -0x20..+0x40:\n        ");
+                for (int off = -0x20; off <= 0x40; off += 4) {
+                    uint32_t addr = (a6 + off) & 0xFFFFFF;
+                    uint32_t w = cpu_read32(cpu, addr);
+                    fprintf(stderr, "@%+d=$%08X%s", off, w, (off%16==12)?"\n        ":" ");
+                }
+                fprintf(stderr, "\n");
+                /* Static link chain: parent frame stored at saved A6 (@A6+0). */
+                uint32_t parent_fp = cpu_read32(cpu, (a6 + 0) & 0xFFFFFF) & 0xFFFFFF;
+                fprintf(stderr, "        parent A6 (CreateProcess)=$%06X\n", parent_fp);
+                /* Dump MMU state for stackmmu (123) — tells us whether it
+                 * has been programmed by MM_Setup yet, and where to. */
+                int seg; uint16_t sor, slr; uint8_t chg;
+                (void)lisa_mmu_xlate_info(123u << 17, &seg, &sor, &slr, &chg);
+                fprintf(stderr, "        stackmmu (seg123) state: SOR=$%03X SLR=$%03X chg=$%X (phys base=$%06X)\n",
+                        sor, slr, chg, ((uint32_t)sor << 9) & 0xFFFFFF);
+                (void)lisa_mmu_xlate_info(104u << 17, &seg, &sor, &slr, &chg);
+                fprintf(stderr, "        minsysldsnmmu (seg104) state: SOR=$%03X SLR=$%03X chg=$%X (phys base=$%06X)\n",
+                        sor, slr, chg, ((uint32_t)sor << 9) & 0xFFFFFF);
+            }
+        }
+
         /* P86e HLE guard: DEL_MMLIST spin when SRB list is empty.
          *
          * MEM_CLEANUP calls Del_SRB twice to remove the pseudo-outer

@@ -116,4 +116,25 @@ void lisa_mmu_register(lisa_mem_t *mem);
 /* Diagnostic: dump all configured segments for the current context to stderr. */
 void lisa_mmu_dump_segments(void);
 
+/* Diagnostic: translate a logical address to physical using the currently
+ * active MMU context, and optionally return the seg index / SOR / SLR /
+ * changed flags so callers can reason about aliasing. Any out-ptr may be
+ * NULL. Returns the physical address (24-bit, unwrapped — caller applies
+ * % LISA_RAM_SIZE or similar if needed). */
+uint32_t lisa_mmu_xlate_info(uint32_t logical,
+                             int *out_seg, uint16_t *out_sor,
+                             uint16_t *out_slr, uint8_t *out_changed);
+
+/* Diagnostic: direct physical-RAM read, bypassing MMU. Returns 0 if
+ * phys is out of range or no active mem is registered. */
+uint8_t  lisa_mem_read_phys8 (uint32_t phys);
+uint16_t lisa_mem_read_phys16(uint32_t phys);
+uint32_t lisa_mem_read_phys32(uint32_t phys);
+
+/* Diagnostic: peek at an MMU segment descriptor in a specific context.
+ * Returns true if populated (out_* valid), false otherwise. */
+bool     lisa_mmu_seg_info(int ctx, int seg,
+                           uint16_t *out_sor, uint16_t *out_slr,
+                           uint8_t *out_changed);
+
 #endif /* LISA_MMU_H */
