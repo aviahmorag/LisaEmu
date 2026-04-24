@@ -189,9 +189,108 @@ commit as the real replacement.
 | 11 | **Shell (APDM)** | full desktop | Not started |
 | 12 | **Apps** | LisaWrite, LisaCalc, etc. | Not started |
 
-## Current Status (2026-04-24 post-P128d — **Bug C fixed**, 10201 eliminated; real scheduler dispatches MemMgr through Initiate end-to-end; boot reaches scheduler idle (Pause at $07765A). 23/27 milestones is architectural progress, not regression — cleanup milestones were only reached before via the 10201 unwind HLE which is now retired.)
+## Current Status (2026-04-24 post-P128e — **diagnostic-only**: root-caused the 23/27 SYS_PROC_INIT wall, contradicting the post-P128d handoff hypothesis. The kernel pseudo-PCB does NOT block waiting for a MemMgr signal — it blocks on a **fake semaphore at a corrupted address** because of an upstream FS_INIT cascade. No code-behavior change shipped this session; only diagnostic probes added.)
 
-### P128d (2026-04-24) — Bug C shipped
+### P128e (2026-04-24 pm) — Diagnostic: root-caused the 23/27 wall
+
+**The post-P128d handoff hypothesized "MemMgr fails to signal a sem
+during init handshake." That hypothesis was wrong.** Empirical probes
+of `Wait_sem` / `Signal_sem` / `Block_Process` / `open_temp` /
+`SplitPathname` / `MAKE_SYSDATASEG` / `MAKE_DATASEG` / `DS_OPEN` show
+the actual cascade:
+
+1. `SYS_PROC_INIT → Make_SProcess(Root, …, resident=false)` (non-resident path)
+2. `Get_Resources → MAKE_SYSDATASEG(progname='', discsize=$0C00)`
+3. `SPLITPATHNAME('')` returns **`progunit=-1`** (DecompPath default for
+   empty path; ecode=E_NO_DEVICE — caller MAKE_SYSDATASEG **ignores**
+   `errnum` after this call)
+4. `MAKE_SYSDATASEG`: `firstunit := progunit = -1` →
+   `MAKE_IT(-1)` → `dsname := 'x'` (Apple's placeholder)
+5. `MAKE_DATASEG('x', ds_private)`:
+   - `SplitPathname('x')` → Gobble returns `delim=' '` (no '-' in 'x') →
+     `device := working_dev`
+   - **`working_dev = -1`** in the kernel pseudo-PCB's syslocal
+   - `f_segname := concat('-', configinfo[-1]^.devname, '-PDS')` (garbage)
+6. `DS_OPEN.OPENIT`:
+   - `SplitPathname(garbage_segname)` → `device = -1`
+   - `OPEN_TEMP(?, device=-1, ?)`
+7. `open_temp`: `mounttable[-1]` reads 4 bytes BEFORE the table at
+   logical `$CC502C` → returns garbage `$4C0E5C8F`
+8. `mounttable[device]^.semio = $4C0E5C8F + $6C = $4C0E5CFB` —
+   the bogus "sem" address
+9. `wait_sem(@$4C0E5CFB, [])` → cnt at that addr happens to be 0 →
+   `Block_Process(kernel_pcb=$CCB58E, [sem])`
+10. **Nobody will ever signal a fake sem.** Scheduler dispatches MemMgr
+    (the only other Ready process), MemMgr runs its body, blocks on
+    `WAIT_SEM(memmgr_sem)` (cnt=0, waiting for a swap request that
+    will never come), idle → Pause forever.
+
+**Why `working_dev = -1` in the kernel syslocal:** `FS_SETUP(sloc_ptr)`
+(at SOURCE-FSINIT2.TEXT:891) sets `working_dev := bootdev`. It runs
+at the END of `FS_INIT` (STARTUP.TEXT:954), AFTER `FS_MASTER_INIT`
+succeeds. Our **10707 HLE suppression** unwinds out of FS_INIT
+before FS_SETUP runs, leaving `working_dev` in its default-init
+state of `-1`. Pre-P128c+P128d this didn't surface because the
+kernel pseudo-PCB never actually got dispatched into Block_Process
+(Bug B's queue-unlink miscompile masked it via the 10204 cascade).
+
+**Why `FS_MASTER_INIT` fails (= why 10707 fires):** After
+`fs_mount → real_mount → def_mount → MDDF_IO HLE → BitMap_IO HLE →
+MDDF_IO WRITE HLE → UltraIO → DISKIO → MakeSGSpace HLE → DISKIO retry`,
+the chain reaches an `OPEN_SFILE(rootsnum)` call. The compiled `slist_io`
+returns `ecode=871 = E1_SENTRY_BAD` (visible in regs at 10707-fire:
+`D2 = $367 = 871`). So either:
+- our disk image's slist entry for `rootsnum=3` (root catalog) has
+  `hintaddr = 0` despite `diskimage.c:476` writing it correctly, OR
+- the MDDF read returns wrong `rootsnum` / `slist_addr` /
+  `slist_packing` so we look up the wrong slist page, OR
+- `slist_io`'s `vm()` call sub-block-reads from the wrong physical
+  block due to our P104 MDDF_IO HLE intercepting only some I/O paths
+  but not the real `vm` chain that slist_io actually uses.
+
+### Three options for the next session (user picked C / "real fix")
+
+**A) One-line HLE extension** — make the 10707 suppression also do
+`working_dev := bootdev` (`writeword to syslocal+$A8`, `bootdev` is
+at `A5+$FF2C` per FS_Setup compiled asm). Smallest patch; probably
+unblocks until the next FS-dependent failure (`MAKE_SYSDATASEG`
+returning `e_filesyserr+e_dsbase` → `SYSTEM_ERROR(10101)`). Path of
+least resistance, but band-aid.
+
+**B) Fake-mount HLE** — populate `mounttable[bootdev]` with a synthetic
+mountrec whose `semio=1` (mutex) and whose other fields cause
+downstream FS calls to return clean errors. Allows resident-process
+creation if we patch open_temp's "if mounted" check. Bigger surface.
+
+**C) ✅ Real fix — Phase 4** — make `FS_MASTER_INIT` actually succeed.
+This requires: (a) verify our disk image's MDDF + slist entries are
+read correctly by the OS; (b) find why `slist_io(rootsnum)` returns
+`E1_SENTRY_BAD = 871`; (c) fix the underlying mismatch (likely in
+`diskimage.c` MDDF/slist field placement, OR add slist_io HLE so it
+reads from disk image directly like MDDF_IO does). Multi-session
+work but architecturally clean per CLAUDE.md Phase 4 plan.
+
+### Probes added this session (P128e — diagnostic only, no fix)
+
+`src/m68k.c` — pci_trace budget bumped 200 → 800; new probe block
+that fires only after `Make_SProcess#2` and dumps:
+- `Wait_sem` / `Signal_sem` entries with @sem, count, owner,
+  wait_queue (decoded from sem record at @sem)
+- `Block_Process` / `Unblock_Process` entries with @pcb and reasons
+- `Get_Resources` / `FinishCreate` / `MAKE_SYSDATASEG` /
+  `MAKE_DATASEG` / `DS_OPEN` / `open_temp` / `SplitPathname`
+  entries with their typed args decoded from the stack
+- `open_temp` additionally dumps `mounttable[device]` and the first
+  16 mounttable entries
+
+Three new probe symbols added to `pcs[]`: `open_temp`, `DS_OPEN`,
+`MAKE_DATASEG`. Probe budget capped at 80 fires of the diagnostic
+block to avoid log explosion.
+
+These probes are **load-bearing diagnostic infrastructure** for the
+next session. Do not remove them when shipping a fix.
+
+### P128d (2026-04-24 am) — Bug C shipped (10201 retired)
 
 Root cause: `lisa_hle_prog_mmu` in `src/lisa.c` stored the SMT `origin`
 directly as the MMU's SOR register value — but the real Lisa
