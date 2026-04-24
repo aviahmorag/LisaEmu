@@ -181,15 +181,110 @@ commit as the real replacement.
 | 3 | **First driver file (SYSTEM.CD_PROFILE)** | source-PROFILE.TEXT compiled as .OBJ, placed on disk with catalog entry | In progress — driver loads, dispatch armed |
 | 4 | **MDDF / disk-image full FS** | removes 10707 suppression; real FS_INIT / FS_MASTER_INIT | In progress — P128g retires MDDF_IO+BitMap_IO, psio HLE handles both via single nbytes-respecting intercept; FS_INIT completes naturally now (10707 no longer fires during boot) |
 | 5 | **IRQ-driven I/O completion** | removes Block_Process-on-POP deadlock | In progress — IRQ scaffold complete (P120), seg-alias guard shipped (P122); PARALLEL → IODONE still pending |
-| 6 | **SYS_PROC_INIT + real processes** | removes P89i + CreateProcess HLE pile; fixes Pascal `ptr^[i]` type-resolution class of bugs (P125 surfaced) | Not started — Make_SProcess blocked on codegen |
-| 7 | **Cleanup HLEs** (FS/MEM/PR_CLEANUP) | real cleanup bodies | Not started |
+| 6 | **SYS_PROC_INIT + real processes** | removes P89i + CreateProcess HLE pile; fixes Pascal `ptr^[i]` type-resolution class of bugs (P125 surfaced) | In progress — MemMgr dispatches and runs post-PR_CLEANUP (P128l); next investigate REMAP_SEGMENT loop |
+| 7 | **Cleanup HLEs** (FS/MEM/PR_CLEANUP) | real cleanup bodies | In progress — all four cleanup milestones reach naturally |
 | 8 | **Safety-net HLEs** (REG_OPEN_LIST, excep_setup) | remove | Not started |
 | 9 | **System libraries** (SYS1LIB, SYS2LIB) | new compile targets | Not started |
 | 10 | **Graphics** (LIBQD, LIBTK) | new compile targets | Not started |
 | 11 | **Shell (APDM)** | full desktop | Not started |
 | 12 | **Apps** | LisaWrite, LisaCalc, etc. | Not started |
 
-## Current Status (2026-04-24 post-P128k — **27/27 milestones reached NATURALLY end-to-end; kernel init path completes without HLE-unwind suppression for the first time in project history.** Boot halts at a new blocker: USER-MODE `SYSTEM_ERROR(10201)` (superstack=0, excep_kind=23 illg_inst) AFTER PR_CLEANUP — downstream of the scheduler's first real-process dispatch. 348 of 2153 procedures entered (16.2%). This is the first time ALL 27 kernel milestones have resolved through the real code path (no HLE unwind past SYS_PROC_INIT crashes). P128k shipped the narrow fix for Pascal nested-procedure scoping that unblocked the 10101 wall.)
+## Current Status (2026-04-24 post-P128l — **27/27 milestones + MemMgr LIVE post-PR_CLEANUP; no SYSTEM_ERROR, no hard_excep, no illegal-inst.** MemMgr dispatches after the scheduler idle loop, processes its first service request (CLEAR_SPACE → MOVE_SEG → REMAP_SEGMENT chain), and continues executing. PC stays hot in REMAP_SEGMENT/INSERTSDB/REMOVESDB as MemMgr does (apparently real) memory-compaction work. This is the first boot in project history where the kernel init path completes AND the scheduler's first user-mode dispatch survives past its initial service request.)
+
+### P128l (2026-04-24 pm) — Retire user-mode 10201: sysglobal sdb didn't cover sgheap
+
+**Diagnosis (structural).** The P128k handoff predicted "Bug C: MMU
+aliasing for Initiate's RTS" as the cause of user-mode 10201. It
+wasn't. Initiate's RTS popped a valid MemMgr PC ($0004B7FE). MemMgr
+then ran for thousands of instructions — Initiate → MEMMGR body →
+wait_sem at $04B8BC → Block_Process → Scheduler#2 → Launch#2 →
+MemMgr resumes → MOVE_SEG → REMAP_SEGMENT → CLR_INMOTION_SEG. The
+10201 fires inside CLR_INMOTION_SEG's queue walk via CALLDRIVER.
+
+**Root cause (different class-of-bug).** MemMgr's CLEAR_SPACE picked
+the sysglobal sdb (memaddr=$03DC, memsize=$38) and ran MOVE_SEG to
+relocate it. MOVER copied exactly memsize\*512=$7000 bytes. But the
+sgheap — which contains MMRB at logical offset $B00A from sysglobal
+base — lived PAST the sdb's $7000 range. Our MMU doesn't enforce
+the SLR limit, so writes to logical $CCB00A during early boot had
+landed at phys `b_sysglobal+$B00A` (past the sdb's declared range)
+and the MMRB was properly initialized there. After MOVE_SEG copied
+only the first 28KB and REMAP_SEGMENT pointed seg 102 at the new
+phys origin, logical $CCB00A mapped to a phys location that was
+never written. Reads returned $0000. MMRB.hd_qioreq_list.fwd_link
+silently changed from $402A (valid self-pointer) to $0000.
+CLR_INMOTION_SEG's `while c_qioreq <> l_qioreq` then entered the
+loop (instead of exiting on the self-sentinel) with `c_qioreq =
+b_sysglobal_ptr + 0 = b_sysglobal_ptr`. The loop body called
+`CALLDRIVER(err, request^.cfigptr=$0725B6, @parm)` where $0725B6
+is the address of `overflow_trap` — whatever byte the bogus request
+pointer landed on in low memory. CALLDRIVER JSR'd (A0)=$48E7FFFE
+(the literal MOVEM.L opcode bytes of overflow_trap reinterpreted as
+a code pointer). CPU executed 42 bytes of garbage across seg 115→116
+boundary, landed at PC=$48E80028 (MMU-translated via seg 116 SOR=0
+to phys $28 = vector 10 slot), tried to interpret the $00FE0320
+vector data as an instruction → illegal-inst → hard_excep+646 →
+SYSTEM_ERROR(10201) at $022210, superstack=0 (user mode).
+
+**Fix — `src/lisa.c` loader params.** Put sgheap INSIDE the sysglobal
+sdb by reordering the layout:
+
+```
+OLD layout (phys):       NEW layout (phys):
+ [globals  $7000]         [globals  $7000]
+ [supstack $4000]         [sgheap   $7E00]   ← moved up
+ [sgheap   $7E00]         [supstack $4000]
+```
+
+And extending `l_sys_global` passed to the kernel from $7000 to
+$7000+$7E00 = $EE00. MAKE_REGION now creates the sysglobal sdb with
+memsize = $EE00/512 = $77 = 119 pages covering both Pascal globals
+and sgheap. MOVE_SEG copies all 77KB including MMRB. After
+REMAP_SEGMENT, logical $CC700A (new MMRB address in the rearranged
+layout) continues to map to the copied-and-remapped MMRB data.
+Supstack is untouched because it has its own MMU seg (seg 101 =
+superstkmmu); moving seg 102's sdb doesn't affect supstack's
+logical→phys mapping.
+
+**Verification.**
+- `make audit`: 0 unresolved, 8877/8877 resolved.
+- Headless 10000 frames: 27/27 milestones reached naturally. NO
+  SYSTEM_ERROR. NO hard_excep. NO illegal-inst. NO P128i-RUNAWAY.
+- CLR_INMOTION_SEG#1..5 all fire with correct self-pointer
+  (fwd=$822A = -$7DD6 = `@hd_qioreq_list - A5` for MMRB@$CC700A
+  and A5=$CCEDE0). Loop exits immediately without spinning.
+- MemMgr continues running after PR_CLEANUP; PC hot in REMAP_SEGMENT
+  (144K hits), INSERTSDB, REMOVESDB, Mover. Whether this is
+  productive compaction work or a new loop bug is next session's
+  job.
+
+**Probes added (load-bearing diagnostic infra, keep).**
+- `src/m68k.c ~4050`: P128l CLR_INMOTION_SEG entry probe —
+  dumps mmrb_addr, MMRB.hd_qioreq_list fwd/bkwd, expected
+  self-pointer relptr. Catches recurrence of this class.
+- `src/m68k.c ~4072`: P128l MAP_SEGMENT entry probe — dumps
+  c_sdb, c_mmu, domain, c_access, sdb memaddr+memsize. Helps
+  diagnose future seg programming bugs.
+- `src/m68k.c ~509`: `g_p128l_mmrb_watch_armed` +
+  `g_p128l_mmrb_addr` globals. Armed at SYS_PROC_INIT after
+  P80-DIAG confirms MMRB initialization.
+- `src/lisa_mmu.c ~329`: byte-write watchpoint on MMRB+0..+3.
+  Fires if anyone clobbers the self-pointer.
+- `src/lisa_mmu.c ~560`: WATCH-SMT extension — always log
+  writes to SMT[seg=102] regardless of the 128-cap. Surfaces
+  seg-102 SMT programming events.
+
+**Long-term proper fix (deferred).** Implement SLR limit
+enforcement in `lisa_mmu.c` `mmu_translate()` so writes past
+a segment's declared length fault, matching Apple's demand-paging
+design. Right now the limit is ignored, which silently lets writes
+land outside sdb ranges and creates bugs like this one whenever a
+seg gets moved. Out of scope for P128l but should be the next
+structural MMU cleanup.
+
+**Memory saved.** `project_move_seg_needs_full_sdb.md` — indexed in
+`MEMORY.md`.
+
 
 ### P128k (2026-04-24 pm) — Disambiguate nested `Recover` across parents
 
