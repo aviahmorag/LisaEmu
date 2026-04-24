@@ -2257,7 +2257,16 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
                 if (cg->num_relocs < CODEGEN_MAX_RELOCS) {
                     cg_reloc_t *r = &cg->relocs[cg->num_relocs++];
                     r->offset = cg->code_size - 4;
-                    strncpy(r->symbol, node->name, sizeof(r->symbol) - 1);
+                    /* P128k: mangle Recover-class calls so a caller inside
+                     * a parent that has its own nested Recover reaches THAT
+                     * Recover rather than a same-named sibling's. */
+                    if (ident_sig && ident_sig->parent_proc[0] &&
+                        strcasecmp(node->name, "Recover") == 0) {
+                        snprintf(r->symbol, sizeof(r->symbol), "%s.%s",
+                                 ident_sig->parent_proc, node->name);
+                    } else {
+                        strncpy(r->symbol, node->name, sizeof(r->symbol) - 1);
+                    }
                     r->size = 4;
                     r->pc_relative = false;
                 }
@@ -3285,7 +3294,15 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
             if (cg->num_relocs < CODEGEN_MAX_RELOCS) {
                 cg_reloc_t *r = &cg->relocs[cg->num_relocs++];
                 r->offset = cg->code_size - 4;
-                strncpy(r->symbol, node->name, sizeof(r->symbol) - 1);
+                /* P128k: mangle Recover-class calls; see note at ident_sig
+                 * site above. */
+                if (sig && sig->parent_proc[0] &&
+                    strcasecmp(node->name, "Recover") == 0) {
+                    snprintf(r->symbol, sizeof(r->symbol), "%s.%s",
+                             sig->parent_proc, node->name);
+                } else {
+                    strncpy(r->symbol, node->name, sizeof(r->symbol) - 1);
+                }
                 r->size = 4;
                 r->pc_relative = false;
             }
@@ -3868,7 +3885,14 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                 if (cg->num_relocs < CODEGEN_MAX_RELOCS) {
                     cg_reloc_t *r = &cg->relocs[cg->num_relocs++];
                     r->offset = cg->code_size - 4;
-                    strncpy(r->symbol, node->name, sizeof(r->symbol) - 1);
+                    /* P128k: mangle Recover-class calls (see note above). */
+                    if (call_sig && call_sig->parent_proc[0] &&
+                        strcasecmp(node->name, "Recover") == 0) {
+                        snprintf(r->symbol, sizeof(r->symbol), "%s.%s",
+                                 call_sig->parent_proc, node->name);
+                    } else {
+                        strncpy(r->symbol, node->name, sizeof(r->symbol) - 1);
+                    }
                     r->size = 4;
                 }
                 /* Clean up args -- only for caller-clean routines */
@@ -4805,8 +4829,30 @@ static void gen_proc_or_func(codegen_t *cg, ast_node_t *node) {
     /* Ensure word alignment before entry point */
     align_code(cg);
 
+    /* P128k: mangle specific known-clashing nested procedure names with
+     * the enclosing parent's name ("Parent.Child") so the linker can
+     * disambiguate them. We restrict mangling to `Recover` for now —
+     * it's declared as a nested procedure in ~19 different parents
+     * across the OS source with different semantics (MAKE_DATASEG's
+     * does `errnum := error + e_dsbase` while Get_Resources's does
+     * `errnum := error`), and an unmangled registration lets the
+     * linker pick the wrong body for a caller. Broader nested-proc
+     * mangling (every nested proc) breaks other paths where callers
+     * legitimately reach a nested proc by its unmangled name through
+     * forward declarations. Linker's P128k dot-exact-match rule
+     * ensures "Parent.Child" never prefix-matches the parent's own
+     * unmangled entry. */
+    char entry_name[128];
+    const char *reg_name = node->name;
+    if (cg->scope_depth >= 1 && cg->scopes[cg->scope_depth - 1].proc_name[0] &&
+        strcasecmp(node->name, "Recover") == 0) {
+        snprintf(entry_name, sizeof(entry_name), "%s.%s",
+                 cg->scopes[cg->scope_depth - 1].proc_name, node->name);
+        reg_name = entry_name;
+    }
+
     /* Record entry point */
-    cg_symbol_t *entry = add_global_sym(cg, node->name, NULL);
+    cg_symbol_t *entry = add_global_sym(cg, reg_name, NULL);
     if (entry) entry->offset = (int)cg->code_size;
 
     push_scope(cg);
@@ -5404,13 +5450,37 @@ static cg_proc_sig_t *find_proc_sig(codegen_t *cg, const char *name) {
     cg_proc_sig_t *imp_resolved = NULL;
     cg_proc_sig_t *imp_partial = NULL;
     cg_proc_sig_t *fallback = NULL;
-    (void)0; /* P128k: parent_proc tracking kept in sig for future use; lookup
-              * disabled because it requires symbol-table mangling to emit
-              * different addresses for same-named nested procs across parents,
-              * which in turn collides with the linker's 8-char prefix match
-              * and breaks other call paths. Kept the parent_proc field so
-              * find_proc_sig can tier on it later when the linker learns to
-              * suppress prefix match for dot-mangled names. */
+    /* P128k tier-0: for known-clashing nested procedure names (just
+     * "Recover" for now), prefer a sig whose parent_proc matches an
+     * ancestor scope. Keeps the resolution correct inside Get_Resources
+     * (returns Get_Resources.Recover) while leaving other nested procs
+     * alone. Kept narrow because broader tier-0 affected callers that
+     * reach nested procs through forward declarations. */
+    if (cg->proc_sigs && cg->scope_depth >= 1 &&
+        strcasecmp(name, "Recover") == 0) {
+        cg_proc_sig_t *parent_resolved = NULL;
+        cg_proc_sig_t *parent_partial = NULL;
+        for (int i = 0; i < cg->num_proc_sigs; i++) {
+            cg_proc_sig_t *s = &cg->proc_sigs[i];
+            if (strcasecmp(s->name, name) != 0) continue;
+            if (s->is_external) continue;
+            if (!s->parent_proc[0]) continue;
+            for (int d = cg->scope_depth - 1; d >= 0; d--) {
+                const char *anc = cg->scopes[d].proc_name;
+                if (!anc || !anc[0]) continue;
+                if (strcasecmp(s->parent_proc, anc) == 0) {
+                    if (sig_is_fully_resolved(s)) {
+                        if (!parent_resolved) parent_resolved = s;
+                    } else if (!parent_partial) {
+                        parent_partial = s;
+                    }
+                    break;
+                }
+            }
+        }
+        if (parent_resolved) return parent_resolved;
+        if (parent_partial) return parent_partial;
+    }
     /* Search local signatures */
     if (cg->proc_sigs) {
         for (int i = 0; i < cg->num_proc_sigs; i++) {

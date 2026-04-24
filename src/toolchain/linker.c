@@ -50,6 +50,18 @@ static int find_global_symbol(linker_t *lk, const char *name) {
                 extern_match = i;  /* Remember first EXTERN match */
         }
     }
+    /* P128k: dot-mangled names are private to the module that emitted
+     * them (nested Pascal procedures use `Parent.Child` mangling to
+     * disambiguate same-named nested procs across different parents,
+     * e.g. MAKE_DATASEG.Recover vs Get_Resources.Recover). Such names
+     * must only match via EXACT strcasecmp — never via the 8-char
+     * prefix fallback below, which would prefix-match them against
+     * the parent's unmangled entry (e.g. "Get_Resources.Recover" would
+     * LCP-match "Get_Resources" and steal the resolution). If exact
+     * match above failed for a dot-mangled name, the reference is
+     * genuinely unresolvable; return -1. */
+    if (strchr(name, '.') != NULL) return -1;
+
     /* 8-char prefix match — Lisa assembler truncates symbols to 8 significant
      * characters. Apple's rule: two identifiers are the same iff their
      * first-8-char truncations are equal. Short names (< 8 chars) are
