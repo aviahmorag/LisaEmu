@@ -2185,6 +2185,17 @@ static void gen_expression(codegen_t *cg, ast_node_t *node) {
             break;
 
         case AST_STRING_LITERAL: {
+            /* P128h — in CHAR context (case label, char-var assignment,
+             * char comparison), a 1-char string literal is semantically
+             * a CHAR value, not a string pointer. Emit MOVEQ so D0 holds
+             * the char value (not the address of the length-prefixed
+             * string data). See codegen_t.char_literal_context. */
+            if (cg->char_literal_context &&
+                strlen(node->str_val) == 1) {
+                emit16(cg,
+                    0x7000 | (uint8_t)node->str_val[0]);  /* MOVEQ #ch,D0 */
+                break;
+            }
             /* Store string in code, load address to A0 */
             /* LEA string_data(PC),A0 */
             emit16(cg, 0x41FA);       /* LEA d(PC),A0 */
@@ -3444,9 +3455,18 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                     break;
                 }
             }
-            /* Evaluate RHS into D0 */
+            /* Evaluate RHS into D0. P128h: if LHS resolves to a char-sized
+             * target (1 byte), enable char_literal_context so a 1-char
+             * string-literal RHS compiles to MOVEQ #ch,D0 (value) instead
+             * of a string-pointer. Fixes `delimiter := ' '` (Gobble) and
+             * every similar char-var assignment. */
+            {
+                int lhs_byte_sz = expr_size(cg, node->children[0]);
+                if (lhs_byte_sz == 1) cg->char_literal_context = true;
+            }
             int rhs_sz = expr_size(cg, node->children[1]);
             gen_expression(cg, node->children[1]);
+            cg->char_literal_context = false;
             /* Post-hoc: if the generated code ends with a 32-bit producer
              * (MOVE.L A0,D0, MOVE.L #imm,D0, MOVE.L disp(An),D0, etc.),
              * ensure the store uses 4 bytes even if expr_size missed it. */
@@ -4312,7 +4332,14 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                 if (label_node->type == AST_CASE_LABELS) {
                     uint32_t beq_positions[16]; int num_beqs = 0;
                     for (int li = 0; li < label_node->num_children; li++) {
+                        /* P128h: case label is semantically a CHAR (for
+                         * `case of char`) or an ordinal. Enable the
+                         * char-literal short-circuit so 1-char string
+                         * literals compile to MOVEQ #ch,D0 (value), not
+                         * a string pointer. See comment in AST_STRING_LITERAL. */
+                        cg->char_literal_context = true;
                         gen_expression(cg, label_node->children[li]);
+                        cg->char_literal_context = false;
                         /* Reload selector from stack top into D3. */
                         if (csz == 4) emit16(cg, 0x262F);  /* MOVE.L 0(SP),D3 */
                         else          emit16(cg, 0x362F);  /* MOVE.W 0(SP),D3 */
@@ -4333,7 +4360,10 @@ static void gen_statement(codegen_t *cg, ast_node_t *node) {
                                 (uint16_t)(body_pos - beq_positions[bi]));
                     }
                 } else {
+                    /* Single-label arm — same P128h char-label context. */
+                    cg->char_literal_context = true;
                     gen_expression(cg, label_node);
+                    cg->char_literal_context = false;
                     if (csz == 4) emit16(cg, 0x262F);
                     else          emit16(cg, 0x362F);
                     emit16(cg, 0);

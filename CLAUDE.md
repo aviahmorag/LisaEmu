@@ -189,7 +189,100 @@ commit as the real replacement.
 | 11 | **Shell (APDM)** | full desktop | Not started |
 | 12 | **Apps** | LisaWrite, LisaCalc, etc. | Not started |
 
-## Current Status (2026-04-24 post-P128g — **psio HLE shipped; MDDF_IO and BitMap_IO HLEs retired; FS_INIT now completes naturally and FS_Setup runs.** Boot still at **23/27** (SYS_PROC_INIT) but the whole FS path is now structurally correct: no more 512-byte pool overflow, no more freelist corruption, no more 10707 suppression firing. Next blocker: post-SYS_PROC_INIT bogus-sem cascade via `MAKE_SYSDATASEG('') → MAKE_DATASEG('x') → open_temp(device=-1)`. Working_dev is still -1 at the open_temp call despite FS_Setup running earlier — suggesting a different syslocal is being read than the one FS_Setup populated.)
+## Current Status (2026-04-24 post-P128h — **case-of-char codegen bug retired; DecompPath works; post-SYS_PROC_INIT bogus-sem cascade no longer the blocker.** Boot now advances past MAKE_DATASEG → DS_OPEN → FMAP_IO → vm before hitting SYSTEM_ERROR(10201) at `hard_excep+646` — the SAME Bug C from P128b (kernel-view and user-view stack segments don't alias for newly-created process's Initiate RTS), now re-exposed because we actually reach the Initiate path. 10201 was previously masked by the open_temp(-1) fake-sem infinite loop that preceded it.)
+
+### P128h (2026-04-24 pm, post-dff5940) — Single-char string-literal codegen fix
+
+**Root cause (class-of-bug, structural).** Lisa Pascal's `'-'`, `' '`,
+`'+'`, etc. are CHAR values, not STRING pointers. Our Pascal codegen
+emitted AST_STRING_LITERAL uniformly as a `LEA data(PC),A0 / MOVE.L
+A0,D0` sequence — so in expression contexts D0 holds the ADDRESS of
+the length-prefixed string data, not the char VALUE. In CHAR-expecting
+contexts (case labels, char assignments, char comparisons) the
+downstream code then treats that address as the value:
+
+- `case delim of '-': ...`: `CMP.W D3,D0` compares delim byte against
+  low word of a code address. Never matches. The `' '`/`'+'` arm
+  never fires either. `device` stays -1 (its initial value), which
+  cascaded into `open_temp(device=-1)` and the P128e/g bogus-sem wall.
+- `delimiter := ' '` (Gobble): `MOVE.B D0,(A0)` writes the LOW byte
+  of the address (e.g. $A8, depending on where the ' ' literal landed
+  in code) into the delim slot. Every caller of DecompPath/Gobble
+  that relied on the delim return was reading a garbage byte.
+- `if c <> '-'` comparisons (Gobble's scan loop): same class.
+
+**Fix — `src/toolchain/pascal_codegen.[ch]` + context flag**. Added
+`codegen_t.char_literal_context` flag. `AST_STRING_LITERAL` codegen
+now checks: if `char_literal_context && strlen==1`, emit
+`MOVEQ #ch,D0` (load the char value). Otherwise emit the original
+LEA/data/MOVE.L pattern (correct for actual string pointers). Flag
+set at three call sites (P128h structural fix):
+
+1. **Case labels** (both `AST_CASE_LABELS` multi-label loop and
+   single-label else branch in the `AST_CASE` handler). `case of
+   char` now dispatches correctly.
+2. **Assignments where LHS is byte-sized**
+   (`char_literal_context = true` when `expr_size(LHS) == 1`).
+   `charVar := 'x'` now writes the char value, not an address byte.
+3. Comparisons still TODO (Gobble's scan loop uses the string-path
+   in AST_BINARY_OP string-compare logic, which happens to byte-compare
+   char-vs-1-char-string correctly because the length byte mismatch
+   path falls through to "not equal" — which is the right answer for
+   non-delimiter chars. Not reliable for correctness; add context flag
+   to AST_BINARY_OP `=`/`<>` next session.).
+
+**Verification.**
+- `make audit`: 0 unresolved, all modules link clean.
+- Headless run: `DecompPath EXIT @dev=$CBF9DC → dev=37` (was `dev=-1`).
+- Case dispatch trace: `delim = $20` (was $A8). PC flows
+  `+118 BNE → +166 ('-' mismatch) → +174 BEQ for ' ' (match) →
+  +194 body` and writes working_dev=37 into @device.
+- Boot advances: `Sys_Proc_Init → Make_SProcess → Get_Resources →
+  Make_SysDataseg → MAKE_DATASEG → DS_OPEN → FMAP_IO → vm` before
+  halting at SYSTEM_ERROR(10201). Pre-P128h the chain stalled at
+  `open_temp(device=-1)` waiting on a bogus sem address.
+- Boot milestone: still 23/27 (SYS_PROC_INIT), but reaching the
+  Root-process Initiate path is new forward progress inside that
+  milestone.
+
+**Files changed (P128h).**
+- `src/toolchain/pascal_codegen.h` — new `char_literal_context` flag
+  on `codegen_t`.
+- `src/toolchain/pascal_codegen.c` — AST_STRING_LITERAL honors the
+  flag; AST_CASE label emission and AST_ASSIGN (when LHS size==1)
+  set/clear the flag.
+- `src/m68k.c` — P128h probe block: `DecompPath` / `getdevnum` /
+  `Gobble` / `FS_Setup` entry+exit + code dumps + case-dispatch PC
+  trace. Load-bearing diagnostic infrastructure for future
+  codepath debugging. Keep.
+
+**Retires.** The P128f/g `open_temp(device=-1) → bogus mt[-1] →
+fake sem wait → scheduler dispatches nobody → Pause` cascade no
+longer happens. The P128e probes (which diagnosed that cascade) are
+kept as infrastructure but that specific path is dead.
+
+### Next blocker — SYSTEM_ERROR(10201) at hard_excep+646 (recurrence of P128b Bug C)
+
+Once DecompPath correctly returns dev=37 and MAKE_DATASEG runs, the
+flow reaches `DS_OPEN → FMAP_IO → vm` and eventually `Initiate` for
+the newly-created Root process. `Initiate`'s RTS reads the user
+stack via stackmmu (seg 123) but the kernel-view setup wrote to
+seg 104. The two physical pages don't alias → RTS pops zeros →
+PC=0 → vector walk → `SYSTEM_ERROR(10201)` at `hard_excep+646`.
+
+Same root cause as the P128b Bug C diagnosis. P128d shipped a
+partial fix (`mmustack hw_adjust` in `lisa_hle_prog_mmu`) but
+apparently doesn't cover the Root process's ldsn setup path.
+Concrete next move: probe `SET_LDSN(stk_sdb, stackmmu, mmustack)`
+against the Root process's stack sdb and confirm seg 123's SOR
+aliases the same physical frames as seg 104 used during Build_Stack.
+If not, extend the P128d fix to cover `SET_LDSN` as well.
+
+Do NOT add an HLE to suppress 10201 — per
+`feedback_do_the_real_fix.md`, the MMU aliasing is a real
+emulator bug (our MMU translates SOR=0 literally instead of
+demand-faulting). Fix the structural invariant: a given LDSN's
+user-view and kernel-view both map to the same physical frames.
 
 ### P128g (2026-04-24 pm) — psio HLE, MDDF_IO/BitMap_IO retired (real fix for freelist corruption)
 

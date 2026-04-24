@@ -247,6 +247,14 @@ typedef struct {
      * code reading PRIORITY(A1) as CMP.W sees positive word values for
      * priorities 128..255). */
     int in_packed;
+
+    /* P128h: char-literal context flag. When set, gen_expression for a
+     * single-character AST_STRING_LITERAL emits MOVEQ #ch,D0 (loading the
+     * char VALUE) instead of the default LEA/data/MOVE.L pattern (which
+     * loads the DATA ADDRESS as a string pointer). Set by callers that
+     * know the operand is semantically a CHAR, not a STRING — case
+     * labels, char-var assignments, char comparisons. */
+    bool char_literal_context;
 } codegen_t;
 
 /* Public API */

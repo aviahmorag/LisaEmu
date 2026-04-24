@@ -6034,6 +6034,267 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             }
         }
 
+        /* P128h probes — diagnose the post-SYS_PROC_INIT bogus-sem cascade.
+         *
+         * Hypothesis (from P128g handoff): MAKE_DATASEG('x') → open_temp gets
+         * device=-1 because getdevnum reads `b_syslocal_ptr^.working_dev` and
+         * that field is still -1 despite FS_Setup having run. Either:
+         *   A) FS_Setup wrote to a DIFFERENT syslocal than the one getdevnum
+         *      reads (MMU context or pointer mismatch);
+         *   B) FS_Setup's codegen writes working_dev to the wrong offset
+         *      (sibling of the P125 ptr^[i].field class of bug);
+         *   C) bootdev itself is -1/0 at FS_Setup time.
+         *
+         * Probe plan:
+         *   1. At FS_Setup entry ($02FA9E): log sl_ptr (param), b_syslocal_ptr
+         *      global, bootdev global. Capture sl_ptr + ret_pc for exit hook.
+         *      Dump 192 bytes of *sl_ptr to snapshot syslocal PRE-FS_Setup.
+         *   2. At FS_Setup ret_pc (post-RTS): dump 192 bytes of *sl_ptr again;
+         *      the diff vs the entry snapshot shows exactly where FS_Setup
+         *      wrote (including working_dev).
+         *   3. At getdevnum entry ($02D9A4): log the devName length (decides
+         *      the "empty path → working_dev" branch), b_syslocal_ptr value,
+         *      dump 192 bytes of *b_syslocal_ptr. Also dump 64 code bytes at
+         *      getdevnum itself so we can read the compiled offset for
+         *      .working_dev directly from the MOVE.W instruction.
+         * Budget per probe: 4 fires. */
+        {
+            extern uint32_t boot_progress_lookup(const char *name);
+            static uint32_t pc_fs_setup = 0, pc_decomppath = 0,
+                             pc_gobble = 0, pc_splitpathname = 0;
+            static int p128h_gen = -1;
+            static int fs_setup_entries = 0;
+            static int decomp_entries = 0;
+            static int gobble_entries = 0;
+            static uint32_t fs_setup_ret_pc = 0;
+            static uint32_t fs_setup_sl_ptr = 0;
+            static uint32_t fs_setup_pre[48];  /* 192 bytes as 48 longs */
+            static int decomp_code_dumped = 0;
+            /* DecompPath exit tracking */
+            static uint32_t decomp_ret_pc = 0;
+            static uint32_t decomp_dev_addr = 0;
+            if (p128h_gen != g_emu_generation) {
+                p128h_gen = g_emu_generation;
+                pc_fs_setup = boot_progress_lookup("FS_Setup");
+                pc_decomppath = boot_progress_lookup("DecompPath");
+                pc_gobble = boot_progress_lookup("Gobble");
+                pc_splitpathname = boot_progress_lookup("SplitPathname");
+                fs_setup_entries = 0;
+                decomp_entries = 0;
+                gobble_entries = 0;
+                fs_setup_ret_pc = 0;
+                fs_setup_sl_ptr = 0;
+                decomp_code_dumped = 0;
+                decomp_ret_pc = 0;
+                decomp_dev_addr = 0;
+            }
+            /* FS_Setup entry probe */
+            if (pc_fs_setup && cpu->pc == pc_fs_setup && fs_setup_entries < 4) {
+                fs_setup_entries++;
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                uint32_t a5 = cpu->a[5] & 0xFFFFFF;
+                uint32_t ret_pc = cpu_read32(cpu, sp) & 0xFFFFFF;
+                uint32_t sl_ptr = cpu_read32(cpu, (sp + 4) & 0xFFFFFF) & 0xFFFFFF;
+                uint32_t bsl = cpu_read32(cpu, (a5 - 24785) & 0xFFFFFF) & 0xFFFFFF;
+                int16_t bootdev = (int16_t)cpu_read16(cpu,
+                                      (a5 - 212) & 0xFFFFFF);
+                fprintf(stderr,
+                  "[P128h] FS_Setup#%d ENTRY sl_ptr=$%06X b_syslocal_ptr=$%06X "
+                  "bootdev=%d A5=$%06X ret=$%06X SR=$%04X\n",
+                  fs_setup_entries, sl_ptr, bsl, bootdev, a5, ret_pc, cpu->sr);
+                /* Snapshot 192 bytes of *sl_ptr */
+                fs_setup_ret_pc = ret_pc;
+                fs_setup_sl_ptr = sl_ptr;
+                fprintf(stderr, "         *sl_ptr PRE (192 bytes):\n");
+                for (int off = 0; off < 192; off += 16) {
+                    fprintf(stderr, "           +%03d:", off);
+                    for (int b = 0; b < 16; b += 2) {
+                        uint16_t w = cpu_read16(cpu,
+                            (sl_ptr + off + b) & 0xFFFFFF);
+                        fprintf(stderr, " %04X", w);
+                    }
+                    fprintf(stderr, "\n");
+                    fs_setup_pre[(off / 16) * 4 + 0] =
+                        cpu_read32(cpu, (sl_ptr + off + 0) & 0xFFFFFF);
+                    fs_setup_pre[(off / 16) * 4 + 1] =
+                        cpu_read32(cpu, (sl_ptr + off + 4) & 0xFFFFFF);
+                    fs_setup_pre[(off / 16) * 4 + 2] =
+                        cpu_read32(cpu, (sl_ptr + off + 8) & 0xFFFFFF);
+                    fs_setup_pre[(off / 16) * 4 + 3] =
+                        cpu_read32(cpu, (sl_ptr + off + 12) & 0xFFFFFF);
+                }
+            }
+            /* FS_Setup exit probe — re-dump *sl_ptr + diff vs PRE snapshot */
+            if (fs_setup_ret_pc && cpu->pc == fs_setup_ret_pc &&
+                fs_setup_sl_ptr) {
+                uint32_t sl_ptr = fs_setup_sl_ptr;
+                uint32_t a5 = cpu->a[5] & 0xFFFFFF;
+                int16_t bootdev = (int16_t)cpu_read16(cpu,
+                                      (a5 - 212) & 0xFFFFFF);
+                fprintf(stderr,
+                  "[P128h] FS_Setup EXIT sl_ptr=$%06X bootdev=%d — DIFF vs PRE:\n",
+                  sl_ptr, bootdev);
+                for (int off = 0; off < 192; off += 4) {
+                    uint32_t post = cpu_read32(cpu,
+                        (sl_ptr + off) & 0xFFFFFF);
+                    uint32_t pre = fs_setup_pre[off / 4];
+                    if (post != pre) {
+                        fprintf(stderr,
+                          "           +%03d: $%08X → $%08X\n",
+                          off, pre, post);
+                    }
+                }
+                fs_setup_ret_pc = 0;
+                fs_setup_sl_ptr = 0;
+            }
+            /* DecompPath entry probe — this is what MAKE_DATASEG('x') routes
+             * through (via SplitPathname → DecompPath), NOT getdevnum.
+             * Pascal caller-clean (all var): ret(4), @ecode(4), @path(4),
+             * @device(4), @parID(4), @volPath(4).
+             *
+             * DecompPath pseudo:
+             *   ptrSyslocal := pointer(b_syslocal_ptr);
+             *   device := -1;
+             *   parID := -1;
+             *   Gobble(path, i, volName, delim);
+             *   case delim of
+             *     '-':  device := map_dev_name(volName);
+             *     ' '/+:  device := ptrSyslocal^.working_dev;
+             *   end;
+             * If delim falls through both cases, device stays -1 → e_no_device. */
+            if (pc_decomppath && cpu->pc == pc_decomppath &&
+                decomp_entries < 4) {
+                decomp_entries++;
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                uint32_t a5 = cpu->a[5] & 0xFFFFFF;
+                uint32_t ret_pc = cpu_read32(cpu, sp) & 0xFFFFFF;
+                uint32_t ecode_addr = cpu_read32(cpu, (sp + 4) & 0xFFFFFF) & 0xFFFFFF;
+                uint32_t path_addr  = cpu_read32(cpu, (sp + 8) & 0xFFFFFF) & 0xFFFFFF;
+                uint32_t dev_addr   = cpu_read32(cpu, (sp + 12) & 0xFFFFFF) & 0xFFFFFF;
+                uint32_t parID_addr = cpu_read32(cpu, (sp + 16) & 0xFFFFFF) & 0xFFFFFF;
+                uint8_t plen = cpu->read8(path_addr & 0xFFFFFF);
+                char pbuf[40];
+                int n = plen < 24 ? plen : 24;
+                for (int i = 0; i < n; i++)
+                    pbuf[i] = cpu->read8((path_addr + 1 + i) & 0xFFFFFF);
+                pbuf[n] = '\0';
+                uint32_t bsl = cpu_read32(cpu, (a5 - 24785) & 0xFFFFFF) & 0xFFFFFF;
+                /* Read candidate working_dev (offset +168 per P128h FS_Setup diff) */
+                int16_t wd_168 = bsl ?
+                    (int16_t)cpu_read16(cpu, (bsl + 168) & 0xFFFFFF) : -999;
+                fprintf(stderr,
+                  "[P128h] DecompPath#%d ENTRY path=$%06X len=%d \"%s\" @dev=$%06X "
+                  "@parID=$%06X b_syslocal_ptr=$%06X (*bsp+168)=%d ret=$%06X\n",
+                  decomp_entries, path_addr, plen, pbuf, dev_addr,
+                  parID_addr, bsl, wd_168, ret_pc);
+                (void)ecode_addr;
+                /* Dump 192 bytes at *b_syslocal_ptr so we see working_dev in context */
+                if (bsl) {
+                    fprintf(stderr, "         *b_syslocal_ptr (at $%06X, 192 bytes):\n", bsl);
+                    for (int off = 0; off < 192; off += 16) {
+                        fprintf(stderr, "           +%03d:", off);
+                        for (int b = 0; b < 16; b += 2) {
+                            uint16_t w = cpu_read16(cpu,
+                                (bsl + off + b) & 0xFFFFFF);
+                            fprintf(stderr, " %04X", w);
+                        }
+                        fprintf(stderr, "\n");
+                    }
+                }
+                /* Capture exit hook state */
+                decomp_ret_pc = ret_pc;
+                decomp_dev_addr = dev_addr;
+                /* Dump 384 code bytes at DecompPath one-shot so the case
+                 * statement + branches are fully visible. */
+                if (!decomp_code_dumped) {
+                    decomp_code_dumped = 1;
+                    fprintf(stderr, "         DecompPath code @$%06X (384 bytes):\n",
+                            pc_decomppath);
+                    for (int off = 0; off < 384; off += 16) {
+                        fprintf(stderr, "           +%03d:", off);
+                        for (int b = 0; b < 16; b += 2)
+                            fprintf(stderr, " %04X",
+                                cpu_read16(cpu, (pc_decomppath + off + b) & 0xFFFFFF));
+                        fprintf(stderr, "\n");
+                    }
+                }
+            }
+            /* P128h case-dispatch trace — watch PCs inside DecompPath
+             * to see where control flows in the case-of-char. */
+            if (pc_decomppath && decomp_entries > 0 && decomp_entries <= 2) {
+                static int case_trace_budget = 60;
+                uint32_t off = cpu->pc - pc_decomppath;
+                /* Fire at key dispatch points: +110 ('-'), +118 BNE,
+                 * +166 ('-' mismatch target / ' ' dispatch), +174 BEQ for ' ',
+                 * +178 ('+' dispatch), +186 BEQ for '+',
+                 * +190 BRA past_body (fallthrough), +194 body. */
+                if (case_trace_budget > 0 &&
+                    (off == 92 || off == 110 || off == 118 ||
+                     off == 166 || off == 174 || off == 178 ||
+                     off == 186 || off == 190 || off == 194)) {
+                    uint32_t a6 = cpu->a[6] & 0xFFFFFF;
+                    uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                    uint8_t delim_byte = cpu->read8((a6 - 0x29) & 0xFFFFFF);
+                    uint16_t stack_top = cpu_read16(cpu, sp);
+                    fprintf(stderr,
+                      "[P128h-CASE] pc=+%u D0=$%08X D3=$%08X delim(A6-29)=$%02X top(SP)=$%04X\n",
+                      off, cpu->d[0], cpu->d[3], delim_byte, stack_top);
+                    case_trace_budget--;
+                }
+            }
+            /* DecompPath exit — dump the @device value that got stored */
+            if (decomp_ret_pc && cpu->pc == decomp_ret_pc &&
+                decomp_dev_addr) {
+                int16_t dev_out = (int16_t)cpu_read16(cpu,
+                                      decomp_dev_addr & 0xFFFFFF);
+                fprintf(stderr,
+                  "[P128h] DecompPath EXIT @dev=$%06X → dev=%d\n",
+                  decomp_dev_addr, dev_out);
+                decomp_ret_pc = 0;
+                decomp_dev_addr = 0;
+            }
+            /* Gobble entry — log delim output after return. For our
+             * "x" path we need to confirm delim actually comes back as
+             * ' ' (end of string) or something else. Gobble's 4th param
+             * @delim: char — 1 byte, caller-clean.
+             * Pascal sig: Gobble(var path, var i: integer, var name, var delim: char)
+             * At entry SP+4=@path, SP+8=@i, SP+12=@name, SP+16=@delim.
+             * We can't easily hook Gobble's exit, so log the entry; the
+             * DecompPath exit dump will show the resulting device anyway. */
+            if (pc_gobble && cpu->pc == pc_gobble && gobble_entries < 2) {
+                gobble_entries++;
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                uint32_t path_addr = cpu_read32(cpu, (sp + 4) & 0xFFFFFF) & 0xFFFFFF;
+                uint32_t i_addr = cpu_read32(cpu, (sp + 8) & 0xFFFFFF) & 0xFFFFFF;
+                uint32_t name_addr = cpu_read32(cpu, (sp + 12) & 0xFFFFFF) & 0xFFFFFF;
+                uint32_t delim_addr = cpu_read32(cpu, (sp + 16) & 0xFFFFFF) & 0xFFFFFF;
+                uint8_t plen = cpu->read8(path_addr & 0xFFFFFF);
+                uint16_t iv = cpu_read16(cpu, i_addr & 0xFFFFFF);
+                char pbuf[40];
+                int n = plen < 24 ? plen : 24;
+                for (int j = 0; j < n; j++)
+                    pbuf[j] = cpu->read8((path_addr + 1 + j) & 0xFFFFFF);
+                pbuf[n] = '\0';
+                fprintf(stderr,
+                  "[P128h] Gobble#%d path=$%06X(\"%s\" len=%d) i=%d @name=$%06X @delim=$%06X\n",
+                  gobble_entries, path_addr, pbuf, plen, iv, name_addr, delim_addr);
+                /* One-shot Gobble code dump */
+                static int gobble_code_dumped = 0;
+                if (!gobble_code_dumped) {
+                    gobble_code_dumped = 1;
+                    fprintf(stderr, "         Gobble code @$%06X (128 bytes):\n",
+                            pc_gobble);
+                    for (int off = 0; off < 128; off += 16) {
+                        fprintf(stderr, "           +%03d:", off);
+                        for (int b = 0; b < 16; b += 2)
+                            fprintf(stderr, " %04X",
+                                cpu_read16(cpu, (pc_gobble + off + b) & 0xFFFFFF));
+                        fprintf(stderr, "\n");
+                    }
+                }
+            }
+        }
+
         /* Diagnostic: on entry to FIND_EMPTYSLOT, dump the first few configinfo[]
          * entries and their devnames so we can see why the scan doesn't find a
          * 'BITBKT' slot. configinfo lives at A5-$A0 (signed 32-bit global offset
