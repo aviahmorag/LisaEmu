@@ -506,6 +506,11 @@ static int g_pc_ring_idx = 0;
 static int g_pc_ring_gen = -1;
 
 int g_emu_generation = 0;
+bool g_p128f_watch_armed = false;
+uint32_t g_p128f_last_pc = 0;
+uint32_t g_p128f_last_a6 = 0;
+uint32_t g_p128f_last_a0 = 0;
+uint32_t g_p128f_last_sp = 0;
 int g_vec_guard_active = 0;  /* P78d: set after SYS_PROC_INIT to protect vector table */
 int m68k_exception_histogram[256] = {0};
 #define exception_histogram m68k_exception_histogram
@@ -5119,21 +5124,54 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             static uint32_t gs_pending_ret = 0;
             static uint32_t gs_pending_varptr = 0;
             static uint32_t gs_pending_amount = 0;
+            static uint32_t gs_pending_b_area = 0;
             static int gs_pending_gen = 0;
             if (gs_pending_gen != g_emu_generation) {
                 gs_pending_ret = 0; gs_pending_varptr = 0;
-                gs_pending_amount = 0; gs_pending_gen = g_emu_generation;
+                gs_pending_amount = 0; gs_pending_b_area = 0;
+                gs_pending_gen = g_emu_generation;
             }
             if (pc_GETSPACE && cpu->pc == pc_GETSPACE) {
                 uint32_t sp = cpu->a[7] & 0xFFFFFF;
                 gs_pending_ret    = cpu_read32(cpu, sp) & 0xFFFFFF;
                 gs_pending_amount = cpu_read16(cpu, sp + 4);
+                gs_pending_b_area = cpu_read32(cpu, sp + 6) & 0xFFFFFF;
                 gs_pending_varptr = cpu_read32(cpu, sp + 10) & 0xFFFFFF;
             } else if (gs_pending_ret && cpu->pc == gs_pending_ret) {
                 uint32_t allocated = cpu_read32(cpu, gs_pending_varptr) & 0xFFFFFF;
-                /* Only zero when allocation landed in RAM-like range. */
+                /* P128f sanity gate: the zero-fill HLE was helpfully
+                 * zero-initializing the allocated chunk to give Pascal
+                 * GETSPACE calloc semantics. But when GETSPACE itself
+                 * returns a NONSENSE address (e.g. one pointing into
+                 * the supervisor stack — observed when the OPEN_SFILE
+                 * call chain hits GetFCB after fs_mount completes), the
+                 * zero-fill propagates the bug into a corruption of
+                 * caller stack frames.
+                 *
+                 * Gate: only zero-fill when `allocated` lies inside the
+                 * SAME 64KB region as the requested b_area — i.e. it's
+                 * actually a chunk in the right pool. If not, skip the
+                 * zero-fill silently; the Pascal caller will see whatever
+                 * GETSPACE returned (broken or not) and either succeed
+                 * or fail naturally without us amplifying the damage. */
+                bool same_pool = ((allocated >> 16) == (gs_pending_b_area >> 16));
+                if (g_p128f_watch_armed) {
+                    static int p128f_zero_logs = 0;
+                    if (p128f_zero_logs < 5) {
+                        fprintf(stderr,
+                          "[P128f-ZF] GETSPACE ret_PC=$%06X varptr=$%06X "
+                          "b_area=$%06X allocated=$%06X amount=%u %s\n",
+                          gs_pending_ret, gs_pending_varptr,
+                          gs_pending_b_area, allocated,
+                          gs_pending_amount,
+                          same_pool ? "(SAME_POOL → zero-fill)" :
+                                     "(OUT-OF-POOL → skip zero-fill)");
+                        p128f_zero_logs++;
+                    }
+                }
                 if (allocated >= 0x000400 && allocated + gs_pending_amount <= 0xFE0000
-                        && gs_pending_amount > 0 && gs_pending_amount < 0x10000) {
+                        && gs_pending_amount > 0 && gs_pending_amount < 0x10000
+                        && same_pool) {
                     for (uint32_t i = 0; i < gs_pending_amount; i++)
                         cpu_write8(cpu, allocated + i, 0);
                 }
@@ -5374,8 +5412,12 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 {"Queue_Process",  0},
                 {"open_temp",      0}, {"DS_OPEN",        0},
                 {"MAKE_DATASEG",   0},
+                {"slist_io",       0}, {"OPEN_SFILE",     0},
+                {"FMAP_IO",        0}, {"hentry_io",      0},
+                {"psio",           0}, {"vm",             0},
+                {"real_mount",     0},
             };
-            static uint32_t pcs_cache[55];
+            static uint32_t pcs_cache[64];
             static int pci_gen = -1;
             if (pci_gen != g_emu_generation) {
                 pci_gen = g_emu_generation;
@@ -5687,6 +5729,217 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                           path_addr, len, path_buf, dev_addr);
                         p128e_split_count++;
                         p128e_log_count++;
+                    }
+                }
+                /* P128f slist_io probe — fire ALWAYS (not gated by
+                 * Make_SProcess) since slist_io fires during fs_mount
+                 * BEFORE Make_SProcess. Dumps the device, sfile, op,
+                 * @addr, computed page/offset, AND the bytes at @addr
+                 * after vm() returns (next time slist_io's RTS fires).
+                 * Pascal slist_io(var ecode, device, sfile, op, var addr)
+                 * SP+4=@ecode SP+8=device(w) SP+10=sfile(w) SP+12=op(w)
+                 * SP+14=@addr (4) */
+                {
+                    static int p128f_log = 0;
+                    static uint32_t p128f_last_addr = 0;
+                    static uint32_t p128f_last_sfile = 0;
+                    static uint32_t pc_slist = 0;
+                    static int p128f_gen = -1;
+                    if (p128f_gen != g_emu_generation) {
+                        p128f_gen = g_emu_generation;
+                        pc_slist = boot_progress_lookup("slist_io");
+                        p128f_log = 0;
+                    }
+                    if (pc_slist && cpu->pc == pc_slist && p128f_log < 8) {
+                        uint32_t sp = cpu->a[7];
+                        uint32_t ecode_a = cpu_read32(cpu, sp + 4);
+                        int16_t device = (int16_t)cpu_read16(cpu, sp + 8);
+                        int16_t sfile = (int16_t)cpu_read16(cpu, sp + 10);
+                        int16_t op = (int16_t)cpu_read16(cpu, sp + 12);
+                        uint32_t addr = cpu_read32(cpu, sp + 14);
+                        fprintf(stderr,
+                          "[P128f] slist_io ENTRY device=%d sfile=%d op=%d "
+                          "@ecode=$%06X @addr=$%08X\n",
+                          device, sfile, op, ecode_a, addr);
+                        /* Dump sentry bytes BEFORE vm runs */
+                        fprintf(stderr, "         sentry@$%06X PRE: ",
+                                addr & 0xFFFFFF);
+                        for (int b = 0; b < 14; b++)
+                            fprintf(stderr, "%02X",
+                                    cpu->read8((addr + b) & 0xFFFFFF));
+                        fprintf(stderr, "\n");
+                        p128f_last_addr = addr;
+                        p128f_last_sfile = (uint16_t)sfile;
+                        p128f_log++;
+                    }
+                    /* Fire when we land on the byte AFTER slist_io's
+                     * BSR back. Hard to compute; instead capture every
+                     * time we exit slist_io's range — i.e. PC moves
+                     * from inside slist_io to outside. Use the PC of
+                     * the next symbol (ResetFmap = $066C98). */
+                    static uint32_t p128f_dump_done = 0;
+                    if (p128f_last_addr && p128f_log <= 16 &&
+                        cpu->pc == 0x066C98 && p128f_dump_done < 3) {
+                        /* This won't always fire — a heuristic. Better
+                         * to add a real EXIT hook. For now, just dump
+                         * @addr after every slist_io entry once we
+                         * see ANY pc change to indicate slist_io exited. */
+                        p128f_dump_done++;
+                    }
+                    /* Watch the devnum slot inside OPEN_SFILE's frame.
+                     * After OPEN_SFILE entry+LINK, devnum lives at
+                     * A6+14. Track when it changes from 37 → 0.
+                     * Also set globals consumed by lisa_mmu.c watchpoint. */
+                    extern bool g_p128f_watch_armed;
+                    extern uint32_t g_p128f_last_pc;
+                    extern uint32_t g_p128f_last_a6, g_p128f_last_a0,
+                                    g_p128f_last_sp;
+                    g_p128f_last_pc = cpu->pc;
+                    g_p128f_last_a6 = cpu->a[6];
+                    g_p128f_last_a0 = cpu->a[0];
+                    g_p128f_last_sp = cpu->a[7];
+                    static uint32_t open_sfile_a6 = 0;
+                    static int16_t  open_sfile_last_devnum = -1;
+                    static int      p128f_watch_logs = 0;
+                    if (cpu->pc == 0x009404 /* just after LINK */) {
+                        open_sfile_a6 = cpu->a[6] & 0xFFFFFF;
+                        open_sfile_last_devnum = (int16_t)cpu_read16(cpu,
+                            (open_sfile_a6 + 14) & 0xFFFFFF);
+                        fprintf(stderr,
+                          "[P128f] WATCH armed: A6=$%06X devnum=%d (slot at $%06X)\n",
+                          open_sfile_a6, open_sfile_last_devnum,
+                          (open_sfile_a6 + 14) & 0xFFFFFF);
+                        p128f_watch_logs = 0;
+                        g_p128f_watch_armed = true;
+                    } else if (open_sfile_a6 != 0 && p128f_watch_logs < 8) {
+                        int16_t cur = (int16_t)cpu_read16(cpu,
+                            (open_sfile_a6 + 14) & 0xFFFFFF);
+                        if (cur != open_sfile_last_devnum) {
+                            fprintf(stderr,
+                              "[P128f] WATCH devnum CHANGED %d → %d at PC=$%06X "
+                              "A0=$%08X A1=$%08X SP=$%06X\n",
+                              open_sfile_last_devnum, cur, cpu->pc,
+                              cpu->a[0], cpu->a[1], cpu->a[7] & 0xFFFFFF);
+                            open_sfile_last_devnum = cur;
+                            p128f_watch_logs++;
+                        }
+                    }
+                    /* When entering GETSPACE ($0072CA) inside the OPEN_SFILE
+                     * call chain, dump the @allocaddr arg (3rd arg). For
+                     * GETSPACE(size:int2; b_area:absptr; var allocaddr:int2),
+                     * args pushed right-to-left → @allocaddr at SP+4 (top
+                     * after JSR). */
+                    /* Probe at the MOVE.L D0,(A0) inside GETSPACE
+                     * ($0076C8) — log D0 (= the value GETSPACE is about
+                     * to write as the allocated address). */
+                    static int p128f_gs_store_logs = 0;
+                    if (cpu->pc == 0x0076C8 && open_sfile_a6 != 0 &&
+                        p128f_gs_store_logs < 5) {
+                        fprintf(stderr,
+                          "[P128f-GS-STORE] PC=$0076C8 D0=$%08X D1=$%08X "
+                          "D2=$%08X A0=$%08X (about to MOVE.L D0 to (A0))\n",
+                          cpu->d[0], cpu->d[1], cpu->d[2], cpu->a[0]);
+                        p128f_gs_store_logs++;
+                    }
+                    static int p128f_gs_logs = 0;
+                    if (cpu->pc == 0x0072CA && open_sfile_a6 != 0 &&
+                        p128f_gs_logs < 30) {
+                        uint32_t sp = cpu->a[7];
+                        /* Pascal right-to-left push: @allocaddr first
+                         * (at SP+10), b_area second (SP+6), size last
+                         * (SP+4 as word). */
+                        uint16_t sz = cpu_read16(cpu, sp + 4);
+                        uint32_t ba = cpu_read32(cpu, sp + 6);
+                        uint32_t aa = cpu_read32(cpu, sp + 10);
+                        fprintf(stderr,
+                          "[P128f] GETSPACE entry size=%d b_area=$%06X "
+                          "@allocaddr=$%06X (devnum_slot=$%06X) %s\n",
+                          sz, ba, aa,
+                          (open_sfile_a6 + 14) & 0xFFFFFF,
+                          (aa == ((open_sfile_a6 + 14) & 0xFFFFFF)) ?
+                            "← MATCH! GETSPACE writes here" : "");
+                        p128f_gs_logs++;
+                    }
+                    /* Probe at OPEN_SFILE entry ($009400) to log devnum
+                     * arg. Pascal sig: open_sfile(var ecode, sfile,
+                     * devnum, var fcbptr). At entry SP+0=ret, SP+4=@ecode,
+                     * SP+8=sfile(w), SP+10=devnum(w), SP+12=@fcbptr.
+                     * NOTE: based on call-site asm decoding, args appear
+                     * to be pushed in REVERSE order (right-to-left), so
+                     * @ecode is on top after JSR. */
+                    static int p128f_open_entries = 0;
+                    if (cpu->pc == 0x009400 && p128f_open_entries < 5) {
+                        uint32_t sp = cpu->a[7];
+                        uint32_t ecode = cpu_read32(cpu, sp + 4);
+                        int16_t sfile = (int16_t)cpu_read16(cpu, sp + 8);
+                        int16_t devnum = (int16_t)cpu_read16(cpu, sp + 10);
+                        uint32_t fcb = cpu_read32(cpu, sp + 12);
+                        fprintf(stderr,
+                          "[P128f] OPEN_SFILE ENTRY @ecode=$%06X sfile=%d "
+                          "devnum=%d @fcb=$%06X (stack: $%08X $%08X $%08X $%08X)\n",
+                          ecode, sfile, devnum, fcb,
+                          cpu_read32(cpu, sp), cpu_read32(cpu, sp+4),
+                          cpu_read32(cpu, sp+8), cpu_read32(cpu, sp+12));
+                        p128f_open_entries++;
+                    }
+                    /* Probe at $009DDE (JSR signal_sem inside OPEN_SFILE
+                     * cleanup) — dump A0 (which holds @semio) and the
+                     * actual mounttable[devnum] value to see why it's
+                     * landing at badptr1+$6C. */
+                    static int p128f_cleanup_probes = 0;
+                    if (cpu->pc == 0x009DDE && p128f_cleanup_probes < 3) {
+                        uint32_t mt_off = boot_progress_lookup("mounttable");
+                        uint32_t mt_abs = (cpu->a[5] + mt_off) & 0xFFFFFF;
+                        /* devnum sat at A6+$E in OPEN_SFILE */
+                        int16_t dev = (int16_t)cpu_read16(cpu,
+                            (cpu->a[6] + 14) & 0xFFFFFF);
+                        uint32_t mt_dev = cpu_read32(cpu,
+                            (mt_abs + (uint16_t)dev * 4) & 0xFFFFFF);
+                        fprintf(stderr,
+                          "[P128f] OPEN_SFILE cleanup signal_sem PC=$009DDE "
+                          "A0=$%08X devnum=%d mt[%d]=$%08X (badptr1=$00414231)\n",
+                          cpu->a[0], dev, dev, mt_dev);
+                        p128f_cleanup_probes++;
+                    }
+                    /* Probe at PC = $0095B0, the instruction RIGHT AFTER
+                     * the JSR slist_io call inside OPEN_SFILE. ecode is
+                     * in *@ecode, sentry is at @addr. Captures what the
+                     * OS sees post-slist_io. */
+                    static int p128f_post_dumps = 0;
+                    if (cpu->pc == 0x0095B0 && p128f_post_dumps < 4 &&
+                        p128f_last_addr) {
+                        uint16_t ecode_v = cpu_read16(cpu,
+                                              (uint32_t)0x00CBFFB8 & 0xFFFFFF);
+                        /* Read ecode via the saved @ecode addr from entry */
+                        fprintf(stderr,
+                          "[P128f] OPEN_SFILE post-slist_io PC=$0095B0 "
+                          "@addr=$%08X sfile=%d\n",
+                          p128f_last_addr, p128f_last_sfile);
+                        fprintf(stderr, "         sentry@$%06X: ",
+                                p128f_last_addr & 0xFFFFFF);
+                        for (int b = 0; b < 14; b++)
+                            fprintf(stderr, "%02X",
+                                    cpu->read8((p128f_last_addr + b) & 0xFFFFFF));
+                        fprintf(stderr, " (ecode=%d)\n", ecode_v);
+                        /* Decode sentry */
+                        uint32_t hint = ((uint32_t)cpu->read8((p128f_last_addr + 0) & 0xFFFFFF) << 24) |
+                                        ((uint32_t)cpu->read8((p128f_last_addr + 1) & 0xFFFFFF) << 16) |
+                                        ((uint32_t)cpu->read8((p128f_last_addr + 2) & 0xFFFFFF) << 8) |
+                                        ((uint32_t)cpu->read8((p128f_last_addr + 3) & 0xFFFFFF));
+                        uint32_t fa = ((uint32_t)cpu->read8((p128f_last_addr + 4) & 0xFFFFFF) << 24) |
+                                      ((uint32_t)cpu->read8((p128f_last_addr + 5) & 0xFFFFFF) << 16) |
+                                      ((uint32_t)cpu->read8((p128f_last_addr + 6) & 0xFFFFFF) << 8) |
+                                      ((uint32_t)cpu->read8((p128f_last_addr + 7) & 0xFFFFFF));
+                        uint32_t fs = ((uint32_t)cpu->read8((p128f_last_addr + 8) & 0xFFFFFF) << 24) |
+                                      ((uint32_t)cpu->read8((p128f_last_addr + 9) & 0xFFFFFF) << 16) |
+                                      ((uint32_t)cpu->read8((p128f_last_addr + 10) & 0xFFFFFF) << 8) |
+                                      ((uint32_t)cpu->read8((p128f_last_addr + 11) & 0xFFFFFF));
+                        fprintf(stderr,
+                          "         decoded: hintaddr=%u fileaddr=%u filesize=%u%s\n",
+                          hint, fa, fs,
+                          (hint == 0 || (int32_t)hint <= 0) ?
+                            " ← TRIGGERS E1_SENTRY_BAD" : " (OK)");
+                        p128f_post_dumps++;
                     }
                 }
             }

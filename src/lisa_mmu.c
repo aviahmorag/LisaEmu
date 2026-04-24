@@ -319,7 +319,34 @@ static void update_mmu_context(lisa_mem_t *mem) {
     mem->mmu_enabled = true;
 }
 
+extern bool g_p128f_watch_armed;
+extern uint32_t g_p128f_last_pc;
+extern uint32_t g_p128f_last_a6;
+extern uint32_t g_p128f_last_a0;
+extern uint32_t g_p128f_last_sp;
+
 void lisa_mem_write8(lisa_mem_t *mem, uint32_t addr, uint8_t val) {
+    /* P128f watchpoint — log writes that touch the OPEN_SFILE devnum
+     * slot at $CBFF2C..$CBFF2D so we can pinpoint the corrupting site.
+     * Only active when WATCH is armed (= we're inside OPEN_SFILE). */
+    extern int g_emu_generation;
+    static int p128f_w8_gen = -1;
+    static int p128f_w8_count = 0;
+    if (p128f_w8_gen != g_emu_generation) {
+        p128f_w8_gen = g_emu_generation;
+        p128f_w8_count = 0;
+    }
+    uint32_t a = addr & 0xFFFFFF;
+    if (g_p128f_watch_armed && (a == 0xCBFF2C || a == 0xCBFF2D) &&
+        p128f_w8_count < 8) {
+        fprintf(stderr,
+          "[P128f-W8] write8 to $%06X val=$%02X "
+          "(PC=$%06X A6=$%06X A0=$%06X SP=$%06X)\n",
+          a, val, g_p128f_last_pc,
+          g_p128f_last_a6, g_p128f_last_a0, g_p128f_last_sp);
+        p128f_w8_count++;
+    }
+
     addr &= 0xFFFFFF;
 
     switch (addr_region(addr)) {
@@ -600,6 +627,23 @@ void lisa_mem_write8(lisa_mem_t *mem, uint32_t addr, uint8_t val) {
 
 void lisa_mem_write16(lisa_mem_t *mem, uint32_t addr, uint16_t val) {
     addr &= 0xFFFFFF;
+
+    /* P128f one-shot watchpoint: log writes to OPEN_SFILE devnum slot
+     * ($CBFF2C) so we can find what miscompile is clobbering it. */
+    extern int g_emu_generation;
+    static int p128f_w16_gen = -1;
+    static int p128f_w16_count = 0;
+    if (p128f_w16_gen != g_emu_generation) {
+        p128f_w16_gen = g_emu_generation;
+        p128f_w16_count = 0;
+    }
+    if (g_p128f_watch_armed && (addr & 0xFFFFFF) == 0xCBFF2C &&
+        p128f_w16_count < 8) {
+        fprintf(stderr,
+          "[P128f-W16] write16 to $CBFF2C val=$%04X (PC≈$%06X)\n",
+          val, g_p128f_last_pc);
+        p128f_w16_count++;
+    }
 
     /* HLE: Bypass Lisabug auto-entry on dev-disk boots.
      *

@@ -189,9 +189,100 @@ commit as the real replacement.
 | 11 | **Shell (APDM)** | full desktop | Not started |
 | 12 | **Apps** | LisaWrite, LisaCalc, etc. | Not started |
 
-## Current Status (2026-04-24 post-P128e — **diagnostic-only**: root-caused the 23/27 SYS_PROC_INIT wall, contradicting the post-P128d handoff hypothesis. The kernel pseudo-PCB does NOT block waiting for a MemMgr signal — it blocks on a **fake semaphore at a corrupted address** because of an upstream FS_INIT cascade. No code-behavior change shipped this session; only diagnostic probes added.)
+## Current Status (2026-04-24 post-P128f — **slist_io HLE shipped + vm HLE re-enabled + GETSPACE zero-fill sanity gate**. Boot reaches **23/27** (SYS_PROC_INIT) via the natural FS path now (the existing 10707 unwind still fires, but the 23/27 result no longer depends on it). The kernel pseudo-PCB block on a fake sem (P128e finding) is no longer the active blocker — fs_mount → real_mount → OPEN_SFILE → GetFCB now reaches a deeper Pascal allocator bug where compiled GETSPACE returns a stack-area address for a sysglobal pool allocation.)
 
-### P128e (2026-04-24 pm) — Diagnostic: root-caused the 23/27 wall
+### P128f (2026-04-24 pm) — slist_io HLE shipped, GETSPACE zero-fill gated
+
+Three fixes shipped this round, in order of discovery:
+
+**Fix 1 — `hle_handle_slist_io`** (`src/lisa.c`). Reads the requested
+s_entry directly from the slist on our profile image. Sits parallel
+to MDDF_IO and BitMap_IO HLEs — bypasses `vm → UltraIO → DISKIO`
+chain that would otherwise need a real IRQ-driven I/O completion to
+deliver the bytes. Verified empirically: pre-fix `vm()` returned
+`ecode=511` and DID NOT WRITE the sentry buffer; post-fix the
+sentry decodes correctly (hintaddr=1589, fileaddr=1590, filesize=3456
+for `rootsnum=3`). Wired into the dispatch alongside the other FS
+HLEs at `src/lisa.c:4416`-ish.
+
+**Fix 2 — re-enabled `hle_handle_vm`** (`src/lisa.c:4538`). The
+P108 `hle_handle_vm` (general-purpose page-aware sub-block reader)
+was gated off after a previous regression. With slist_io HLE in
+place, the regression no longer applies — vm now handles
+`hentry_io / FMAP_IO / pglblio` cleanly. Toggle: `#if 1` in the
+fsio_addr dispatch block.
+
+**Fix 3 — GETSPACE zero-fill sanity gate** (`src/m68k.c`). The
+existing GETSPACE post-RTS hook zero-fills the allocated chunk to
+give Pascal `GETSPACE` calloc semantics. But when compiled GETSPACE
+returns a bogus address (observed: `$CBFF1E` = OPEN_SFILE's saved
+A6, on the supervisor stack, returned by GetFCB's GETSPACE call
+inside fs_mount), the zero-fill amplifies the bug into stack
+corruption — wiping OPEN_SFILE's `devnum` parameter at A6+14, which
+caused the cleanup `signal_sem(mounttable[devnum]^.semio)` to read
+`mounttable[0]^.semio` (= badptr1 + $6C = bogus addr — the P128e
+bogus-sem). Gate: only zero when `(allocated >> 16) == (b_area >>
+16)` — i.e., allocated lives in the same 64KB region as the requested
+pool. Skip the zero-fill silently otherwise. Pascal allocator bugs
+will surface naturally as caller-visible failures rather than as
+stack corruption masquerading as deeper symptoms.
+
+### Probe sweep added in P128f
+
+`src/m68k.c` P128f probe block (additive to P128e):
+- `slist_io / OPEN_SFILE / FMAP_IO / hentry_io / psio / vm /
+  real_mount` added to `pcs[]` table (`pcs_cache[64]`)
+- `OPEN_SFILE ENTRY` probe at `$009400` decodes the call args
+- `OPEN_SFILE post-slist_io` probe at `$0095B0` dumps the sentry
+  bytes the OS sees, confirming whether vm wrote them
+- `OPEN_SFILE cleanup signal_sem` probe at `$009DDE` dumps A0,
+  devnum, and `mounttable[devnum]` so we can spot bogus sems
+- `WATCH armed` at `$009404` (post-LINK) latches OPEN_SFILE's A6
+  so we can monitor `devnum` clobbering throughout the call
+- `GETSPACE entry` probe at `$0072CA` decodes size/b_area/@allocaddr
+- `GETSPACE-STORE` probe at `$0076C8` (gated on `open_sfile_a6 != 0`)
+  was added but never fires — execution skips that path in our
+  trace (TODO: verify if Pascal pool walk takes a different exit)
+- `GETSPACE-ZF` probe at the post-RTS hook decodes whether the
+  allocation is in-pool or out-of-pool (see Fix 3)
+
+`src/lisa_mmu.c` adds a P128f write watchpoint:
+- `lisa_mem_write8` and `lisa_mem_write16` log writes to
+  `$CBFF2C..$CBFF2D` (the OPEN_SFILE devnum slot in the trace's
+  specific frame) when `g_p128f_watch_armed` is true
+- Globals `g_p128f_watch_armed`, `g_p128f_last_pc`,
+  `g_p128f_last_a6`, `g_p128f_last_a0`, `g_p128f_last_sp` defined
+  in `m68k.c`, set per-instruction inside the P128e/P128f probe
+  block, consumed by the write hook
+
+These probes are **load-bearing diagnostic infrastructure**.
+Do not remove them.
+
+### Next blocker (P128g territory)
+
+**Pascal `GETSPACE` returns invalid stack-area address `$CBFF1E`
+for a sysglobal pool allocation** (`size=254 b_area=$CC6FE0`).
+GetFCB requested 254 bytes from sysglobal; GETSPACE walked the
+free list and ended up at `currfree = $CBFF1C` (a stack address),
+returning `ordaddr = currfree + 2 = $CBFF1E`. Possible causes:
+
+1. **Corrupted pool header**. The sysglobal pool header at
+   `b_sysglobal - 24575` (= `$CC1001` for our boot) has
+   `firstfree` field that ends up pointing into stack memory.
+   If something earlier wrote bad data into the pool header,
+   the free-list walk follows broken next-pointers into garbage.
+2. **Codegen miscompile** in GETSPACE's free-list walk. P125
+   identified a class of `ptr^[i]` codegen failures (~40 sites
+   per build) that default to `array_low=0, elem_size=2` when
+   pointer-to-array type chains don't resolve. GETSPACE's free
+   list traversal might be hitting a sibling site of that bug.
+
+Per CLAUDE.md note on P111 ("Our compiled MM4.TEXT:GetFree is
+allocating LOW pages that overlap kernel A5-globals") this is a
+known class of bug in our compiled allocator. **Fix it once and
+many downstream FS / process-creation paths get unblocked.**
+
+### P128e (2026-04-24 mid) — Diagnostic that root-caused the cascade
 
 **The post-P128d handoff hypothesized "MemMgr fails to signal a sem
 during init handshake." That hypothesis was wrong.** Empirical probes

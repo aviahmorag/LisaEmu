@@ -3701,6 +3701,103 @@ static bool hle_handle_bitmap_io(lisa_t *lisa, m68k_t *cpu) {
     return true;
 }
 
+/* P128f: HLE slist_io. Reads the requested s_entry directly from
+ * the slist on our profile image. Sits parallel to MDDF_IO and
+ * BitMap_IO HLEs — bypasses vm → UltraIO → DISKIO chain that would
+ * otherwise need a real IRQ-driven I/O completion to actually
+ * deliver the bytes (Phase 5 work).
+ *
+ * Without this HLE: vm() returns ecode > 0 and DOES NOT WRITE the
+ * sentry buffer. open_sfile then sees `ecode > 0 OR sentry.hintaddr
+ * <= 0` → ecode := E1_SENTRY_BAD = 871 → propagates up to FS_INIT →
+ * SYSTEM_ERROR(stup_fsinit) = 10707 → 10707 HLE unwinds out of
+ * FS_INIT WITHOUT running FS_SETUP → kernel pseudo-PCB has
+ * working_dev=-1 → cascading bogus-sem block during Make_SProcess.
+ *
+ * With this HLE: open_sfile gets a valid sentry → fs_mount
+ * completes normally → FS_SETUP runs → working_dev:=bootdev → kernel
+ * can create system processes through the proper FS path.
+ *
+ * Pascal signature (callee-clean? actually caller-clean, see asm at
+ * $0095B0 = `ADDA.W #14,A7` after JSR):
+ *   procedure slist_io( var ecode  : error;     [SP+4]   4
+ *                            device : integer;   [SP+8]   2
+ *                            s_file : integer;   [SP+10]  2
+ *                            op     : ioop;      [SP+12]  2
+ *                        var addr  : s_entry );  [SP+14]  4
+ *
+ * Retires when Phase 5 IRQ-driven I/O completion is fully wired so
+ * the real vm() can deliver bytes to the sentry buffer end-to-end.
+ */
+__attribute__((unused))
+static bool hle_handle_slist_io(lisa_t *lisa, m68k_t *cpu) {
+    uint32_t sp = cpu->a[7] & 0xFFFFFF;
+    uint32_t ret_addr  = cpu_read32(cpu, sp + 0);
+    uint32_t ecode_ptr = cpu_read32(cpu, sp + 4);
+    int16_t  device    = (int16_t)cpu_read16(cpu, sp + 8);
+    int16_t  sfile     = (int16_t)cpu_read16(cpu, sp + 10);
+    int16_t  op        = (int16_t)cpu_read16(cpu, sp + 12);
+    uint32_t addr      = cpu_read32(cpu, sp + 14);
+    bool read_op = (op == 0);
+
+    DBGSTATIC(int, sli_trace, 0);
+    if (sli_trace < 8) {
+        sli_trace++;
+        fprintf(stderr,
+          "HLE slist_io: %s dev=%d sfile=%d @ecode=$%06X @addr=$%06X\n",
+          read_op ? "READ" : "WRITE", device, sfile,
+          ecode_ptr, addr);
+    }
+
+    int16_t error = 0;
+
+    if (!lisa->profile.mounted || ldr_fs.slist_packing <= 0 ||
+        ldr_fs.slist_addr <= 0 || sfile < 0) {
+        error = 511; /* same code real vm returned */
+    } else {
+        /* Compute slist disk block + offset of this sentry within data */
+        int32_t spage_fs   = (sfile / ldr_fs.slist_packing) + ldr_fs.slist_addr;
+        int     soffset    = (sfile % ldr_fs.slist_packing) * 14;
+        int32_t block0     = ldr_fs.geo_firstblock;
+        if (block0 <= 0 || block0 > ldr_fs.fs_block0)
+            block0 = ldr_fs.fs_block0;
+        uint32_t disk_block = (uint32_t)(block0 + spage_fs);
+
+        if (soffset + 14 > 512) {
+            error = 511;
+        } else if (read_op) {
+            uint8_t block_data[PROFILE_DATA_SIZE];
+            if (hle_read_block(lisa, disk_block, block_data, NULL) != 0) {
+                error = 511;
+            } else {
+                for (int b = 0; b < 14; b++)
+                    cpu->write8(mask_24(addr + b), block_data[soffset + b]);
+            }
+        } else {
+            /* WRITE: read-modify-write the slist block. The OS rarely
+             * writes slist during boot, but support it for correctness. */
+            uint8_t block_data[PROFILE_DATA_SIZE];
+            if (hle_read_block(lisa, disk_block, block_data, NULL) != 0) {
+                error = 511;
+            } else {
+                for (int b = 0; b < 14; b++)
+                    block_data[soffset + b] = cpu->read8(mask_24(addr + b));
+                if (hle_write_block(lisa, disk_block, block_data, NULL) != 0)
+                    error = 511;
+            }
+        }
+    }
+
+    if (ecode_ptr)
+        cpu->write16(mask_24(ecode_ptr), (uint16_t)error);
+
+    /* Pop retAddr, return. Caller cleans the 14 bytes of args. */
+    cpu->a[7] += 4;
+    cpu->pc = ret_addr;
+    cpu->cycles += 80;
+    return true;
+}
+
 /* P108: shared helper — translate an absolute fs-page to a physical disk
  * block on our ProFile image using ldr_fs.geo_firstblock (MDDF's
  * geography.firstblock; falls back to fs_block0, the disk block where
@@ -4376,6 +4473,7 @@ bool lisa_hle_intercept(lisa_t *lisa, m68k_t *cpu) {
         static uint32_t psio_addr        = 0;
         static uint32_t vm_addr          = 0;
         static uint32_t makesgspace_addr = 0;
+        static uint32_t slist_io_addr    = 0;
         static int      fsio_probe_gen = -1;
         if (fsio_probe_gen != g_emu_generation) {
             fsio_probe_gen = g_emu_generation;
@@ -4386,6 +4484,7 @@ bool lisa_hle_intercept(lisa_t *lisa, m68k_t *cpu) {
             vm_addr          = boot_progress_lookup("VM");
             if (!vm_addr) vm_addr = boot_progress_lookup("vm");
             makesgspace_addr = boot_progress_lookup("MakeSGSpace");
+            slist_io_addr    = boot_progress_lookup("slist_io");
         }
         /* P119 investigation: tried re-enabling MDDF_IO HLE plus a
          * parallel BitMap_IO HLE (+ narrow NOT-fix for blockstructured).
@@ -4415,9 +4514,12 @@ bool lisa_hle_intercept(lisa_t *lisa, m68k_t *cpu) {
             return hle_handle_bitmap_io(lisa, cpu);
         if (makesgspace_addr && pc == makesgspace_addr)
             return hle_handle_makesgspace(lisa, cpu);
+        if (slist_io_addr && pc == slist_io_addr)
+            return hle_handle_slist_io(lisa, cpu);
 #else
         (void)mddf_io_addr;
         (void)bitmap_io_addr;
+        (void)slist_io_addr;
 #endif
         /* P108 (unshipped): psio and vm HLEs compile but are gated off.
          * Together they carry real_mount and fs_mount past bitmap_io /
@@ -4431,12 +4533,23 @@ bool lisa_hle_intercept(lisa_t *lisa, m68k_t *cpu) {
          * open_sfile / wait_sem properly, or (b) Phase 3 proper
          * (compiled SYSTEM.CD_PROFILE populates ext_diskconfig so the
          * real psio/vm chain works through UltraIO). */
-        (void)psio_addr; (void)vm_addr;
+        (void)psio_addr;
+        /* P128f re-enable: with slist_io HLE in place, vm now correctly
+         * handles the rest of the FS sub-block reads (HENTRY_IO,
+         * FMAP_IO, pglblio) that follow successful fs_mount. The P108
+         * regression "10707 unwind lands short of SYS_PROC_INIT" no
+         * longer applies — fs_mount completes naturally now, FS_SETUP
+         * runs, and 10707 doesn't fire. */
+        #if 1
+        if (vm_addr && pc == vm_addr)
+            return hle_handle_vm(lisa, cpu);
+        #endif
+        /* psio HLE still gated off — its interposition may interact
+         * with other paths; revisit if a future failure traces to
+         * an un-intercepted psio call. */
         #if 0
         if (psio_addr && pc == psio_addr)
             return hle_handle_psio(lisa, cpu);
-        if (vm_addr && pc == vm_addr)
-            return hle_handle_vm(lisa, cpu);
         #endif
     }
 
