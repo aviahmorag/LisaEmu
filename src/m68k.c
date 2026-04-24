@@ -5158,12 +5158,25 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 if (g_p128f_watch_armed) {
                     static int p128f_zero_logs = 0;
                     if (p128f_zero_logs < 5) {
+                        /* Dump pool header at the adjusted pool address.
+                         * For sysglobal: pool_hdr is at b_area - 24575
+                         * (the same offset the Pascal GETSPACE uses).
+                         * Header layout:
+                         *   +0 pool_size  (int2, in WORDS)
+                         *   +2 firstfree  (int4, byte offset, 0 = empty)
+                         *   +6 freecount  (int2, WORDS available) */
+                        uint32_t hdr = gs_pending_b_area - 24575;
+                        uint16_t psize = cpu_read16(cpu, hdr) & 0xFFFF;
+                        uint32_t fff = cpu_read32(cpu, hdr + 2);
+                        uint16_t fc = cpu_read16(cpu, hdr + 6) & 0xFFFF;
                         fprintf(stderr,
                           "[P128f-ZF] GETSPACE ret_PC=$%06X varptr=$%06X "
-                          "b_area=$%06X allocated=$%06X amount=%u %s\n",
+                          "b_area=$%06X allocated=$%06X amount=%u D0=$%08X "
+                          "[hdr@$%06X size=%u ff=$%X fc=%u (=%u bytes)] %s\n",
                           gs_pending_ret, gs_pending_varptr,
                           gs_pending_b_area, allocated,
-                          gs_pending_amount,
+                          gs_pending_amount, cpu->d[0],
+                          hdr, psize, fff, fc, fc * 2,
                           same_pool ? "(SAME_POOL → zero-fill)" :
                                      "(OUT-OF-POOL → skip zero-fill)");
                         p128f_zero_logs++;
@@ -5840,6 +5853,30 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                           "D2=$%08X A0=$%08X (about to MOVE.L D0 to (A0))\n",
                           cpu->d[0], cpu->d[1], cpu->d[2], cpu->a[0]);
                         p128f_gs_store_logs++;
+                    }
+                    /* P128f probe at GETSPACE no-space exit ($00769C):
+                     * after BEQ at $007698 NOT taken (= currfree wraps
+                     * back to c_pool_ptr → no free area found), tries
+                     * EXP_POOLSPACE then sets getspace:=false. Log so
+                     * we can confirm the GetFCB/OPEN_SFILE failure path. */
+                    static int p128f_no_space_logs = 0;
+                    if (cpu->pc == 0x00769C && open_sfile_a6 != 0 &&
+                        p128f_no_space_logs < 4) {
+                        fprintf(stderr,
+                          "[P128f-NO-SPACE] GETSPACE took no-space path "
+                          "PC=$00769C D0=$%08X (will try EXP_POOLSPACE)\n",
+                          cpu->d[0]);
+                        p128f_no_space_logs++;
+                    }
+                    /* Probe at GETSPACE failed-final ($0076B0) — shows
+                     * EXP_POOLSPACE result (D0). Per asm: 0=fail, 1=ok. */
+                    static int p128f_exp_logs = 0;
+                    if (cpu->pc == 0x0076B0 && open_sfile_a6 != 0 &&
+                        p128f_exp_logs < 4) {
+                        fprintf(stderr,
+                          "[P128f-EXP-RES] EXP_POOLSPACE returned D0=$%08X\n",
+                          cpu->d[0]);
+                        p128f_exp_logs++;
                     }
                     static int p128f_gs_logs = 0;
                     if (cpu->pc == 0x0072CA && open_sfile_a6 != 0 &&
