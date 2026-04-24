@@ -347,21 +347,6 @@ void lisa_mem_write8(lisa_mem_t *mem, uint32_t addr, uint8_t val) {
         p128f_w8_count++;
     }
 
-    /* P128g pool-split 8-bit watch */
-    {
-        static int p128g_pool8_gen = -1;
-        static int p128g_pool8_count = 0;
-        if (p128g_pool8_gen != g_emu_generation) {
-            p128g_pool8_gen = g_emu_generation;
-            p128g_pool8_count = 0;
-        }
-        if (a >= 0xCCBE8A && a <= 0xCCBE8D && p128g_pool8_count < 16) {
-            fprintf(stderr,
-              "[P128g-POOL8] write8 to $%06X val=$%02X (PC=$%06X)\n",
-              a, val, g_p128f_last_pc);
-            p128g_pool8_count++;
-        }
-    }
 
     addr &= 0xFFFFFF;
 
@@ -661,26 +646,6 @@ void lisa_mem_write16(lisa_mem_t *mem, uint32_t addr, uint16_t val) {
         p128f_w16_count++;
     }
 
-    /* P128g pool-split watchpoint — log 16-bit writes to the sysglobal
-     * pool's "split" zone around $CCBD4C..$CCBF00. Active at ALL times
-     * (no watch_armed gate) so we catch the corruption during call #58.
-     * Gated by count to avoid log explosion. */
-    {
-        extern uint32_t g_p128f_last_pc;
-        static int p128g_pool_gen = -1;
-        static int p128g_pool_count = 0;
-        if (p128g_pool_gen != g_emu_generation) {
-            p128g_pool_gen = g_emu_generation;
-            p128g_pool_count = 0;
-        }
-        uint32_t a = addr & 0xFFFFFF;
-        if (a >= 0xCCBE8A && a <= 0xCCBE8D && p128g_pool_count < 24) {
-            fprintf(stderr,
-              "[P128g-POOL16] write16 to $%06X val=$%04X (PC=$%06X)\n",
-              a, val, g_p128f_last_pc);
-            p128g_pool_count++;
-        }
-    }
 
     /* HLE: Bypass Lisabug auto-entry on dev-disk boots.
      *

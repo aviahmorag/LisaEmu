@@ -4502,25 +4502,37 @@ bool lisa_hle_intercept(lisa_t *lisa, m68k_t *cpu) {
          * The structural fix is Phase-5 (IRQ-driven I/O completion),
          * not more HLE layering. HLEs kept gated off for pickup
          * once IRQ completion lands. */
-/* P121: re-enabled alongside narrow boolean-NOT codegen fix and
- * P120 IRQ scaffold. Goal: trigger a real ProFile transaction so
- * the IRQ path earns its keep. Retires together when compiled
- * SYSTEM.CD_PROFILE handles psio→UltraIO natively + IRQ
- * completion fully wakes blocked processes. */
-#if 1
+/* P128g: retire MDDF_IO and BitMap_IO HLEs. Both were writing a
+ * fixed 512-byte disk block into the caller's buffer, but the
+ * caller allocates via `SuperGetspace(sizeof(MDDFdb), ...)` which
+ * is 316 bytes for MDDFdb (not 512 — our Pascal compile matches
+ * Apple's record layout here). The 512-byte write overflows by
+ * 196 bytes into the next sysglobal-pool chunk, clobbering the
+ * live freelist entry's `size` field — setting it to zero.
+ * After that, GETSPACE's freelist walk finds `size=0, next=0`
+ * and returns FALSE for every subsequent sysglobal allocation
+ * (the handoff's "GETSPACE(254) from GetFCB fails" symptom).
+ *
+ * Apple's real MDDF_IO / BitMap_IO call `psio(..., nbytes=...)`
+ * with `sizeof(MDDFdb)` / `bitmap_bytes`. Our `hle_handle_psio`
+ * (below) already respects nbytes: it reads full data-size pages
+ * plus a final partial page via RMW, copying only `extra` bytes
+ * out. So letting the COMPILED MDDF_IO / BitMap_IO run and
+ * intercepting at psio fixes the overflow at the right layer
+ * and retires two bug-prone length-ignorant HLEs in one move. */
+#if 0
         if (mddf_io_addr && pc == mddf_io_addr)
             return hle_handle_mddf_io(lisa, cpu);
         if (bitmap_io_addr && pc == bitmap_io_addr)
             return hle_handle_bitmap_io(lisa, cpu);
+#else
+        (void)mddf_io_addr;
+        (void)bitmap_io_addr;
+#endif
         if (makesgspace_addr && pc == makesgspace_addr)
             return hle_handle_makesgspace(lisa, cpu);
         if (slist_io_addr && pc == slist_io_addr)
             return hle_handle_slist_io(lisa, cpu);
-#else
-        (void)mddf_io_addr;
-        (void)bitmap_io_addr;
-        (void)slist_io_addr;
-#endif
         /* P108 (unshipped): psio and vm HLEs compile but are gated off.
          * Together they carry real_mount and fs_mount past bitmap_io /
          * slist_io, but the downstream open_sfile → wait_sem / cleanup
@@ -4533,7 +4545,6 @@ bool lisa_hle_intercept(lisa_t *lisa, m68k_t *cpu) {
          * open_sfile / wait_sem properly, or (b) Phase 3 proper
          * (compiled SYSTEM.CD_PROFILE populates ext_diskconfig so the
          * real psio/vm chain works through UltraIO). */
-        (void)psio_addr;
         /* P128f re-enable: with slist_io HLE in place, vm now correctly
          * handles the rest of the FS sub-block reads (HENTRY_IO,
          * FMAP_IO, pglblio) that follow successful fs_mount. The P108
@@ -4544,10 +4555,14 @@ bool lisa_hle_intercept(lisa_t *lisa, m68k_t *cpu) {
         if (vm_addr && pc == vm_addr)
             return hle_handle_vm(lisa, cpu);
         #endif
-        /* psio HLE still gated off — its interposition may interact
-         * with other paths; revisit if a future failure traces to
-         * an un-intercepted psio call. */
-        #if 0
+        /* P128g enable: psio HLE replaces MDDF_IO / BitMap_IO HLEs
+         * as the single interception point for block-structured disk
+         * reads. Respects the `nbytes` arg so partial-page reads
+         * (e.g. MDDFdb at 316 bytes / bitmap at N bytes) copy only
+         * the requested bytes via read-modify-write of the trailing
+         * page. No 512-byte overflow into the caller's next-chunk
+         * freelist metadata. */
+        #if 1
         if (psio_addr && pc == psio_addr)
             return hle_handle_psio(lisa, cpu);
         #endif

@@ -179,7 +179,7 @@ commit as the real replacement.
 | 1 | **PMEM + boot-CD selection** | Native `FIND_PM_IDS` via PRAM stub | ✅ Complete (2026-04-18 P90) |
 | 2 | **Real LOADER + filesystem** | source-LOADER.TEXT + source-ldlfs.text + real MDDF/slist/catalog/filemap on profile.image | In progress — started 2026-04-18 |
 | 3 | **First driver file (SYSTEM.CD_PROFILE)** | source-PROFILE.TEXT compiled as .OBJ, placed on disk with catalog entry | In progress — driver loads, dispatch armed |
-| 4 | **MDDF / disk-image full FS** | removes 10707 suppression; real FS_INIT / FS_MASTER_INIT | Not started |
+| 4 | **MDDF / disk-image full FS** | removes 10707 suppression; real FS_INIT / FS_MASTER_INIT | In progress — P128g retires MDDF_IO+BitMap_IO, psio HLE handles both via single nbytes-respecting intercept; FS_INIT completes naturally now (10707 no longer fires during boot) |
 | 5 | **IRQ-driven I/O completion** | removes Block_Process-on-POP deadlock | In progress — IRQ scaffold complete (P120), seg-alias guard shipped (P122); PARALLEL → IODONE still pending |
 | 6 | **SYS_PROC_INIT + real processes** | removes P89i + CreateProcess HLE pile; fixes Pascal `ptr^[i]` type-resolution class of bugs (P125 surfaced) | Not started — Make_SProcess blocked on codegen |
 | 7 | **Cleanup HLEs** (FS/MEM/PR_CLEANUP) | real cleanup bodies | Not started |
@@ -189,7 +189,84 @@ commit as the real replacement.
 | 11 | **Shell (APDM)** | full desktop | Not started |
 | 12 | **Apps** | LisaWrite, LisaCalc, etc. | Not started |
 
-## Current Status (2026-04-24 post-P128f — **slist_io HLE shipped + vm HLE re-enabled + GETSPACE zero-fill sanity gate**. Boot reaches **23/27** (SYS_PROC_INIT) via the natural FS path now (the existing 10707 unwind still fires, but the 23/27 result no longer depends on it). The kernel pseudo-PCB block on a fake sem (P128e finding) is no longer the active blocker — fs_mount → real_mount → OPEN_SFILE → GetFCB now reaches a deeper Pascal allocator bug where compiled GETSPACE returns a stack-area address for a sysglobal pool allocation.)
+## Current Status (2026-04-24 post-P128g — **psio HLE shipped; MDDF_IO and BitMap_IO HLEs retired; FS_INIT now completes naturally and FS_Setup runs.** Boot still at **23/27** (SYS_PROC_INIT) but the whole FS path is now structurally correct: no more 512-byte pool overflow, no more freelist corruption, no more 10707 suppression firing. Next blocker: post-SYS_PROC_INIT bogus-sem cascade via `MAKE_SYSDATASEG('') → MAKE_DATASEG('x') → open_temp(device=-1)`. Working_dev is still -1 at the open_temp call despite FS_Setup running earlier — suggesting a different syslocal is being read than the one FS_Setup populated.)
+
+### P128g (2026-04-24 pm) — psio HLE, MDDF_IO/BitMap_IO retired (real fix for freelist corruption)
+
+**Root cause.** MDDF_IO HLE wrote a full 512-byte disk block into the
+caller's buffer, but Apple's MDDF_IO calls
+`psio(..., nbytes=sizeof(MDDFdb)=316, ...)` — the buffer is only 316
+bytes. The 196-byte overflow clobbered the sysglobal pool's next
+freelist entry at `currfree + 318`, setting its `size` field to 0.
+On the next GETSPACE call the walk saw `free[0]: size=0 next=0`,
+treated the pool as empty, and returned FALSE. Observed at
+`GetFCB → getspace(sizeof(sfcb)=254, b_sysglobal_ptr, addrFCB)`
+during `fs_mount → OPEN_SFILE` — matches the P128f handoff's
+"GETSPACE returns FALSE for sysglobal" blocker.
+
+**Fix.** `src/lisa.c:lisa_hle_intercept` — retire `hle_handle_mddf_io`
+and `hle_handle_bitmap_io` (length-ignorant 512-byte writes).
+Enable `hle_handle_psio` instead: it already existed (gated off as
+P108 scaffold) and respects `nbytes` correctly via RMW on the
+trailing partial page. Apple's compiled MDDF_IO / BitMap_IO /
+FMAP_IO / pglblio all call through psio (or `vm`) so a single
+psio intercept subsumes three bug-prone HLEs.
+
+**Verification.** Pool freelist stays healthy across all 60+
+GETSPACE calls (pre-fix: `free[0].size=0 next=0` by call #59;
+post-fix: clean `size=14230 next=0` at the previously-failing
+254-byte call). GETSPACE(254) from GetFCB now returns D0=1
+(success). `SYSTEM_ERROR(10707)` no longer fires during boot —
+FS_INIT completes naturally, `FS_Setup` runs end-to-end. Pool
+never hits the out-of-pool retry path anymore.
+
+**Files changed (P128g).**
+- `src/lisa.c:~4510` — `#if 0` MDDF_IO + BitMap_IO intercepts;
+  `#if 1` the psio intercept (was `#if 0`).
+- `src/m68k.c` — P128g-ENTRY diagnostic probe at every sysglobal
+  GETSPACE entry: dumps pool header + free-list walk so future
+  freelist corruption is immediately visible. Gated by `(b_area
+  >> 16) == 0xCC` so it fires across builds. Limited to 30 dumps.
+  Added `"FS_Setup"` to `pcs[]` so [POST-BOOT] logs confirm
+  FS_Setup entry (prior sessions wrongly assumed it didn't run).
+- `src/lisa_mmu.c` — removed P128f-era one-shot pool watchpoints
+  that targeted $CCBE8A (build-specific pool offset) now that
+  the overflow is fixed at the source.
+
+**Retirement chain.** `hle_handle_mddf_io` and `hle_handle_bitmap_io`
+remain defined in `src/lisa.c` but unreferenced. Safe to delete in
+a future cleanup pass. Do NOT delete unless you also delete the
+Pascal-side callers' expectations — they don't exist, since Apple's
+compiled MDDF_IO / BitMap_IO work fine through psio.
+
+### Next blocker — post-SYS_PROC_INIT bogus-sem cascade (unchanged from P128e)
+
+Even with P128g's real fix, the 23/27 → 24/27 wall holds because
+`SYS_PROC_INIT → Make_SProcess → Get_Resources → MAKE_SYSDATASEG('') →
+MAKE_DATASEG('x') → open_temp(device=-1)` still fires — `working_dev`
+reads as -1 at that call. FS_Setup DOES run now (verified via
+`[POST-BOOT] entered FS_Setup @$02FA9E` probe fires twice: once on
+the kernel syslocal, then again on a process-under-creation's
+syslocal during SYS_PROC_INIT). But either:
+
+1. The `working_dev` field inside the NEW process's syslocal isn't
+   getting populated by our FS_Setup run (our codegen may produce
+   the write but to the wrong offset), OR
+2. The `getdevnum` call that reads `working_dev` is reading from
+   a different syslocal than the one FS_Setup wrote to.
+
+Next-session starting move: add an A5-relative `working_dev` dump
+at FS_Setup exit and at `getdevnum` / MAKE_DATASEG entry so we
+can see which syslocal each side touches. Per our pin table,
+`b_syslocal_ptr` is at `A5-24785` (= $CC5F6F in our boot). That
+pointer's dereferenced value is the syslocal base; `working_dev`
+is a field inside that syslocal. Dump `(*b_syslocal_ptr).working_dev`
+before and after FS_Setup, and at every getdevnum call, to close
+the gap.
+
+### Earlier (P128f, P128e, etc.) findings — still load-bearing
+
+
 
 ### P128f (2026-04-24 pm) — slist_io HLE shipped, GETSPACE zero-fill gated
 
@@ -980,16 +1057,28 @@ handles the IRQ end-to-end via `dinterrupt → IODONE`.
   sentinel, Level1 HLE with PARALLEL JSR synthesis, CA1 gate).
 - **P122 SEG-ALIAS-GUARD** (`src/lisa_mmu.c` write8) — drops
   seg-1+ writes that alias into phys `< $400`.
-- MDDF_IO + BitMap_IO HLEs (P121 re-enable).
+- **P128g psio HLE** (`src/lisa.c:hle_handle_psio`) — single intercept
+  covers Apple's compiled MDDF_IO / BitMap_IO / FMAP_IO / pglblio
+  paths (all call psio). Respects `nbytes` arg so partial-page reads
+  (e.g. MDDFdb=316 bytes, bitmap=1208 bytes) copy only the requested
+  bytes via RMW on the trailing page. Retires together with the vm
+  HLE once SYSTEM.CD_PROFILE handles psio→UltraIO natively + IRQ
+  completion is fully wired.
 
 ### Active HLEs (remaining scaffolds)
 
 - CALLDRIVER for fnctn=7 (dcontrol dcode=20 spare-table health).
 - CALLDRIVER for fnctn=12 (DATTACH) — no-op.
-- MDDF_IO HLE — retires when compiled CD_PROFILE handles
-  psio→UltraIO→DiskIO natively with IRQ completion.
-- BitMap_IO HLE — same retirement plan.
-- SYSTEM_ERROR(10707) suppression → SYS_PROC_INIT unwind.
+- **psio HLE** — covers all FS block I/O. Retires with CD_PROFILE.
+- **vm HLE** — covers FS sub-block reads. Retires with CD_PROFILE.
+- **slist_io HLE** — reads sentry directly from disk image. Retires
+  when vm HLE covers the specific slist_io indexing path.
+- **MakeSGSpace HLE** — pool-expansion work normally done by memmgr
+  process. Retires with Phase 6.
+- SYSTEM_ERROR(10707) suppression — NO LONGER FIRES during boot
+  (P128g made FS_INIT complete naturally). Kept as safety net for
+  unusual boot paths; can be retired once we've verified no boot
+  scenario still needs it.
 
 ## Reference: previous session history
 
@@ -1168,12 +1257,19 @@ ProFile blocks: 512 data + 20-byte tag (lisaem `libdc42.h`) +
 - **GET_BOOTSPACE** (`src/lisa.c:lisa_hle_intercept`) — returns pages
   in MMU seg 16 (pass-through). Retires when MM4.GetFree returns
   high-memory pages.
-- **MDDF_IO + BitMap_IO** (`src/lisa.c`, `#if 1` since P121) — bypass
-  psio chain by reading directly from disk image. P122 added a
-  SEG-ALIAS-GUARD in `lisa_mem_write8` so BitMap_IO's writes through
-  an unallocated (SOR=0) segment don't trample the vector table.
-  Retires once compiled CD_PROFILE handles psio→UltraIO→DiskIO
-  natively with IRQ completion.
+- **P128g psio HLE** (`src/lisa.c:hle_handle_psio`, `#if 1` since P128g)
+  — single intercept replacing both MDDF_IO and BitMap_IO HLEs.
+  Respects `nbytes` arg (pre-P128g MDDF_IO/BitMap_IO HLEs wrote a
+  fixed 512-byte block which overflowed the caller's 316-byte
+  MDDFdb buffer into the sysglobal pool's next-chunk freelist
+  metadata, setting its size field to 0 and breaking subsequent
+  GETSPACE calls). Retires once compiled CD_PROFILE handles
+  psio→UltraIO→DiskIO natively with IRQ completion.
+- **vm HLE** (`src/lisa.c:hle_handle_vm`, `#if 1` since P128f) —
+  covers sub-block reads (HENTRY_IO/FMAP_IO/pglblio paths).
+- **slist_io HLE** (`src/lisa.c:hle_handle_slist_io`, `#if 1`) —
+  reads sentry directly from disk image for slist indexing path
+  that vm doesn't cover.
 - **SEG-ALIAS-GUARD** (`src/lisa_mmu.c` `lisa_mem_write8`) — drops
   writes where logical ≥ `$20000` aliases to phys `< $400`.
   Architectural invariant: only seg-0 addresses the vector table.

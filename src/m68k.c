@@ -4435,10 +4435,12 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
              * header + first few free-list entries so we can see why the
              * first call (GetFCB, amount=254) returns FALSE even though the
              * pool has just been freshly initialized. */
-            /* P128g probe, ungated — watch the sysglobal pool throughout boot so we
-             * can see WHEN freecount and the freelist diverge, and WHEN firstfree
-             * goes to 0 despite freecount claiming thousands of free words. */
-            if (b_area == 0xCC6FE0 && gs_walk_dumps < 60) {
+            /* P128g probe — watch the sysglobal pool every call so we see the
+             * freelist evolving. Any future freelist corruption (pre-P128g
+             * symptom: size=0 entries despite freecount>0) will be obvious
+             * in these dumps. Gate on "looks like b_sysglobal_ptr" (upper
+             * byte $CC, equal to A5 in the kernel context). */
+            if ((b_area >> 16) == 0xCC && gs_walk_dumps < 30) {
                 /* hdr_freepool layout (SYSGLOBAL.TEXT:540):
                  *   +0 pool_size: int2 (2 bytes, words)
                  *   +2 firstfree: int4 (4 bytes, byte offset into pool)
@@ -5478,6 +5480,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 {"FMAP_IO",        0}, {"hentry_io",      0},
                 {"psio",           0}, {"vm",             0},
                 {"real_mount",     0},
+                {"FS_Setup",       0},
             };
             static uint32_t pcs_cache[64];
             static int pci_gen = -1;
