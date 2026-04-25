@@ -189,57 +189,72 @@ the real replacement.
 | 11 | Shell (APDM) | full desktop | Not started |
 | 12 | Apps | LisaWrite, LisaCalc, etc. | Not started |
 
-## Current Status (2026-04-25 post-P128n diagnosis)
+## Current Status (2026-04-25 P128o — pool-layout diagnosis)
 
 **27/27 milestones reached naturally; MemMgr LIVE post-PR_CLEANUP.** No
 SYSTEM_ERROR, no hard_excep, no illegal-inst. After scheduler idle, MemMgr
 dispatches, processes its first service request (CLEAR_SPACE → MOVE_SEG →
 REMAP_SEGMENT), and the loop runs but does not progress.
 
-**P128m claim debunked (P128n).** P128m said Pascal codegen miscompiles
-`false` as MOVEQ #1 at MM2.TEXT:595. P128n verified that bytes
-`70 01 3F 00` at $04A930 in `linked.bin` actually correspond to
-`Clear_Space(holeAddr, delta_size, true)` at MM3.TEXT:609 (inside
-`ALT_DS_SIZE`, $04A7E4..$04AC99 in the linker map) — not MM2.TEXT:595.
-Instrumenting all four AST_IDENT_EXPR emit sites for `false`/`true`
-across the whole codebase produced 36760 traces, every one correct.
-**There is no codegen bug for boolean literals.** The P128n memory
-file `project_clear_space_force_codegen_bug.md` is the canonical
-debunk — read it before re-litigating.
+**P128m boolean-codegen claim debunked (P128n).** Bytes `70 01 3F 00` at
+$04A930 in `linked.bin` correspond to `Clear_Space(holeAddr, delta_size,
+true)` at MM3.TEXT:609 (inside `ALT_DS_SIZE`), not a `false` literal.
+36760 traces of every `false`/`true` AST_IDENT_EXPR emit site, all
+correct. See `project_clear_space_force_codegen_bug.md`.
 
-**Root cause locked (P128n):** REMAP_SEGMENT iter 1 stomps on the
-kernel's sysglobal MMU mapping. ALT_DS_SIZE legitimately calls
-`CLEAR_SPACE(force=TRUE, hole_memaddr=$0453, space_needed=$0006)`. iter 1's
-MOVE_SEG runs `MAP_SEGMENT(c_sdb=$00CC74B0, c_mmu=102, dom=0, ..., memaddr=$04A5)`
-which reprograms MMU 102 in domain 0. But sysglobal at logical $00CC0000
-lives in segment 102 (= `$66 << 17`). After the remap, every kernel
-read of logical $00CC0000+ (including `head_sdb.freechain.fwd_link` at
-$00CC7042) lands at a different physical address and returns garbage.
-The W8 byte-write watchpoint shows ZERO logical-address writes to
-$00CC7042 between iter 1 INSERTSDB EXIT (which left $00B1B80E correctly)
-and iter 2 MOVE_SEG entry (which reads $00B5160E) — proving the
-physical bytes didn't change; only the MMU mapping did. Subsequent
-CLEAR_SPACE iterations re-derive a stale free_sdb from the bad read,
-and MOVE_SEG/REMAP_SEGMENT enter the visible no-op loop ($0F5B → $0F5B).
+**Mechanism nailed (P128n + P128o):** Inside MOVE_SEG, when `moving_sdb`
+is the sdb of *the very segment being moved* (sysglobal case), Apple's
+order — `TAKE_FREE → MOVER (physical→physical via realmem) →
+moving_sdb.memaddr := destaddr → MAKE_FREE/INSERTSDB → REMAP_SEGMENT`
+— leaves the post-MOVER kernel writes stranded at OLD physical via
+MMU 102 dom 0, while REMAP redirects future reads to NEW physical
+which only contains the pre-MOVER snapshot. The W8 byte-write
+watchpoint confirms: zero writes to logical $00CC7042 between
+INSERTSDB#1 EXIT (head.fch.fwd=$00B1B80E correct) and MOVE_SEG#2
+entry (reads $00B5160E stale) — physical bytes didn't change, only
+the MMU mapping did. CLEAR_SPACE then loops $0F5B → $0F5B forever.
 
-**Why this happens structurally:** Apple's design has domain 0
-reserved for kernel-only mappings; user segments live in process
-domains (1, 2, ...). Their REMAP_SEGMENT scan never finds dom=0
-entries to stomp. In our run, *some* user segment got installed at
-SMT[dom=0, mmu=102] alongside sysglobal — that's the structural bug.
-The fix path: probe MAP_SEGMENT entry across boot, find which call
-site registers a user segment in domain 0, and route it to a process
-domain instead. SLR limit enforcement (deferred — see
-`project_move_seg_needs_full_sdb.md`) would surface the bug as a
-fault rather than silently returning garbage, but doesn't fix the
-underlying domain collision.
+**Why CLEAR_SPACE picks sysglobal (P128o pool walk):** With
+`hole_memaddr=$0453`, `space_needed=$06`, `force=true`, the system
+pool's memchain at MOVE_SEG#1 entry is:
+```
+HEAD → sysglobal($03DC..$0452 data lock=2)
+     → free($04DC..$051B size=$40)              ← head of freelist
+     → data($055C,$11) → data($056D,$3)
+     → slocal($0570,$6) → stack($0576,$15)
+     → free($058B..$0F6F size=$9E5)
+     → DCode($0F70,$1) → slocal($0F71,$6) → stack($0F77,$9)
+     → header($1000,0 sentinel) → loop
+```
+Sysglobal is the *immediate memchain.bkw of the chosen free_sdb*, so
+the toright-direction logic (`moving_sdb := free_sdb.memchain.bkw`)
+picks sysglobal — algorithmically correct, structurally fatal.
 
-P128n probes that captured the diagnosis are LOAD-BEARING in
-`src/m68k.c:~4130` (INSERTSDB ENTRY/EXIT, MAKE_FREE, TAKE_FREE),
-`src/m68k.c:~4090` (`head_sdb LIVE` dump in MOVE_SEG entry), and
-`src/lisa_mmu.c:~362` (W8 limit raised 32 → 240). Don't strip them
-prematurely — they're gated and budgeted, and the next session
-needs them.
+**Working theory for the divergence from real Lisa boots:** in a real
+1MB-RAM Apple boot, sysglobal probably wouldn't end up adjacent to a
+free chunk that needs consolidating. Possibilities to investigate:
+(a) where sysglobal got placed at memaddr=$03DC (STARTUP.TEXT
+MAKE_REGION or earlier), (b) why the first free chunk landed at
+$04DC immediately after sysglobal, (c) whether the MMRB layout
+(side-chains at MMRB+22, +26, +88) hides additional segments that
+would be picked first on a real boot. The chain-walk shows ~1.36 MB
+of sdbs across a 2 MB pool span — lots of unaccounted gaps.
+
+**Earlier P128n hypothesis ("user segment ended up at SMT[dom=0,
+mmu=102]") is wrong.** moving_sdb=$00CC74B0 with memaddr=$03DC really
+is sysglobal's own sdb (memaddr matches MMU 102 dom 0's pre-REMAP
+SOR exactly, memsize=$0077 covers full sysglobal extent). The
+REMAP isn't stomping on an unrelated kernel mapping — it's
+remapping sysglobal-as-segment, and the data-coherence window
+between MOVER and REMAP is what bites. SLR limit enforcement is
+still on the deferred list but it's a *symptom-surfacer*, not a fix.
+
+P128n/P128o probes that captured the diagnosis are LOAD-BEARING in
+`src/m68k.c:~3994` (CLEAR_SPACE entry probe + memchain/freechain
+walks), `~4130` (INSERTSDB ENTRY/EXIT, MAKE_FREE, TAKE_FREE),
+`~4090` (`head_sdb LIVE` dump in MOVE_SEG entry), and
+`src/lisa_mmu.c:~362` (W8 limit raised 32 → 240). Don't strip
+them prematurely — they're gated and budgeted.
 
 **Long-term MMU cleanup (deferred):** `lisa_mmu.c mmu_translate()` ignores
 the SLR limit, which silently lets writes land outside sdb ranges. P128l's

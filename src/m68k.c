@@ -3488,6 +3488,87 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             }
         }
 
+        /* P128o — boot-init pool layout probe. Goal: find when sysglobal
+         * lands at memaddr=$03DC and when the first MAKE_FREE puts the
+         * initial free chunk immediately after sysglobal at $04DC. Apple's
+         * STARTUP.TEXT calls MAKE_FREE(freebase, freelen) for the initial
+         * free pool, then MAKE_REGION for sysglobal. If sysglobal's
+         * c_memaddr is the SAME as something that's already on the
+         * memchain, the chains end up degenerate. Probe every MAKE_REGION
+         * and MAKE_FREE call from boot start; gate to first ~30 fires of
+         * each so we don't flood post-boot. INSERTSDB is similarly capped. */
+        {
+            static uint32_t pc_MAKE_REGION = 0, pc_MAKE_FREE = 0, pc_INSERTSDB = 0;
+            static int pc_gen_p128o = -1;
+            if (pc_gen_p128o != g_emu_generation) {
+                pc_MAKE_REGION = boot_progress_lookup("MAKE_REGION");
+                pc_MAKE_FREE   = boot_progress_lookup("MAKE_FREE");
+                pc_INSERTSDB   = boot_progress_lookup("INSERTSDB");
+                pc_gen_p128o   = g_emu_generation;
+            }
+            DBGSTATIC(int, p128o_mr_count, 0);
+            DBGSTATIC(int, p128o_mf_count, 0);
+            DBGSTATIC(int, p128o_ins_count, 0);
+            if (pc_MAKE_REGION && cpu->pc == pc_MAKE_REGION && p128o_mr_count < 30) {
+                p128o_mr_count++;
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                uint32_t ret = cpu_read32(cpu, sp);
+                /* MAKE_REGION sig (MM4.TEXT:305): var c_sdb_ptr; c_memaddr,
+                 * c_memsize, c_packedSize, c_unpackedSize, c_offset (all int4);
+                 * c_priority (int1+pad); c_sdbtype (int1+pad); link_sdb (bool).
+                 * Stack layout (Pascal-Pascal, args left-to-right pushed):
+                 *   sp+0  ret (4)
+                 *   sp+4  c_sdb_ptr (var, 4)
+                 *   sp+8  c_memaddr (4)
+                 *   sp+12 c_memsize (4)
+                 *   sp+16 c_packedSize (4)
+                 *   sp+20 c_unpackedSize (4)
+                 *   sp+24 c_offset (4)
+                 *   sp+28 c_priority (2 padded)
+                 *   sp+30 c_sdbtype  (2 padded)
+                 *   sp+32 link_sdb (2 padded, bool in low byte)
+                 */
+                uint32_t c_sdb_p   = cpu_read32(cpu, sp + 4);
+                uint32_t c_memaddr = cpu_read32(cpu, sp + 8);
+                uint32_t c_memsize = cpu_read32(cpu, sp + 12);
+                uint16_t c_priority= cpu_read16(cpu, sp + 28);
+                uint16_t c_sdbtype = cpu_read16(cpu, sp + 30);
+                uint16_t link_sdb  = cpu_read16(cpu, sp + 32);
+                fprintf(stderr,
+                    "[P128o] MAKE_REGION#%d ret=$%06X c_sdb_var=$%08X "
+                    "c_memaddr=$%08X c_memsize=$%08X priority=$%04X sdbtype=$%04X link=$%04X\n",
+                    p128o_mr_count, ret, c_sdb_p, c_memaddr, c_memsize,
+                    c_priority, c_sdbtype, link_sdb);
+            }
+            if (pc_MAKE_FREE && cpu->pc == pc_MAKE_FREE && p128o_mf_count < 30) {
+                p128o_mf_count++;
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                uint32_t ret = cpu_read32(cpu, sp);
+                /* MAKE_FREE(maddr, msize) — both int2. */
+                uint16_t maddr = cpu_read16(cpu, sp + 4);
+                uint16_t msize = cpu_read16(cpu, sp + 6);
+                fprintf(stderr,
+                    "[P128o] MAKE_FREE#%d ret=$%06X maddr=$%04X msize=$%04X\n",
+                    p128o_mf_count, ret, maddr, msize);
+            }
+            if (pc_INSERTSDB && cpu->pc == pc_INSERTSDB && p128o_ins_count < 40) {
+                p128o_ins_count++;
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                uint32_t ret = cpu_read32(cpu, sp);
+                uint32_t c_sdb = cpu_read32(cpu, sp + 4);
+                uint16_t ma = 0, ms = 0;
+                uint8_t  type = 0;
+                if ((c_sdb & 0xFFFFFF) >= 0x400 && (c_sdb & 0xFFFFFF) < 0xFE0000) {
+                    ma   = cpu_read16(cpu, (c_sdb + 8)  & 0xFFFFFF);
+                    ms   = cpu_read16(cpu, (c_sdb + 10) & 0xFFFFFF);
+                    type = cpu_read8 (cpu, (c_sdb + 13) & 0xFFFFFF);
+                }
+                fprintf(stderr,
+                    "[P128o] INSERTSDB#%d ret=$%06X c_sdb=$%08X memaddr=$%04X memsize=$%04X type=%d\n",
+                    p128o_ins_count, ret, c_sdb, ma, ms, type);
+            }
+        }
+
         /* P85 probe — FlushNodes buffer-pool spin investigation.
          * After the P84 CHECK_DS fix, FS_INIT reaches and then spins
          * in FlushNodes (VMSTUFF:1369) for tens of thousands of iters.
@@ -4035,11 +4116,83 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                      */
                     uint16_t hd_memaddr = cpu_read16(cpu, m + 42 + 8);
                     uint16_t hd_memsize = cpu_read16(cpu, m + 42 + 10);
+                    uint32_t hd_mch_fwd = cpu_read32(cpu, m + 42 + 0);
+                    uint32_t hd_mch_bkw = cpu_read32(cpu, m + 42 + 4);
                     uint32_t hd_fch_fwd = cpu_read32(cpu, m + 42 + 14);
                     uint32_t hd_fch_bkw = cpu_read32(cpu, m + 42 + 18);
                     fprintf(stderr,
-                        "        head_sdb: memaddr=$%04X memsize=$%04X freechain.fwd=$%08X bkwd=$%08X\n",
-                        hd_memaddr, hd_memsize, hd_fch_fwd, hd_fch_bkw);
+                        "        head_sdb@$%06X: memaddr=$%04X memsize=$%04X memchain.fwd=$%08X bkw=$%08X freechain.fwd=$%08X bkw=$%08X\n",
+                        m + 42, hd_memaddr, hd_memsize, hd_mch_fwd, hd_mch_bkw, hd_fch_fwd, hd_fch_bkw);
+
+                    /* P128o — walk the memchain from head_sdb. memchain
+                     * pointers point to NEXT sdb's start (oset_memchain=0),
+                     * so walking is straightforward. Stop when we loop back
+                     * to head_sdb. sdb layout (per source-MMPRIM.TEXT:208):
+                     *   @0..3   memchain.fwd   @4..7   memchain.bkw
+                     *   @8..9   memaddr        @10..11 memsize
+                     *   @12     lockcount      @13     sdbtype
+                     *   @14..   variant: free→freechain(8B); else→sdbstate+length+...
+                     * sdbtype values: 0=free 1=code 2=data 3=stack 4=slocal
+                     *                 5=header 6=DCode */
+                    static const char *sdbtype_names[7] = {
+                        "free","code","data","stack","slocal","header","DCode"
+                    };
+                    uint32_t head_sdb_addr = (m + 42) & 0xFFFFFF;
+                    fprintf(stderr, "        [P128o] memchain walk from head_sdb:\n");
+                    {
+                        uint32_t cur = hd_mch_fwd & 0xFFFFFF;
+                        int hop = 0;
+                        while (hop < 32 && cur != head_sdb_addr && cur >= 0x400 && cur < 0xFE0000) {
+                            uint16_t ma = cpu_read16(cpu, cur + 8);
+                            uint16_t ms = cpu_read16(cpu, cur + 10);
+                            uint8_t  lock = cpu_read8(cpu, cur + 12);
+                            uint8_t  type = cpu_read8(cpu, cur + 13);
+                            uint32_t mnext = cpu_read32(cpu, cur + 0);
+                            const char *tn = (type < 7) ? sdbtype_names[type] : "??";
+                            fprintf(stderr,
+                                "          [%2d] sdb=$%06X memaddr=$%04X memsize=$%04X type=%d(%s) lock=%d mch.fwd=$%08X\n",
+                                hop, cur, ma, ms, type, tn, lock, mnext);
+                            cur = mnext & 0xFFFFFF;
+                            hop++;
+                        }
+                        if (cur == head_sdb_addr)
+                            fprintf(stderr, "          [%2d] -> head_sdb (loop closed)\n", hop);
+                        else if (hop >= 32)
+                            fprintf(stderr, "          [..] truncated at hop 32\n");
+                        else
+                            fprintf(stderr, "          [..] aborted at sdb=$%06X (out of range)\n", cur);
+                    }
+
+                    /* P128o — walk the freechain from head_sdb. freechain
+                     * pointers point to NEXT sdb's freechain field (offset
+                     * +14, oset_freechain=14). Subtract 14 to get sdb addr.
+                     * head_sdb's own freechain field is at head+14 = m+56;
+                     * the chain wraps back to that address. */
+                    fprintf(stderr, "        [P128o] freechain walk from head_sdb:\n");
+                    {
+                        uint32_t head_fch_addr = (m + 42 + 14) & 0xFFFFFF;
+                        uint32_t cur = hd_fch_fwd & 0xFFFFFF;
+                        int hop = 0;
+                        while (hop < 32 && cur != head_fch_addr && cur >= (0x400 + 14) && cur < 0xFE0000) {
+                            uint32_t sdb_addr = (cur - 14) & 0xFFFFFF;
+                            uint16_t ma = cpu_read16(cpu, sdb_addr + 8);
+                            uint16_t ms = cpu_read16(cpu, sdb_addr + 10);
+                            uint8_t  type = cpu_read8(cpu, sdb_addr + 13);
+                            uint32_t fnext = cpu_read32(cpu, sdb_addr + 14);
+                            const char *tn = (type < 7) ? sdbtype_names[type] : "??";
+                            fprintf(stderr,
+                                "          [%2d] sdb=$%06X memaddr=$%04X memsize=$%04X type=%d(%s) fch.fwd=$%08X\n",
+                                hop, sdb_addr, ma, ms, type, tn, fnext);
+                            cur = fnext & 0xFFFFFF;
+                            hop++;
+                        }
+                        if (cur == head_fch_addr)
+                            fprintf(stderr, "          [%2d] -> head_sdb.freechain (loop closed)\n", hop);
+                        else if (hop >= 32)
+                            fprintf(stderr, "          [..] truncated at hop 32\n");
+                        else
+                            fprintf(stderr, "          [..] aborted at fch=$%06X (out of range)\n", cur);
+                    }
                 }
             }
 
