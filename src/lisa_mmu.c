@@ -361,8 +361,10 @@ void lisa_mem_write8(lisa_mem_t *mem, uint32_t addr, uint8_t val) {
     }
     if (g_p128l_mmrb_watch_armed &&
         g_p128l_mmrb_addr != 0 &&
-        a >= g_p128l_mmrb_addr && a <= g_p128l_mmrb_addr + 3 &&
-        p128l_w8_count < 16) {
+        ((a >= g_p128l_mmrb_addr && a <= g_p128l_mmrb_addr + 3) ||
+         /* P128m: also watch head_sdb.freechain.fwd_link/bkwd_link (MMRB+56..+63) */
+         (a >= g_p128l_mmrb_addr + 56 && a <= g_p128l_mmrb_addr + 63)) &&
+        p128l_w8_count < 32) {
         fprintf(stderr,
           "[P128l-W8] MMRB+%u write val=$%02X (PC=$%06X A6=$%06X A0=$%06X SP=$%06X)\n",
           (unsigned)(a - g_p128l_mmrb_addr), val,

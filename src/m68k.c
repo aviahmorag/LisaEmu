@@ -3929,7 +3929,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
              * above. */
 
             DBGSTATIC(int, p128l_cis_count, 0);
-            if (cpu->pc == 0x049046 && p128l_cis_count < 5) {
+            if (cpu->pc == 0x049046 && p128l_cis_count < 50) {
                 p128l_cis_count++;
                 uint32_t a5 = cpu->a[5] & 0xFFFFFF;
                 uint32_t mmrb_addr_slot = (a5 - 25691) & 0xFFFFFF;
@@ -3958,6 +3958,171 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                     for (int i = 0; i < 16; i += 2)
                         fprintf(stderr, " $%04X", cpu_read16(cpu, m + i));
                     fprintf(stderr, "\n");
+                }
+            }
+
+            /* P128m — CLEAR_SPACE entry probe. CLEAR_SPACE($0493F8) is the
+             * outer driver of MemMgr's compaction loop. Args (Pascal
+             * left-to-right): hole_memaddr, space_needed (int2), and
+             * force_to_hole_memaddr (boolean=byte). With LINK A6 entry,
+             * arg layout from the caller's MOVE_SEG site is:
+             *   SP+0   = ret addr (long)
+             *   SP+4   = hole_memaddr   (word, 2B-aligned)
+             *   SP+6   = space_needed   (word)
+             *   SP+8   = force_to_hole_memaddr (byte, in HIGH byte of word)
+             * After LINK we'll be past the prologue, so probe BEFORE LINK
+             * (cpu->pc == 0x0493F8 fires the very first instruction).
+             * Also dump c_mmrb (resolved from caller / a global) and the
+             * head_sdb's freechain.fwd_link & first free sdb info. */
+            /* P128m bytes-dump probe disabled (one-shot offline disasm).
+             * Enable by toggling 0→1 if needed for future codegen analysis. */
+#if 0
+            DBGSTATIC(int, p128m_dump_done, 0);
+            if (cpu->pc == 0x0493F8 && !p128m_dump_done) {
+                p128m_dump_done = 1;
+                fprintf(stderr, "[P128m] CLEAR_SPACE call site bytes from $04A920..$04A946:\n");
+                for (int o = 0; o < 64; o += 16) {
+                    fprintf(stderr, "  $%06X:", 0x04A920 + o);
+                    for (int i = 0; i < 16; i += 2)
+                        fprintf(stderr, " %04X", cpu_read16(cpu, (0x04A920 + o + i) & 0xFFFFFF));
+                    fprintf(stderr, "\n");
+                }
+            }
+#endif
+
+            DBGSTATIC(int, p128m_cs_count, 0);
+            if (cpu->pc == 0x0493F8 && p128m_cs_count < 30) {
+                p128m_cs_count++;
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                uint32_t ret = cpu_read32(cpu, sp);
+                uint16_t hole_ma   = cpu_read16(cpu, (sp + 4) & 0xFFFFFF);
+                uint16_t sp_needed = cpu_read16(cpu, (sp + 6) & 0xFFFFFF);
+                /* boolean: Pascal-Pascal calls (caller-clean) put byte in
+                 * LOW byte; Pascal-asm calls (callee-clean) put it in HIGH
+                 * byte. CLEAR_SPACE is Pascal-Pascal so use LOW byte. */
+                uint16_t force_w   = cpu_read16(cpu, (sp + 8) & 0xFFFFFF);
+                uint8_t  force     = force_w & 0xFF;
+                uint32_t a5 = cpu->a[5] & 0xFFFFFF;
+                uint32_t mmrb = cpu_read32(cpu, (a5 - 25691) & 0xFFFFFF);
+                uint32_t sgp  = cpu_read32(cpu, 0x200);
+                fprintf(stderr,
+                    "[P128m] CLEAR_SPACE#%d entry ret=$%06X hole_ma=$%04X "
+                    "space_needed=$%04X force=%d  A5=$%06X mmrb=$%08X sgp=$%08X\n",
+                    p128m_cs_count, ret, hole_ma, sp_needed, force,
+                    a5, mmrb, sgp);
+                /* head_sdb is at MMRB+oset_head_sdb. From PASCALDEFS, the
+                 * MMRB layout starts: hd_qioreq_list(4), seg_wait_sem(8),
+                 * memmgr_sem(8), ... head_sdb. Without exact offsets we
+                 * just dump the freechain pointer the Pascal reads:
+                 *   free_sdb := pointer(c_mmrb^.head_sdb.freechain.fwd_link
+                 *                       - oset_freechain);
+                 * We don't have oset_freechain at hand here, so we instead
+                 * dump A0/D0 immediately AFTER LINK by hooking the next
+                 * probe site. For now log mmrb's first ~32 bytes. */
+                if ((mmrb & 0xFFFFFF) >= 0xCC0000 && (mmrb & 0xFFFFFF) < 0xCE0000) {
+                    uint32_t m = mmrb & 0xFFFFFF;
+                    /* Dump 0..96 so we can see head_sdb (starts at MMRB+42)
+                     * and its freechain.fwd_link (at +42+14 = +56). */
+                    for (int row = 0; row < 96; row += 16) {
+                        fprintf(stderr, "        MMRB+%2d:", row);
+                        for (int i = 0; i < 16; i += 2)
+                            fprintf(stderr, " $%04X", cpu_read16(cpu, m + row + i));
+                        fprintf(stderr, "\n");
+                    }
+                    /* Decode head_sdb (at MMRB+42, sdb layout):
+                     *   memchain (8B) memaddr(2) memsize(2) lockcount(1) tag(1)
+                     *   freechain (8B at offset 14 = MMRB+56)
+                     */
+                    uint16_t hd_memaddr = cpu_read16(cpu, m + 42 + 8);
+                    uint16_t hd_memsize = cpu_read16(cpu, m + 42 + 10);
+                    uint32_t hd_fch_fwd = cpu_read32(cpu, m + 42 + 14);
+                    uint32_t hd_fch_bkw = cpu_read32(cpu, m + 42 + 18);
+                    fprintf(stderr,
+                        "        head_sdb: memaddr=$%04X memsize=$%04X freechain.fwd=$%08X bkwd=$%08X\n",
+                        hd_memaddr, hd_memsize, hd_fch_fwd, hd_fch_bkw);
+                }
+            }
+
+            /* P128m — MOVE_SEG entry probe ($049186). Catch the dir arg and
+             * (via static link) the parent CLEAR_SPACE's free_sdb +
+             * moving_sdb. Their offsets within CLEAR_SPACE's frame depend
+             * on codegen, so we dump the LINK-side workspace via A6:
+             * MOVE_SEG's static link reaches CLEAR_SPACE's locals. Per our
+             * codegen, A2 holds the static link inside the called nested
+             * proc (Pascal "intermediate-level" addressing). Dump A2 plus
+             * a window around it so we can spot moving_sdb/free_sdb. */
+            DBGSTATIC(int, p128m_ms_count, 0);
+            if (cpu->pc == 0x049186 && p128m_ms_count < 50) {
+                p128m_ms_count++;
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                uint32_t ret = cpu_read32(cpu, sp);
+                uint16_t dir = cpu_read16(cpu, (sp + 4) & 0xFFFFFF);
+                fprintf(stderr,
+                    "[P128m] MOVE_SEG#%d entry ret=$%06X dir=$%04X (%s) A2=$%08X A5=$%08X A6=$%08X\n",
+                    p128m_ms_count, ret, dir,
+                    (dir & 0xFF) == 0 ? "toleft" : "toright",
+                    cpu->a[2], cpu->a[5], cpu->a[6]);
+                /* MOVE_SEG hasn't LINKed yet — A6 still points to CLEAR_SPACE's
+                 * frame. CLEAR_SPACE locals (Pascal source order):
+                 *   space_gained: int2          (2B)
+                 *   free_sdb, next_sdb, moving_sdb: sdb_ptr  (4B each = 12B)
+                 *   free_start, free_end: int2  (4B)
+                 *   c_mmrb: mmrb_ptr            (4B)
+                 * Pascal allocates these at A6-2..A6-26ish. Dump A6-32..A6 in
+                 * 4-byte chunks so we can see free_sdb / moving_sdb. */
+                uint32_t a6 = cpu->a[6] & 0xFFFFFF;
+                if (a6 >= 0x400 && a6 < 0xFE0000) {
+                    /* Per pascal_codegen.c local layout (declared order, sizes
+                     * 2/4/4/4/2/2/4 → offsets -2/-6/-10/-14/-16/-18/-22):
+                     *   space_gained @ A6-2,  free_sdb @ A6-6,
+                     *   next_sdb     @ A6-10, moving_sdb @ A6-14,
+                     *   free_start   @ A6-16, free_end   @ A6-18,
+                     *   c_mmrb       @ A6-22.
+                     * Dump each by name, plus dereference the sdb pointers. */
+                    int16_t  sp_gained = (int16_t)cpu_read16(cpu, (a6 - 2)  & 0xFFFFFF);
+                    uint32_t free_sdb  = cpu_read32(cpu,         (a6 - 6)  & 0xFFFFFF);
+                    uint32_t next_sdb  = cpu_read32(cpu,         (a6 - 10) & 0xFFFFFF);
+                    uint32_t moving_sdb= cpu_read32(cpu,         (a6 - 14) & 0xFFFFFF);
+                    int16_t  fr_start  = (int16_t)cpu_read16(cpu, (a6 - 16) & 0xFFFFFF);
+                    int16_t  fr_end    = (int16_t)cpu_read16(cpu, (a6 - 18) & 0xFFFFFF);
+                    uint32_t c_mmrb_l  = cpu_read32(cpu,         (a6 - 22) & 0xFFFFFF);
+                    fprintf(stderr,
+                        "        CLEAR_SPACE: c_mmrb=$%08X free_sdb=$%08X next_sdb=$%08X moving_sdb=$%08X\n",
+                        c_mmrb_l, free_sdb, next_sdb, moving_sdb);
+                    fprintf(stderr,
+                        "                     space_gained=$%04X free_start=$%04X free_end=$%04X\n",
+                        (uint16_t)sp_gained, (uint16_t)fr_start, (uint16_t)fr_end);
+                    /* Dereference sdb pointers (memaddr at +8, memsize at +10). */
+                    if ((free_sdb & 0xFFFFFF) >= 0xCC0000 && (free_sdb & 0xFFFFFF) < 0xCE0000) {
+                        uint32_t f = free_sdb & 0xFFFFFF;
+                        uint16_t ma = cpu_read16(cpu, (f + 8) & 0xFFFFFF);
+                        uint16_t ms = cpu_read16(cpu, (f + 10) & 0xFFFFFF);
+                        uint16_t sdbtype = cpu_read16(cpu, (f + 12) & 0xFFFFFF);
+                        /* freechain.fwd_link is at offset 0 (sdb), memchain.fwd_link at offset 4 */
+                        uint16_t mch_fwd = cpu_read16(cpu, (f + 4) & 0xFFFFFF);
+                        uint16_t mch_bkw = cpu_read16(cpu, (f + 6) & 0xFFFFFF);
+                        uint16_t fch_fwd = cpu_read16(cpu, (f + 0) & 0xFFFFFF);
+                        uint16_t fch_bkw = cpu_read16(cpu, (f + 2) & 0xFFFFFF);
+                        fprintf(stderr,
+                            "          *free_sdb: memaddr=$%04X memsize=$%04X type=$%04X memchain.fwd=$%04X bkw=$%04X freechain.fwd=$%04X bkw=$%04X\n",
+                            ma, ms, sdbtype, mch_fwd, mch_bkw, fch_fwd, fch_bkw);
+                    }
+                    if ((moving_sdb & 0xFFFFFF) >= 0xCC0000 && (moving_sdb & 0xFFFFFF) < 0xCE0000) {
+                        uint32_t m = moving_sdb & 0xFFFFFF;
+                        uint16_t ma = cpu_read16(cpu, (m + 8) & 0xFFFFFF);
+                        uint16_t ms = cpu_read16(cpu, (m + 10) & 0xFFFFFF);
+                        uint16_t sdbtype = cpu_read16(cpu, (m + 12) & 0xFFFFFF);
+                        fprintf(stderr,
+                            "          *moving_sdb: memaddr=$%04X memsize=$%04X type=$%04X\n",
+                            ma, ms, sdbtype);
+                    }
+                    if ((free_sdb & 0xFFFFFF) >= 0x400 && (free_sdb & 0xFFFFFF) < 0xFE0000) {
+                        uint32_t f = free_sdb & 0xFFFFFF;
+                        fprintf(stderr, "          @free_sdb $%06X bytes:", f);
+                        for (int i = 0; i < 32; i += 2)
+                            fprintf(stderr, " %04X", cpu_read16(cpu, (f + i) & 0xFFFFFF));
+                        fprintf(stderr, "\n");
+                    }
                 }
             }
 
@@ -4344,7 +4509,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             }
             /* REMAP_SEGMENT(c_sdb, old_memaddr, old_memsize). Each call
              * updates MMU domains after sdb.memaddr changes. */
-            if (pc_Remap_Segment && cpu->pc == pc_Remap_Segment && p128d_rs_count < 6) {
+            if (pc_Remap_Segment && cpu->pc == pc_Remap_Segment && p128d_rs_count < 50) {
                 p128d_rs_count++;
                 uint32_t sp = cpu->a[7] & 0xFFFFFF;
                 uint32_t ret = cpu_read32(cpu, sp);
