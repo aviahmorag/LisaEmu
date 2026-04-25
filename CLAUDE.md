@@ -189,7 +189,69 @@ the real replacement.
 | 11 | Shell (APDM) | full desktop | Not started |
 | 12 | Apps | LisaWrite, LisaCalc, etc. | Not started |
 
-## Current Status (2026-04-25 P128o — pool-layout diagnosis)
+## Current Status (2026-04-25 P128p — SLR limit enforcement landed)
+
+**SLR limit enforcement now active in `src/lisa_mmu.c::mmu_translate`**
+(was deferred since P127). Three modes via env `LISAEMU_SLR_ENFORCE`:
+0=legacy, 1=log-only (default), 2=log+drop. Mode 1 ships safely: 27/27
+boot milestones still reach naturally on the compiled OS, but every
+out-of-range read/write is now logged with PC, ctx, seg, offset, and
+the decoded valid-offset window.
+
+**Encoding decoded** (per source-LDASM:321-329 `do_an_mmu`): hardware
+SLR limit byte uses two distinct schemes —
+- **non-stack** (`RO_MEM`/`RW_MEM`): hw_lim = `twos_comp(memsize)`,
+  decode `valid_pages = 256 - hw_lim` (with hw_lim=0 ⇒ 256 = full seg).
+- **stack** (`RO_STK`/`RW_STK`): hw_lim = `memsize - 1` AND origin is
+  shifted to TOP of segment. Valid range = `[128KB - stack_bytes,
+  128KB - 1]`. Decode `stack_pages = hw_lim + 1`.
+- I/O variants short-circuit (no limit check). UNUSED_PAGE is fault.
+
+**What enforcement immediately revealed:**
+1. **Compiled-OS path**: 7 distinct violation PCs, all stack-segment
+   accesses on segs 101/123 with `slr=$0600` (limit_lo=$00 ⇒ decoded
+   as a 1-page stack). Source: `src/lisa.c:2304-2306` hardcodes
+   `0x0600` for `b_superstack` regardless of `l_superstack`. Real
+   stack is 16 KB = 32 pages, so the SLR limit byte should be $1F
+   (`l_superstack/512 - 1`). Same pattern likely on other stack
+   segments. Fix is a one-liner in the loader-init, but the
+   violation log + 27/27 milestones tells us the kernel itself
+   never relies on this metadata — it's an emulator-side metadata
+   bug surfaced by the new check.
+2. **Prebuilt-image path** (`prebuilt/los_compilation_base.image`):
+   loader at PC=$A840A2+ tries to execute through seg 84 (`mmucodemmu`)
+   in ctx=0 (start mode), but our boot-ROM init leaves seg 84 at
+   default `slr=$0C00` (UNUSED_PAGE). lisaem-master initializes
+   `mmu_all[0][i]` with copy-from-context-1 logic; we don't.
+   Specific, fixable boot-ROM gap.
+
+**Strategic significance**: P128p is the first HLE-retiring fix that
+helps BOTH boot paths. The compiled-OS path was already passing
+through this region without checking; the prebuilt-image path was
+silently misbehaving. With enforcement on, both paths have *visible
+diagnostics* at the exact line of trouble.
+
+**MOVE_SEG self-reference (the P128n/P128o focus) is still live** but
+has a clearer fix path now: once stack-segment SLR encoding is
+corrected (item 1 above), MakeSGSpace HLE can be tightened to refuse
+out-of-sgheap chunks (the SLR enforcement will fault those reads/
+writes naturally in mode 2), letting `b_syslocal` return to its
+natural position right after `b_superstack`. With the P127 gap gone,
+CLEAR_SPACE finds free space adjacent to sysglobal end and never
+picks sysglobal as `moving_sdb`.
+
+Concrete remaining work toward HLE retirement (in approximate
+order):
+1. Fix `src/lisa.c:2304-2306` SLR encoding for stack segments
+   (`slr = 0x0600 | (l_superstack/512 - 1)`).
+2. Tighten MakeSGSpace HLE to `chunk_seg_end = b_sgheap + l_sgheap`
+   instead of segment-end.
+3. Move `b_syslocal` back to natural position (right after
+   `b_superstack`); remove P127 gap; verify MOVE_SEG works.
+4. Map seg 84 (`mmucodemmu`) in ctx=0 during boot-ROM init so the
+   prebuilt loader can JSR through it.
+
+## Earlier (2026-04-25 P128o — pool-layout diagnosis)
 
 **27/27 milestones reached naturally; MemMgr LIVE post-PR_CLEANUP.** No
 SYSTEM_ERROR, no hard_excep, no illegal-inst. After scheduler idle, MemMgr

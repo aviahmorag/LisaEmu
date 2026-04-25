@@ -21,6 +21,7 @@
 #include "lisa_mmu.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 int mmu_write_count_global = 0;
 
@@ -223,7 +224,50 @@ static void mmu_reg_write(lisa_mem_t *mem, uint32_t addr, uint16_t data) {
     }
 }
 
-/* Translate address through MMU */
+/* P128p — SLR limit enforcement.
+ *
+ * Lisa MMU semantics (per Apple hw spec + MAP_SEGMENT in source-MMPRIM):
+ *   SOR (16b) = origin in pages (1 page = 512 bytes)
+ *   SLR (16b) = (access_byte<<8) | limit_byte
+ *               access_byte: bits 11:8 select access mode (SLR_RO_STK..SLR_SIO_SPACE)
+ *               limit_byte:  page count valid in this segment
+ *   Valid offsets: 0 .. limit_byte*512 - 1
+ *   I/O segments (SLR_IO_SPACE / SLR_SIO_SPACE) skip the limit (direct
+ *   offset → $FC0000+).
+ *   Unused segments (SLR_UNUSED_PAGE) are invalid; any access faults.
+ *
+ * On real hardware an out-of-range access raises a memory-error trap which
+ * the OS handles via demand paging (and as a guard against pointer bugs).
+ * Our emulator currently doesn't deliver that trap. As a stepping stone we
+ * detect the violation, log it (rate-limited per generation), and return a
+ * safe value (0 for reads, drop for writes) so behavior is observable
+ * without a flood. The mode is controlled by g_slr_enforce:
+ *   0 = legacy (no detection) — bit-for-bit pre-P128p behavior
+ *   1 = LOG-ONLY: detect & log; reads/writes still hit the computed phys
+ *   2 = LOG + DROP: detect, log, and zero reads / drop writes
+ *   3 = reserved for fault-delivery once a Lisa segment-fault trap is plumbed
+ *
+ * Default is 1 (log-only) so adding enforcement doesn't change existing
+ * boot behavior. Mode 2 lets us experiment with fault-equivalent semantics
+ * without touching the OS. Override via env LISAEMU_SLR_ENFORCE=N. */
+int g_slr_enforce = -1;  /* lazy-init from env */
+static void slr_enforce_init(void) {
+    if (g_slr_enforce >= 0) return;
+    const char *env = getenv("LISAEMU_SLR_ENFORCE");
+    if (env && *env) g_slr_enforce = atoi(env);
+    else g_slr_enforce = 1;
+}
+
+/* Counters reset per emulator generation so a power-cycle resets logging. */
+static int slr_log_gen = -1;
+static int slr_log_count = 0;
+#define SLR_LOG_BUDGET 80
+
+/* Side-channel flag: set by mmu_translate when an SLR violation occurs,
+ * cleared by callers after they read it. Single-threaded emulator so a
+ * static flag is safe. */
+static int g_slr_violation = 0;
+
 static uint32_t mmu_translate(lisa_mem_t *mem, uint32_t addr) {
     if (!mem->mmu_enabled)
         return addr;
@@ -255,7 +299,85 @@ static uint32_t mmu_translate(lisa_mem_t *mem, uint32_t addr) {
         return 0xFC0000 | offset;  /* Direct offset into I/O space */
     }
 
+    /* P128p — SLR limit enforcement (lazy init).
+     *
+     * Encoding (per DO_AN_MMU asm in source-LDASM:321-329):
+     *   stack segs (RO_STK/RW_STK): hw_limit = memsize - 1, AND DO_AN_MMU
+     *     also adjusts origin to (origin + length - hw_adjust) so the
+     *     stack lives at the TOP of the 128 KB segment. Valid offsets:
+     *     [128KB - stack_bytes, 128KB - 1].  stack_pages = limit_lo + 1.
+     *   non-stack segs (RO_MEM/RW_MEM): hw_limit = twos_comp(memsize).
+     *     Valid offsets: [0, mem_bytes - 1].
+     *     mem_pages = (256 - limit_lo) mod 256, with limit_lo=0 ⇒ 256.
+     * I/O variants short-circuit above (no limit check). UNUSED_PAGE is
+     * an outright fault. */
+    slr_enforce_init();
+    if (g_slr_enforce > 0) {
+        extern int g_emu_generation;
+        if (slr_log_gen != g_emu_generation) {
+            slr_log_gen = g_emu_generation;
+            slr_log_count = 0;
+        }
+        unsigned limit_lo = s->slr & 0xFF;
+        int is_stack = (slr_type == SLR_RO_STK || slr_type == SLR_RW_STK);
+
+        uint32_t valid_lo, valid_hi;  /* inclusive offset bounds */
+        if (is_stack) {
+            unsigned stack_pages = limit_lo + 1;            /* 1..256 */
+            uint32_t stack_bytes = stack_pages << 9;
+            valid_hi = 0x20000u - 1u;                       /* top of 128K seg */
+            valid_lo = (stack_bytes >= 0x20000u) ? 0u
+                                                  : (0x20000u - stack_bytes);
+        } else {
+            unsigned valid_pages = (limit_lo == 0) ? 256u
+                                                   : (256u - limit_lo);
+            uint32_t valid_bytes = valid_pages << 9;
+            valid_lo = 0u;
+            valid_hi = (valid_bytes == 0u) ? 0u : (valid_bytes - 1u);
+        }
+
+        int unused = (slr_type == SLR_UNUSED_PAGE);
+        int over   = (offset < valid_lo || offset > valid_hi);
+
+        if (unused || over) {
+            if (slr_log_count < SLR_LOG_BUDGET) {
+                extern uint32_t g_last_cpu_pc;
+                fprintf(stderr,
+                    "[P128p] SLR-VIOLATION %s ctx=%d seg=%d log=$%06X "
+                    "offset=$%05X valid=[$%05X..$%05X] (slr=$%04X type=%s) PC=$%06X\n",
+                    unused ? "UNUSED-PAGE" : "OVER-LIMIT",
+                    ctx, seg, addr & 0xFFFFFF,
+                    offset, valid_lo, valid_hi, s->slr,
+                    slr_type == SLR_RO_STK ? "RO_STK" :
+                    slr_type == SLR_RO_MEM ? "RO_MEM" :
+                    slr_type == SLR_RW_STK ? "RW_STK" :
+                    slr_type == SLR_RW_MEM ? "RW_MEM" :
+                    slr_type == SLR_UNUSED_PAGE ? "UNUSED" :
+                    "?",
+                    g_last_cpu_pc);
+                slr_log_count++;
+                if (slr_log_count == SLR_LOG_BUDGET) {
+                    fprintf(stderr,
+                        "[P128p] SLR-VIOLATION log budget reached; "
+                        "further violations suppressed this generation\n");
+                }
+            }
+            /* In mode 2+, set side-channel flag so caller drops the
+             * read/write. Mode 1 logs only — phys is still returned. */
+            if (g_slr_enforce >= 2)
+                g_slr_violation = 1;
+        }
+    }
+
     return phys & 0xFFFFFF;  /* 24-bit physical address */
+}
+
+/* Public-ish helper for read/write paths to consume the violation flag.
+ * Returns 1 if the most recent translation faulted; clears the flag. */
+static inline int slr_take_violation(void) {
+    int v = g_slr_violation;
+    g_slr_violation = 0;
+    return v;
 }
 
 /* Determine which region an address falls in */
@@ -276,6 +398,11 @@ uint8_t lisa_mem_read8(lisa_mem_t *mem, uint32_t addr) {
     switch (addr_region(addr)) {
         case 0: { /* RAM */
             uint32_t phys = mmu_translate(mem, addr);
+            /* P128p — if mmu_translate flagged an SLR violation, return a
+             * safe value (0) instead of indexing into RAM with a phys we
+             * shouldn't trust. The violation has already been logged. */
+            if (slr_take_violation())
+                return 0;
             /* Translation may redirect to I/O */
             if (phys >= LISA_IO_BASE && phys < LISA_ROM_BASE) {
                 if (mem->io_read)
@@ -377,6 +504,10 @@ void lisa_mem_write8(lisa_mem_t *mem, uint32_t addr, uint8_t val) {
     switch (addr_region(addr)) {
         case 0: { /* RAM */
             uint32_t phys = mmu_translate(mem, addr);
+            /* P128p — drop writes that would land outside the SLR limit.
+             * The violation has been logged inside mmu_translate. */
+            if (slr_take_violation())
+                break;
             /* Translation may redirect to I/O */
             if (phys >= LISA_IO_BASE && phys < LISA_ROM_BASE) {
                 if (mem->io_write)
