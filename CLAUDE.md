@@ -207,22 +207,39 @@ across the whole codebase produced 36760 traces, every one correct.
 file `project_clear_space_force_codegen_bug.md` is the canonical
 debunk — read it before re-litigating.
 
-**Active blocker (real one):** ALT_DS_SIZE legitimately calls
-`CLEAR_SPACE(force=TRUE, hole_memaddr=$0453, space_needed=$0006)`. After
-two productive MOVE_SEG iterations, iteration 3+ keeps picking the
-SAME `moving_sdb=$00CC8352` (memaddr $0F5B size $0015) and REMAP_SEGMENT
-becomes a no-op ($0F5B → $0F5B). The smoking gun: at iteration 3 entry
-the local `free_sdb` is still $00B51600 (memaddr $058B size $09E5) —
-the SAME free region as iteration 2 — even though iter 1 created a new
-free at memaddr $03DC and iter 2 created another. `head_sdb.freechain.fwd`
-is not being updated to point at the new lower-memaddr free regions.
-P_ENQUEUE/P_DEQUEUE bytes were dumped from `linked.bin` at $046A6E /
-$046AC2 and look correct; the suspicion now is INSERTSDB's
-freechain-walk-and-insert, MAKE_FREE, or how head_sdb is reached
-through the `c_mmrb^.head_sdb` `with`-context. Anchors: `source-MM0.TEXT`
-P_ENQUEUE @203, REMOVESDB @221, TAKE_FREE @250, INSERTSDB @332,
-MAKE_FREE @377; linker-map addrs $046A6E P_ENQUEUE, $046AFE REMOVESDB,
-$046B58 TAKE_FREE, $046CEE INSERTSDB, $046E54 MAKE_FREE.
+**Root cause locked (P128n):** REMAP_SEGMENT iter 1 stomps on the
+kernel's sysglobal MMU mapping. ALT_DS_SIZE legitimately calls
+`CLEAR_SPACE(force=TRUE, hole_memaddr=$0453, space_needed=$0006)`. iter 1's
+MOVE_SEG runs `MAP_SEGMENT(c_sdb=$00CC74B0, c_mmu=102, dom=0, ..., memaddr=$04A5)`
+which reprograms MMU 102 in domain 0. But sysglobal at logical $00CC0000
+lives in segment 102 (= `$66 << 17`). After the remap, every kernel
+read of logical $00CC0000+ (including `head_sdb.freechain.fwd_link` at
+$00CC7042) lands at a different physical address and returns garbage.
+The W8 byte-write watchpoint shows ZERO logical-address writes to
+$00CC7042 between iter 1 INSERTSDB EXIT (which left $00B1B80E correctly)
+and iter 2 MOVE_SEG entry (which reads $00B5160E) — proving the
+physical bytes didn't change; only the MMU mapping did. Subsequent
+CLEAR_SPACE iterations re-derive a stale free_sdb from the bad read,
+and MOVE_SEG/REMAP_SEGMENT enter the visible no-op loop ($0F5B → $0F5B).
+
+**Why this happens structurally:** Apple's design has domain 0
+reserved for kernel-only mappings; user segments live in process
+domains (1, 2, ...). Their REMAP_SEGMENT scan never finds dom=0
+entries to stomp. In our run, *some* user segment got installed at
+SMT[dom=0, mmu=102] alongside sysglobal — that's the structural bug.
+The fix path: probe MAP_SEGMENT entry across boot, find which call
+site registers a user segment in domain 0, and route it to a process
+domain instead. SLR limit enforcement (deferred — see
+`project_move_seg_needs_full_sdb.md`) would surface the bug as a
+fault rather than silently returning garbage, but doesn't fix the
+underlying domain collision.
+
+P128n probes that captured the diagnosis are LOAD-BEARING in
+`src/m68k.c:~4130` (INSERTSDB ENTRY/EXIT, MAKE_FREE, TAKE_FREE),
+`src/m68k.c:~4090` (`head_sdb LIVE` dump in MOVE_SEG entry), and
+`src/lisa_mmu.c:~362` (W8 limit raised 32 → 240). Don't strip them
+prematurely — they're gated and budgeted, and the next session
+needs them.
 
 **Long-term MMU cleanup (deferred):** `lisa_mmu.c mmu_translate()` ignores
 the SLR limit, which silently lets writes land outside sdb ranges. P128l's
