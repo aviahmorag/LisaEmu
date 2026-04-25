@@ -2253,6 +2253,26 @@ void lisa_reset(lisa_t *lisa) {
                 lisa->mem.segments[ctx][seg].changed = 3; \
             } while(0)
 
+            /* P128p — proper hardware SLR encoding (matches do_an_mmu in
+             * source-LDASM:411-414):
+             *   non-stack (RW_MEM=$7, RO_MEM=$5): hw_lim = twos_comp(memsize)
+             *   stack    (RW_STK=$6, RO_STK=$4): hw_lim = memsize - 1
+             * Decode (used by lisa_mmu.c::mmu_translate):
+             *   non-stack pages: 256 - hw_lim, with hw_lim=0 ⇒ 256 pages
+             *   stack pages:     hw_lim + 1
+             * `bytes` is the segment size in bytes; result is the full 16-bit
+             * slr value with access nibble in the high byte and limit byte
+             * in the low byte. Bytes = full 128KB ⇒ limit byte 0 (matches
+             * Apple's "memsize=0 means 256 pages" convention). */
+            #define SLR_MEM(access, bytes) \
+                ((uint16_t)(((access) << 8) | \
+                            ((((bytes) >> 9) >= 256) ? 0 : \
+                             ((256u - ((bytes) >> 9)) & 0xFF))))
+            #define SLR_STK(access, bytes) \
+                ((uint16_t)(((access) << 8) | \
+                            ((((bytes) >> 9) > 0) ? \
+                             ((((bytes) >> 9) - 1) & 0xFF) : 0)))
+
             /* P127-NEXT: also write the SMT (in RAM at smt_base) so the
              * OS's Pascal code (REMAP_SEGMENT etc.) sees consistent
              * entries. Otherwise SMT[seg].origin stays at uninitialized
@@ -2277,8 +2297,12 @@ void lisa_reset(lisa_t *lisa) {
 
             int ctx = 1;  /* Normal context */
 
-            /* sysglobmmu (102): maps $CC0000 → physical sysglobal */
-            SET_MMU_SEG(ctx, 102, 0x0700, (uint16_t)(b_sysglobal >> 9));
+            /* sysglobmmu (102): maps $CC0000 → physical sysglobal.
+             * Use proper SLR encoding so SLR enforcement catches accesses
+             * past l_sysglobal (e.g. MakeSGSpace HLE handing out logical
+             * $CD2E00 when sgheap actually ends at $CCEE00). Once those
+             * are surfaced and fixed we can drop MakeSGSpace HLE. */
+            SET_MMU_SEG(ctx, 102, SLR_MEM(0x07, l_sysglobal), (uint16_t)(b_sysglobal >> 9));
             /* SMT[102] = { origin=b_sysglobal/512, access=RW_MEM, limit=l_sysglobal/512 } */
             SET_SMT_ENTRY(102, b_sysglobal / 512, 0x07, l_sysglobal / 512);
 
@@ -2288,7 +2312,7 @@ void lisa_reset(lisa_t *lisa) {
              * b_syslocal decl above. Must match the outer value. */
             uint32_t b_syslocal = b_sysglobal + 0x20000;
             uint32_t l_syslocal = 0x4000;
-            SET_MMU_SEG(ctx, 103, 0x0700, (uint16_t)(b_syslocal >> 9));
+            SET_MMU_SEG(ctx, 103, SLR_MEM(0x07, l_syslocal), (uint16_t)(b_syslocal >> 9));
             SET_SMT_ENTRY(103, b_syslocal / 512, 0x07, l_syslocal / 512);
 
             /* Stack segments: Lisa MMU DO_AN_MMU computes SOR differently
@@ -2300,25 +2324,29 @@ void lisa_reset(lisa_t *lisa) {
             #define STACK_SOR(base, len) \
                 (uint16_t)(((base) >> 9) + ((len) >> 9) - 0x100)
 
-            /* superstkmmu (101): maps $CA0000 → physical supervisor stack */
-            SET_MMU_SEG(ctx, 101, 0x0600, STACK_SOR(b_superstack, l_superstack));
+            /* superstkmmu (101): maps $CA0000 → physical supervisor stack.
+             * P128p: was 0x0600 (limit_lo=0 ⇒ 1-page stack per do_an_mmu's
+             * memsize=hw_lim+1 decode). Real stack is l_superstack bytes;
+             * limit byte must be (pages - 1) so SLR enforcement covers the
+             * top-justified valid range [128KB - l_superstack, 128KB-1]. */
+            SET_MMU_SEG(ctx, 101, SLR_STK(0x06, l_superstack), STACK_SOR(b_superstack, l_superstack));
             /* SMT[101] = { origin=b_superstack/512, access=stack($6), limit=l_superstack/512 } */
             SET_SMT_ENTRY(101, b_superstack / 512, 0x06, l_superstack / 512);
 
             /* stackmmu (123): maps $F60000 → physical user stack + jump table */
             uint32_t b_stack = b_syslocal + l_syslocal;
             uint32_t b_opustack = b_stack;
-            SET_MMU_SEG(ctx, 123, 0x0600, STACK_SOR(b_opustack, l_opustack));
+            SET_MMU_SEG(ctx, 123, SLR_STK(0x06, l_opustack), STACK_SOR(b_opustack, l_opustack));
             SET_SMT_ENTRY(123, b_opustack / 512, 0x06, l_opustack / 512);
 
             /* Also map segment 104 for legacy compatibility */
-            SET_MMU_SEG(ctx, 104, 0x0600, STACK_SOR(b_stack, l_opustack));
+            SET_MMU_SEG(ctx, 104, SLR_STK(0x06, l_opustack), STACK_SOR(b_stack, l_opustack));
             SET_SMT_ENTRY(104, b_stack / 512, 0x06, l_opustack / 512);
 
             #undef STACK_SOR
 
             /* screenmmu (105): maps $D20000 → physical screen */
-            SET_MMU_SEG(ctx, 105, 0x0700, (uint16_t)(b_screen >> 9));
+            SET_MMU_SEG(ctx, 105, SLR_MEM(0x07, l_screen), (uint16_t)(b_screen >> 9));
             SET_SMT_ENTRY(105, b_screen / 512, 0x07, l_screen / 512);
 
             /* realmemmmu (85-100): identity map first 2MB as real memory */
@@ -2347,6 +2375,8 @@ void lisa_reset(lisa_t *lisa) {
              * map $CC0000 → $E2000 for POOL_INIT and GETSPACE. */
 
             #undef SET_MMU_SEG
+            #undef SLR_MEM
+            #undef SLR_STK
         }
         /* Verify RAM at $4EC matches linker output */
         printf("RAM at $4E8-$4FF: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X\n",

@@ -207,17 +207,24 @@ SLR limit byte uses two distinct schemes —
   128KB - 1]`. Decode `stack_pages = hw_lim + 1`.
 - I/O variants short-circuit (no limit check). UNUSED_PAGE is fault.
 
-**What enforcement immediately revealed:**
-1. **Compiled-OS path**: 7 distinct violation PCs, all stack-segment
-   accesses on segs 101/123 with `slr=$0600` (limit_lo=$00 ⇒ decoded
-   as a 1-page stack). Source: `src/lisa.c:2304-2306` hardcodes
-   `0x0600` for `b_superstack` regardless of `l_superstack`. Real
-   stack is 16 KB = 32 pages, so the SLR limit byte should be $1F
-   (`l_superstack/512 - 1`). Same pattern likely on other stack
-   segments. Fix is a one-liner in the loader-init, but the
-   violation log + 27/27 milestones tells us the kernel itself
-   never relies on this metadata — it's an emulator-side metadata
-   bug surfaced by the new check.
+**What enforcement immediately revealed (and how P128p resolved each):**
+1. ~~**Compiled-OS path**: 7 distinct violation PCs, stack segments
+   slr=$0600 (1-page).~~ **FIXED in P128p**: added `SLR_MEM(access,
+   bytes)` and `SLR_STK(access, bytes)` macros in `src/lisa.c` that
+   match `do_an_mmu`'s encoding (non-stack: `twos_comp(memsize)`;
+   stack: `memsize - 1`). All loader-init MMU calls now use
+   correct-size encoding. Sysglobmmu(102), syslocmmu(103),
+   superstkmmu(101), stackmmu(123), seg-104, screenmmu(105) all
+   updated. realmemmmu(85-100) and kernelmmu(17-20) untouched
+   (they map full 128 KB segs ⇒ limit byte 0 already correct).
+   27/27 milestones still reach. Remaining violations on the
+   compiled-OS path: 4 distinct PCs ($005FAA, $006688, $03CEB6,
+   $07963C). $07963C reads logical $CA0000+0..$CA000F repeatedly
+   — that's segment 101's BOTTOM, well outside the stack's
+   top-justified valid range [$1C000..$1FFFF]. Kernel appears to
+   use seg 101's bottom for non-stack data (jump table? globals?);
+   the access works in mode 1 (log-only), but is flagged for
+   investigation.
 2. **Prebuilt-image path** (`prebuilt/los_compilation_base.image`):
    loader at PC=$A840A2+ tries to execute through seg 84 (`mmucodemmu`)
    in ctx=0 (start mode), but our boot-ROM init leaves seg 84 at
@@ -242,13 +249,24 @@ picks sysglobal as `moving_sdb`.
 
 Concrete remaining work toward HLE retirement (in approximate
 order):
-1. Fix `src/lisa.c:2304-2306` SLR encoding for stack segments
-   (`slr = 0x0600 | (l_superstack/512 - 1)`).
-2. Tighten MakeSGSpace HLE to `chunk_seg_end = b_sgheap + l_sgheap`
-   instead of segment-end.
-3. Move `b_syslocal` back to natural position (right after
-   `b_superstack`); remove P127 gap; verify MOVE_SEG works.
-4. Map seg 84 (`mmucodemmu`) in ctx=0 during boot-ROM init so the
+1. ✅ **DONE in P128p**: SLR encoding for all loader-init MMU
+   segments fixed via SLR_MEM / SLR_STK macros.
+2. Investigate 4 remaining compiled-OS violation PCs ($005FAA,
+   $006688, $03CEB6, $07963C). $07963C reads seg 101 offset 0+
+   (below stack range) — likely a kernel jump table at logical
+   $CA0000. Either (a) supstack should NOT be mapped via MMU 101
+   (use a different MMU for the jump table), or (b) supstack's
+   non-stack-shaped use means the segment shouldn't be encoded as
+   stack-type at all.
+3. Tighten MakeSGSpace HLE to `chunk_seg_end = b_sgheap + l_sgheap`
+   instead of segment-end. With sysglobmmu now properly limited
+   (slr=$0789), mode-2 enforcement would fault MakeSGSpace's
+   over-extent writes.
+4. Move `b_syslocal` back to natural position (right after
+   `b_superstack`); remove P127 gap; verify MOVE_SEG works (the
+   self-referential bug from P128n disappears once sysglobal isn't
+   the chosen `moving_sdb`).
+5. Map seg 84 (`mmucodemmu`) in ctx=0 during boot-ROM init so the
    prebuilt loader can JSR through it.
 
 ## Earlier (2026-04-25 P128o — pool-layout diagnosis)
