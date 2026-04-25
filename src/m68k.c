@@ -4089,6 +4089,16 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                     fprintf(stderr,
                         "        CLEAR_SPACE: c_mmrb=$%08X free_sdb=$%08X next_sdb=$%08X moving_sdb=$%08X\n",
                         c_mmrb_l, free_sdb, next_sdb, moving_sdb);
+                    /* P128n: dump head_sdb.freechain.fwd_link via the c_mmrb
+                     * local. head_sdb at MMRB+42, freechain.fwd at +14. */
+                    if ((c_mmrb_l & 0xFFFFFF) >= 0x00CC0000 && (c_mmrb_l & 0xFFFFFF) < 0x00CE0000) {
+                        uint32_t hd_fch = cpu_read32(cpu, ((c_mmrb_l & 0xFFFFFF) + 42 + 14) & 0xFFFFFF);
+                        uint32_t hd_mch = cpu_read32(cpu, ((c_mmrb_l & 0xFFFFFF) + 42 + 0)  & 0xFFFFFF);
+                        uint16_t hd_ms  = cpu_read16(cpu, ((c_mmrb_l & 0xFFFFFF) + 42 + 10) & 0xFFFFFF);
+                        fprintf(stderr,
+                            "          head_sdb LIVE: fch.fwd=$%08X mch.fwd=$%08X memsize=$%04X\n",
+                            hd_fch, hd_mch, hd_ms);
+                    }
                     fprintf(stderr,
                         "                     space_gained=$%04X free_start=$%04X free_end=$%04X\n",
                         (uint16_t)sp_gained, (uint16_t)fr_start, (uint16_t)fr_end);
@@ -4124,6 +4134,72 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                         fprintf(stderr, "\n");
                     }
                 }
+            }
+
+            /* P128n — INSERTSDB entry probe ($046CEE). Read c_sdb arg, dump
+             * c_sdb's memaddr/sdbtype, head_sdb.freechain.fwd_link BEFORE
+             * the call. Static MMRB addr cached via boot_progress lookup. */
+            /* Gate INSERTSDB/MAKE_FREE/TAKE_FREE probes to fire only AFTER
+             * the first CLEAR_SPACE entry probe has hit (so we capture the
+             * MemMgr-loop calls, not MM_INIT noise). */
+            DBGSTATIC(int, p128n_ins_count, 0);
+            if (cpu->pc == 0x046CEE && p128n_ins_count < 30 && p128m_cs_count > 0) {
+                p128n_ins_count++;
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                uint32_t ret = cpu_read32(cpu, sp);
+                uint32_t c_sdb = cpu_read32(cpu, (sp + 4) & 0xFFFFFF);
+                uint16_t c_ma = cpu_read16(cpu, (c_sdb + 8) & 0xFFFFFF);
+                uint16_t c_ms = cpu_read16(cpu, (c_sdb + 10) & 0xFFFFFF);
+                uint8_t  c_st = cpu_read8(cpu,  (c_sdb + 13) & 0xFFFFFF);
+                uint32_t a5 = cpu->a[5] & 0xFFFFFF;
+                uint32_t mmrb = cpu_read32(cpu, (a5 - 25691) & 0xFFFFFF);
+                uint32_t hd_fch_fwd = cpu_read32(cpu, (mmrb + 42 + 14) & 0xFFFFFF);
+                fprintf(stderr,
+                    "[P128n] INSERTSDB#%d ENTRY ret=$%06X A5=$%06X mmrb=$%08X c_sdb=$%08X (memaddr=$%04X memsize=$%04X type=$%02X)  head.fch.fwd=$%08X\n",
+                    p128n_ins_count, ret, a5, mmrb, c_sdb, c_ma, c_ms, c_st, hd_fch_fwd);
+            }
+
+            /* P128n — INSERTSDB exit ($046E52, just before UNLK). Dump
+             * head.freechain.fwd_link AFTER P_ENQUEUEs + MERGE_FREEs. */
+            DBGSTATIC(int, p128n_inx_count, 0);
+            if (cpu->pc == 0x046E52 && p128n_inx_count < 30 && p128m_cs_count > 0) {
+                p128n_inx_count++;
+                uint32_t a5 = cpu->a[5] & 0xFFFFFF;
+                uint32_t mmrb = cpu_read32(cpu, (a5 - 25691) & 0xFFFFFF);
+                uint32_t hd_fch_fwd = cpu_read32(cpu, (mmrb + 42 + 14) & 0xFFFFFF);
+                uint32_t hd_mch_fwd = cpu_read32(cpu, (mmrb + 42 + 0)  & 0xFFFFFF);
+                uint16_t hd_ms      = cpu_read16(cpu, (mmrb + 42 + 10) & 0xFFFFFF);
+                fprintf(stderr,
+                    "[P128n] INSERTSDB#%d EXIT  A5=$%06X mmrb=$%08X head.fch.fwd=$%08X  head.mch.fwd=$%08X  head.memsize=$%04X\n",
+                    p128n_inx_count, a5, mmrb, hd_fch_fwd, hd_mch_fwd, hd_ms);
+            }
+
+            /* P128n — MAKE_FREE entry probe ($046E54). Args: maddr (W) at
+             * SP+4, msize (W) at SP+6 (Pascal pushes args as words). */
+            DBGSTATIC(int, p128n_mf_count, 0);
+            if (cpu->pc == 0x046E54 && p128n_mf_count < 30 && p128m_cs_count > 0) {
+                p128n_mf_count++;
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                uint32_t ret = cpu_read32(cpu, sp);
+                uint16_t maddr = cpu_read16(cpu, (sp + 4) & 0xFFFFFF);
+                uint16_t msize = cpu_read16(cpu, (sp + 6) & 0xFFFFFF);
+                fprintf(stderr,
+                    "[P128n] MAKE_FREE#%d ENTRY ret=$%06X maddr=$%04X msize=$%04X\n",
+                    p128n_mf_count, ret, maddr, msize);
+            }
+
+            /* P128n — TAKE_FREE entry probe ($046B58). Arg: free_sdb (L)
+             * at SP+4, upd_avail (B) at SP+8 (high byte = caller-clean
+             * convention OR low byte for Pascal). Read both, decide. */
+            DBGSTATIC(int, p128n_tf_count, 0);
+            if (cpu->pc == 0x046B58 && p128n_tf_count < 30 && p128m_cs_count > 0) {
+                p128n_tf_count++;
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                uint32_t ret = cpu_read32(cpu, sp);
+                uint32_t free_sdb = cpu_read32(cpu, (sp + 4) & 0xFFFFFF);
+                fprintf(stderr,
+                    "[P128n] TAKE_FREE#%d ENTRY ret=$%06X free_sdb=$%08X\n",
+                    p128n_tf_count, ret, free_sdb);
             }
 
             /* P128j probe — CHK_LDSN_FREE entry/exit.

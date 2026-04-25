@@ -189,21 +189,40 @@ the real replacement.
 | 11 | Shell (APDM) | full desktop | Not started |
 | 12 | Apps | LisaWrite, LisaCalc, etc. | Not started |
 
-## Current Status (2026-04-24 post-P128l)
+## Current Status (2026-04-25 post-P128n diagnosis)
 
 **27/27 milestones reached naturally; MemMgr LIVE post-PR_CLEANUP.** No
 SYSTEM_ERROR, no hard_excep, no illegal-inst. After scheduler idle, MemMgr
 dispatches, processes its first service request (CLEAR_SPACE → MOVE_SEG →
-REMAP_SEGMENT), and continues executing. PC stays hot in REMAP_SEGMENT /
-INSERTSDB / REMOVESDB doing memory-compaction work — first boot in project
-history where the kernel init path completes AND the scheduler's first
-user-mode dispatch survives past its initial service request.
+REMAP_SEGMENT), and the loop runs but does not progress.
 
-**Active blocker:** post-PR_CLEANUP MemMgr appears stuck in a
-REMAP_SEGMENT/INSERTSDB/REMOVESDB busy loop (144K+ hits on REMAP_SEGMENT).
-Whether this is productive compaction or a new loop bug is the next
-session's job — start by sampling PCs across a long run and seeing whether
-the loop has a visible exit condition.
+**P128m claim debunked (P128n).** P128m said Pascal codegen miscompiles
+`false` as MOVEQ #1 at MM2.TEXT:595. P128n verified that bytes
+`70 01 3F 00` at $04A930 in `linked.bin` actually correspond to
+`Clear_Space(holeAddr, delta_size, true)` at MM3.TEXT:609 (inside
+`ALT_DS_SIZE`, $04A7E4..$04AC99 in the linker map) — not MM2.TEXT:595.
+Instrumenting all four AST_IDENT_EXPR emit sites for `false`/`true`
+across the whole codebase produced 36760 traces, every one correct.
+**There is no codegen bug for boolean literals.** The P128n memory
+file `project_clear_space_force_codegen_bug.md` is the canonical
+debunk — read it before re-litigating.
+
+**Active blocker (real one):** ALT_DS_SIZE legitimately calls
+`CLEAR_SPACE(force=TRUE, hole_memaddr=$0453, space_needed=$0006)`. After
+two productive MOVE_SEG iterations, iteration 3+ keeps picking the
+SAME `moving_sdb=$00CC8352` (memaddr $0F5B size $0015) and REMAP_SEGMENT
+becomes a no-op ($0F5B → $0F5B). The smoking gun: at iteration 3 entry
+the local `free_sdb` is still $00B51600 (memaddr $058B size $09E5) —
+the SAME free region as iteration 2 — even though iter 1 created a new
+free at memaddr $03DC and iter 2 created another. `head_sdb.freechain.fwd`
+is not being updated to point at the new lower-memaddr free regions.
+P_ENQUEUE/P_DEQUEUE bytes were dumped from `linked.bin` at $046A6E /
+$046AC2 and look correct; the suspicion now is INSERTSDB's
+freechain-walk-and-insert, MAKE_FREE, or how head_sdb is reached
+through the `c_mmrb^.head_sdb` `with`-context. Anchors: `source-MM0.TEXT`
+P_ENQUEUE @203, REMOVESDB @221, TAKE_FREE @250, INSERTSDB @332,
+MAKE_FREE @377; linker-map addrs $046A6E P_ENQUEUE, $046AFE REMOVESDB,
+$046B58 TAKE_FREE, $046CEE INSERTSDB, $046E54 MAKE_FREE.
 
 **Long-term MMU cleanup (deferred):** `lisa_mmu.c mmu_translate()` ignores
 the SLR limit, which silently lets writes land outside sdb ranges. P128l's
