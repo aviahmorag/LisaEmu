@@ -189,43 +189,35 @@ the real replacement.
 | 11 | Shell (APDM) | full desktop | Not started |
 | 12 | Apps | LisaWrite, LisaCalc, etc. | Not started |
 
-## Current Status (2026-05-04 post-P108b)
+## Current Status (2026-05-04 post-P109)
 
-**Milestones**: **23/26** kernel checkpoints reached natively, last
-checkpoint `SYS_PROC_INIT`. The 2026-05-04 session landed P108 (two
-commits) addressing the FS_INIT stall and advancing boot from 22/26
-to 23/26.
+**Milestones**: **27/27** kernel checkpoints reached natively, last
+checkpoint `PR_CLEANUP` (scheduler idle loop). Boot runs the complete
+kernel init sequence with zero SYSTEM_ERRORs. MemMgr dispatches and
+processes service requests post-PR_CLEANUP.
 
-**P108 commit `903e6b2`**: Two structural fixes in the toolchain:
-1. **`exclude_modules` mechanism** for `compile_target_t` — added
-   field + filtering in LOOSE mode. DRIVERASM, PROFILEASM, DRIVERMAIN
-   excluded from SYSTEM.OS build. These are driver-only modules whose
-   thunks (routing through DRIVRJT at $210) shadowed real OS
-   implementations like GETSPACE/RELSPACE from SYSG1.
-2. **Case-insensitive `$I` include resolution** — `pascal_lexer.c`'s
-   `lexer_resolve_include` now tries uppercase-name variants
-   (`source-SYSG1.TEXT.unix.txt`) on case-sensitive filesystems.
-   Without this, `{$I source/sysg1.text}` in SYSGLOBAL failed silently,
-   leaving GETSPACE/RELSPACE as unresolved RTS stubs.
+**P109 commit `af4da1f`**: Fixed `$I` include resolution to try
+uppercase PREFIX (not just uppercase name). Files like
+`SOURCE-PMMAKE.TEXT.unix.txt` couldn't match `{$I source/pmmake.text}`
+because the resolver only tried `source-PMMAKE` not `SOURCE-PMMAKE`.
+This unlocked PMMAKE (Make_SProcess), PMCNTRL, PMTERM, PMSPROCS — the
+entire process management subsystem was missing from the kernel build.
+Boot jumped from 23/26 to 27/27.
 
-**P108b commit `8244b6f`**: Three runtime fixes:
-1. **Boot ROM TRAP5 handler BNE.S displacement** ($6604 → $6608) —
-   the old displacement landed in the middle of a MOVEA.L instruction,
-   causing garbage execution and PC=0 for any TRAP5 call other than
-   ScreenAddr/AltScreenAddr (e.g. TimeStamp D7=$58).
-2. **psio HLE vector-table protection** — real_mount's bitmap read
-   calls psio with addr=0 (Make_MRData returned null buffer, likely a
-   codegen issue in the VAR addr parameter). The psio HLE wrote 1208
-   bytes of bitmap data starting at address 0, zeroing the exception
-   vector table including TRAP5 at $94. Guard: reject reads to
-   addresses < $400 with error 654. bitmap_io → real_mount fails
-   gracefully → 10707 suppression unwinds → boot continues.
-3. **Make_SProcess trace guard** — pc_msp=0 (symbol not in map)
-   matched PC=0 unconditionally, causing 56K false trace entries.
+**P108b commit `8244b6f`** (earlier this session): Boot ROM TRAP5
+BNE.S displacement fix + psio vector-table protection (bitmap read to
+addr=0 was zeroing the exception vector table) + Make_SProcess trace
+guard.
 
-**Next blocker**: SYSTEM_ERROR(10101) in SYS_PROC_INIT —
-Make_SProcess fails during system process creation. This is the
-known P35 blocker requiring functional process creation machinery.
+**P108 commit `903e6b2`** (earlier this session): `exclude_modules`
+mechanism for compile_target_t + case-insensitive $I include (uppercase
+name, not prefix — P109 completed the fix for uppercase prefix).
+
+**Next blocker**: SHELL and WS_MAIN (milestones 28-29 in map) require
+loading APDM/Workshop from disk — Phase 9+ work. The immediate path
+forward is investigating post-PR_CLEANUP behavior: MemMgr's MOVE_SEG
+loop (the P128n/P128o CLEAR_SPACE non-progression) and whether the
+improved process management code changes the dynamics.
 
 Concrete remaining work toward HLE retirement (in approximate
 order):
