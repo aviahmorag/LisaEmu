@@ -189,63 +189,43 @@ the real replacement.
 | 11 | Shell (APDM) | full desktop | Not started |
 | 12 | Apps | LisaWrite, LisaCalc, etc. | Not started |
 
-## Current Status (2026-04-25 P128p — SLR limit enforcement landed)
+## Current Status (2026-05-04 post-P108b)
 
-**SLR limit enforcement now active in `src/lisa_mmu.c::mmu_translate`**
-(was deferred since P127). Three modes via env `LISAEMU_SLR_ENFORCE`:
-0=legacy, 1=log-only (default), 2=log+drop. Mode 1 ships safely: 27/27
-boot milestones still reach naturally on the compiled OS, but every
-out-of-range read/write is now logged with PC, ctx, seg, offset, and
-the decoded valid-offset window.
+**Milestones**: **23/26** kernel checkpoints reached natively, last
+checkpoint `SYS_PROC_INIT`. The 2026-05-04 session landed P108 (two
+commits) addressing the FS_INIT stall and advancing boot from 22/26
+to 23/26.
 
-**Encoding decoded** (per source-LDASM:321-329 `do_an_mmu`): hardware
-SLR limit byte uses two distinct schemes —
-- **non-stack** (`RO_MEM`/`RW_MEM`): hw_lim = `twos_comp(memsize)`,
-  decode `valid_pages = 256 - hw_lim` (with hw_lim=0 ⇒ 256 = full seg).
-- **stack** (`RO_STK`/`RW_STK`): hw_lim = `memsize - 1` AND origin is
-  shifted to TOP of segment. Valid range = `[128KB - stack_bytes,
-  128KB - 1]`. Decode `stack_pages = hw_lim + 1`.
-- I/O variants short-circuit (no limit check). UNUSED_PAGE is fault.
+**P108 commit `903e6b2`**: Two structural fixes in the toolchain:
+1. **`exclude_modules` mechanism** for `compile_target_t` — added
+   field + filtering in LOOSE mode. DRIVERASM, PROFILEASM, DRIVERMAIN
+   excluded from SYSTEM.OS build. These are driver-only modules whose
+   thunks (routing through DRIVRJT at $210) shadowed real OS
+   implementations like GETSPACE/RELSPACE from SYSG1.
+2. **Case-insensitive `$I` include resolution** — `pascal_lexer.c`'s
+   `lexer_resolve_include` now tries uppercase-name variants
+   (`source-SYSG1.TEXT.unix.txt`) on case-sensitive filesystems.
+   Without this, `{$I source/sysg1.text}` in SYSGLOBAL failed silently,
+   leaving GETSPACE/RELSPACE as unresolved RTS stubs.
 
-**What enforcement immediately revealed (and how P128p resolved each):**
-1. ~~**Compiled-OS path**: 7 distinct violation PCs, stack segments
-   slr=$0600 (1-page).~~ **FIXED in P128p**: added `SLR_MEM(access,
-   bytes)` and `SLR_STK(access, bytes)` macros in `src/lisa.c` that
-   match `do_an_mmu`'s encoding (non-stack: `twos_comp(memsize)`;
-   stack: `memsize - 1`). All loader-init MMU calls now use
-   correct-size encoding. Sysglobmmu(102), syslocmmu(103),
-   superstkmmu(101), stackmmu(123), seg-104, screenmmu(105) all
-   updated. realmemmmu(85-100) and kernelmmu(17-20) untouched
-   (they map full 128 KB segs ⇒ limit byte 0 already correct).
-   27/27 milestones still reach. Remaining violations on the
-   compiled-OS path: 4 distinct PCs ($005FAA, $006688, $03CEB6,
-   $07963C). $07963C reads logical $CA0000+0..$CA000F repeatedly
-   — that's segment 101's BOTTOM, well outside the stack's
-   top-justified valid range [$1C000..$1FFFF]. Kernel appears to
-   use seg 101's bottom for non-stack data (jump table? globals?);
-   the access works in mode 1 (log-only), but is flagged for
-   investigation.
-2. **Prebuilt-image path** (`prebuilt/los_compilation_base.image`):
-   loader at PC=$A840A2+ tries to execute through seg 84 (`mmucodemmu`)
-   in ctx=0 (start mode), but our boot-ROM init leaves seg 84 at
-   default `slr=$0C00` (UNUSED_PAGE). lisaem-master initializes
-   `mmu_all[0][i]` with copy-from-context-1 logic; we don't.
-   Specific, fixable boot-ROM gap.
+**P108b commit `8244b6f`**: Three runtime fixes:
+1. **Boot ROM TRAP5 handler BNE.S displacement** ($6604 → $6608) —
+   the old displacement landed in the middle of a MOVEA.L instruction,
+   causing garbage execution and PC=0 for any TRAP5 call other than
+   ScreenAddr/AltScreenAddr (e.g. TimeStamp D7=$58).
+2. **psio HLE vector-table protection** — real_mount's bitmap read
+   calls psio with addr=0 (Make_MRData returned null buffer, likely a
+   codegen issue in the VAR addr parameter). The psio HLE wrote 1208
+   bytes of bitmap data starting at address 0, zeroing the exception
+   vector table including TRAP5 at $94. Guard: reject reads to
+   addresses < $400 with error 654. bitmap_io → real_mount fails
+   gracefully → 10707 suppression unwinds → boot continues.
+3. **Make_SProcess trace guard** — pc_msp=0 (symbol not in map)
+   matched PC=0 unconditionally, causing 56K false trace entries.
 
-**Strategic significance**: P128p is the first HLE-retiring fix that
-helps BOTH boot paths. The compiled-OS path was already passing
-through this region without checking; the prebuilt-image path was
-silently misbehaving. With enforcement on, both paths have *visible
-diagnostics* at the exact line of trouble.
-
-**MOVE_SEG self-reference (the P128n/P128o focus) is still live** but
-has a clearer fix path now: once stack-segment SLR encoding is
-corrected (item 1 above), MakeSGSpace HLE can be tightened to refuse
-out-of-sgheap chunks (the SLR enforcement will fault those reads/
-writes naturally in mode 2), letting `b_syslocal` return to its
-natural position right after `b_superstack`. With the P127 gap gone,
-CLEAR_SPACE finds free space adjacent to sysglobal end and never
-picks sysglobal as `moving_sdb`.
+**Next blocker**: SYSTEM_ERROR(10101) in SYS_PROC_INIT —
+Make_SProcess fails during system process creation. This is the
+known P35 blocker requiring functional process creation machinery.
 
 Concrete remaining work toward HLE retirement (in approximate
 order):
