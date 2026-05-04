@@ -189,35 +189,37 @@ the real replacement.
 | 11 | Shell (APDM) | full desktop | Not started |
 | 12 | Apps | LisaWrite, LisaCalc, etc. | Not started |
 
-## Current Status (2026-05-04 post-P109)
+## Current Status (2026-05-04 post-P110)
 
 **Milestones**: **27/27** kernel checkpoints reached natively, last
 checkpoint `PR_CLEANUP` (scheduler idle loop). Boot runs the complete
 kernel init sequence with zero SYSTEM_ERRORs. MemMgr dispatches and
 processes service requests post-PR_CLEANUP.
 
+**P110 commit `89df3fe`**: Converted all P128l/m/n diagnostic probes
+to `boot_progress_lookup()` dynamic resolution (addresses were stale
+by -12 bytes since P109's PMMAKE inclusion). Fixed Mover probe arg
+decoding (Pascal left-to-right push order: SP+4=length, SP+8=dest,
+SP+12=source). Produced clean CLEAR_SPACE loop diagnosis showing
+exact non-progression mechanism.
+
 **P109 commit `af4da1f`**: Fixed `$I` include resolution to try
-uppercase PREFIX (not just uppercase name). Files like
-`SOURCE-PMMAKE.TEXT.unix.txt` couldn't match `{$I source/pmmake.text}`
-because the resolver only tried `source-PMMAKE` not `SOURCE-PMMAKE`.
-This unlocked PMMAKE (Make_SProcess), PMCNTRL, PMTERM, PMSPROCS — the
-entire process management subsystem was missing from the kernel build.
+uppercase PREFIX (not just uppercase name). Unlocked the entire
+process management subsystem (PMMAKE, PMCNTRL, PMTERM, PMSPROCS).
 Boot jumped from 23/26 to 27/27.
 
-**P108b commit `8244b6f`** (earlier this session): Boot ROM TRAP5
-BNE.S displacement fix + psio vector-table protection (bitmap read to
-addr=0 was zeroing the exception vector table) + Make_SProcess trace
-guard.
-
-**P108 commit `903e6b2`** (earlier this session): `exclude_modules`
-mechanism for compile_target_t + case-insensitive $I include (uppercase
-name, not prefix — P109 completed the fix for uppercase prefix).
-
-**Next blocker**: SHELL and WS_MAIN (milestones 28-29 in map) require
-loading APDM/Workshop from disk — Phase 9+ work. The immediate path
-forward is investigating post-PR_CLEANUP behavior: MemMgr's MOVE_SEG
-loop (the P128n/P128o CLEAR_SPACE non-progression) and whether the
-improved process management code changes the dynamics.
+**Next blocker**: CLEAR_SPACE `$0F5B→$0F5B` non-progression. The
+call is `CLEAR_SPACE($044B, $0006, force=TRUE)` — caller at
+$04A93A wants 6 pages at the end of sysglobal. After MOVE_SEG#2
+moves the stack to $0F5B, the free chunk at $056E has
+`free_start=$056E > hole_memaddr=$044B`, so the force condition
+keeps looping. The `toright` path calculates `destaddr = srcaddr`
+(stack already at free's right edge), producing an infinite
+no-op loop. Root cause is pool geometry: the gap between $044B
+and $0554 contains segments that need to move LEFT, but the
+toleft branch never fires because `free_end > hole_memaddr`.
+Next step: identify the caller at $04A93A and investigate
+whether adjusting initial pool layout avoids this case.
 
 Concrete remaining work toward HLE retirement (in approximate
 order):
