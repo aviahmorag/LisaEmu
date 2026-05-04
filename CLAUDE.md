@@ -189,12 +189,24 @@ the real replacement.
 | 11 | Shell (APDM) | full desktop | Not started |
 | 12 | Apps | LisaWrite, LisaCalc, etc. | Not started |
 
-## Current Status (2026-05-04 post-P110)
+## Current Status (2026-05-04 post-P111)
 
 **Milestones**: **27/27** kernel checkpoints reached natively, last
 checkpoint `PR_CLEANUP` (scheduler idle loop). Boot runs the complete
 kernel init sequence with zero SYSTEM_ERRORs. MemMgr dispatches and
-processes service requests post-PR_CLEANUP.
+processes service requests post-PR_CLEANUP. CLEAR_SPACE infinite loop
+resolved (P111).
+
+**P111**: HLE for EXP_SYSGLOBAL — prevents the CLEAR_SPACE infinite
+loop diagnosed in P128n/o. Root cause: our physical memory layout
+diverges from Apple's real LOADER (we place syslocal at
+b_sysglobal+$20000 per P127, while Apple packs everything via
+sequential BGETSPACE(lo)). This makes CLEAR_SPACE's toright loop
+pick sysglobal itself as moving_sdb, producing infinite no-op moves.
+Fix: intercept EXP_SYSGLOBAL and let MakeSGSpace HLE handle pool
+growth (it carves chunks from pre-mapped seg-102 headroom, making
+physical MemMgr expansion unnecessary). Retires when we match
+Apple's real memory layout.
 
 **P110 commit `89df3fe`**: Converted all P128l/m/n diagnostic probes
 to `boot_progress_lookup()` dynamic resolution (addresses were stale
@@ -207,19 +219,6 @@ exact non-progression mechanism.
 uppercase PREFIX (not just uppercase name). Unlocked the entire
 process management subsystem (PMMAKE, PMCNTRL, PMTERM, PMSPROCS).
 Boot jumped from 23/26 to 27/27.
-
-**Next blocker**: CLEAR_SPACE `$0F5B→$0F5B` non-progression. The
-call is `CLEAR_SPACE($044B, $0006, force=TRUE)` — caller at
-$04A93A wants 6 pages at the end of sysglobal. After MOVE_SEG#2
-moves the stack to $0F5B, the free chunk at $056E has
-`free_start=$056E > hole_memaddr=$044B`, so the force condition
-keeps looping. The `toright` path calculates `destaddr = srcaddr`
-(stack already at free's right edge), producing an infinite
-no-op loop. Root cause is pool geometry: the gap between $044B
-and $0554 contains segments that need to move LEFT, but the
-toleft branch never fires because `free_end > hole_memaddr`.
-Next step: identify the caller at $04A93A and investigate
-whether adjusting initial pool layout avoids this case.
 
 Concrete remaining work toward HLE retirement (in approximate
 order):
@@ -342,6 +341,11 @@ Each entry retires when the listed phase lands.
   directly from disk image for indexing paths vm doesn't cover.
 - **MakeSGSpace HLE** (`$012970`, P124) — pool-expansion work normally
   done by memmgr process. Retires with Phase 6.
+- **EXP_SYSGLOBAL HLE** (`src/lisa.c:hle_handle_exp_sysglobal`, P111) —
+  intercepts MemMgr's EXP_SYSGLOBAL to prevent CLEAR_SPACE infinite
+  loop caused by our non-Apple memory layout (P127's syslocal gap).
+  MakeSGSpace HLE handles the actual pool growth. Retires when we
+  match Apple's BGETSPACE(lo) sequential layout.
 - **SEG-ALIAS-GUARD** (`src/lisa_mmu.c lisa_mem_write8`, P122) — drops
   writes where logical ≥ `$20000` aliases to phys `< $400`. Retires
   when MMU emulates Apple's segment-fault demand-paging semantics

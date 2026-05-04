@@ -3637,6 +3637,68 @@ static bool hle_handle_makesgspace(lisa_t *lisa, m68k_t *cpu) {
     return true;
 }
 
+/* P111 scaffold: HLE EXP_SYSGLOBAL. EXP_SYSGLOBAL is a nested proc
+ * inside MEMMGR that physically grows the sysglobal segment when the
+ * internal freepool is exhausted. It calls ALT_DS_SIZE → CLEAR_SPACE
+ * to consolidate free pages adjacent to sysglobal. On a real Lisa,
+ * the pool geometry (contiguous low-memory allocation) ensures
+ * CLEAR_SPACE converges. On our emulator, syslocal lives at
+ * b_sysglobal+$20000 (P127 fix for seg-102 aliasing), creating a
+ * gap that makes CLEAR_SPACE's toright loop pick sysglobal as
+ * moving_sdb — producing an infinite no-op loop (P128n/o diagnosis).
+ *
+ * Since our MakeSGSpace HLE already carves pool chunks from the
+ * pre-mapped seg-102 headroom (without needing physical MemMgr
+ * expansion), EXP_SYSGLOBAL's physical expansion is redundant.
+ * This HLE simply clears grow_sysglobal + inc_sysglobal and returns,
+ * letting MakeSGSpace handle the pool growth the next time a caller
+ * requests sysglobal space.
+ *
+ * Retires when we match Apple's real memory layout (syslocal
+ * immediately after sysglobal via sequential BGETSPACE(lo)). */
+static bool hle_handle_exp_sysglobal(lisa_t *lisa, m68k_t *cpu) {
+    (void)lisa;
+    uint32_t a5 = cpu->a[5] & 0xFFFFFF;
+    uint32_t grow_sysglobal_addr = (a5 - 26541) & 0xFFFFFF;
+    uint32_t mmrb_addr_loc = (a5 - 25691) & 0xFFFFFF;
+    uint32_t mmrb = cpu_read32(cpu, mmrb_addr_loc) & 0xFFFFFF;
+
+    cpu->write8(grow_sysglobal_addr, 0);
+
+    /* inc_sysglobal is at MMRB + offset. From PASCALDEFS/MM4 analysis:
+     * hd_qioreq_list(8) + seg_wait_sem(8) + memmgr_sem(8) +
+     * sys_swap_space(4) + memmgr_busyF(2) + numbRelSegs(2) +
+     * req_pcb_ptr(4) + hd_sdscb_list(8) + sds_sem(8) + head_sdb(~28) +
+     * tail_sdb(~28) + DriverCode_sdb(~28) + avail_space(2) +
+     * clock_ptr(4) + mrdata(array) ... inc_sysglobal is far in.
+     * Rather than compute the exact offset, we rely on the fact that
+     * MakeSGSpace HLE already cleared grow_sysglobal, and MemMgr's
+     * EXP_SYSGLOBAL body zeroes inc_sysglobal at exit. Since we're
+     * skipping the body, we must zero it ourselves. The field is at the
+     * offset that EXP_SYSGLOBAL reads as `c_mmrb_ptr^.inc_sysglobal`.
+     * From MM3.TEXT, EXP_SYSGLOBAL accesses it via `c_mmrb_ptr` which
+     * is its parent MEMMGR's local `c_mmrb`. However, for the HLE we
+     * just need grow_sysglobal=false — the MEMMGR loop re-checks
+     * grow_sysglobal and won't re-enter EXP_SYSGLOBAL if it's cleared. */
+
+    DBGSTATIC(int, exp_sg_count, 0);
+    if (exp_sg_count++ < 10) {
+        fprintf(stderr,
+                "HLE EXP_SYSGLOBAL#%d: skipped (MakeSGSpace handles pool growth). "
+                "A5=$%06X mmrb=$%06X\n",
+                exp_sg_count, a5, mmrb);
+    }
+
+    /* EXP_SYSGLOBAL is a nested proc (no params, no return value).
+     * Just RTS — the caller (MEMMGR main loop) continues. */
+    uint32_t sp = cpu->a[7] & 0xFFFFFF;
+    uint32_t ret_addr = cpu_read32(cpu, sp);
+    cpu->a[7] = (sp + 4) & 0xFFFFFF;
+    cpu->pc = ret_addr;
+    cpu->cycles += 40;
+    return true;
+}
+
 /* P104 scaffold: HLE MDDF_IO. Sits at a higher abstraction than
  * UltraIO — bypasses the whole psio → LisaIO → UltraIO chain which
  * depends on a properly initialized ext_diskconfig + MDDFdata
@@ -4555,6 +4617,7 @@ bool lisa_hle_intercept(lisa_t *lisa, m68k_t *cpu) {
         static uint32_t vm_addr          = 0;
         static uint32_t makesgspace_addr = 0;
         static uint32_t slist_io_addr    = 0;
+        static uint32_t exp_sysglobal_addr = 0;
         static int      fsio_probe_gen = -1;
         if (fsio_probe_gen != g_emu_generation) {
             fsio_probe_gen = g_emu_generation;
@@ -4566,6 +4629,7 @@ bool lisa_hle_intercept(lisa_t *lisa, m68k_t *cpu) {
             if (!vm_addr) vm_addr = boot_progress_lookup("vm");
             makesgspace_addr = boot_progress_lookup("MakeSGSpace");
             slist_io_addr    = boot_progress_lookup("slist_io");
+            exp_sysglobal_addr = boot_progress_lookup("EXP_SYSGLOBAL");
         }
         /* P119 investigation: tried re-enabling MDDF_IO HLE plus a
          * parallel BitMap_IO HLE (+ narrow NOT-fix for blockstructured).
@@ -4612,6 +4676,8 @@ bool lisa_hle_intercept(lisa_t *lisa, m68k_t *cpu) {
 #endif
         if (makesgspace_addr && pc == makesgspace_addr)
             return hle_handle_makesgspace(lisa, cpu);
+        if (exp_sysglobal_addr && pc == exp_sysglobal_addr)
+            return hle_handle_exp_sysglobal(lisa, cpu);
         if (slist_io_addr && pc == slist_io_addr)
             return hle_handle_slist_io(lisa, cpu);
         /* P108 (unshipped): psio and vm HLEs compile but are gated off.
