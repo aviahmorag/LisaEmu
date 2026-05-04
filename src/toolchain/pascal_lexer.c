@@ -127,10 +127,23 @@ static char *lexer_resolve_include(lexer_t *lex, const char *inc_path) {
         snprintf(path, sizeof(path), "%s/%s-%s.text.unix.txt", lex->base_dir, prefix, name);
         content = lexer_read_file(path);
         if (content) return content;
-        /* Try uppercase */
+        /* Try uppercase extension */
         snprintf(path, sizeof(path), "%s/%s-%s.TEXT.unix.txt", lex->base_dir, prefix, name);
         content = lexer_read_file(path);
         if (content) return content;
+        /* Try uppercase name + extension (e.g. source-SYSG1.TEXT.unix.txt) */
+        {
+            char up_name[256];
+            strncpy(up_name, name, sizeof(up_name) - 1);
+            up_name[sizeof(up_name) - 1] = '\0';
+            for (char *c = up_name; *c; c++) *c = toupper((unsigned char)*c);
+            snprintf(path, sizeof(path), "%s/%s-%s.TEXT.unix.txt", lex->base_dir, prefix, up_name);
+            content = lexer_read_file(path);
+            if (content) return content;
+            snprintf(path, sizeof(path), "%s/%s-%s.text.unix.txt", lex->base_dir, prefix, up_name);
+            content = lexer_read_file(path);
+            if (content) return content;
+        }
     }
 
     /* Try 2: source_root/LIBS/PREFIX/prefix-name.text.unix.txt */

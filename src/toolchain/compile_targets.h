@@ -47,6 +47,13 @@ typedef struct {
                              * sees all other units' exports) and moves
                              * its link module to slot 0 so the linker
                              * places it first. */
+    const char *const *exclude_modules; /* NULL-terminated list of module
+                             * basenames to SKIP in LOOSE mode. Used to
+                             * prevent driver-only modules (DRIVERASM,
+                             * PROFILEASM) from leaking into the kernel
+                             * binary where their thunks shadow the real
+                             * OS implementations. Ignored in strict mode.
+                             * NULL = no exclusions. */
 } compile_target_t;
 
 /* Get the target by name (case-insensitive). */

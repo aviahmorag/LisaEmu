@@ -739,17 +739,30 @@ build_result_t toolchain_build(const char *source_dir,
         static char included_set[256][64];
         int n_included = build_included_set(candidates, num_cand,
                                              included_set, 256);
-        int skipped = 0;
+        int skipped = 0, excluded = 0;
         for (int c = 0; c < num_cand; c++) {
             if (file_is_included(candidates[c].path, included_set, n_included)) {
                 skipped++;
                 continue;
             }
+            if (target->exclude_modules) {
+                const char *base = strrchr(candidates[c].path, '/');
+                base = base ? base + 1 : candidates[c].path;
+                bool excl = false;
+                for (const char *const *ex = target->exclude_modules; *ex; ex++) {
+                    if (strcasestr(base, *ex) != NULL) {
+                        excl = true;
+                        excluded++;
+                        break;
+                    }
+                }
+                if (excl) continue;
+            }
             if (num_files < MAX_SOURCE_FILES)
                 files[num_files++] = candidates[c];
         }
-        fprintf(stderr, "COMPILE TARGET '%s' [LOOSE]: %d modules requested, %d source files (%d skipped as $I-included)\n",
-                target->name, modules_requested, num_files, skipped);
+        fprintf(stderr, "COMPILE TARGET '%s' [LOOSE]: %d modules requested, %d source files (%d skipped as $I-included, %d excluded)\n",
+                target->name, modules_requested, num_files, skipped, excluded);
     }
     free(candidates);
 

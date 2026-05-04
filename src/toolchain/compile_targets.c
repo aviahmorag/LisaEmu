@@ -80,6 +80,13 @@ static const char *const SYSTEM_OS_DIRS[] = {
     NULL
 };
 
+static const char *const SYSTEM_OS_EXCLUDE[] = {
+    "DRIVERASM",
+    "PROFILEASM",
+    "DRIVERMAIN",
+    NULL
+};
+
 static const compile_target_t TARGET_SYSTEM_OS = {
     .name = "SYSTEM.OS",
     .out_path = "OBJECT/SYSTEM.OS",
@@ -92,6 +99,7 @@ static const compile_target_t TARGET_SYSTEM_OS = {
      * is finished. Tracked as pre-existing tech debt. */
     .strict = false,
     .boot_entry = "STARTUP",
+    .exclude_modules = SYSTEM_OS_EXCLUDE,
 };
 
 /* ---- SYSTEM.BT_PROFILE boot-track binary (Phase 2 target) ----
