@@ -3962,7 +3962,24 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 fprintf(stderr, "\n");
             }
 
-            /* P128l probe — CLR_INMOTION_SEG entry ($049046). After PR_CLEANUP
+            /* P128l/m/n probes — dynamically resolve addresses from linked.map
+             * so they survive relinking (P109 shifted all addresses by -12). */
+            static uint32_t pc_CLR_INMOTION = 0, pc_CLEAR_SPACE = 0, pc_MOVE_SEG = 0;
+            static uint32_t pc_INSERTSDB2 = 0, pc_INSERTSDB2_exit = 0;
+            static uint32_t pc_MAKE_FREE2 = 0, pc_TAKE_FREE2 = 0;
+            static int pc_gen_p128m = -1;
+            if (pc_gen_p128m != g_emu_generation) {
+                pc_CLR_INMOTION     = boot_progress_lookup("CLR_INMOTION_SEG");
+                pc_CLEAR_SPACE      = boot_progress_lookup("CLEAR_SPACE");
+                pc_MOVE_SEG         = boot_progress_lookup("MOVE_SEG");
+                pc_INSERTSDB2       = boot_progress_lookup("INSERTSDB");
+                pc_MAKE_FREE2       = boot_progress_lookup("MAKE_FREE");
+                pc_TAKE_FREE2       = boot_progress_lookup("TAKE_FREE");
+                pc_INSERTSDB2_exit  = pc_INSERTSDB2 ? (pc_INSERTSDB2 + 356) : 0;
+                pc_gen_p128m        = g_emu_generation;
+            }
+
+            /* P128l probe — CLR_INMOTION_SEG entry. After PR_CLEANUP
              * MemMgr gets dispatched and enters its main loop (MEMMGR at
              * $04B7FE). Processing a service request eventually reaches
              * MOVE_SEG → CLR_INMOTION_SEG, which walks c_mmrb^.hd_qioreq_list.
@@ -4010,7 +4027,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
              * above. */
 
             DBGSTATIC(int, p128l_cis_count, 0);
-            if (cpu->pc == 0x049046 && p128l_cis_count < 50) {
+            if (pc_CLR_INMOTION && cpu->pc == pc_CLR_INMOTION && p128l_cis_count < 50) {
                 p128l_cis_count++;
                 uint32_t a5 = cpu->a[5] & 0xFFFFFF;
                 uint32_t mmrb_addr_slot = (a5 - 25691) & 0xFFFFFF;
@@ -4059,7 +4076,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
              * Enable by toggling 0→1 if needed for future codegen analysis. */
 #if 0
             DBGSTATIC(int, p128m_dump_done, 0);
-            if (cpu->pc == 0x0493F8 && !p128m_dump_done) {
+            if (pc_CLEAR_SPACE && cpu->pc == pc_CLEAR_SPACE && !p128m_dump_done) {
                 p128m_dump_done = 1;
                 fprintf(stderr, "[P128m] CLEAR_SPACE call site bytes from $04A920..$04A946:\n");
                 for (int o = 0; o < 64; o += 16) {
@@ -4072,7 +4089,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
 #endif
 
             DBGSTATIC(int, p128m_cs_count, 0);
-            if (cpu->pc == 0x0493F8 && p128m_cs_count < 30) {
+            if (pc_CLEAR_SPACE && cpu->pc == pc_CLEAR_SPACE && p128m_cs_count < 30) {
                 p128m_cs_count++;
                 uint32_t sp = cpu->a[7] & 0xFFFFFF;
                 uint32_t ret = cpu_read32(cpu, sp);
@@ -4205,7 +4222,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
              * proc (Pascal "intermediate-level" addressing). Dump A2 plus
              * a window around it so we can spot moving_sdb/free_sdb. */
             DBGSTATIC(int, p128m_ms_count, 0);
-            if (cpu->pc == 0x049186 && p128m_ms_count < 50) {
+            if (pc_MOVE_SEG && cpu->pc == pc_MOVE_SEG && p128m_ms_count < 50) {
                 p128m_ms_count++;
                 uint32_t sp = cpu->a[7] & 0xFFFFFF;
                 uint32_t ret = cpu_read32(cpu, sp);
@@ -4296,7 +4313,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
              * the first CLEAR_SPACE entry probe has hit (so we capture the
              * MemMgr-loop calls, not MM_INIT noise). */
             DBGSTATIC(int, p128n_ins_count, 0);
-            if (cpu->pc == 0x046CEE && p128n_ins_count < 30 && p128m_cs_count > 0) {
+            if (pc_INSERTSDB2 && cpu->pc == pc_INSERTSDB2 && p128n_ins_count < 30 && p128m_cs_count > 0) {
                 p128n_ins_count++;
                 uint32_t sp = cpu->a[7] & 0xFFFFFF;
                 uint32_t ret = cpu_read32(cpu, sp);
@@ -4315,7 +4332,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             /* P128n — INSERTSDB exit ($046E52, just before UNLK). Dump
              * head.freechain.fwd_link AFTER P_ENQUEUEs + MERGE_FREEs. */
             DBGSTATIC(int, p128n_inx_count, 0);
-            if (cpu->pc == 0x046E52 && p128n_inx_count < 30 && p128m_cs_count > 0) {
+            if (pc_INSERTSDB2_exit && cpu->pc == pc_INSERTSDB2_exit && p128n_inx_count < 30 && p128m_cs_count > 0) {
                 p128n_inx_count++;
                 uint32_t a5 = cpu->a[5] & 0xFFFFFF;
                 uint32_t mmrb = cpu_read32(cpu, (a5 - 25691) & 0xFFFFFF);
@@ -4330,7 +4347,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             /* P128n — MAKE_FREE entry probe ($046E54). Args: maddr (W) at
              * SP+4, msize (W) at SP+6 (Pascal pushes args as words). */
             DBGSTATIC(int, p128n_mf_count, 0);
-            if (cpu->pc == 0x046E54 && p128n_mf_count < 30 && p128m_cs_count > 0) {
+            if (pc_MAKE_FREE2 && cpu->pc == pc_MAKE_FREE2 && p128n_mf_count < 30 && p128m_cs_count > 0) {
                 p128n_mf_count++;
                 uint32_t sp = cpu->a[7] & 0xFFFFFF;
                 uint32_t ret = cpu_read32(cpu, sp);
@@ -4345,7 +4362,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
              * at SP+4, upd_avail (B) at SP+8 (high byte = caller-clean
              * convention OR low byte for Pascal). Read both, decide. */
             DBGSTATIC(int, p128n_tf_count, 0);
-            if (cpu->pc == 0x046B58 && p128n_tf_count < 30 && p128m_cs_count > 0) {
+            if (pc_TAKE_FREE2 && cpu->pc == pc_TAKE_FREE2 && p128n_tf_count < 30 && p128m_cs_count > 0) {
                 p128n_tf_count++;
                 uint32_t sp = cpu->a[7] & 0xFFFFFF;
                 uint32_t ret = cpu_read32(cpu, sp);
@@ -4720,15 +4737,16 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                         p128d_moveit_count, ret, c_sdb, memaddr, memsize,
                         (uint32_t)memaddr * 512u, (uint32_t)memsize * 512u);
             }
-            /* Mover(src: absptr, dst: absptr, len: int4). LINK entry:
-             * SP+0=ret, SP+4=src, SP+8=dst, SP+12=len. */
+            /* Mover(source, dest: absptr; length: int4). Pascal pushes
+             * left-to-right so stack at entry is:
+             * SP+0=ret, SP+4=length, SP+8=dest, SP+12=source. */
             if (pc_Mover && cpu->pc == pc_Mover && p128d_mover_count < 8) {
                 p128d_mover_count++;
                 uint32_t sp = cpu->a[7] & 0xFFFFFF;
                 uint32_t ret = cpu_read32(cpu, sp);
-                uint32_t src = cpu_read32(cpu, sp + 4);
+                uint32_t len = cpu_read32(cpu, sp + 4);
                 uint32_t dst = cpu_read32(cpu, sp + 8);
-                uint32_t len = cpu_read32(cpu, sp + 12);
+                uint32_t src = cpu_read32(cpu, sp + 12);
                 int s_seg, d_seg; uint16_t s_sor, s_slr, d_sor, d_slr; uint8_t s_chg, d_chg;
                 uint32_t s_phys = lisa_mmu_xlate_info(src, &s_seg, &s_sor, &s_slr, &s_chg);
                 uint32_t d_phys = lisa_mmu_xlate_info(dst, &d_seg, &d_sor, &d_slr, &d_chg);
