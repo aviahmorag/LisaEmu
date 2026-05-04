@@ -5493,7 +5493,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 pc_msp = boot_progress_lookup("Make_SPr");
                 if (!pc_msp) pc_msp = boot_progress_lookup("Make_SProcess");
             }
-            if (cpu->pc == pc_msp) {
+            if (pc_msp && cpu->pc == pc_msp) {
                 DBGSTATIC(int, msp_count, 0);
                 fprintf(stderr, "[Make_SProcess #%d] A6=$%06X A7=$%06X\n",
                         ++msp_count, cpu->a[6] & 0xFFFFFF, cpu->a[7] & 0xFFFFFF);

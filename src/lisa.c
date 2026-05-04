@@ -3927,7 +3927,11 @@ static bool hle_handle_psio(lisa_t *lisa, m68k_t *cpu) {
     }
 
     int16_t error = 0;
-    if (!lisa->profile.mounted || nbytes < 0 || page_no < 0) {
+    if (addr_buf < 0x400 && nbytes > 0 && read_op) {
+        fprintf(stderr, "HLE psio: BLOCKED read to low memory addr=$%06X nbytes=%d sfile=%d — vector table protection\n",
+                addr_buf, (int)nbytes, sfile);
+        error = 654;
+    } else if (!lisa->profile.mounted || nbytes < 0 || page_no < 0) {
         error = 654;
     } else if (nbytes > 0) {
         if (!ldr_fs.initialized) ldr_fs_init(lisa);

@@ -176,13 +176,12 @@ uint8_t *bootrom_generate(void) {
     /* CMP.W #$1A,D7 — is it AltScreenAddr? */
     emit16(&b, 0x0C47);
     emit16(&b, 0x001A);
-    emit16(&b, 0x6604);          /* BNE.S +4 → just RTE (cursor ops etc.) */
-    /* Load screen address into A0.
-     * Screen base is at low memory $1F8 (ALTMSBASE) or $1F4 (MSBASE).
-     * For simplicity, load from $110 (prom_screen) which we initialize. */
+    emit16(&b, 0x6608);          /* BNE.S +8 → skip MOVEA.L+RTE to no-op RTE */
+    /* Load screen address into A0. */
     emit16(&b, 0x2079);          /* MOVEA.L ($110).L,A0 */
     emit32(&b, 0x00000110);
-    emit16(&b, 0x4E73);          /* RTE */
+    emit16(&b, 0x4E73);          /* RTE (screen addr path) */
+    emit16(&b, 0x4E73);          /* RTE (all other TRAP5 calls — no-op) */
 
     /* ================================================================
      * Line-F (SANE FP) handler at $FE0310:
