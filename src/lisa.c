@@ -2298,21 +2298,23 @@ void lisa_reset(lisa_t *lisa) {
             int ctx = 1;  /* Normal context */
 
             /* sysglobmmu (102): maps $CC0000 → physical sysglobal.
-             * Use proper SLR encoding so SLR enforcement catches accesses
-             * past l_sysglobal (e.g. MakeSGSpace HLE handing out logical
-             * $CD2E00 when sgheap actually ends at $CCEE00). Once those
-             * are surfaced and fixed we can drop MakeSGSpace HLE. */
-            SET_MMU_SEG(ctx, 102, SLR_MEM(0x07, l_sysglobal), (uint16_t)(b_sysglobal >> 9));
-            /* SMT[102] = { origin=b_sysglobal/512, access=RW_MEM, limit=l_sysglobal/512 } */
+             * SLR covers full 128KB: our layout places superstack physically
+             * adjacent to sysglobal within seg-102's window, and INITSYS/
+             * HINITIT access it via this segment. Without demand-paging, the
+             * whole window must be valid. SMT keeps l_sysglobal for OS
+             * bookkeeping (MOVE_SEG, REMAP_SEGMENT use the SMT limit). */
+            SET_MMU_SEG(ctx, 102, SLR_MEM(0x07, 0x20000), (uint16_t)(b_sysglobal >> 9));
             SET_SMT_ENTRY(102, b_sysglobal / 512, 0x07, l_sysglobal / 512);
 
             /* syslocmmu (103): maps $CE0000 → physical syslocal.
              * P127: phys base is b_sysglobal + $20000 (past seg-102's
              * 128KB phys window) — see the comment in the outer
-             * b_syslocal decl above. Must match the outer value. */
+             * b_syslocal decl above. Must match the outer value.
+             * SLR covers full 128KB: HLEs allocate data-seg buffers within
+             * this segment's logical window and we don't demand-page. */
             uint32_t b_syslocal = b_sysglobal + 0x20000;
             uint32_t l_syslocal = 0x4000;
-            SET_MMU_SEG(ctx, 103, SLR_MEM(0x07, l_syslocal), (uint16_t)(b_syslocal >> 9));
+            SET_MMU_SEG(ctx, 103, SLR_MEM(0x07, 0x20000), (uint16_t)(b_syslocal >> 9));
             SET_SMT_ENTRY(103, b_syslocal / 512, 0x07, l_syslocal / 512);
 
             /* Stack segments: Lisa MMU DO_AN_MMU computes SOR differently
@@ -2325,22 +2327,22 @@ void lisa_reset(lisa_t *lisa) {
                 (uint16_t)(((base) >> 9) + ((len) >> 9) - 0x100)
 
             /* superstkmmu (101): maps $CA0000 → physical supervisor stack.
-             * P128p: was 0x0600 (limit_lo=0 ⇒ 1-page stack per do_an_mmu's
-             * memsize=hw_lim+1 decode). Real stack is l_superstack bytes;
-             * limit byte must be (pages - 1) so SLR enforcement covers the
-             * top-justified valid range [128KB - l_superstack, 128KB-1]. */
-            SET_MMU_SEG(ctx, 101, SLR_STK(0x06, l_superstack), STACK_SOR(b_superstack, l_superstack));
-            /* SMT[101] = { origin=b_superstack/512, access=stack($6), limit=l_superstack/512 } */
+             * SLR covers full 128KB: without demand-paging, REG_TO_MAPPED
+             * and kernel code access the full segment extent. SMT keeps
+             * the real l_superstack for OS bookkeeping. */
+            SET_MMU_SEG(ctx, 101, SLR_STK(0x06, 0x20000), STACK_SOR(b_superstack, l_superstack));
             SET_SMT_ENTRY(101, b_superstack / 512, 0x06, l_superstack / 512);
 
-            /* stackmmu (123): maps $F60000 → physical user stack + jump table */
+            /* stackmmu (123): maps $F60000 → physical user stack + jump table.
+             * SLR covers full 128KB: OS init code accesses the full segment
+             * (zero-fill, jump table setup) and we don't implement demand-paging. */
             uint32_t b_stack = b_syslocal + l_syslocal;
             uint32_t b_opustack = b_stack;
-            SET_MMU_SEG(ctx, 123, SLR_STK(0x06, l_opustack), STACK_SOR(b_opustack, l_opustack));
+            SET_MMU_SEG(ctx, 123, SLR_STK(0x06, 0x20000), STACK_SOR(b_opustack, l_opustack));
             SET_SMT_ENTRY(123, b_opustack / 512, 0x06, l_opustack / 512);
 
             /* Also map segment 104 for legacy compatibility */
-            SET_MMU_SEG(ctx, 104, SLR_STK(0x06, l_opustack), STACK_SOR(b_stack, l_opustack));
+            SET_MMU_SEG(ctx, 104, SLR_STK(0x06, 0x20000), STACK_SOR(b_stack, l_opustack));
             SET_SMT_ENTRY(104, b_stack / 512, 0x06, l_opustack / 512);
 
             #undef STACK_SOR
@@ -3585,15 +3587,16 @@ static bool hle_handle_makesgspace(lisa_t *lisa, m68k_t *cpu) {
     uint16_t freecount = cpu_read16(cpu, sg_free_pool_addr + 6);
 
     /* Pick a chunk from the segment headroom above the initial pool.
-     * Persist across calls so successive invocations grab distinct slots. */
+     * Persist across calls so successive invocations grab distinct slots.
+     * Cap at the SLR-valid range: pool occupies l_sgheap bytes from
+     * sg_free_pool_addr, and l_sysglobal = l_globals + l_sgheap covers
+     * the entire valid extent of seg 102. */
     static uint32_t next_chunk = 0;
     static uint32_t chunk_seg_end = 0;
     if (next_chunk == 0) {
-        /* First call: anchor at end of current pool. Pool occupies
-         * pool_hdr + 8 (header) + pool_size*2 (data) bytes. Extend from
-         * there, staying within the same 128KB MMU segment. */
-        next_chunk = (sg_free_pool_addr + 8 + (uint32_t)pool_size * 2 + 15) & ~0xFu;
-        chunk_seg_end = (sg_free_pool_addr & ~0x1FFFFu) + 0x20000u;
+        uint32_t pool_end = sg_free_pool_addr + 8 + (uint32_t)pool_size * 2;
+        next_chunk = (pool_end + 15) & ~0xFu;
+        chunk_seg_end = pool_end;
     }
 
     const uint32_t CHUNK_BYTES = 4096;

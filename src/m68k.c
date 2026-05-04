@@ -5774,8 +5774,9 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 /* P80f: for resident segments, allocate from the sgheap area
                  * which is already MMU-mapped. The sgheap starts after the
                  * sysglobal pool. Use a bump allocator within the mapped range.
-                 * The sgheap is mapped in segment 102 ($CC0000-$CDFFFF). */
-                static uint32_t hle_seg_bump = 0xCCC000;  /* well above pool at $CCB000 */
+                 * Seg 102 SLR covers l_sysglobal=$EE00 bytes from $CC0000,
+                 * so valid range is $CC0000..$CCEDFF. Cap allocations there. */
+                static uint32_t hle_seg_bump = 0xCCC000;
                 static int hle_seg_gen = -1;
                 extern int g_emu_generation;
                 if (hle_seg_gen != g_emu_generation) {
@@ -5783,7 +5784,20 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                     hle_seg_gen = g_emu_generation;
                 }
                 uint32_t seg_ptr = hle_seg_bump;
-                int alloc_size = (memsize > 0) ? memsize : 4096;  /* min 4KB */
+                int alloc_size = (memsize > 0) ? memsize : 4096;
+                uint32_t seg102_limit = 0xCCEE00;
+                if (seg_ptr + alloc_size > seg102_limit) {
+                    fprintf(stderr, "[HLE-MAKE_SYSDATASEG] bump allocator exhausted "
+                            "(need %d at $%06X, limit=$%06X)\n",
+                            alloc_size, seg_ptr, seg102_limit);
+                    alloc_size = 0;
+                    if (ptrs_valid)
+                        cpu_write16(cpu, errnum_ptr, 309);
+                    uint32_t ret = cpu_read32(cpu, sp);
+                    cpu->a[7] += 4;
+                    cpu->pc = ret;
+                    continue;
+                }
                 hle_seg_bump += (alloc_size + 0x1FF) & ~0x1FF;
                 /* Zero-fill the allocated area */
                 for (int j = 0; j < alloc_size; j++)
@@ -8200,6 +8214,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
         cpu->cycles = 0;
         uint32_t sp_before = cpu->a[7];
         uint32_t pc_before = cpu->pc;
+        g_last_cpu_pc = cpu->pc;
 
         /* HLE: Lisabug auto-entry bypass — execution-time.
          *
@@ -8273,11 +8288,16 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                         fprintf(stderr, "    Instruction at PC=$%06X: $%04X\n",
                                 pc_before, op_at);
                     }
-                    /* Dump stack around the corruption */
+                    /* Dump stack around the corruption (suppress SLR logging
+                     * since diagnostic reads shouldn't count as violations) */
+                    extern int g_slr_enforce;
+                    int saved_slr = g_slr_enforce;
+                    g_slr_enforce = 0;
                     fprintf(stderr, "    Stack at SP_before=$%08X:", sp_before);
                     for (int si = 0; si < 8; si++)
                         fprintf(stderr, " %08X", cpu_read32(cpu, (sp_before + si * 4) & 0xFFFFFF));
                     fprintf(stderr, "\n");
+                    g_slr_enforce = saved_slr;
                     /* Last 20 PCs */
                     fprintf(stderr, "    Last 20 PCs:");
                     for (int ri = 20; ri > 0; ri--)
