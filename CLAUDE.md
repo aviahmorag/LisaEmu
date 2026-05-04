@@ -234,12 +234,18 @@ order):
    paging) + suppress SLR during diagnostic stack dumps.
 3. ✅ **DONE in P112**: MakeSGSpace chunk_seg_end capped at pool end.
    MAKE_SYSDATASEG bump allocator also capped at seg-102 boundary.
-4. Move `b_syslocal` back to natural position (right after
-   `b_superstack`); remove P127 gap; verify MOVE_SEG works (the
-   self-referential bug from P128n disappears once sysglobal isn't
-   the chosen `moving_sdb`).
+4. Move `b_syslocal` back to natural position. P112 analysis shows
+   the P127 gap is still load-bearing: INITSYS reads seg-102 offset
+   $EE00 (33-byte copy from A5) and HINITIT accesses offset $FAE8
+   (driver cb). Both land in syslocal's would-be phys area. Proper
+   fix: move superstack to HIGH memory (per Apple's BGETSPACE(hi)),
+   then syslocal can be at b_sysglobal+$EE00 safely. Requires
+   adjusting b_superstack, b_syslocal, b_opustack, and verifying
+   no seg-102 access reaches the syslocal physical range.
 5. Map seg 84 (`mmucodemmu`) in ctx=0 during boot-ROM init so the
-   prebuilt loader can JSR through it.
+   prebuilt loader can JSR through it. (Already propagated via
+   HLE_PROG_MMU cross-ctx copy; only needed when real LOADER runs
+   before OS programs the MMU — Phase 2 step 4b.)
 
 ## Earlier (2026-04-25 P128o — pool-layout diagnosis)
 
@@ -338,13 +344,14 @@ Each entry retires when the listed phase lands.
   sub-block reads (HENTRY_IO/FMAP_IO/pglblio paths).
 - **slist_io HLE** (`src/lisa.c:hle_handle_slist_io`) — reads sentry
   directly from disk image for indexing paths vm doesn't cover.
-- **MakeSGSpace HLE** (`$012970`, P124) — pool-expansion work normally
-  done by memmgr process. Retires with Phase 6.
-- **EXP_SYSGLOBAL HLE** (`src/lisa.c:hle_handle_exp_sysglobal`, P111) —
-  intercepts MemMgr's EXP_SYSGLOBAL to prevent CLEAR_SPACE infinite
-  loop caused by our non-Apple memory layout (P127's syslocal gap).
-  MakeSGSpace HLE handles the actual pool growth. Retires when we
-  match Apple's BGETSPACE(lo) sequential layout.
+- **MakeSGSpace HLE** (`$012970`, P124) — safety-net pool expansion
+  (dormant since P112b; EXP_SYSGLOBAL now does the work). Retires
+  with Phase 6.
+- **EXP_SYSGLOBAL HLE** (`src/lisa.c:hle_handle_exp_sysglobal`, P111/
+  P112b) — intercepts MemMgr's EXP_SYSGLOBAL to prevent CLEAR_SPACE
+  infinite loop, and directly expands the pool with 4KB chunks from
+  seg-102 headroom (offsets $12E00..$20000, past superstack, before
+  syslocal). Retires when we match Apple's layout.
 - **SEG-ALIAS-GUARD** (`src/lisa_mmu.c lisa_mem_write8`, P122) — drops
   writes where logical ≥ `$20000` aliases to phys `< $400`. Retires
   when MMU emulates Apple's segment-fault demand-paging semantics
