@@ -189,24 +189,27 @@ the real replacement.
 | 11 | Shell (APDM) | full desktop | Not started |
 | 12 | Apps | LisaWrite, LisaCalc, etc. | Not started |
 
-## Current Status (2026-05-04 post-P111)
+## Current Status (2026-05-04 post-P112)
 
 **Milestones**: **27/27** kernel checkpoints reached natively, last
 checkpoint `PR_CLEANUP` (scheduler idle loop). Boot runs the complete
-kernel init sequence with zero SYSTEM_ERRORs. MemMgr dispatches and
-processes service requests post-PR_CLEANUP. CLEAR_SPACE infinite loop
-resolved (P111).
+kernel init sequence with zero SYSTEM_ERRORs and **zero SLR violations**.
+MemMgr dispatches and processes service requests post-PR_CLEANUP.
+
+**P112 commit `c7d2b62`**: Resolved all 4 compiled-OS SLR violation PCs.
+Diagnosis: (1) $078644 (REG_TO_MAPPED) and $005FAA (BOOT_IO_INIT) were
+false positives from SP-delta diagnostic reading stack memory at segment
+base. (2) $006688 (INITSYS) and $03CEAA (HINITIT) accessed seg 102 past
+l_sysglobal SLR — caused by our layout placing superstack within seg-102's
+physical window. Fix: suppress SLR during diagnostic stack dumps, set
+full-128KB SLR for all pre-programmed segments since we don't implement
+demand-paging (SMT entries keep real values for OS bookkeeping). Also
+tightened MakeSGSpace chunk_seg_end to pool end and capped
+MAKE_SYSDATASEG bump allocator at SLR boundary.
 
 **P111**: HLE for EXP_SYSGLOBAL — prevents the CLEAR_SPACE infinite
-loop diagnosed in P128n/o. Root cause: our physical memory layout
-diverges from Apple's real LOADER (we place syslocal at
-b_sysglobal+$20000 per P127, while Apple packs everything via
-sequential BGETSPACE(lo)). This makes CLEAR_SPACE's toright loop
-pick sysglobal itself as moving_sdb, producing infinite no-op moves.
-Fix: intercept EXP_SYSGLOBAL and let MakeSGSpace HLE handle pool
-growth (it carves chunks from pre-mapped seg-102 headroom, making
-physical MemMgr expansion unnecessary). Retires when we match
-Apple's real memory layout.
+loop diagnosed in P128n/o. Retires when we match Apple's real memory
+layout.
 
 **P110 commit `89df3fe`**: Converted all P128l/m/n diagnostic probes
 to `boot_progress_lookup()` dynamic resolution (addresses were stale
@@ -224,17 +227,13 @@ Concrete remaining work toward HLE retirement (in approximate
 order):
 1. ✅ **DONE in P128p**: SLR encoding for all loader-init MMU
    segments fixed via SLR_MEM / SLR_STK macros.
-2. Investigate 4 remaining compiled-OS violation PCs ($005FAA,
-   $006688, $03CEB6, $07963C). $07963C reads seg 101 offset 0+
-   (below stack range) — likely a kernel jump table at logical
-   $CA0000. Either (a) supstack should NOT be mapped via MMU 101
-   (use a different MMU for the jump table), or (b) supstack's
-   non-stack-shaped use means the segment shouldn't be encoded as
-   stack-type at all.
-3. Tighten MakeSGSpace HLE to `chunk_seg_end = b_sgheap + l_sgheap`
-   instead of segment-end. With sysglobmmu now properly limited
-   (slr=$0789), mode-2 enforcement would fault MakeSGSpace's
-   over-extent writes.
+2. ✅ **DONE in P112**: All 4 violation PCs resolved. Root causes:
+   false-positive diagnostic reads (seg 101/123) + layout-induced
+   seg-102 overruns (superstack within seg-102 window). Fixed via
+   full-128KB MMU SLR for all pre-programmed segments (no demand-
+   paging) + suppress SLR during diagnostic stack dumps.
+3. ✅ **DONE in P112**: MakeSGSpace chunk_seg_end capped at pool end.
+   MAKE_SYSDATASEG bump allocator also capped at seg-102 boundary.
 4. Move `b_syslocal` back to natural position (right after
    `b_superstack`); remove P127 gap; verify MOVE_SEG works (the
    self-referential bug from P128n disappears once sysglobal isn't
