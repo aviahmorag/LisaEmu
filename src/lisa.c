@@ -3588,15 +3588,15 @@ static bool hle_handle_makesgspace(lisa_t *lisa, m68k_t *cpu) {
 
     /* Pick a chunk from the segment headroom above the initial pool.
      * Persist across calls so successive invocations grab distinct slots.
-     * Cap at the SLR-valid range: pool occupies l_sgheap bytes from
-     * sg_free_pool_addr, and l_sysglobal = l_globals + l_sgheap covers
-     * the entire valid extent of seg 102. */
+     * Safe range: past superstack (offset $12E00 from seg-102 base) up
+     * to syslocal gap (offset $20000). Skip the superstack area
+     * [$EE00, $12E00) which is physically occupied by l_superstack. */
     static uint32_t next_chunk = 0;
     static uint32_t chunk_seg_end = 0;
     if (next_chunk == 0) {
-        uint32_t pool_end = sg_free_pool_addr + 8 + (uint32_t)pool_size * 2;
-        next_chunk = (pool_end + 15) & ~0xFu;
-        chunk_seg_end = pool_end;
+        uint32_t seg_base = sg_free_pool_addr & ~0x1FFFFu;
+        next_chunk = (seg_base + 0x12E00u + 15) & ~0xFu;
+        chunk_seg_end = seg_base + 0x20000u;
     }
 
     const uint32_t CHUNK_BYTES = 4096;
@@ -3663,37 +3663,55 @@ static bool hle_handle_exp_sysglobal(lisa_t *lisa, m68k_t *cpu) {
     (void)lisa;
     uint32_t a5 = cpu->a[5] & 0xFFFFFF;
     uint32_t grow_sysglobal_addr = (a5 - 26541) & 0xFFFFFF;
-    uint32_t mmrb_addr_loc = (a5 - 25691) & 0xFFFFFF;
-    uint32_t mmrb = cpu_read32(cpu, mmrb_addr_loc) & 0xFFFFFF;
+    uint32_t sg_free_pool_addr_loc = (a5 - 24575) & 0xFFFFFF;
+    uint32_t sg_free_pool_addr = cpu_read32(cpu, sg_free_pool_addr_loc) & 0xFFFFFF;
+
+    /* Directly expand the pool by granting a fresh 4KB chunk from
+     * seg-102 headroom past the superstack area. This is what the real
+     * EXP_SYSGLOBAL→ALT_DS_SIZE would achieve (growing the segment),
+     * but without the CLEAR_SPACE call that loops on our layout. */
+    static uint32_t exp_next_chunk = 0;
+    static uint32_t exp_chunk_end = 0;
+    static int exp_gen = -1;
+    extern int g_emu_generation;
+    if (exp_gen != g_emu_generation) {
+        uint32_t seg_base = sg_free_pool_addr & ~0x1FFFFu;
+        exp_next_chunk = (seg_base + 0x12E00u + 15) & ~0xFu;
+        exp_chunk_end = seg_base + 0x20000u;
+        exp_gen = g_emu_generation;
+    }
+
+    const uint32_t CHUNK_BYTES = 4096;
+    bool expanded = false;
+    if (exp_next_chunk + CHUNK_BYTES <= exp_chunk_end) {
+        uint32_t chunk_addr = exp_next_chunk;
+        exp_next_chunk += CHUNK_BYTES;
+
+        uint16_t freecount = cpu_read16(cpu, sg_free_pool_addr + 6);
+        uint32_t firstfree = cpu_read32(cpu, sg_free_pool_addr + 2);
+        int16_t chunk_words = (int16_t)(CHUNK_BYTES / 2);
+        cpu->write16(chunk_addr & 0xFFFFFF, (uint16_t)chunk_words);
+        cpu->write32((chunk_addr + 2) & 0xFFFFFF, firstfree);
+        uint32_t new_firstfree = chunk_addr - sg_free_pool_addr;
+        cpu->write32((sg_free_pool_addr + 2) & 0xFFFFFF, new_firstfree);
+        cpu->write16((sg_free_pool_addr + 6) & 0xFFFFFF,
+                     (uint16_t)(freecount + chunk_words));
+        expanded = true;
+    }
 
     cpu->write8(grow_sysglobal_addr, 0);
-
-    /* inc_sysglobal is at MMRB + offset. From PASCALDEFS/MM4 analysis:
-     * hd_qioreq_list(8) + seg_wait_sem(8) + memmgr_sem(8) +
-     * sys_swap_space(4) + memmgr_busyF(2) + numbRelSegs(2) +
-     * req_pcb_ptr(4) + hd_sdscb_list(8) + sds_sem(8) + head_sdb(~28) +
-     * tail_sdb(~28) + DriverCode_sdb(~28) + avail_space(2) +
-     * clock_ptr(4) + mrdata(array) ... inc_sysglobal is far in.
-     * Rather than compute the exact offset, we rely on the fact that
-     * MakeSGSpace HLE already cleared grow_sysglobal, and MemMgr's
-     * EXP_SYSGLOBAL body zeroes inc_sysglobal at exit. Since we're
-     * skipping the body, we must zero it ourselves. The field is at the
-     * offset that EXP_SYSGLOBAL reads as `c_mmrb_ptr^.inc_sysglobal`.
-     * From MM3.TEXT, EXP_SYSGLOBAL accesses it via `c_mmrb_ptr` which
-     * is its parent MEMMGR's local `c_mmrb`. However, for the HLE we
-     * just need grow_sysglobal=false — the MEMMGR loop re-checks
-     * grow_sysglobal and won't re-enter EXP_SYSGLOBAL if it's cleared. */
 
     DBGSTATIC(int, exp_sg_count, 0);
     if (exp_sg_count++ < 10) {
         fprintf(stderr,
-                "HLE EXP_SYSGLOBAL#%d: skipped (MakeSGSpace handles pool growth). "
-                "A5=$%06X mmrb=$%06X\n",
-                exp_sg_count, a5, mmrb);
+                "HLE EXP_SYSGLOBAL#%d: %s pool (chunk@$%06X). "
+                "A5=$%06X pool=$%06X\n",
+                exp_sg_count,
+                expanded ? "expanded" : "exhausted",
+                expanded ? (exp_next_chunk - CHUNK_BYTES) : 0,
+                a5, sg_free_pool_addr);
     }
 
-    /* EXP_SYSGLOBAL is a nested proc (no params, no return value).
-     * Just RTS — the caller (MEMMGR main loop) continues. */
     uint32_t sp = cpu->a[7] & 0xFFFFFF;
     uint32_t ret_addr = cpu_read32(cpu, sp);
     cpu->a[7] = (sp + 4) & 0xFFFFFF;
