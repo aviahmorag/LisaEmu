@@ -1428,8 +1428,21 @@ build_result_t toolchain_build(const char *source_dir,
         }
     }
 
+    /* SYSTEM.SHELL: minimal program OBJ that Make_Process can parse.
+     * Contains a halt-loop code segment so the Shell process can be
+     * created without System_Error(10102). */
+    {
+        uint32_t shell_size = 0;
+        uint8_t *shell_data = build_program_obj(&shell_size);
+        if (shell_data && shell_size > 0) {
+            disk_add_file(db, "system.shell", FTYPE_OBJ, shell_data, shell_size);
+            fprintf(stderr, "Disk: system.shell (%u bytes)\n", shell_size);
+            free(shell_data);
+        }
+    }
+
     /* SYSTEM.OS: placed on disk as a named file (the real LOADER will
-     * find it by name via MDDF + catalog — Step 3d). Currently also
+     * find it by name via MDDF + catalog �� Step 3d). Currently also
      * serves as boot-track content fallback if BT_PROFILE is missing,
      * to keep HLE'd boot working during the transition. */
     uint32_t link_size;

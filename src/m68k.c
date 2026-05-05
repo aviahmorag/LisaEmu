@@ -6091,6 +6091,9 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
          * which procedures have been entered. O(1) lookup, cheap. */
         boot_progress_record_pc(cpu->pc);
 
+        /* P115 debug probes removed — symbol-address mismatch makes them
+         * unreliable. See linker symbol offset bug (P115 diagnosis). */
+
         /* HLE: bypass SRCH_SDSCB.Find_it. The nested Find_it walks
          * c_mmrb^.hd_sdscb_list; when the chain's self-sentinel
          * isn't correctly initialized (suspected MM_INIT codegen bug
