@@ -181,7 +181,7 @@ the real replacement.
 | 3 | First driver file (SYSTEM.CD_PROFILE) | source-PROFILE.TEXT compiled, on disk, dispatched | In progress — driver loads, dispatch armed |
 | 4 | MDDF / disk-image full FS | removes 10707 suppression; real FS_INIT / FS_MASTER_INIT | In progress — psio HLE covers MDDF_IO+BitMap_IO; FS_INIT completes naturally |
 | 5 | IRQ-driven I/O completion | removes Block_Process-on-POP deadlock | In progress — IRQ scaffold complete (P120), seg-alias guard (P122); PARALLEL→IODONE pending |
-| 6 | SYS_PROC_INIT + real processes | removes P89i + CreateProcess HLE pile | In progress — MemMgr dispatches and runs post-PR_CLEANUP (P128l); next: REMAP_SEGMENT loop |
+| 6 | SYS_PROC_INIT + real processes | removes P89i + CreateProcess HLE pile | In progress — Root scheduled + runs post-P113; CreateShell→Make_Process→MAKE_DATASEG→DS_OPEN crashes (illg_inst in syslocal) |
 | 7 | Cleanup HLEs (FS/MEM/PR_CLEANUP) | real cleanup bodies | In progress — all four cleanup milestones reach naturally |
 | 8 | Safety-net HLEs (REG_OPEN_LIST, excep_setup) | remove | Not started |
 | 9 | System libraries (SYS1LIB, SYS2LIB) | new compile targets | Not started |
@@ -189,12 +189,31 @@ the real replacement.
 | 11 | Shell (APDM) | full desktop | Not started |
 | 12 | Apps | LisaWrite, LisaCalc, etc. | Not started |
 
-## Current Status (2026-05-04 post-P112)
+## Current Status (2026-05-05 post-P113)
 
 **Milestones**: **27/27** kernel checkpoints reached natively, last
 checkpoint `PR_CLEANUP` (scheduler idle loop). Boot runs the complete
-kernel init sequence with zero SYSTEM_ERRORs and **zero SLR violations**.
-MemMgr dispatches and processes service requests post-PR_CLEANUP.
+kernel init sequence, then **Root process gets scheduled and runs**.
+
+**P113 commit `ed3388d`**: Fixed grow_sysglobal offset in
+EXP_SYSGLOBAL + MakeSGSpace HLEs (A5-216, not A5-26541). The stale
+offset meant the HLE cleared a wrong byte while grow_sysglobal stayed
+TRUE, trapping MemMgr in an infinite EXP_SYSGLOBAL loop without ever
+servicing req_pcb_ptr. With the fix, MemMgr services Root's memory
+needs via SWAPIN_SEG, Root gets scheduled, and runs through:
+`Root → CreateShell → Make_Process → Get_Resources → MAKE_SYSDATASEG
+→ MAKE_IT → MAKE_DATASEG → DS_OPEN.RECOVER` before hitting an illegal
+instruction at $F7F5A2 (SYSTEM_ERROR 10201). The crash is in Root's
+syslocal segment — a procedure variable or vtable pointer in the
+mapped syslocal contains garbage/zeros.
+
+Also diagnosed a **compiler `WITH` scoping bug**: inside `with
+c_mmrb^ do`, the assignment `grow_sysglobal:=true` compiles as a
+write to MMRB+54 instead of the global at A5-216. The READ of
+grow_sysglobal in the same scope correctly resolves to A5-216.
+Doesn't block boot because something else sets the global (likely
+POOL_INIT initialization path or stack init), but should be fixed
+in the Pascal compiler eventually.
 
 **P112 commit `c7d2b62`**: Resolved all 4 compiled-OS SLR violation PCs.
 Diagnosis: (1) $078644 (REG_TO_MAPPED) and $005FAA (BOOT_IO_INIT) were
