@@ -4494,6 +4494,10 @@ bool lisa_hle_intercept(lisa_t *lisa, m68k_t *cpu) {
                         retaddr);
             }
             lisa->hle.disk_routine = routine;
+            /* Enable VIA1 CA1 interrupt — real DiskDriver init does this
+             * so ProFile completion fires Level1. Without it, IER=0 means
+             * CA1 in IFR never propagates to CPU IRQ level 1. */
+            via_write(&lisa->via1, VIA_IER, 0x80 | VIA_IRQ_CA1);
             cpu->a[7] = (cpu->a[7] + 8) & 0xFFFFFF;  /* pop retaddr + arg */
             cpu->pc = retaddr;
             return true;
