@@ -5474,31 +5474,63 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
          * and the dynamic-link walk returned the wrong frame so the
          * comparison used a neighboring local's value. With the proper
          * static-link ABI, let the natural body run. */
-        /* P80e: trace MAKE_DATASEG RECOVER to find failure cause */
+        /* P114: trace DS_OPEN.RECOVER and DS_OPEN entry to diagnose
+         * return-address corruption causing illegal-inst at $F7F5A2. */
         {
-            static uint32_t pc_recover = 0;
+            static uint32_t pc_recover = 0, pc_ds_open2 = 0, pc_make_ds = 0;
             static int rec_probed = 0;
-            if (!rec_probed) { rec_probed = 1; pc_recover = boot_progress_lookup("RECOVER"); }
-            /* RECOVER is at $01AF16. Its first param is error: int2 at A6+8 (after LINK) */
+            if (!rec_probed) {
+                rec_probed = 1;
+                pc_recover = boot_progress_lookup("DS_OPEN.RECOVER");
+                pc_ds_open2 = boot_progress_lookup("DS_OPEN");
+                pc_make_ds = boot_progress_lookup("MAKE_DATASEG");
+            }
+            if (pc_make_ds && cpu->pc == pc_make_ds) {
+                DBGSTATIC(int, mds_count, 0);
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                if (mds_count++ < 5) {
+                    fprintf(stderr, "[P114 MAKE_DATASEG #%d] entry SP=$%06X A6=$%06X ret=$%06X\n",
+                            mds_count, sp, cpu->a[6] & 0xFFFFFF,
+                            cpu_read32(cpu, sp) & 0xFFFFFF);
+                    fprintf(stderr, "  stack:");
+                    for (int i = 0; i < 48; i += 4)
+                        fprintf(stderr, " $%08X", cpu_read32(cpu, sp + i));
+                    fprintf(stderr, "\n");
+                }
+            }
+            if (pc_ds_open2 && cpu->pc == pc_ds_open2) {
+                DBGSTATIC(int, dso_count, 0);
+                uint32_t sp = cpu->a[7] & 0xFFFFFF;
+                if (dso_count++ < 5) {
+                    fprintf(stderr, "[P114 DS_OPEN #%d] entry SP=$%06X A6=$%06X ret=$%06X\n",
+                            dso_count, sp, cpu->a[6] & 0xFFFFFF,
+                            cpu_read32(cpu, sp) & 0xFFFFFF);
+                    fprintf(stderr, "  stack:");
+                    for (int i = 0; i < 48; i += 4)
+                        fprintf(stderr, " $%08X", cpu_read32(cpu, sp + i));
+                    fprintf(stderr, "\n");
+                }
+            }
             if (pc_recover && cpu->pc == pc_recover) {
                 uint32_t sp = cpu->a[7] & 0xFFFFFF;
-                int16_t error = (int16_t)cpu_read16(cpu, sp + 4); /* error param before LINK */
-                /* Also read the actual errnum from MAKE_DATASEG's VAR param */
-                uint32_t a6 = cpu->a[6] & 0xFFFFFF; /* RECOVER's A6 = MAKE_DATASEG's frame */
-                uint32_t mds_a6 = cpu_read32(cpu, a6) & 0xFFFFFF; /* follow static link to parent */
-                uint32_t errnum_ptr = cpu_read32(cpu, mds_a6 + 8) & 0xFFFFFF; /* MAKE_DATASEG param at A6+8 */
-                int16_t real_errnum = (errnum_ptr >= 0x1000) ? (int16_t)cpu_read16(cpu, errnum_ptr) : -9999;
+                int16_t error = (int16_t)cpu_read16(cpu, sp + 4);
                 DBGSTATIC(int, rec_count, 0);
                 if (rec_count++ < 5) {
-                    fprintf(stderr, "[MAKE_DATASEG-RECOVER #%d] error=%d errnum=%d ret=$%06X\n",
-                            rec_count, error, real_errnum, cpu_read32(cpu, sp) & 0xFFFFFF);
-                    /* Walk A6 chain for context */
+                    fprintf(stderr, "[P114 DS_OPEN.RECOVER #%d] error=%d ret=$%06X SP=$%06X A6=$%06X\n",
+                            rec_count, error,
+                            cpu_read32(cpu, sp) & 0xFFFFFF, sp, cpu->a[6] & 0xFFFFFF);
+                    /* Walk A6 chain for context — 8 frames deep */
                     uint32_t fp = cpu->a[6] & 0xFFFFFF;
-                    for (int i = 0; i < 4 && fp > 0x400 && fp < 0xFFFFFF; i++) {
+                    for (int i = 0; i < 8 && fp > 0x400 && fp < 0xFFFFFF; i++) {
                         uint32_t r = cpu_read32(cpu, fp + 4) & 0xFFFFFF;
                         fprintf(stderr, "  frame[%d]: A6=$%06X ret=$%06X\n", i, fp, r);
                         fp = cpu_read32(cpu, fp) & 0xFFFFFF;
                     }
+                    /* Dump 64 bytes from SP to see full stack picture */
+                    fprintf(stderr, "  stack @SP:");
+                    for (int i = 0; i < 64; i += 4)
+                        fprintf(stderr, " $%08X", cpu_read32(cpu, sp + i));
+                    fprintf(stderr, "\n");
                 }
             }
         }

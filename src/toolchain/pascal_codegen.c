@@ -5118,11 +5118,40 @@ static void gen_proc_or_func(codegen_t *cg, ast_node_t *node) {
     /* Generate code for nested procedures/functions FIRST.
      * In Pascal, nested procs are callable from the parent's body.
      * They get their own LINK/UNLK frames and are placed before
-     * the parent's code in the output. */
+     * the parent's code in the output.
+     *
+     * P114: save/restore label + pending_goto state around nested proc
+     * compilation. gen_proc_or_func resets num_labels and num_pending_gotos
+     * to 0 (line 4881-2), which drops any pending forward GOTOs from the
+     * nested proc that target labels in the parent (e.g. RECOVER's
+     * `goto 10` → DS_OPEN's label 10). After the nested proc finishes,
+     * its unresolved pending_gotos must be merged back so the parent's
+     * AST_LABEL_DECL patching sees them. */
     for (int i = 0; i < node->num_children; i++) {
         ast_node_t *child = node->children[i];
         if (child->type == AST_PROC_DECL || child->type == AST_FUNC_DECL) {
+            int save_num_labels = cg->num_labels;
+            int save_num_pending = cg->num_pending_gotos;
+            typeof(cg->labels) save_labels;
+            typeof(cg->pending_gotos) save_pending;
+            memcpy(save_labels, cg->labels, sizeof(save_labels));
+            memcpy(save_pending, cg->pending_gotos, sizeof(save_pending));
+
             gen_proc_or_func(cg, child);
+
+            int nested_pending = cg->num_pending_gotos;
+            typeof(cg->pending_gotos) nested_gotos;
+            memcpy(nested_gotos, cg->pending_gotos, sizeof(nested_gotos));
+
+            memcpy(cg->labels, save_labels, sizeof(cg->labels));
+            cg->num_labels = save_num_labels;
+            memcpy(cg->pending_gotos, save_pending, sizeof(cg->pending_gotos));
+            cg->num_pending_gotos = save_num_pending;
+
+            for (int g = 0; g < nested_pending && cg->num_pending_gotos < 128; g++) {
+                cg->pending_gotos[cg->num_pending_gotos] = nested_gotos[g];
+                cg->num_pending_gotos++;
+            }
         }
     }
 
