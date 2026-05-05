@@ -6452,7 +6452,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                         /* If this is memmgr_sem, show grow_sysglobal + req_pcb_ptr */
                         if (sem == 0x00CC7016) {
                             uint32_t a5v = cpu->a[5] & 0xFFFFFF;
-                            uint8_t grow_sg = cpu_read8(cpu, (a5v - 26541) & 0xFFFFFF);
+                            uint16_t grow_sg = cpu_read16(cpu, (a5v - 216) & 0xFFFFFF);
                             uint32_t mmrb = cpu_read32(cpu, (a5v - 25691) & 0xFFFFFF) & 0xFFFFFF;
                             uint32_t req_pcb_24 = (mmrb > 0x400) ?
                                 cpu_read32(cpu, (mmrb + 24) & 0xFFFFFF) : 0;
@@ -6521,22 +6521,6 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                           "[P128e] Unblock_Process ret=$%06X pcb=$%06X "
                           "reasons=$%08X\n",
                           ret, pcb, reasons);
-                        p128e_log_count++;
-                    } else if (cpu->pc == 0x04B8B0) {
-                        /* MemMgr resumes after WAIT_SEM — check state */
-                        static int mm_resume_count = 0;
-                        if (mm_resume_count++ < 10) {
-                            uint32_t a5v = cpu->a[5] & 0xFFFFFF;
-                            uint8_t grow_sg = cpu_read8(cpu, (a5v - 26541) & 0xFFFFFF);
-                            uint32_t mmrb = cpu_read32(cpu, (a5v - 25691) & 0xFFFFFF) & 0xFFFFFF;
-                            uint32_t req_pcb = (mmrb > 0x400) ?
-                                cpu_read32(cpu, (mmrb + 26) & 0xFFFFFF) : 0;
-                            uint8_t busyF = cpu_read8(cpu, (mmrb + 20) & 0xFFFFFF);
-                            fprintf(stderr,
-                              "[P113] MM-RESUME#%d @$04B8B0: grow_sg=%d req_pcb=$%08X"
-                              " busyF=%d SR=$%04X\n",
-                              mm_resume_count, grow_sg, req_pcb, busyF, cpu->sr);
-                        }
                         p128e_log_count++;
                     } else if (pc_swapin && cpu->pc == pc_swapin) {
                         static int swapin_hits = 0;
@@ -6626,6 +6610,21 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                         }
                         fprintf(stderr, "\n");
                         p128e_log_count++;
+                    }
+                }
+                /* P113: MemMgr post-WAIT_SEM probe (budgeted). */
+                if (pc_memmgr && cpu->pc == (pc_memmgr + 0xBE)) {
+                    static int mm_resume_count = 0;
+                    if (mm_resume_count < 5) {
+                        mm_resume_count++;
+                        uint32_t a5v = cpu->a[5] & 0xFFFFFF;
+                        uint16_t grow_sg = cpu_read16(cpu, (a5v - 216) & 0xFFFFFF);
+                        uint32_t mmrb = cpu_read32(cpu, (a5v - 25691) & 0xFFFFFF) & 0xFFFFFF;
+                        uint32_t req_pcb = (mmrb > 0x400) ?
+                            cpu_read32(cpu, (mmrb + 26) & 0xFFFFFF) : 0;
+                        fprintf(stderr,
+                          "[P113] MM-RESUME#%d: grow_sg=%d req_pcb=$%08X\n",
+                          mm_resume_count, grow_sg, req_pcb);
                     }
                 }
                 /* P128e SplitPathname probe — separate trigger so it

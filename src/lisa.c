@@ -3579,7 +3579,7 @@ static bool hle_handle_makesgspace(lisa_t *lisa, m68k_t *cpu) {
 
     uint32_t a5 = cpu->a[5] & 0xFFFFFF;
     uint32_t sg_free_pool_addr = cpu_read32(cpu, (a5 - 24575) & 0xFFFFFF);
-    uint32_t grow_sysglobal_addr = (a5 - 26541) & 0xFFFFFF;
+    uint32_t grow_sysglobal_addr = (a5 - 216) & 0xFFFFFF;
 
     /* Pool header: pool_size(int2)@+0, firstfree(int4)@+2, freecount(int2)@+6. */
     uint16_t pool_size = cpu_read16(cpu, sg_free_pool_addr);
@@ -3622,7 +3622,7 @@ static bool hle_handle_makesgspace(lisa_t *lisa, m68k_t *cpu) {
     }
 
     /* Clear grow_sysglobal so GETSPACE's EXP_POOLSPACE won't re-trigger. */
-    cpu->write8(grow_sysglobal_addr, 0);
+    cpu->write16(grow_sysglobal_addr, 0);
     cpu->write16(no_space_ptr & 0xFFFFFF, (uint16_t)no_space);
 
     DBGSTATIC(int, msg_trace, 0);
@@ -3662,7 +3662,7 @@ static bool hle_handle_makesgspace(lisa_t *lisa, m68k_t *cpu) {
 static bool hle_handle_exp_sysglobal(lisa_t *lisa, m68k_t *cpu) {
     (void)lisa;
     uint32_t a5 = cpu->a[5] & 0xFFFFFF;
-    uint32_t grow_sysglobal_addr = (a5 - 26541) & 0xFFFFFF;
+    uint32_t grow_sysglobal_addr = (a5 - 216) & 0xFFFFFF;
     uint32_t sg_free_pool_addr_loc = (a5 - 24575) & 0xFFFFFF;
     uint32_t sg_free_pool_addr = cpu_read32(cpu, sg_free_pool_addr_loc) & 0xFFFFFF;
 
@@ -3699,7 +3699,7 @@ static bool hle_handle_exp_sysglobal(lisa_t *lisa, m68k_t *cpu) {
         expanded = true;
     }
 
-    cpu->write8(grow_sysglobal_addr, 0);
+    cpu->write16(grow_sysglobal_addr, 0);
 
     DBGSTATIC(int, exp_sg_count, 0);
     if (exp_sg_count++ < 10) {
