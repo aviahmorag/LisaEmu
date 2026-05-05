@@ -6124,17 +6124,15 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
             }
         }
 
-        /* HLE: bypass Setup_IUInfo. Our source-compile boot doesn't
-         * have INTRINSIC.LIB populated via a real loader, so
-         * Build_Unit_Directory's `for i := 1 to nUnits do GetObjVar(..)`
-         * spins forever reading stale bytes from an empty/unseeded
-         * intrinsic library file. Setup_IUInfo is only needed for
-         * dynamic code loading (IU trap handler, shared-segment dir);
-         * the boot path to FS_INIT / system processes doesn't strictly
-         * require it. Bypassing it is the same strategy as the
-         * ENTER_LOADER HLE (P24) and lets boot advance.
+        /* HLE: bypass Setup_IUInfo (P115 — kept as scaffold).
+         * INTRINSIC.LIB is now on disk but the compiled filesystem
+         * can't read it during kernel init (IPL=7, no IRQ completion).
+         * The bypass is equivalent to Setup_IUInfo returning without
+         * creating the IU directory segment. Make_Process handles this
+         * gracefully via the DS_OPEN.RECOVER path — see P114 analysis.
          *
-         * Setup_IUInfo takes no Pascal args, so HLE = pop retaddr, RTS. */
+         * Retires when Phase 5 IRQ completion is functional and
+         * we can let Setup_IUInfo read INTRINSIC.LIB natively. */
         {
             extern uint32_t boot_progress_lookup(const char *name);
             static uint32_t setup_iuinfo_addr = 0;
@@ -6147,7 +6145,7 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                 cpu->cycles += 20;
                 DBGSTATIC(int, si_count, 0);
                 if (si_count++ < 3)
-                    fprintf(stderr, "[HLE-Setup_IUInfo #%d] bypassed, return to $%06X\n",
+                    fprintf(stderr, "[HLE-Setup_IUInfo #%d] bypassed (P115: INTRINSIC.LIB on disk, IRQ pending), return to $%06X\n",
                             si_count, retaddr);
                 continue;
             }

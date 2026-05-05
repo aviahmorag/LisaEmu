@@ -19,6 +19,7 @@
 #include "bootrom.h"
 #include "toolchain_fileset.h"
 #include "compile_targets.h"
+#include "intrinsic_lib.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1411,6 +1412,19 @@ build_result_t toolchain_build(const char *source_dir,
             }
         } else {
             fprintf(stderr, "WARN: SYSTEM.CD_PROFILE linker output empty\n");
+        }
+    }
+
+    /* INTRINSIC.LIB: minimal OBJ-format intrinsic unit directory.
+     * Allows Setup_IUInfo to create the IU directory data segment,
+     * which Open_IUDirectory needs during Make_Process. */
+    {
+        uint32_t ilib_size = 0;
+        uint8_t *ilib_data = build_intrinsic_lib(&ilib_size);
+        if (ilib_data && ilib_size > 0) {
+            disk_add_file(db, "intrinsic.lib", FTYPE_OBJ, ilib_data, ilib_size);
+            fprintf(stderr, "Disk: intrinsic.lib (%u bytes)\n", ilib_size);
+            free(ilib_data);
         }
     }
 
