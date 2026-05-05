@@ -6398,7 +6398,8 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                                 pc_unblock = 0, pc_msp = 0, pc_getres = 0,
                                 pc_finish = 0, pc_open_temp = 0,
                                 pc_make_dataseg = 0, pc_ds_open = 0,
-                                pc_make_sysds = 0, mt_off = 0;
+                                pc_make_sysds = 0, mt_off = 0,
+                                pc_getseg = 0, pc_swapin = 0, pc_memmgr = 0;
                 static int probe_gen = -1;
                 static int p128e_msp_count = 0;
                 static bool p128e_armed = false;
@@ -6417,6 +6418,9 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                     pc_ds_open = boot_progress_lookup("DS_OPEN");
                     pc_make_sysds = boot_progress_lookup("MAKE_SYSDATASEG");
                     mt_off = boot_progress_lookup("mounttable");
+                    pc_getseg = boot_progress_lookup("GET_SEG");
+                    pc_swapin = boot_progress_lookup("SWAPIN_SEG");
+                    pc_memmgr = boot_progress_lookup("MEMMGR");
                     p128e_msp_count = 0;
                     p128e_armed = false;
                     p128e_log_count = 0;
@@ -6445,10 +6449,28 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                           "[P128e] Wait_sem ret=$%06X @sem=$%08X ctrl=$%04X "
                           "cnt=%d own=$%06X wq=$%06X SR=$%04X SP=$%06X\n",
                           ret, sem, ctrl, cnt, own, wq, cpu->sr, sp);
-                        fprintf(stderr, "         stack@SP:");
-                        for (int o = 0; o < 24; o += 4)
-                            fprintf(stderr, " $%08X", cpu_read32(cpu, sp + o));
-                        fprintf(stderr, "\n");
+                        /* If this is memmgr_sem, show grow_sysglobal + req_pcb_ptr */
+                        if (sem == 0x00CC7016) {
+                            uint32_t a5v = cpu->a[5] & 0xFFFFFF;
+                            uint8_t grow_sg = cpu_read8(cpu, (a5v - 26541) & 0xFFFFFF);
+                            uint32_t mmrb = cpu_read32(cpu, (a5v - 25691) & 0xFFFFFF) & 0xFFFFFF;
+                            uint32_t req_pcb_24 = (mmrb > 0x400) ?
+                                cpu_read32(cpu, (mmrb + 24) & 0xFFFFFF) : 0;
+                            uint32_t req_pcb_26 = (mmrb > 0x400) ?
+                                cpu_read32(cpu, (mmrb + 26) & 0xFFFFFF) : 0;
+                            fprintf(stderr,
+                              "         [MM-DIAG] grow_sg=%d req@24=$%08X req@26=$%08X"
+                              " busy@20=%02X%02X relsegs@22=%04X\n",
+                              grow_sg, req_pcb_24, req_pcb_26,
+                              cpu_read8(cpu, (mmrb + 20) & 0xFFFFFF),
+                              cpu_read8(cpu, (mmrb + 21) & 0xFFFFFF),
+                              cpu_read16(cpu, (mmrb + 22) & 0xFFFFFF));
+                        } else {
+                            fprintf(stderr, "         stack@SP:");
+                            for (int o = 0; o < 24; o += 4)
+                                fprintf(stderr, " $%08X", cpu_read32(cpu, sp + o));
+                            fprintf(stderr, "\n");
+                        }
                         p128e_log_count++;
                     } else if (cpu->pc == pc_sig) {
                         uint32_t ret = cpu_read32(cpu, sp);
@@ -6469,6 +6491,27 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                           "[P128e] Block_Process ret=$%06X pcb=$%06X "
                           "reasons=$%08X SR=$%04X\n",
                           ret, pcb, reasons, cpu->sr);
+                        /* P113: dump MMRB on first MemMgr block */
+                        {
+                            static int mmrb_dump_count = 0;
+                            if (mmrb_dump_count < 2) {
+                                uint32_t a5v = cpu->a[5] & 0xFFFFFF;
+                                uint32_t mmrb = cpu_read32(cpu, (a5v - 25691) & 0xFFFFFF) & 0xFFFFFF;
+                                if (mmrb > 0x400 && mmrb < 0xF00000) {
+                                    fprintf(stderr, "       MMRB@$%06X bytes 0..40:", mmrb);
+                                    for (int di = 0; di < 40; di += 2)
+                                        fprintf(stderr, " %04X", cpu_read16(cpu, (mmrb + di) & 0xFFFFFF));
+                                    fprintf(stderr, "\n       MMRB bytes 20..28 (req_pcb area):");
+                                    for (int di = 20; di < 28; di++)
+                                        fprintf(stderr, " %02X", cpu_read8(cpu, (mmrb + di) & 0xFFFFFF));
+                                    fprintf(stderr, "\n       memmgr_sem@$CC7016 raw:");
+                                    for (int di = 0; di < 8; di++)
+                                        fprintf(stderr, " %02X", cpu_read8(cpu, 0xCC7016 + di));
+                                    fprintf(stderr, "\n");
+                                    mmrb_dump_count++;
+                                }
+                            }
+                        }
                         p128e_log_count++;
                     } else if (cpu->pc == pc_unblock) {
                         uint32_t ret = cpu_read32(cpu, sp);
@@ -6479,9 +6522,45 @@ int m68k_execute(m68k_t *cpu, int target_cycles) {
                           "reasons=$%08X\n",
                           ret, pcb, reasons);
                         p128e_log_count++;
+                    } else if (cpu->pc == 0x04B8B0) {
+                        /* MemMgr resumes after WAIT_SEM — check state */
+                        static int mm_resume_count = 0;
+                        if (mm_resume_count++ < 10) {
+                            uint32_t a5v = cpu->a[5] & 0xFFFFFF;
+                            uint8_t grow_sg = cpu_read8(cpu, (a5v - 26541) & 0xFFFFFF);
+                            uint32_t mmrb = cpu_read32(cpu, (a5v - 25691) & 0xFFFFFF) & 0xFFFFFF;
+                            uint32_t req_pcb = (mmrb > 0x400) ?
+                                cpu_read32(cpu, (mmrb + 26) & 0xFFFFFF) : 0;
+                            uint8_t busyF = cpu_read8(cpu, (mmrb + 20) & 0xFFFFFF);
+                            fprintf(stderr,
+                              "[P113] MM-RESUME#%d @$04B8B0: grow_sg=%d req_pcb=$%08X"
+                              " busyF=%d SR=$%04X\n",
+                              mm_resume_count, grow_sg, req_pcb, busyF, cpu->sr);
+                        }
+                        p128e_log_count++;
+                    } else if (pc_swapin && cpu->pc == pc_swapin) {
+                        static int swapin_hits = 0;
+                        if (swapin_hits++ < 5) {
+                            fprintf(stderr,
+                              "[P113] SWAPIN_SEG entry #%d SR=$%04X A6=$%06X\n",
+                              swapin_hits, cpu->sr, cpu->a[6]);
+                        }
+                        p128e_log_count++;
+                    } else if (pc_getseg && cpu->pc == pc_getseg) {
+                        static int getseg_hits = 0;
+                        if (getseg_hits++ < 5) {
+                            uint32_t a5v = cpu->a[5] & 0xFFFFFF;
+                            uint32_t mmrb = cpu_read32(cpu, (a5v - 25691) & 0xFFFFFF) & 0xFFFFFF;
+                            uint16_t avail = (mmrb > 0x400) ? cpu_read16(cpu, (mmrb + 188) & 0xFFFFFF) : 0;
+                            fprintf(stderr,
+                              "[P113] GET_SEG entry #%d SR=$%04X avail_space=%d "
+                              "A6=$%06X\n",
+                              getseg_hits, cpu->sr, (int16_t)avail, cpu->a[6]);
+                        }
+                        p128e_log_count++;
                     } else if (cpu->pc == pc_getres) {
                         fprintf(stderr,
-                          "[P128e] Get_Resources entry SR=$%04X A6=$%06X\n",
+                          "[P113] Get_Resources entry SR=$%04X A6=$%06X\n",
                           cpu->sr, cpu->a[6]);
                         p128e_log_count++;
                     } else if (cpu->pc == pc_finish) {
